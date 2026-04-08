@@ -7,6 +7,29 @@
 - 大陆流量优先直连，不进代理
 - 默认不做全局环境代理，需要时按命令启用代理
 
+## 快速开始
+
+首次初始化：
+
+```bash
+cp ./config.example.yaml ./config.yaml
+./proxy.sh render
+./proxy.sh restart
+```
+
+快速检查：
+
+```bash
+./proxy.sh status
+./proxy.sh ai-status
+```
+
+临时让单条命令走代理：
+
+```bash
+./proxy.sh with-proxy curl https://chatgpt.com
+```
+
 ## 导航
 
 优先看这几份文件：
