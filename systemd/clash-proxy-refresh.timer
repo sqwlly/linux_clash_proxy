@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile Clash Proxy runtime config
+Documentation=file:/root/clash_proxy/README.md
+
+[Timer]
+Unit=clash-proxy-refresh.service
+OnBootSec=3min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Clash Proxy (Mihomo) managed by proxy.sh
+Documentation=file:/root/clash_proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+WorkingDirectory=/root/clash_proxy
+ExecStartPre=/root/clash_proxy/proxy.sh render
+ExecStart=/root/clash_proxy/proxy.sh restart
+ExecStop=/root/clash_proxy/proxy.sh stop
+ExecReload=/root/clash_proxy/proxy.sh restart
+PIDFile=/root/clash_proxy/mihomo.pid
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target

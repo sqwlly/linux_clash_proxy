@@ -1,0 +1,151 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:9090
+secret: ''
+
+profile:
+  store-selected: true
+  tracing: false
+  store-fake-ip: false
+
+unified-delay: true
+
+hosts:
+  localhost.localhost: 127.0.0.1
+
+dns:
+  enable: true
+  ipv6: false
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  use-hosts: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - 223.5.5.5
+    - 223.6.6.6
+  fake-ip-filter:
+    - '*.lan'
+    - localhost.ptlogin2.qq.com
+    - dns.msftncsi.com
+    - '*.srv.nintendo.net'
+    - '*.stun.playstation.net'
+    - 'xbox.*.microsoft.com'
+    - '*.xboxlive.com'
+
+proxies:
+  - name: '🇸🇬 Singapore丨01'
+    type: ss
+    server: ssg.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: REPLACE_WITH_REAL_PASSWORD
+    udp: true
+  - name: '🇸🇬 Singapore丨02'
+    type: ss
+    server: ssg2.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: REPLACE_WITH_REAL_PASSWORD
+    udp: true
+  - name: '🇺🇸 United States丨01'
+    type: ss
+    server: us1.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: REPLACE_WITH_REAL_PASSWORD
+    udp: true
+  - name: '🇺🇸 United States丨02'
+    type: ss
+    server: us2.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: REPLACE_WITH_REAL_PASSWORD
+    udp: true
+
+proxy-groups:
+  - name: SSRDOG
+    type: select
+    proxies:
+      - Auto
+      - '🇸🇬 Singapore丨01'
+      - '🇸🇬 Singapore丨02'
+      - '🇺🇸 United States丨01'
+      - '🇺🇸 United States丨02'
+  - name: Auto
+    type: fallback
+    proxies:
+      - '🇸🇬 Singapore'
+      - '🇺🇸 United States'
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300
+  - name: '🇸🇬 Singapore'
+    type: select
+    proxies:
+      - '🇸🇬 Singapore丨01'
+      - '🇸🇬 Singapore丨02'
+  - name: '🇺🇸 United States'
+    type: select
+    proxies:
+      - '🇺🇸 United States丨01'
+      - '🇺🇸 United States丨02'
+
+rule-providers:
+  YouTube:
+    type: http
+    behavior: classical
+    url: https://example.invalid/rules/YouTube.yml
+    interval: 86400
+    path: ./ruleset/YouTube.yml
+  SteamCN:
+    type: http
+    behavior: classical
+    url: https://example.invalid/rules/SteamCN.yml
+    interval: 86400
+    path: ./ruleset/SteamCN.yml
+  Bahamut:
+    type: http
+    behavior: classical
+    url: https://example.invalid/rules/Bahamut.yml
+    interval: 86400
+    path: ./ruleset/Bahamut.yml
+  DMM:
+    type: http
+    behavior: classical
+    url: https://example.invalid/rules/DMM.yml
+    interval: 86400
+    path: ./ruleset/DMM.yml
+  ChinaMax:
+    type: http
+    behavior: classical
+    url: https://example.invalid/rules/ChinaMax.yml
+    interval: 86400
+    path: ./ruleset/ChinaMax.yml
+
+rules:
+  - DOMAIN,dog.ssrdog.com,SSRDOG
+  - DOMAIN,ic.adobe.io,REJECT
+  - DOMAIN-KEYWORD,linkedin,SSRDOG
+  - RULE-SET,SteamCN,DIRECT
+  - RULE-SET,Bahamut,🇸🇬 Singapore
+  - RULE-SET,DMM,🇺🇸 United States
+  - RULE-SET,ChinaMax,DIRECT
+  - DOMAIN,local.adguard.org,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,17.0.0.0/8,DIRECT
+  - IP-CIDR,100.64.0.0/10,DIRECT
+  - IP-CIDR,224.0.0.0/4,DIRECT
+  - IP-CIDR,203.0.113.0/24,DIRECT
+  - IP-CIDR,192.0.2.0/24,DIRECT
+  - IP-CIDR6,fe80::/10,DIRECT
+  - MATCH,SSRDOG

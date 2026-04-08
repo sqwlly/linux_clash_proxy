@@ -1,0 +1,12 @@
+.git/
+.claude/
+.codex
+
+clash.log
+cache.db
+mihomo.pid
+config.yaml
+runtime.yaml
+mihomo.gz
+
+.DS_Store

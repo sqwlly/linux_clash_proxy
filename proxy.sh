@@ -1,0 +1,1311 @@
+#!/bin/bash
+# Clash/Mihomo 代理管理脚本
+# 版本: 1.2.0
+# 更新: 2026-04-09
+
+set -o pipefail
+
+# ==================== 配置区 ====================
+# 兼容旧版 CONFIG_FILE，将其视为原始配置输入
+PROG_NAME="${PROG_NAME:-mihomo}"
+PROG_PATH="${PROG_PATH:-/usr/local/bin/mihomo}"
+CONFIG_DIR="${CONFIG_DIR:-/root/clash_proxy}"
+SOURCE_CONFIG_FILE="${SOURCE_CONFIG_FILE:-${CONFIG_FILE:-$CONFIG_DIR/config.yaml}}"
+RUNTIME_CONFIG_FILE="${RUNTIME_CONFIG_FILE:-$CONFIG_DIR/runtime.yaml}"
+PID_FILE="${PID_FILE:-$CONFIG_DIR/mihomo.pid}"
+LOG_FILE="${LOG_FILE:-$CONFIG_DIR/clash.log}"
+DEFAULT_PROXY_PORT="${DEFAULT_PROXY_PORT:-7890}"
+DEFAULT_CONTROLLER_ADDR="${DEFAULT_CONTROLLER_ADDR:-127.0.0.1:9090}"
+START_TIMEOUT="${START_TIMEOUT:-5}"
+LOCK_FILE="${CONFIG_DIR}/.lock"
+TEST_URL="${TEST_URL:-http://cp.cloudflare.com/generate_204}"
+TEST_TIMEOUT="${TEST_TIMEOUT:-5000}"
+PROXY_NO_PROXY_DEFAULT="${PROXY_NO_PROXY_DEFAULT:-127.0.0.1,localhost}"
+
+# ==================== AI 规则配置 ====================
+AI_MANUAL_GROUP="AI-MANUAL"
+AI_AUTO_GROUP="AI-AUTO"
+AI_US_GROUP="AI-US"
+AI_SG_GROUP="AI-SG"
+AI_REGION_US="🇺🇸 United States"
+AI_REGION_SG="🇸🇬 Singapore"
+
+# ==================== 颜色定义 ====================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ==================== 全局变量 ====================
+CACHED_PID=""
+
+# ==================== 信号处理 ====================
+cleanup() {
+    rm -f "$LOCK_FILE" 2>/dev/null
+    exit 0
+}
+trap cleanup EXIT INT TERM
+
+# ==================== 工具函数 ====================
+
+print_error() {
+    echo -e "${RED}$*${NC}" >&2
+}
+
+print_warn() {
+    echo -e "${YELLOW}$*${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}$*${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}$*${NC}"
+}
+
+check_python_yaml() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        print_error "错误: 未找到 python3，无法渲染运行配置或解析 API 响应"
+        return 1
+    fi
+
+    if ! python3 - <<'PY' >/dev/null 2>&1
+import yaml
+PY
+    then
+        print_error "错误: python3 缺少 PyYAML 模块，无法渲染运行配置"
+        return 1
+    fi
+
+    return 0
+}
+
+check_requirements() {
+    local errors=0
+
+    if [ ! -x "$PROG_PATH" ]; then
+        print_error "错误: mihomo 可执行文件不存在或无执行权限: $PROG_PATH"
+        errors=$((errors + 1))
+    fi
+
+    if [ ! -f "$SOURCE_CONFIG_FILE" ]; then
+        print_error "错误: 原始配置文件不存在: $SOURCE_CONFIG_FILE"
+        errors=$((errors + 1))
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        print_warn "警告: curl 未安装，API 控制与 test 功能将不可用"
+    fi
+
+    if ! check_python_yaml; then
+        errors=$((errors + 1))
+    fi
+
+    return "$errors"
+}
+
+get_read_config_file() {
+    if [ -f "$RUNTIME_CONFIG_FILE" ]; then
+        echo "$RUNTIME_CONFIG_FILE"
+    else
+        echo "$SOURCE_CONFIG_FILE"
+    fi
+}
+
+get_yaml_value() {
+    local config_file="$1"
+    local key="$2"
+    local fallback="${3:-}"
+
+    if [ ! -f "$config_file" ]; then
+        echo "$fallback"
+        return 0
+    fi
+
+    python3 - "$config_file" "$key" "$fallback" <<'PY'
+import sys
+import yaml
+
+config_path, key, fallback = sys.argv[1:4]
+try:
+    with open(config_path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    print(fallback)
+    raise SystemExit(0)
+
+value = data.get(key, fallback)
+if value is None:
+    value = fallback
+
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+get_proxy_port() {
+    local config_file
+    config_file="$(get_read_config_file)"
+    get_yaml_value "$config_file" "mixed-port" "$DEFAULT_PROXY_PORT"
+}
+
+get_controller_addr() {
+    local config_file
+    config_file="$(get_read_config_file)"
+    get_yaml_value "$config_file" "external-controller" "$DEFAULT_CONTROLLER_ADDR"
+}
+
+get_api_secret() {
+    local config_file
+    config_file="$(get_read_config_file)"
+    get_yaml_value "$config_file" "secret" ""
+}
+
+get_controller_url() {
+    local addr
+    addr="$(get_controller_addr)"
+
+    case "$addr" in
+        http://*|https://*)
+            echo "$addr"
+            ;;
+        *)
+            echo "http://$addr"
+            ;;
+    esac
+}
+
+get_proxy_http_url() {
+    local port
+    port="$(get_proxy_port)"
+    echo "http://127.0.0.1:${port}"
+}
+
+get_proxy_all_url() {
+    local port
+    port="$(get_proxy_port)"
+    echo "socks5h://127.0.0.1:${port}"
+}
+
+build_proxy_env_lines() {
+    local http_url
+    local all_url
+    local no_proxy
+
+    http_url="$(get_proxy_http_url)"
+    all_url="$(get_proxy_all_url)"
+    no_proxy="${PROXY_NO_PROXY:-$PROXY_NO_PROXY_DEFAULT}"
+
+    cat <<EOF
+HTTP_PROXY=$http_url
+HTTPS_PROXY=$http_url
+ALL_PROXY=$all_url
+http_proxy=$http_url
+https_proxy=$http_url
+all_proxy=$all_url
+NO_PROXY=$no_proxy
+no_proxy=$no_proxy
+EOF
+}
+
+proxy_env() {
+    build_proxy_env_lines
+}
+
+with_proxy() {
+    if [ "$#" -eq 0 ]; then
+        print_error "错误: 用法: $0 with-proxy <command> [args...]"
+        return 1
+    fi
+
+    local http_url
+    local all_url
+    local no_proxy
+
+    http_url="$(get_proxy_http_url)"
+    all_url="$(get_proxy_all_url)"
+    no_proxy="${PROXY_NO_PROXY:-$PROXY_NO_PROXY_DEFAULT}"
+
+    env \
+        HTTP_PROXY="$http_url" \
+        HTTPS_PROXY="$http_url" \
+        ALL_PROXY="$all_url" \
+        http_proxy="$http_url" \
+        https_proxy="$http_url" \
+        all_proxy="$all_url" \
+        NO_PROXY="$no_proxy" \
+        no_proxy="$no_proxy" \
+        "$@"
+}
+
+proxy_shell() {
+    local shell_bin
+
+    shell_bin="${SHELL:-/bin/bash}"
+
+    print_info "进入临时代理 shell，退出后代理环境失效"
+    with_proxy "$shell_bin" -l
+}
+
+urlencode() {
+    python3 - "$1" <<'PY'
+import sys
+from urllib.parse import quote
+
+print(quote(sys.argv[1], safe=""))
+PY
+}
+
+api_request() {
+    local method="$1"
+    local path="$2"
+    local data="${3:-}"
+    local base_url
+    local secret
+    local curl_args=()
+
+    base_url="$(get_controller_url)"
+    secret="$(get_api_secret)"
+
+    curl_args=(-fsS --connect-timeout 5 -X "$method")
+
+    if [ -n "$secret" ]; then
+        curl_args+=(-H "Authorization: Bearer $secret")
+    fi
+
+    if [ -n "$data" ]; then
+        curl_args+=(-H "Content-Type: application/json" --data "$data")
+    fi
+
+    curl "${curl_args[@]}" "${base_url}${path}"
+}
+
+api_delay_test() {
+    local target="$1"
+    local url="$2"
+    local timeout="$3"
+    local base_url
+    local secret
+    local encoded_target
+    local curl_args=()
+
+    base_url="$(get_controller_url)"
+    secret="$(get_api_secret)"
+    encoded_target="$(urlencode "$target")"
+
+    curl_args=(-fsS --connect-timeout 5 --get)
+
+    if [ -n "$secret" ]; then
+        curl_args+=(-H "Authorization: Bearer $secret")
+    fi
+
+    curl_args+=(
+        --data-urlencode "url=$url"
+        --data-urlencode "timeout=$timeout"
+    )
+
+    curl "${curl_args[@]}" "${base_url}/proxies/${encoded_target}/delay"
+}
+
+api_available() {
+    api_request "GET" "/version" >/dev/null 2>&1
+}
+
+require_api() {
+    if ! api_available; then
+        print_error "错误: Mihomo API 不可访问，请检查 external-controller 或 secret 配置"
+        return 1
+    fi
+
+    return 0
+}
+
+runtime_needs_refresh() {
+    if [ ! -f "$RUNTIME_CONFIG_FILE" ]; then
+        return 0
+    fi
+
+    if [ "$SOURCE_CONFIG_FILE" -nt "$RUNTIME_CONFIG_FILE" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_runtime_config() {
+    if runtime_needs_refresh; then
+        print_warn "运行配置不存在或已过期，开始重新渲染..."
+        render || return 1
+    fi
+
+    return 0
+}
+
+get_candidate_config_files() {
+    local files=()
+
+    if [ -f "$RUNTIME_CONFIG_FILE" ]; then
+        files+=("$RUNTIME_CONFIG_FILE")
+    elif [ -f "$SOURCE_CONFIG_FILE" ]; then
+        files+=("$SOURCE_CONFIG_FILE")
+    fi
+
+    printf '%s\n' "${files[@]}"
+}
+
+get_pid() {
+    if [ -n "$CACHED_PID" ] && [ -d "/proc/$CACHED_PID" ]; then
+        echo "$CACHED_PID"
+        return 0
+    fi
+
+    local pid=""
+    local proc_pid
+    local cfg
+
+    if [ -f "$PID_FILE" ]; then
+        pid="$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null)"
+        if [ -n "$pid" ] && [ -f "/proc/$pid/cmdline" ]; then
+            while read -r cfg; do
+                [ -z "$cfg" ] && continue
+                if grep -qaF "$cfg" "/proc/$pid/cmdline" 2>/dev/null; then
+                    CACHED_PID="$pid"
+                    echo "$pid"
+                    return 0
+                fi
+            done < <(get_candidate_config_files)
+        fi
+    fi
+
+    while read -r proc_pid; do
+        [ -z "$proc_pid" ] && continue
+        if [ ! -f "/proc/$proc_pid/cmdline" ]; then
+            continue
+        fi
+
+        while read -r cfg; do
+            [ -z "$cfg" ] && continue
+            if grep -qaF "$cfg" "/proc/$proc_pid/cmdline" 2>/dev/null; then
+                pid="$proc_pid"
+                break 2
+            fi
+        done < <(get_candidate_config_files)
+    done < <(pgrep -x "$PROG_NAME" 2>/dev/null)
+
+    if [ -n "$pid" ]; then
+        CACHED_PID="$pid"
+    fi
+
+    echo "$pid"
+}
+
+clear_pid_cache() {
+    CACHED_PID=""
+}
+
+get_running_config_path() {
+    local pid
+    pid="$(get_pid)"
+
+    if [ -z "$pid" ] || [ ! -f "/proc/$pid/cmdline" ]; then
+        return 1
+    fi
+
+    python3 - "/proc/$pid/cmdline" <<'PY'
+import sys
+
+with open(sys.argv[1], "rb") as fh:
+    args = fh.read().split(b"\x00")
+
+decoded = [arg.decode("utf-8", errors="ignore") for arg in args if arg]
+for idx, arg in enumerate(decoded[:-1]):
+    if arg == "-f":
+        print(decoded[idx + 1])
+        break
+PY
+}
+
+is_running() {
+    local pid
+    local port
+
+    pid="$(get_pid)"
+    port="$(get_proxy_port)"
+
+    if [ -z "$pid" ]; then
+        clear_pid_cache
+        return 1
+    fi
+
+    if [ ! -d "/proc/$pid" ]; then
+        clear_pid_cache
+        return 1
+    fi
+
+    if ss -tln | grep -Eq "LISTEN.+:${port}[[:space:]]"; then
+        return 0
+    fi
+
+    return 1
+}
+
+render() {
+    if ! check_requirements; then
+        return 1
+    fi
+
+    mkdir -p "$CONFIG_DIR" || {
+        print_error "错误: 无法创建目录: $CONFIG_DIR"
+        return 1
+    }
+
+    python3 - "$SOURCE_CONFIG_FILE" "$RUNTIME_CONFIG_FILE" \
+        "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" \
+        "$AI_REGION_US" "$AI_REGION_SG" "$TEST_URL" <<'PY'
+import os
+import sys
+import yaml
+
+(
+    source_path,
+    runtime_path,
+    ai_manual_group,
+    ai_auto_group,
+    ai_us_group,
+    ai_sg_group,
+    ai_region_us,
+    ai_region_sg,
+    test_url,
+) = sys.argv[1:10]
+
+AI_RULES = [
+    f"DOMAIN-SUFFIX,openai.com,{ai_manual_group}",
+    f"DOMAIN-SUFFIX,chatgpt.com,{ai_manual_group}",
+    f"DOMAIN-SUFFIX,oaistatic.com,{ai_manual_group}",
+    f"DOMAIN-SUFFIX,oaiusercontent.com,{ai_manual_group}",
+    f"DOMAIN-SUFFIX,anthropic.com,{ai_manual_group}",
+    f"DOMAIN-SUFFIX,claude.ai,{ai_manual_group}",
+    f"DOMAIN,gemini.google.com,{ai_manual_group}",
+    f"DOMAIN,aistudio.google.com,{ai_manual_group}",
+    f"DOMAIN,ai.google.dev,{ai_manual_group}",
+    f"DOMAIN,generativelanguage.googleapis.com,{ai_manual_group}",
+]
+MAINLAND_DIRECT_RULES = [
+    "GEOIP,CN,DIRECT,no-resolve",
+]
+
+AI_CONFLICT_RULES = {
+    "DOMAIN-KEYWORD,chatgpt,SSRDOG",
+    "DOMAIN-KEYWORD,openai,SSRDOG",
+    "DOMAIN-SUFFIX,chatgpt.com,SSRDOG",
+    "DOMAIN-SUFFIX,openai.com,SSRDOG",
+    "DOMAIN-SUFFIX,anthropic.com,SSRDOG",
+    "DOMAIN-SUFFIX,claude.ai,SSRDOG",
+}
+
+AI_MANAGED_GROUPS = {ai_manual_group, ai_auto_group, ai_us_group, ai_sg_group}
+
+with open(source_path, "r", encoding="utf-8") as fh:
+    data = yaml.safe_load(fh) or {}
+
+if not isinstance(data, dict):
+    raise SystemExit("错误: 原始配置格式非法，顶层必须是 YAML 对象")
+
+groups = data.get("proxy-groups") or []
+if not isinstance(groups, list):
+    raise SystemExit("错误: proxy-groups 必须是列表")
+
+group_map = {}
+for group in groups:
+    if isinstance(group, dict) and group.get("name"):
+        group_map[group["name"]] = group
+
+missing_groups = [name for name in (ai_region_us, ai_region_sg) if name not in group_map]
+if missing_groups:
+    raise SystemExit(f"错误: 原始配置缺少必需的区域组: {', '.join(missing_groups)}")
+
+us_proxies = group_map[ai_region_us].get("proxies") or []
+sg_proxies = group_map[ai_region_sg].get("proxies") or []
+if not us_proxies or not sg_proxies:
+    raise SystemExit("错误: 美国或新加坡区域组未包含任何节点，无法生成 AI 自动切换组")
+
+filtered_groups = [
+    group
+    for group in groups
+    if not (isinstance(group, dict) and group.get("name") in AI_MANAGED_GROUPS)
+]
+
+ai_groups = [
+    {
+        "name": ai_us_group,
+        "type": "fallback",
+        "proxies": us_proxies,
+        "url": test_url,
+        "interval": 300,
+    },
+    {
+        "name": ai_sg_group,
+        "type": "fallback",
+        "proxies": sg_proxies,
+        "url": test_url,
+        "interval": 300,
+    },
+    {
+        "name": ai_auto_group,
+        "type": "fallback",
+        "proxies": [ai_us_group, ai_sg_group],
+        "url": test_url,
+        "interval": 300,
+    },
+    {
+        "name": ai_manual_group,
+        "type": "select",
+        "proxies": [
+            ai_auto_group,
+            ai_us_group,
+            ai_sg_group,
+            ai_region_us,
+            ai_region_sg,
+        ],
+    },
+]
+
+insert_after = None
+for idx, group in enumerate(filtered_groups):
+    if isinstance(group, dict) and group.get("name") == "Auto":
+        insert_after = idx
+        break
+
+if insert_after is None:
+    for idx, group in enumerate(filtered_groups):
+        if isinstance(group, dict) and group.get("name") == "SSRDOG":
+            insert_after = idx
+            break
+
+if insert_after is None:
+    filtered_groups = ai_groups + filtered_groups
+else:
+    filtered_groups = (
+        filtered_groups[: insert_after + 1]
+        + ai_groups
+        + filtered_groups[insert_after + 1 :]
+    )
+
+rules = data.get("rules") or []
+if not isinstance(rules, list):
+    raise SystemExit("错误: rules 必须是列表")
+
+clean_rules = [
+    rule
+    for rule in rules
+    if rule not in AI_RULES and rule not in AI_CONFLICT_RULES and rule not in MAINLAND_DIRECT_RULES
+]
+
+insert_index = None
+for idx, rule in enumerate(clean_rules):
+    if not isinstance(rule, str):
+        continue
+    if rule == "RULE-SET,ChinaMax,DIRECT":
+        insert_index = idx
+        break
+    if rule.startswith("MATCH,"):
+        insert_index = idx
+        break
+
+if insert_index is None:
+    clean_rules.extend(AI_RULES)
+else:
+    clean_rules = clean_rules[:insert_index] + AI_RULES + clean_rules[insert_index:]
+
+match_index = None
+for idx, rule in enumerate(clean_rules):
+    if isinstance(rule, str) and rule.startswith("MATCH,"):
+        match_index = idx
+        break
+
+if match_index is None:
+    clean_rules.extend(MAINLAND_DIRECT_RULES)
+else:
+    clean_rules = clean_rules[:match_index] + MAINLAND_DIRECT_RULES + clean_rules[match_index:]
+
+data["proxy-groups"] = filtered_groups
+data["rules"] = clean_rules
+
+tmp_path = f"{runtime_path}.tmp"
+with open(tmp_path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(
+        data,
+        fh,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    )
+
+os.replace(tmp_path, runtime_path)
+PY
+
+    local result=$?
+    if [ "$result" -ne 0 ]; then
+        print_error "错误: 渲染运行配置失败"
+        return 1
+    fi
+
+    print_success "运行配置已生成: $RUNTIME_CONFIG_FILE"
+    return 0
+}
+
+start() {
+    if ! check_requirements; then
+        return 1
+    fi
+
+    if ! ensure_runtime_config; then
+        return 1
+    fi
+
+    if is_running; then
+        local pid
+        pid="$(get_pid)"
+        print_success "代理已在运行中 (PID: $pid)"
+        return 0
+    fi
+
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_age=0
+        lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        if [ "$lock_age" -lt 30 ]; then
+            print_warn "另一个启动进程正在进行中，请稍候..."
+            return 1
+        fi
+        rm -f "$LOCK_FILE"
+    fi
+
+    print_warn "启动代理..."
+    touch "$LOCK_FILE"
+    mkdir -p "$(dirname "$LOG_FILE")"
+
+    cd "$CONFIG_DIR" || {
+        print_error "错误: 无法进入目录: $CONFIG_DIR"
+        rm -f "$LOCK_FILE"
+        return 1
+    }
+
+    nohup "$PROG_PATH" -f "$RUNTIME_CONFIG_FILE" -d "$CONFIG_DIR" >> "$LOG_FILE" 2>&1 &
+
+    local count=0
+    while [ "$count" -lt "$START_TIMEOUT" ]; do
+        if is_running; then
+            local pid
+            local port
+            pid="$(get_pid)"
+            port="$(get_proxy_port)"
+            echo "$pid" > "$PID_FILE"
+            rm -f "$LOCK_FILE"
+            clear_pid_cache
+            print_success "代理启动成功! (PID: $pid, 端口: $port)"
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+
+    rm -f "$LOCK_FILE"
+    clear_pid_cache
+    print_error "代理启动失败! (超时 ${START_TIMEOUT}秒)"
+    print_warn "请查看日志: $LOG_FILE"
+    return 1
+}
+
+stop() {
+    if ! is_running; then
+        print_warn "代理未运行"
+        rm -f "$PID_FILE"
+        clear_pid_cache
+        return 0
+    fi
+
+    local pid
+    pid="$(get_pid)"
+    print_warn "停止代理 (PID: $pid)..."
+
+    if kill "$pid" 2>/dev/null; then
+        local count=0
+        local max_wait=10
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$count" -ge "$max_wait" ]; then
+                print_warn "进程未响应，强制终止..."
+                kill -9 "$pid" 2>/dev/null
+                sleep 1
+                break
+            fi
+            sleep 1
+            count=$((count + 1))
+            echo -n "."
+        done
+        echo ""
+    fi
+
+    rm -f "$PID_FILE"
+    clear_pid_cache
+
+    if is_running; then
+        print_error "停止失败，进程仍在运行"
+        return 1
+    fi
+
+    print_success "代理已停止"
+    return 0
+}
+
+restart() {
+    print_warn "重启代理..."
+
+    stop
+    local stop_result=$?
+    sleep 1
+    start
+    local start_result=$?
+
+    if [ "$stop_result" -ne 0 ] || [ "$start_result" -ne 0 ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+status() {
+    local port
+    local controller
+    local running_config
+
+    port="$(get_proxy_port)"
+    controller="$(get_controller_addr)"
+
+    print_info "=== Mihomo 代理状态 ==="
+    echo -e "版本: 1.2.0"
+    echo -e "原始配置: $SOURCE_CONFIG_FILE"
+    echo -e "运行配置: $RUNTIME_CONFIG_FILE"
+    echo -e "控制接口: $controller"
+    echo -e "代理端口: $port"
+
+    if runtime_needs_refresh; then
+        echo -e "运行配置状态: ${YELLOW}待刷新${NC}"
+    else
+        echo -e "运行配置状态: ${GREEN}已就绪${NC}"
+    fi
+
+    if is_running; then
+        local pid
+        local elapsed
+        local mem_usage
+        local connections
+        local log_size
+
+        pid="$(get_pid)"
+        running_config="$(get_running_config_path)"
+
+        echo -e "状态: ${GREEN}运行中${NC}"
+        echo -e "PID: $pid"
+        if [ -n "$running_config" ]; then
+            echo -e "实际运行配置: $running_config"
+        fi
+
+        elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+        if [ -n "$elapsed" ]; then
+            local hours=$((elapsed / 3600))
+            local minutes=$(((elapsed % 3600) / 60))
+            local seconds=$((elapsed % 60))
+            printf "运行时间: %02dh %02dm %02ds\n" "$hours" "$minutes" "$seconds"
+        fi
+
+        mem_usage="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+        if [ -n "$mem_usage" ]; then
+            local mem_mb=$((mem_usage / 1024))
+            echo -e "内存使用: ${mem_mb}MB"
+        fi
+
+        connections=$(ss -tn | grep ":$port" | wc -l)
+        echo -e "当前连接数: $connections"
+
+        if api_available; then
+            echo -e "API 状态: ${GREEN}可访问${NC}"
+        else
+            echo -e "API 状态: ${RED}不可访问${NC}"
+        fi
+
+        if [ -f "$LOG_FILE" ]; then
+            log_size="$(du -h "$LOG_FILE" 2>/dev/null | cut -f1)"
+            echo -e "日志大小: $log_size"
+        fi
+    else
+        echo -e "状态: ${RED}未运行${NC}"
+    fi
+}
+
+logs() {
+    if [ ! -f "$LOG_FILE" ]; then
+        print_error "日志文件不存在: $LOG_FILE"
+        return 1
+    fi
+
+    print_info "=== 实时日志 (Ctrl+C 退出) ==="
+    echo -e "日志文件: $LOG_FILE"
+    echo ""
+
+    trap 'echo -e "\n${YELLOW}日志查看已停止${NC}"; return 0' INT
+
+    tail -f "$LOG_FILE" 2>/dev/null || {
+        print_error "无法读取日志文件"
+        return 1
+    }
+}
+
+test() {
+    local proxy_url
+    local passed=0
+    local total=0
+    local ip=""
+    local api
+    local port
+
+    print_info "=== 代理连接测试 ==="
+
+    if ! is_running; then
+        print_error "代理未运行，无法测试"
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        print_error "curl 未安装，无法进行测试"
+        return 1
+    fi
+
+    port="$(get_proxy_port)"
+    proxy_url="http://127.0.0.1:$port"
+
+    total=$((total + 1))
+    echo -n "[$total] 测试 Google: "
+    if curl -x "$proxy_url" -I -s --connect-timeout 5 "https://www.google.com" >/dev/null 2>&1; then
+        print_success "成功"
+        passed=$((passed + 1))
+    else
+        print_error "失败"
+    fi
+
+    total=$((total + 1))
+    echo -n "[$total] 测试 GitHub: "
+    if curl -x "$proxy_url" -I -s --connect-timeout 5 "https://github.com" >/dev/null 2>&1; then
+        print_success "成功"
+        passed=$((passed + 1))
+    else
+        print_error "失败"
+    fi
+
+    total=$((total + 1))
+    echo -n "[$total] 获取出口 IP: "
+    for api in "https://api.ip.sb/ip" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+        ip=$(curl -x "$proxy_url" -s --connect-timeout 5 "$api" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$ip" ]; then
+            print_success "$ip"
+            passed=$((passed + 1))
+            break
+        fi
+    done
+
+    if [ -z "$ip" ]; then
+        print_error "获取失败"
+    fi
+
+    echo ""
+    echo -e "测试结果: ${GREEN}${passed}/${total}${NC} 通过"
+
+    if [ "$passed" -eq "$total" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+list_groups() {
+    if ! ensure_runtime_config; then
+        return 1
+    fi
+
+    print_info "=== 可切换代理组 ==="
+
+    python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = yaml.safe_load(fh) or {}
+
+for group in data.get("proxy-groups", []):
+    if not isinstance(group, dict):
+        continue
+    group_type = str(group.get("type", "")).lower()
+    if group_type in {"select", "fallback", "url-test", "load-balance"}:
+        print(f"{group.get('name', '')}\t{group_type}")
+PY
+}
+
+list_nodes() {
+    local group_name="$1"
+
+    if [ -z "$group_name" ]; then
+        print_error "错误: 请指定代理组名称"
+        return 1
+    fi
+
+    if api_available; then
+        local proxies_json
+        proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+        print_info "=== 组 [$group_name] 的候选项 ==="
+        printf '%s' "$proxies_json" | python3 -c '
+import json
+import sys
+
+group_name = sys.argv[1]
+data = json.load(sys.stdin)
+group = data.get("proxies", {}).get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+
+current = group.get("now", "")
+for item in group.get("all", []):
+    prefix = "* " if item == current else "  "
+    print(f"{prefix}{item}")
+' "$group_name"
+        return $?
+    fi
+
+    if ! ensure_runtime_config; then
+        return 1
+    fi
+
+    print_info "=== 组 [$group_name] 的候选项（静态配置） ==="
+    python3 - "$RUNTIME_CONFIG_FILE" "$group_name" <<'PY'
+import sys
+import yaml
+
+config_path, group_name = sys.argv[1:3]
+with open(config_path, "r", encoding="utf-8") as fh:
+    data = yaml.safe_load(fh) or {}
+
+for group in data.get("proxy-groups", []):
+    if isinstance(group, dict) and group.get("name") == group_name:
+        for item in group.get("proxies", []):
+            print(f"  {item}")
+        break
+else:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+PY
+}
+
+current_group() {
+    local group_name="$1"
+
+    if [ -z "$group_name" ]; then
+        print_error "错误: 请指定代理组名称"
+        return 1
+    fi
+
+    if ! require_api; then
+        return 1
+    fi
+
+    local proxies_json
+    proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+    printf '%s' "$proxies_json" | python3 -c '
+import json
+import sys
+
+group_name = sys.argv[1]
+data = json.load(sys.stdin)
+group = data.get("proxies", {}).get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+
+current = group.get("now")
+if current:
+    print(current)
+else:
+    raise SystemExit(f"错误: 代理组 [{group_name}] 当前无可读的 now 状态，请确认该组类型支持读取当前选择")
+' "$group_name"
+}
+
+switch_group() {
+    local group_name="$1"
+    local target_name="$2"
+
+    if [ -z "$group_name" ] || [ -z "$target_name" ]; then
+        print_error "错误: 用法: $0 switch <group> <node>"
+        return 1
+    fi
+
+    if ! require_api; then
+        return 1
+    fi
+
+    local proxies_json
+    proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+    if ! printf '%s' "$proxies_json" | python3 -c '
+import json
+import sys
+
+group_name, target_name = sys.argv[1:3]
+data = json.load(sys.stdin)
+group = data.get("proxies", {}).get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+
+if group.get("type") != "Selector":
+    raise SystemExit(f"错误: 代理组 [{group_name}] 不是可手动切换的 Selector 类型")
+
+if target_name not in group.get("all", []):
+    raise SystemExit(f"错误: 目标 [{target_name}] 不在代理组 [{group_name}] 的候选列表中")
+' "$group_name" "$target_name"
+    then
+        return 1
+    fi
+
+    local encoded_group
+    encoded_group="$(urlencode "$group_name")"
+
+    api_request "PUT" "/proxies/${encoded_group}" "{\"name\":\"${target_name//\"/\\\"}\"}" >/dev/null || return 1
+    print_success "已切换 [$group_name] -> [$target_name]"
+    return 0
+}
+
+ai_status() {
+    if ! require_api; then
+        return 1
+    fi
+
+    local proxies_json
+    proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+    print_info "=== AI 专用路由状态 ==="
+    printf '%s' "$proxies_json" | python3 -c '
+import json
+import sys
+
+ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg = sys.argv[1:7]
+data = json.load(sys.stdin).get("proxies", {})
+
+def describe(name):
+    group = data.get(name)
+    if not group:
+        print(f"{name}: 缺失")
+        return
+
+    current = group.get("now", "-")
+    group_type = group.get("type", "-")
+    alive = group.get("alive", "-")
+    history = group.get("history") or []
+    delay = "-"
+    if history:
+        last = history[-1]
+        delay = last.get("delay", "-")
+    print(f"{name}: type={group_type} now={current} alive={alive} last_delay={delay}")
+
+for name in (ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg):
+    describe(name)
+' "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG"
+}
+
+test_group() {
+    local group_name="$1"
+    local candidates
+    local member
+    local result
+    local delay
+    local exit_code=0
+
+    if [ -z "$group_name" ]; then
+        print_error "错误: 用法: $0 test-group <group>"
+        return 1
+    fi
+
+    if ! require_api; then
+        return 1
+    fi
+
+    local proxies_json
+    proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+    candidates="$(printf '%s' "$proxies_json" | python3 -c '
+import json
+import sys
+
+group_name = sys.argv[1]
+data = json.load(sys.stdin).get("proxies", {})
+group = data.get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组或节点: {group_name}")
+
+items = group.get("all")
+if items:
+    for item in items:
+        print(item)
+else:
+    print(group_name)
+    ' "$group_name"
+)" || return 1
+
+    print_info "=== 组 [$group_name] 健康检查 ==="
+    while IFS= read -r member; do
+        [ -z "$member" ] && continue
+        printf "%s: " "$member"
+        if result="$(api_delay_test "$member" "$TEST_URL" "$TEST_TIMEOUT" 2>/dev/null)"; then
+            delay="$(printf '%s' "$result" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+print(data.get("delay", "-"))
+')"
+            print_success "${delay}ms"
+        else
+            print_error "失败"
+            exit_code=1
+        fi
+    done <<<"$candidates"
+
+    return "$exit_code"
+}
+
+usage() {
+    cat << EOF
+${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
+
+用法: $0 {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|proxy-env|with-proxy|proxy-shell}
+
+命令:
+  start                     - 渲染运行配置并启动代理
+  stop                      - 停止代理
+  restart                   - 渲染运行配置并重启代理
+  status                    - 查看详细状态
+  logs                      - 查看实时日志
+  test                      - 测试代理连通性
+  render                    - 从原始配置生成运行配置
+  list-groups               - 列出可切换代理组
+  list-nodes <group>        - 列出代理组候选项
+  current <group>           - 查看代理组当前选择
+  switch <group> <node>     - 手动切换 Selector 代理组
+  ai-status                 - 查看 AI 专用路由状态
+  test-group <group>        - 测试代理组或节点健康情况
+  proxy-env                 - 输出命令级代理环境变量
+  with-proxy <cmd...>       - 仅为单条命令注入代理环境
+  proxy-shell               - 打开临时代理 shell
+
+环境变量:
+  PROG_PATH                 - mihomo 可执行文件路径
+  CONFIG_DIR                - 配置目录
+  SOURCE_CONFIG_FILE        - 原始配置文件路径
+  CONFIG_FILE               - 原始配置文件路径（兼容旧变量）
+  RUNTIME_CONFIG_FILE       - 运行配置文件路径
+  DEFAULT_PROXY_PORT        - 默认代理端口（兜底）
+  DEFAULT_CONTROLLER_ADDR   - 默认控制接口地址（兜底）
+  START_TIMEOUT             - 启动超时秒数
+  TEST_URL                  - 健康检查 URL
+  TEST_TIMEOUT              - 健康检查超时毫秒
+  PROXY_NO_PROXY            - 覆盖默认 NO_PROXY 列表
+
+示例:
+  $0 render
+  $0 start
+  $0 list-groups
+  $0 list-nodes "$AI_MANUAL_GROUP"
+  $0 switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
+  $0 switch "$AI_REGION_US" "🇺🇸 United States丨02"
+  $0 ai-status
+  $0 proxy-env
+  $0 with-proxy curl https://chatgpt.com
+  $0 proxy-shell
+
+EOF
+}
+
+main() {
+    local command="${1:-}"
+
+    case "$command" in
+        start)
+            start
+            ;;
+        stop)
+            stop
+            ;;
+        restart)
+            restart
+            ;;
+        status)
+            status
+            ;;
+        logs)
+            logs
+            ;;
+        test)
+            test
+            ;;
+        render)
+            render
+            ;;
+        list-groups)
+            list_groups
+            ;;
+        list-nodes)
+            shift
+            list_nodes "$1"
+            ;;
+        current)
+            shift
+            current_group "$1"
+            ;;
+        switch)
+            shift
+            switch_group "$1" "$2"
+            ;;
+        ai-status)
+            ai_status
+            ;;
+        test-group)
+            shift
+            test_group "$1"
+            ;;
+        proxy-env)
+            proxy_env
+            ;;
+        with-proxy)
+            shift
+            with_proxy "$@"
+            ;;
+        proxy-shell)
+            proxy_shell
+            ;;
+        ""|-h|--help|help)
+            usage
+            exit 0
+            ;;
+        *)
+            print_error "错误: 未知命令 '$command'"
+            echo ""
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
