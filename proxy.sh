@@ -1410,6 +1410,11 @@ print(f"当前选择: {display_name(current)}")
 
 ai_status() {
     local raw_mode=0
+    local config_file
+    local proxy_http_url
+    local probe_timeout
+    local chatgpt_url
+    local openai_api_url
 
     if [ "${1:-}" = "--raw" ]; then
         raw_mode=1
@@ -1422,46 +1427,27 @@ ai_status() {
     local proxies_json
     proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-    if [ "$raw_mode" -eq 1 ]; then
-        printf '%s' "$proxies_json" | python3 -c '
-import json
-import sys
+    config_file="$(get_read_config_file)"
+    proxy_http_url="$(get_proxy_http_url)"
+    probe_timeout="$(get_yaml_value "$config_file" "ai-probe-timeout" "$(get_yaml_value "$config_file" "connectivity-timeout" "5")")"
+    chatgpt_url="$(get_yaml_value "$config_file" "ai-chatgpt-url" "https://chatgpt.com")"
+    openai_api_url="$(get_yaml_value "$config_file" "ai-openai-api-url" "https://api.openai.com/v1/models")"
 
-ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg = sys.argv[1:7]
-data = json.load(sys.stdin).get("proxies", {})
-
-def describe(name):
-    group = data.get(name)
-    if not group:
-        print(f"{name}: 缺失")
-        return
-
-    current = group.get("now", "-")
-    group_type = group.get("type", "-")
-    alive = group.get("alive", "-")
-    history = group.get("history") or []
-    delay = "-"
-    if history:
-        last = history[-1]
-        delay = last.get("delay", "-")
-    print(f"{name}: type={group_type} now={current} alive={alive} last_delay={delay}")
-
-for name in (ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg):
-    describe(name)
-' "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG"
-        return $?
+    if [ "$raw_mode" -ne 1 ]; then
+        print_info "=== AI 路由状态 ==="
     fi
 
-    print_info "=== AI 路由状态 ==="
-
-    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+    PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
 import json
 import os
+import socket
 import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener
 
 exec(os.environ["DISPLAY_NAME_PY"])
-ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg = sys.argv[1:7]
-data = json.load(sys.stdin).get("proxies", {})
+raw_mode, ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg, proxy_url, probe_timeout, chatgpt_url, openai_api_url = sys.argv[1:12]
+data = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
 
 def get_group(name):
     return data.get(name) or {}
@@ -1491,8 +1477,46 @@ def format_delay(value):
         return "-"
     return f"{value}ms"
 
+def probe_failure_detail(exc):
+    if isinstance(exc, socket.timeout):
+        return "超时"
+
+    text = str(exc).strip()
+    if "timed out" in text.lower():
+        return "超时"
+    if text:
+        return text
+    return "连接失败"
+
+def probe_targets():
+    opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    results = []
+
+    for name, url in (("ChatGPT Web", chatgpt_url), ("OpenAI API", openai_api_url)):
+        request = Request(url, headers={"User-Agent": "cproxy/1.2.0"})
+        try:
+            with opener.open(request, timeout=int(probe_timeout)) as response:
+                status = getattr(response, "status", response.getcode())
+            results.append({"name": name, "url": url, "ok": True, "detail": f"HTTP {status}" if status else "成功"})
+        except HTTPError as exc:
+            results.append({"name": name, "url": url, "ok": 400 <= exc.code < 500, "detail": f"HTTP {exc.code}"})
+        except (URLError, OSError) as exc:
+            results.append({"name": name, "url": url, "ok": False, "detail": probe_failure_detail(exc)})
+
+    return results
+
+def probe_summary(results):
+    ok_count = sum(1 for item in results if item["ok"])
+    if ok_count == len(results):
+        return "正常"
+    if ok_count == 0:
+        return "失败"
+    return "部分异常"
+
 manual_target = get_current(ai_manual)
 auto_target = get_current(ai_auto)
+probe_results = probe_targets()
+probe_status = probe_summary(probe_results)
 
 auto_mode = manual_target == ai_auto
 
@@ -1518,10 +1542,49 @@ standby_node = get_current(standby_group)
 standby_delay = get_delay(standby_group)
 standby_status = get_status(standby_group)
 
+if raw_mode == "1":
+    def describe(name):
+        group = data.get(name)
+        if not group:
+            print(f"{name}: 缺失")
+            return
+
+        current = group.get("now", "-")
+        group_type = group.get("type", "-")
+        alive = group.get("alive", "-")
+        history = group.get("history") or []
+        delay = "-"
+        if history:
+            delay = history[-1].get("delay", "-")
+        print(f"{name}: type={group_type} now={current} alive={alive} last_delay={delay}")
+
+    for name in (ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg):
+        describe(name)
+
+    print(f"AI-PROBE: {probe_status}")
+    for item in probe_results:
+        print(
+            "AI-PROBE-ITEM: name="
+            + str(item["name"])
+            + " ok="
+            + str(item["ok"])
+            + " detail="
+            + str(item["detail"])
+            + " url="
+            + str(item["url"])
+        )
+    raise SystemExit(0)
+
 print(
     f"AI 路由: {mode_label}  当前出口={display_name(active_node)}  "
     f"区域={active_group}  延迟={format_delay(active_delay)}  状态={active_status}"
 )
+print(f"AI 探测: {probe_status}")
+print()
+print("OpenAI 连通性")
+for item in probe_results:
+    label = "正常" if item["ok"] else "失败"
+    print(label + "  " + str(item["name"]) + "  " + str(item["url"]))
 print()
 print("当前链路")
 print(ai_manual)
@@ -1543,7 +1606,7 @@ print("分组状态")
 
 for name in (ai_manual, ai_auto, ai_us, ai_sg):
     print(f"{name:<10} {get_type(name):<8} 当前: {display_name(get_current(name))}")
-' "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG"
+' "$raw_mode" "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG" "$proxy_http_url" "$probe_timeout" "$chatgpt_url" "$openai_api_url"
 }
 
 test_group() {

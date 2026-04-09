@@ -99,6 +99,15 @@ cproxy test-group "AI-AUTO" --raw
 
 - `current/list-groups/list-nodes`：API 优先，API 不可达时回退 `runtime.yaml`
 - `ai-status/test-group/switch`：只依赖 API
+- `ai-status` 默认还会通过本地代理探测 `chatgpt.com` 与 `api.openai.com/v1/models`
+
+如需覆盖探测地址：
+
+```yaml
+ai-chatgpt-url: https://chatgpt.com
+ai-openai-api-url: https://api.openai.com/v1/models
+ai-probe-timeout: 5
+```
 
 ## 命令级代理
 

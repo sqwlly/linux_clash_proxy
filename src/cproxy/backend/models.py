@@ -63,3 +63,16 @@ class ConnectivityCheckResult:
 class ConnectivityReport:
     results: list[ConnectivityCheckResult]
     exit_ip: str | None
+
+
+@dataclass(frozen=True)
+class AIProbeResult:
+    name: str
+    url: str
+    ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class AIProbeReport:
+    results: list[AIProbeResult]

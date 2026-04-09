@@ -79,6 +79,29 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
+class _ProxyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "http://probe.local/chatgpt":
+            self._send(200, "ok")
+            return
+        if self.path == "http://probe.local/openai-api":
+            self._send(502, "bad gateway")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def _send(self, status: int, body_text: str):
+        body = body_text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
 def _run(env, *args):
     return subprocess.run(
         [sys.executable, "-m", "cproxy.cli", *args],
@@ -91,15 +114,20 @@ def _run(env, *args):
 
 def test_query_commands_use_api_output(tmp_path: Path):
     server = HTTPServer(("127.0.0.1", 0), _Handler)
+    proxy_server = HTTPServer(("127.0.0.1", 0), _ProxyHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
+    proxy_thread = Thread(target=proxy_server.serve_forever, daemon=True)
     thread.start()
+    proxy_thread.start()
 
     try:
         config_dir = tmp_path / ".config" / "cproxy"
         config_dir.mkdir(parents=True)
         (config_dir / "config.yaml").write_text(
             f"external-controller: 127.0.0.1:{server.server_port}\n"
-            "mixed-port: 7890\n",
+            f"mixed-port: {proxy_server.server_port}\n"
+            "ai-chatgpt-url: http://probe.local/chatgpt\n"
+            "ai-openai-api-url: http://probe.local/openai-api\n",
             encoding="utf-8",
         )
 
@@ -128,6 +156,10 @@ def test_query_commands_use_api_output(tmp_path: Path):
         ai_status_result = _run(env, "ai-status")
         assert ai_status_result.returncode == 0
         assert "AI 路由:" in ai_status_result.stdout
+        assert "AI 探测: 部分异常" in ai_status_result.stdout
+        assert "OpenAI 连通性" in ai_status_result.stdout
+        assert "正常  ChatGPT Web  http://probe.local/chatgpt" in ai_status_result.stdout
+        assert "失败  OpenAI API  http://probe.local/openai-api" in ai_status_result.stdout
         assert "当前链路" in ai_status_result.stdout
 
         ai_status_raw = _run(env, "ai-status", "--raw")
@@ -136,6 +168,8 @@ def test_query_commands_use_api_output(tmp_path: Path):
     finally:
         server.shutdown()
         thread.join()
+        proxy_server.shutdown()
+        proxy_thread.join()
 
 
 def test_query_commands_fall_back_to_runtime_when_api_unavailable(tmp_path: Path):

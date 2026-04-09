@@ -76,18 +76,19 @@ EOF
 
 cat >"$STUB_DIR/ss" <<'EOF'
 #!/bin/bash
+PORT="${PROXY_PORT:-7890}"
 if [ "${1:-}" = "-tln" ]; then
     cat <<OUT
 State  Recv-Q Send-Q Local Address:Port Peer Address:Port
-LISTEN 0      128    127.0.0.1:7890   0.0.0.0:*
+LISTEN 0      128    127.0.0.1:${PORT}   0.0.0.0:*
 OUT
     exit 0
 fi
 
 if [ "${1:-}" = "-tn" ]; then
     cat <<OUT
-ESTAB 0 0 127.0.0.1:7890 127.0.0.1:51001
-ESTAB 0 0 127.0.0.1:7890 127.0.0.1:51002
+ESTAB 0 0 127.0.0.1:${PORT} 127.0.0.1:51001
+ESTAB 0 0 127.0.0.1:${PORT} 127.0.0.1:51002
 OUT
     exit 0
 fi
@@ -186,6 +187,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/proxies":
             self._send({"proxies": load_state()})
             return
+        if self.path == "http://probe.local/chatgpt":
+            self._send_text(200, "ok")
+            return
+        if self.path == "http://probe.local/openai-api":
+            self._send_text(502, "bad gateway")
+            return
         if self.path.startswith("/proxies/") and "/delay" in self.path:
             target = self.path[len("/proxies/"):].split("/delay", 1)[0]
             target = unquote(target)
@@ -199,6 +206,14 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, status, text):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -230,7 +245,9 @@ PORT="$(cat "$PORT_FILE")"
 
 cat >"$CONFIG_FILE" <<EOF
 external-controller: 127.0.0.1:${PORT}
-mixed-port: 7890
+mixed-port: ${PORT}
+ai-chatgpt-url: http://probe.local/chatgpt
+ai-openai-api-url: http://probe.local/openai-api
 proxy-groups:
   - name: SSRDOG
     type: select
@@ -265,6 +282,7 @@ printf '%s\n' "$DUMMY_PID" >"$PID_FILE"
 
 COMMON_ENV=(
     PATH="$STUB_DIR:$PATH"
+    PROXY_PORT="$PORT"
     PROG_NAME="bash"
     SOURCE_CONFIG_FILE="$CONFIG_FILE"
     RUNTIME_CONFIG_FILE="$CONFIG_FILE"
@@ -304,6 +322,8 @@ ai_status_raw="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" ai-status --raw
 )"
 assert_contains "$ai_status_raw" "AI-MANUAL: type=Selector now=AI-AUTO" "ai-status --raw 应输出旧式平铺字段"
+assert_contains "$ai_status_raw" "AI-PROBE: 部分异常" "ai-status --raw 应输出探测汇总"
+assert_contains "$ai_status_raw" "AI-PROBE-ITEM: name=ChatGPT Web ok=True detail=HTTP 200 url=http://probe.local/chatgpt" "ai-status --raw 应输出 ChatGPT Web 探测结果"
 assert_not_contains "$ai_status_raw" "当前链路" "ai-status --raw 不应输出新区块"
 assert_not_contains "$ai_status_raw" "=== AI 路由状态 ===" "ai-status --raw 不应输出人类标题"
 

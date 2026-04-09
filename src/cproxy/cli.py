@@ -7,9 +7,9 @@ from pathlib import Path
 
 from . import __version__
 from .api import APIUnavailableError
-from .backend.models import ProxyGroup
+from .backend.models import AIProbeReport, ProxyGroup
 from .config import default_paths
-from .diagnostics import ConnectivityReport, GroupCheckReport, run_connectivity_test, test_group
+from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe, run_connectivity_test, test_group
 from .geodata import check_country_mmdb
 from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config, migrate_from_legacy
 from .logs import follow_lines, read_recent_lines
@@ -135,6 +135,7 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         "🇺🇸 United States",
         "🇸🇬 Singapore",
     )
+    probe_report = run_ai_probe(default_paths())
     if raw:
         for name in names:
             group = groups.get(name)
@@ -146,6 +147,9 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
                 f"{name}: type={_group_value(group, 'type', '-')} now={_group_value(group, 'now', '-')} "
                 f"alive={_group_value(group, 'alive', '-')} last_delay={delay}"
             )
+        print(f"AI-PROBE: {_probe_summary_status(probe_report)}")
+        for item in probe_report.results:
+            print(f"AI-PROBE-ITEM: name={item.name} ok={item.ok} detail={item.detail} url={item.url}")
         return 0
 
     route = _resolve_ai_route(groups)
@@ -164,6 +168,12 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         f"AI 路由: {route['mode_label']}  当前出口={normalize_name(active_node)}  "
         f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={active_status}"
     )
+    print(f"AI 探测: {_probe_summary_status(probe_report)}")
+    print()
+    print("OpenAI 连通性")
+    for item in probe_report.results:
+        label = "正常" if item.ok else "失败"
+        print(f"{label}  {item.name}  {item.url}")
     print()
     print("当前链路")
     print("AI-MANUAL")
@@ -183,6 +193,15 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         group = _get_group(groups, name)
         print(f"{name:<10} {_group_value(group, 'type', '-'):<8} 当前: {normalize_name(_group_value(group, 'now', '-'))}")
     return 0
+
+
+def _probe_summary_status(report: AIProbeReport) -> str:
+    ok_count = sum(1 for item in report.results if item.ok)
+    if ok_count == len(report.results):
+        return "正常"
+    if ok_count == 0:
+        return "失败"
+    return "部分异常"
 
 
 def _render_status(raw: bool) -> int:

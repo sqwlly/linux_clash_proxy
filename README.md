@@ -167,7 +167,7 @@ cproxy test
 默认输出面向人类阅读：
 
 - `status`：`运行摘要（含 API / AI 路由模式 / 当前出口延迟） + 连接与资源 + 配置路径`
-- `ai-status`：`摘要 + 当前链路 + 备用路径 + 分组状态`
+- `ai-status`：`摘要（含 OpenAI 探测汇总） + OpenAI 连通性 + 当前链路 + 备用路径 + 分组状态`
 - `list-groups`：`组名 / 类型 / 当前选择`
 - `list-nodes`：`当前选择 + 候选列表`
 - `test-group`：`检查摘要 + 检查结果`
@@ -203,6 +203,15 @@ cproxy test-group "AI-AUTO" --raw
 
 - `render` 后、`start` 前，`current/list-groups/list-nodes` 仍然可用
 - `ai-status/switch/test-group` 仍要求 Mihomo API 可访问
+- `ai-status` 会额外通过本地代理探测 `chatgpt.com` 与 `api.openai.com/v1/models`
+
+如需覆盖默认探测地址，可在 `config.yaml` 里配置：
+
+```yaml
+ai-chatgpt-url: https://chatgpt.com
+ai-openai-api-url: https://api.openai.com/v1/models
+ai-probe-timeout: 5
+```
 
 ## AI 路由设计
 

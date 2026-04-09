@@ -91,6 +91,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/proxies":
             self._send(payload)
             return
+        if self.path == "http://probe.local/chatgpt":
+            self._send_text(200, "ok")
+            return
+        if self.path == "http://probe.local/openai-api":
+            self._send_text(502, "bad gateway")
+            return
 
         self.send_response(404)
         self.end_headers()
@@ -99,6 +105,14 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, status, text):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -131,7 +145,9 @@ PORT="$(cat "$PORT_FILE")"
 
 cat >"$CONFIG_FILE" <<EOF
 external-controller: 127.0.0.1:${PORT}
-mixed-port: 7890
+mixed-port: ${PORT}
+ai-chatgpt-url: http://probe.local/chatgpt
+ai-openai-api-url: http://probe.local/openai-api
 EOF
 
 ai_status_output="$(
@@ -141,6 +157,10 @@ ai_status_output="$(
 )"
 
 assert_contains "$ai_status_output" "AI 路由:" "ai-status 应输出顶部摘要"
+assert_contains "$ai_status_output" "AI 探测: 部分异常" "ai-status 应输出 OpenAI 探测汇总"
+assert_contains "$ai_status_output" "OpenAI 连通性" "ai-status 应输出 OpenAI 连通性区块"
+assert_contains "$ai_status_output" "正常  ChatGPT Web  http://probe.local/chatgpt" "ai-status 应展示 ChatGPT Web 探测结果"
+assert_contains "$ai_status_output" "失败  OpenAI API  http://probe.local/openai-api" "ai-status 应展示 OpenAI API 探测结果"
 assert_contains "$ai_status_output" "当前链路" "ai-status 应输出当前链路区块"
 assert_contains "$ai_status_output" "备用路径" "ai-status 应输出备用路径区块"
 assert_contains "$ai_status_output" "分组状态" "ai-status 应输出分组状态区块"

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import socket
 from typing import Iterable
-from urllib.request import ProxyHandler, build_opener
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener
 
 from ..backend.api import APIBackend
-from ..backend.models import ConnectivityCheckResult, ConnectivityReport, DelayCheckResult, GroupCheckReport
+from ..backend.models import AIProbeReport, AIProbeResult, ConnectivityCheckResult, ConnectivityReport, DelayCheckResult, GroupCheckReport
 from ..backend.process import ProcessBackend
 from ..config import AppPaths, read_config
 from ..geodata import check_country_mmdb
@@ -21,6 +23,10 @@ DEFAULT_IP_CHECK_URLS = [
     "https://ifconfig.me/ip",
     "https://icanhazip.com",
 ]
+DEFAULT_AI_PROBE_TARGETS = [
+    ("ChatGPT Web", "https://chatgpt.com"),
+    ("OpenAI API", "https://api.openai.com/v1/models"),
+]
 
 
 def _config_list(config: dict, key: str, defaults: Iterable[str]) -> list[str]:
@@ -36,6 +42,35 @@ def _config_int(config: dict, key: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _config_str(config: dict, key: str, default: str) -> str:
+    value = config.get(key, default)
+    text = str(value).strip()
+    return text or default
+
+
+def _proxy_opener(paths: AppPaths):
+    return build_opener(
+        ProxyHandler(
+            {
+                "http": proxy_http_url(paths),
+                "https": proxy_http_url(paths),
+            }
+        )
+    )
+
+
+def _probe_failure_detail(exc: Exception) -> str:
+    if isinstance(exc, socket.timeout):
+        return "超时"
+
+    text = str(exc).strip()
+    if "timed out" in text.lower():
+        return "超时"
+    if text:
+        return text
+    return "连接失败"
 
 
 class DiagnosticsService:
@@ -73,14 +108,7 @@ class DiagnosticsService:
         connectivity_urls = _config_list(config, "connectivity-test-urls", DEFAULT_CONNECTIVITY_URLS)
         ip_urls = _config_list(config, "ip-check-urls", DEFAULT_IP_CHECK_URLS)
 
-        opener = build_opener(
-            ProxyHandler(
-                {
-                    "http": proxy_http_url(self.paths),
-                    "https": proxy_http_url(self.paths),
-                }
-            )
-        )
+        opener = _proxy_opener(self.paths)
 
         results: list[ConnectivityCheckResult] = []
         results.append(check_country_mmdb(self.paths))
@@ -112,3 +140,27 @@ class DiagnosticsService:
             )
         )
         return ConnectivityReport(results=results, exit_ip=exit_ip)
+
+    def run_ai_probe(self) -> AIProbeReport:
+        config = read_config(self.paths)
+        timeout = _config_int(config, "ai-probe-timeout", _config_int(config, "connectivity-timeout", 5))
+        targets = [
+            ("ChatGPT Web", _config_str(config, "ai-chatgpt-url", DEFAULT_AI_PROBE_TARGETS[0][1])),
+            ("OpenAI API", _config_str(config, "ai-openai-api-url", DEFAULT_AI_PROBE_TARGETS[1][1])),
+        ]
+        opener = _proxy_opener(self.paths)
+
+        results: list[AIProbeResult] = []
+        for name, url in targets:
+            request = Request(url, headers={"User-Agent": "cproxy/0.1.0"})
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    status = getattr(response, "status", response.getcode())
+                detail = f"HTTP {status}" if status else "成功"
+                results.append(AIProbeResult(name=name, url=url, ok=True, detail=detail))
+            except HTTPError as exc:
+                ok = 400 <= exc.code < 500
+                results.append(AIProbeResult(name=name, url=url, ok=ok, detail=f"HTTP {exc.code}"))
+            except (URLError, OSError) as exc:
+                results.append(AIProbeResult(name=name, url=url, ok=False, detail=_probe_failure_detail(exc)))
+        return AIProbeReport(results=results)

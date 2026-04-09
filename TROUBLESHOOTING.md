@@ -16,6 +16,7 @@ cproxy logs --lines 50
 - `status` 是否显示 `运行配置状态: 已就绪`
 - `status` 是否显示 `状态: 运行中`
 - `status` 是否显示 `AI 路由模式` 与 `AI 当前出口`
+- `ai-status` 是否显示 `AI 探测: 正常 / 部分异常 / 失败`
 - `ai-status` 是否能看出 `AI-MANUAL -> AI-AUTO -> AI-US/AI-SG` 的当前链路
 - `test-group "AI-AUTO"` 是否能测出至少一个可用区域
 
@@ -101,6 +102,7 @@ cproxy test-group "AI-AUTO"
 
 - `AI-MANUAL` 默认指向 `AI-AUTO`
 - `AI-AUTO` 当前指向 `AI-US` 或 `AI-SG`
+- `ai-status` 里的 `ChatGPT Web` 与 `OpenAI API` 至少应有一项正常
 - `test-group "AI-AUTO"` 能测出延迟
 
 常见原因：
