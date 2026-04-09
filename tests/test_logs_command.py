@@ -25,6 +25,7 @@ def test_logs_command_reads_recent_lines(tmp_path: Path):
     )
 
     assert result.returncode == 0
+    assert "日志" in result.stdout
     assert "日志文件:" in result.stdout
     assert "line-2" in result.stdout
     assert "line-3" in result.stdout

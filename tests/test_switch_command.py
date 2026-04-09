@@ -98,7 +98,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         )
 
         assert switch_result.returncode == 0
-        assert "切换结果" in switch_result.stdout
+        assert "结果" in switch_result.stdout
         assert "代理组: AI-MANUAL" in switch_result.stdout
         assert "当前选择: AI-SG" in switch_result.stdout
 
@@ -123,6 +123,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         )
 
         assert current_result.returncode == 0
+        assert "摘要" in current_result.stdout
         assert "当前选择: AI-US" in current_result.stdout
     finally:
         server.shutdown()

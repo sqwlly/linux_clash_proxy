@@ -122,6 +122,7 @@ def _render_current(groups: dict, group_name: str, raw: bool) -> int:
     if raw:
         print(current)
     else:
+        _print_section("摘要")
         print(f"当前选择: {_accent(normalize_name(current))}")
     return 0
 
@@ -349,6 +350,7 @@ def _render_logs(lines: int, follow: bool) -> int:
     if not path.exists():
         raise SystemExit(f"错误: 日志文件不存在: {path}")
 
+    _print_section("日志")
     print(f"日志文件: {path}")
     print()
     for line in read_recent_lines(path, lines):
@@ -466,7 +468,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "switch":
             service = QueryService(default_paths())
             group = service.switch_group(args.group, args.target)
-            print(_section_title("切换结果"))
+            print(_section_title("结果"))
             print(f"代理组: {args.group}")
             print(f"当前选择: {_accent(normalize_name(group.current))}")
             return 0

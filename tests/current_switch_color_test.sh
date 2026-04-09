@@ -184,6 +184,7 @@ assert_not_contains "$help_output" '\033[' "--help 非 TTY 输出不应包含字
 current_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
 )"
+assert_contains "$current_output" "摘要" "current 应输出摘要区块"
 assert_contains "$current_output" "当前选择: AI-AUTO" "current 应输出摘要式当前选择"
 
 current_color_output="$(
@@ -194,7 +195,7 @@ assert_contains "$current_color_output" $'\033[' "FORCE_COLOR=1 时 current 应�
 switch_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" switch "AI-MANUAL" "AI-SG"
 )"
-assert_contains "$switch_output" "切换结果" "switch 应输出切换结果区块"
+assert_contains "$switch_output" "结果" "switch 应输出结果区块"
 assert_contains "$switch_output" "代理组: AI-MANUAL" "switch 应展示目标代理组"
 assert_contains "$switch_output" "当前选择: AI-SG" "switch 应展示切换后的当前选择"
 
