@@ -14,6 +14,8 @@ pipx install /path/to/clash_proxy
 ./scripts/install.sh
 ```
 
+`./scripts/install.sh` 会自动尝试一键部署（等价于 `cproxy bootstrap`）。
+
 安装脚本会检查默认 GeoIP 数据文件：
 
 - `~/.local/share/cproxy/country.mmdb`
@@ -24,6 +26,12 @@ pipx install /path/to/clash_proxy
 
 ```bash
 cproxy init
+```
+
+或直接无参数一键：
+
+```bash
+cproxy bootstrap
 ```
 
 配置文件位置：

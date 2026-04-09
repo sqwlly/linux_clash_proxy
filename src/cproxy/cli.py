@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -9,7 +10,8 @@ from .api import APIUnavailableError
 from .backend.models import ProxyGroup
 from .config import default_paths
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_connectivity_test, test_group
-from .install import init_user_layout, migrate_from_legacy
+from .geodata import check_country_mmdb
+from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config, migrate_from_legacy
 from .logs import follow_lines, read_recent_lines
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .process import ProcessOwnershipError, get_status, restart_process, start_process, stop_process
@@ -248,6 +250,41 @@ def _render_logs(lines: int, follow: bool) -> int:
     return 0
 
 
+def _run_bootstrap() -> int:
+    paths = default_paths()
+    config_path = init_user_layout(paths)
+    migrated_from: Path | None = None
+
+    if is_placeholder_config(paths):
+        migrated_path = auto_migrate_from_default_legacy(paths)
+        if migrated_path is None:
+            legacy_root = Path(os.environ.get("CPROXY_LEGACY_ROOT", "/root/clash_proxy"))
+            legacy_config = legacy_root / "config.yaml"
+            raise RuntimeError(f"错误: 当前配置为空，且未找到可迁移配置: {legacy_config}")
+        migrated_from = Path(os.environ.get("CPROXY_LEGACY_ROOT", "/root/clash_proxy")) / "config.yaml"
+        config_path = migrated_path
+
+    runtime_path = render_runtime(paths)
+    pid = start_process(paths)
+    snapshot = get_status(paths)
+    if not snapshot.running:
+        raise RuntimeError("错误: 代理启动后状态异常，请执行 cproxy logs --lines 100 排查")
+
+    geodata_check = check_country_mmdb(paths)
+
+    print("一键部署完成")
+    print(f"配置文件: {config_path}")
+    if migrated_from is not None:
+        print(f"已自动迁移旧配置: {migrated_from}")
+    print(f"运行配置: {runtime_path}")
+    print(f"代理进程: 运行中 (PID: {pid})")
+    if geodata_check.ok:
+        print(f"GeoIP: {geodata_check.detail}")
+    else:
+        print(f"GeoIP: {geodata_check.detail}")
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = build_root_parser()
     args: Namespace = parser.parse_args(argv)
@@ -259,6 +296,8 @@ def run(argv: list[str] | None = None) -> int:
             config_file = init_user_layout(default_paths())
             print(f"已初始化配置: {config_file}")
             return 0
+        if args.command == "bootstrap":
+            return _run_bootstrap()
         if args.command == "migrate-from-legacy":
             config_file = migrate_from_legacy(default_paths(), Path(args.legacy_root))
             print(f"已迁移配置: {config_file}")

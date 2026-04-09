@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
-from .config import AppPaths
+from .config import AppPaths, read_config
 
 
 DEFAULT_CONFIG = """mixed-port: 7890
@@ -14,6 +15,7 @@ proxies: []
 proxy-groups: []
 rules: []
 """
+DEFAULT_LEGACY_ROOT = Path("/root/clash_proxy")
 
 
 def init_user_layout(paths: AppPaths) -> Path:
@@ -40,3 +42,23 @@ def migrate_from_legacy(paths: AppPaths, legacy_root: Path) -> Path:
     target = paths.config_dir / "config.yaml"
     shutil.copyfile(legacy_config, target)
     return target
+
+
+def default_legacy_root() -> Path:
+    return Path(os.environ.get("CPROXY_LEGACY_ROOT", str(DEFAULT_LEGACY_ROOT)))
+
+
+def is_placeholder_config(paths: AppPaths) -> bool:
+    config = read_config(paths)
+    proxies = config.get("proxies") or []
+    groups = config.get("proxy-groups") or []
+    rules = config.get("rules") or []
+    return not proxies and not groups and not rules
+
+
+def auto_migrate_from_default_legacy(paths: AppPaths) -> Path | None:
+    legacy_root = default_legacy_root()
+    legacy_config = legacy_root / "config.yaml"
+    if not legacy_config.exists():
+        return None
+    return migrate_from_legacy(paths, legacy_root)

@@ -22,6 +22,7 @@ def build_root_parser() -> ArgumentParser:
     parser.add_argument("--version", action="store_true", help="Show version and exit")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("init", help="Initialize user config directories")
+    subparsers.add_parser("bootstrap", help="One-click bootstrap without arguments")
 
     current_parser = subparsers.add_parser("current", help="Show current proxy selection")
     current_parser.add_argument("group")

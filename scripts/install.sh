@@ -48,6 +48,14 @@ main() {
 
     warn_missing_geodata
 
+    if PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+        CPROXY_LEGACY_ROOT="${ROOT_DIR}" \
+        python3 -m cproxy.cli bootstrap; then
+        echo "一键部署: 完成"
+    else
+        echo "警告: 一键部署未完成，可稍后手动执行 cproxy bootstrap" >&2
+    fi
+
     echo "安装完成"
     echo "命令入口: cproxy"
     echo "用户配置: ${XDG_CONFIG_HOME:-$HOME/.config}/cproxy/config.yaml"

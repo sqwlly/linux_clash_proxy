@@ -34,6 +34,8 @@ pipx install /path/to/clash_proxy
 ./scripts/install.sh
 ```
 
+这条脚本现在会在安装后自动尝试无参一键部署流程（等价于 `cproxy bootstrap`）。
+
 安装脚本会：
 
 - 优先使用 `pipx install --force --editable`
@@ -96,6 +98,12 @@ cproxy ai-status
 
 ```bash
 cproxy migrate-from-legacy /root/clash_proxy
+```
+
+如果你希望无参数一键完成初始化、自动迁移、渲染和启动：
+
+```bash
+cproxy bootstrap
 ```
 
 ## 用户级目录
