@@ -39,6 +39,25 @@ pipx install /path/to/clash_proxy
 - 优先使用 `pipx install --force --editable`
 - 回退到 `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
+- 检查默认 GeoIP 数据文件是否存在
+
+## GeoIP 数据
+
+`cproxy render` 会注入：
+
+- `GEOIP,CN,DIRECT,no-resolve`
+
+因此运行时依赖 `country.mmdb`。默认手动放置路径是：
+
+- `~/.local/share/cproxy/country.mmdb`
+
+这是因为 `cproxy start` 会用用户级数据目录作为 Mihomo 的 `-d` 工作目录。
+
+需要注意：
+
+- 在无代理或受限网络环境下，Mihomo 不一定能自动获取 `country.mmdb`
+- `./scripts/install.sh` 会检查该文件是否存在，但不会强制下载
+- 如果缺失，先手动放到上面的默认路径，再执行 `cproxy test`
 
 常用可选配置项：
 
@@ -67,6 +86,7 @@ cproxy init
 
 ```bash
 cproxy render
+cproxy test
 cproxy start
 cproxy status
 cproxy ai-status
@@ -144,6 +164,10 @@ cproxy test
 - `list-nodes`：`当前选择 + 候选列表`
 - `test-group`：`检查摘要 + 检查结果`
 - `test`：`检查摘要 + 检查结果`
+
+`test` 还会额外检查：
+
+- `~/.local/share/cproxy/country.mmdb` 是否存在
 
 脚本场景可显式加 `--raw`：
 

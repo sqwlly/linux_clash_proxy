@@ -117,6 +117,7 @@ def test_diagnostics_and_proxy_commands(tmp_path: Path):
         config_dir.mkdir(parents=True)
         data_dir.mkdir(parents=True)
         state_dir.mkdir(parents=True)
+        (data_dir / "country.mmdb").write_bytes(b"test")
 
         runtime_path = data_dir / "runtime.yaml"
         runtime_path.write_text("port: 7890\n", encoding="utf-8")
@@ -191,8 +192,73 @@ ip-check-urls:
         assert test_result.returncode == 0
         assert "检查摘要" in test_result.stdout
         assert "目标: 代理连通性" in test_result.stdout
-        assert "可用: 3/3" in test_result.stdout
+        assert "可用: 4/4" in test_result.stdout
         assert "出口 IP: 203.0.113.7" in test_result.stdout
+        assert "正常  GeoIP 数据" in test_result.stdout
+    finally:
+        if "managed_process" in locals():
+            managed_process.terminate()
+            managed_process.wait(timeout=5)
+        api_server.shutdown()
+        api_thread.join()
+        proxy_server.shutdown()
+        proxy_thread.join()
+
+
+def test_diagnostics_report_missing_geodata(tmp_path: Path):
+    api_server, api_thread = _start_server(_ApiHandler)
+    proxy_server, proxy_thread = _start_server(_ProxyHandler)
+
+    try:
+        config_dir = tmp_path / ".config" / "cproxy"
+        data_dir = tmp_path / ".local" / "share" / "cproxy"
+        state_dir = tmp_path / ".local" / "state" / "cproxy"
+        config_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        state_dir.mkdir(parents=True)
+
+        runtime_path = data_dir / "runtime.yaml"
+        runtime_path.write_text("port: 7890\n", encoding="utf-8")
+        owned_proc = tmp_path / "owned-proc.sh"
+        owned_proc.write_text(
+            """#!/bin/bash
+trap 'exit 0' TERM INT
+while true; do
+  sleep 1
+done
+""",
+            encoding="utf-8",
+        )
+        owned_proc.chmod(0o755)
+        managed_process = subprocess.Popen([str(owned_proc), str(runtime_path)])
+        (state_dir / "cproxy.pid").write_text(f"{managed_process.pid}\n", encoding="utf-8")
+        (state_dir / "cproxy-process.json").write_text(
+            json.dumps({"pid": managed_process.pid, "program": str(owned_proc), "runtime": str(runtime_path)}) + "\n",
+            encoding="utf-8",
+        )
+
+        (config_dir / "config.yaml").write_text(
+            f"""
+external-controller: 127.0.0.1:{api_server.server_port}
+mixed-port: {proxy_server.server_port}
+connectivity-test-urls:
+  - http://probe.local/google
+ip-check-urls:
+  - http://probe.local/ip
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = "/root/clash_proxy/src"
+        env["HOME"] = str(tmp_path)
+
+        test_result = _run(env, "test")
+        assert test_result.returncode == 1
+        assert "失败  GeoIP 数据" in test_result.stdout
+        assert "country.mmdb" in test_result.stdout
+        assert str(data_dir / "country.mmdb") in test_result.stdout
     finally:
         if "managed_process" in locals():
             managed_process.terminate()

@@ -7,6 +7,7 @@ from ..backend.api import APIBackend
 from ..backend.models import ConnectivityCheckResult, ConnectivityReport, DelayCheckResult, GroupCheckReport
 from ..backend.process import ProcessBackend
 from ..config import AppPaths, read_config
+from ..geodata import check_country_mmdb
 from ..proxyenv import proxy_http_url
 
 DEFAULT_TEST_URL = "http://cp.cloudflare.com/generate_204"
@@ -82,6 +83,8 @@ class DiagnosticsService:
         )
 
         results: list[ConnectivityCheckResult] = []
+        results.append(check_country_mmdb(self.paths))
+
         for url in connectivity_urls:
             try:
                 with opener.open(url, timeout=timeout) as response:

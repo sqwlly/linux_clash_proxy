@@ -14,6 +14,12 @@ pipx install /path/to/clash_proxy
 ./scripts/install.sh
 ```
 
+安装脚本会检查默认 GeoIP 数据文件：
+
+- `~/.local/share/cproxy/country.mmdb`
+
+如果缺失，会打印警告，但不会阻塞安装。
+
 ## 初始化
 
 ```bash
@@ -37,10 +43,15 @@ connectivity-timeout: 5
 
 ```bash
 cproxy render
+cproxy test
 cproxy start
 cproxy logs --lines 50
 cproxy status
 ```
+
+如果 `cproxy test` 提示缺少 `country.mmdb`，先把该文件放到：
+
+- `~/.local/share/cproxy/country.mmdb`
 
 ## AI 路由
 
@@ -121,6 +132,7 @@ cproxy status --raw
 说明：
 
 - `test` 会先校验当前运行进程是否属于 `cproxy`
+- `test` 会检查默认 GeoIP 数据文件 `~/.local/share/cproxy/country.mmdb`
 - `stop` 和 `restart` 也会做同样的 ownership 校验
 
 ## 用户级 systemd

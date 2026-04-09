@@ -21,6 +21,19 @@ install_with_pip() {
     python3 -m pip install --user --editable "$ROOT_DIR"
 }
 
+warn_missing_geodata() {
+    local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local mmdb_path="${data_home}/cproxy/country.mmdb"
+    if [ -f "$mmdb_path" ]; then
+        echo "GeoIP 数据: ${mmdb_path}"
+        return 0
+    fi
+
+    echo "警告: 未检测到 GeoIP 数据文件: ${mmdb_path}" >&2
+    echo "提示: 在无代理或受限网络环境下，mihomo 可能无法自动获取 country.mmdb" >&2
+    echo "提示: 可手动放置该文件后再运行 cproxy test" >&2
+}
+
 main() {
     require_cmd python3
 
@@ -32,6 +45,8 @@ main() {
 
     PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
         python3 -m cproxy.cli init >/dev/null
+
+    warn_missing_geodata
 
     echo "安装完成"
     echo "命令入口: cproxy"

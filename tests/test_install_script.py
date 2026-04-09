@@ -39,6 +39,8 @@ exit 0
     log_text = pipx_log.read_text(encoding="utf-8")
     assert "install --force --editable /root/clash_proxy" in log_text
     assert "安装完成" in result.stdout
+    assert "未检测到 GeoIP 数据文件" in result.stderr
+    assert str(tmp_path / ".local" / "share" / "cproxy" / "country.mmdb") in result.stderr
 
 
 def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path):
@@ -81,6 +83,8 @@ exit 1
     log_text = python_log.read_text(encoding="utf-8")
     assert "-m pip install --user --editable /root/clash_proxy" in log_text
     assert "安装完成" in result.stdout
+    assert "未检测到 GeoIP 数据文件" in result.stderr
+    assert str(tmp_path / ".local" / "share" / "cproxy" / "country.mmdb") in result.stderr
 
 
 def test_pyproject_declares_runtime_dependencies():

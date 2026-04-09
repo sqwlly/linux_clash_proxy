@@ -40,6 +40,10 @@ pipx ensurepath
 exec "$SHELL" -l
 ```
 
+如果安装脚本提示未检测到 `country.mmdb`，这不是安装失败。默认手动放置路径是：
+
+- `~/.local/share/cproxy/country.mmdb`
+
 ## 3. `start` 失败或状态一直是未运行
 
 排查：
@@ -72,6 +76,12 @@ api-timeout: 2
 
 ```bash
 cproxy logs --lines 200
+```
+
+如果你看到 `GEOIP,CN,DIRECT,no-resolve` 已经注入，但 `country.mmdb` 缺失，先执行：
+
+```bash
+cproxy test
 ```
 
 如果此前遗留了 stale pidfile，新版本不会直接复用它，也不会误杀同 PID 的无关进程。
@@ -178,6 +188,7 @@ cproxy status
 此外还依赖：
 
 - 当前 PID 与 ownership 元数据匹配
+- 默认 GeoIP 数据文件 `~/.local/share/cproxy/country.mmdb` 存在
 
 如果 stderr 提示“不属于 cproxy 管理的进程”，说明你当前的 pidfile 已陈旧，或目标进程不是由 `cproxy start` 拉起。
 
@@ -193,6 +204,11 @@ ip-check-urls:
 connectivity-timeout: 5
 test-timeout: 5000
 ```
+
+如果输出里出现 `失败  GeoIP 数据`，优先检查：
+
+- `~/.local/share/cproxy/country.mmdb` 是否存在
+- 当前机器是否处于无代理或受限网络环境，导致 Mihomo 无法自动获取该文件
 
 ## 8. 从旧目录迁移后配置不见了
 
