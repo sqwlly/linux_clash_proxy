@@ -60,6 +60,7 @@ rules:
     assert runtime_file.is_file()
     assert "name: AI-MANUAL" in runtime_text
     assert "name: AI-AUTO" in runtime_text
+    assert "url: https://cp.cloudflare.com/generate_204" in runtime_text
     assert "DOMAIN-SUFFIX,openai.com,AI-MANUAL" in runtime_text
     assert "GEOIP,CN,DIRECT,no-resolve" in runtime_text
 

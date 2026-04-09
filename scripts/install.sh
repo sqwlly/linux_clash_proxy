@@ -82,6 +82,8 @@ setup_logrotate() {
 setup_legacy_logrotate() {
     local logrotate_dir="${CPROXY_LOGROTATE_DIR:-/etc/logrotate.d}"
     local logrotate_conf="${logrotate_dir}/clash_proxy"
+    local state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+    local log_file="${state_home}/clash_proxy/clash.log"
 
     if [ ! -d "${logrotate_dir}" ]; then
         return 0
@@ -92,7 +94,7 @@ setup_legacy_logrotate() {
     fi
 
     cat > "${logrotate_conf}" << 'EOF'
-/root/clash_proxy/clash.log {
+{{LOG_FILE}} {
     daily
     size 10M
     rotate 7
@@ -100,18 +102,11 @@ setup_legacy_logrotate() {
     delaycompress
     missingok
     notifempty
-    create 0640 root root
-    postrotate
-        # 如果mihomo正在运行，发送USR1信号重新打开日志文件
-        if [ -f /root/clash_proxy/mihomo.pid ]; then
-            pid=$(cat /root/clash_proxy/mihomo.pid 2>/dev/null)
-            if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
-                kill -USR1 "$pid" 2>/dev/null || true
-            fi
-        fi
-    endscript
+    copytruncate
 }
 EOF
+
+    sed -i "s|{{LOG_FILE}}|${log_file}|g" "${logrotate_conf}"
 
     add_logrotate_cron "${logrotate_conf}" "logrotate.*clash_proxy"
 }

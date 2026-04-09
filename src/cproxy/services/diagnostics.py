@@ -10,7 +10,7 @@ from ..config import AppPaths, read_config
 from ..geodata import check_country_mmdb
 from ..proxyenv import proxy_http_url
 
-DEFAULT_TEST_URL = "http://cp.cloudflare.com/generate_204"
+DEFAULT_TEST_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_TEST_TIMEOUT = 5000
 DEFAULT_CONNECTIVITY_URLS = [
     "https://www.google.com",

@@ -172,10 +172,12 @@ def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
     assert legacy_conf.is_file()
     cproxy_text = cproxy_conf.read_text(encoding="utf-8")
     legacy_text = legacy_conf.read_text(encoding="utf-8")
+    assert str(tmp_path / ".local" / "state" / "cproxy" / "cproxy.log") in cproxy_text
+    assert str(tmp_path / ".local" / "state" / "clash_proxy" / "clash.log") in legacy_text
     assert "copytruncate" in cproxy_text
     assert "postrotate" not in cproxy_text
-    assert "create postrotate" not in legacy_text
-    assert "postrotate" in legacy_text
+    assert "copytruncate" in legacy_text
+    assert "postrotate" not in legacy_text
 
     cproxy_check = subprocess.run(
         ["logrotate", "-d", str(cproxy_conf)],

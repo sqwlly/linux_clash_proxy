@@ -13,7 +13,7 @@ AI_US_GROUP = "AI-US"
 AI_SG_GROUP = "AI-SG"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
-TEST_URL = "http://cp.cloudflare.com/generate_204"
+TEST_URL = "https://cp.cloudflare.com/generate_204"
 
 
 class RuntimeBackend:

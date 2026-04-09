@@ -100,7 +100,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(proxies_payload)
             return
 
-        if self.path.startswith("/proxies/") and self.path.endswith("/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=5000"):
+        if self.path.startswith("/proxies/") and self.path.endswith("/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=5000"):
             target = self.path[len("/proxies/"):].split("/delay", 1)[0]
             target = unquote(target)
             if target in delay_map:
