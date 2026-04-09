@@ -12,6 +12,14 @@
 - 命令级代理环境注入
 - 从旧仓库目录迁移 `config.yaml`
 
+当前内部结构也已经完成第一版 backend 重构：
+
+- `backend/api.py` 负责 Mihomo API
+- `backend/runtime.py` 负责 `runtime.yaml` 读取与渲染
+- `backend/process.py` 负责进程 ownership 与生命周期
+- `services/query.py` 负责 `API 优先 / runtime 回退`
+- `services/diagnostics.py` 负责 `test` 与 `test-group`
+
 ## 安装
 
 正式入口优先用 `pipx`：
@@ -31,6 +39,17 @@ pipx install /path/to/clash_proxy
 - 优先使用 `pipx install --force --editable`
 - 回退到 `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
+
+常用可选配置项：
+
+- `program-path`
+  指定 `mihomo` 可执行文件路径
+- `api-timeout`
+  控制 Mihomo API 请求超时，默认 `2` 秒
+- `test-timeout`
+  控制 `test-group` 延迟检测超时
+- `connectivity-timeout`
+  控制 `test` 连通性检查超时
 
 ## 快速开始
 
@@ -137,6 +156,22 @@ cproxy current "AI-MANUAL" --raw
 cproxy test-group "AI-AUTO" --raw
 ```
 
+## 查询后端策略
+
+查询命令现在有明确的后端边界：
+
+- `current`：API 优先，API 不可达时回退 runtime
+- `list-groups`：API 优先，API 不可达时回退 runtime
+- `list-nodes`：API 优先，API 不可达时回退 runtime
+- `ai-status`：只依赖 API
+- `switch`：只依赖 API
+- `test-group`：只依赖 API
+
+这意味着：
+
+- `render` 后、`start` 前，`current/list-groups/list-nodes` 仍然可用
+- `ai-status/switch/test-group` 仍要求 Mihomo API 可访问
+
 ## AI 路由设计
 
 渲染时会自动注入：
@@ -170,6 +205,12 @@ cproxy test-group "AI-AUTO" --raw
 - `proxy.sh` 仍保留在仓库内，便于对照和渐进迁移
 
 这不影响 `cproxy` 作为用户级 CLI 使用，但文档和运维入口应优先以 `cproxy` 为准。
+
+另外，`cproxy` 只管理自己启动的 mihomo 进程：
+
+- `start` 会写入 PID 和 ownership 元数据
+- `stop/restart/status/test` 会校验该进程是否仍属于当前 `cproxy`
+- stale pidfile 不会再误杀无关进程
 
 ## 用户级 systemd
 

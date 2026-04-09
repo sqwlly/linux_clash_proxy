@@ -5,27 +5,42 @@ from argparse import Namespace
 from pathlib import Path
 
 from . import __version__
-from .api import proxies_data, update_proxy
+from .api import APIUnavailableError
+from .backend.models import ProxyGroup
 from .config import default_paths
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_connectivity_test, test_group
 from .install import init_user_layout, migrate_from_legacy
 from .logs import follow_lines, read_recent_lines
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
-from .process import get_status, restart_process, start_process, stop_process
+from .process import ProcessOwnershipError, get_status, restart_process, start_process, stop_process
 from .config import log_file
 from .runtime import render_runtime
 from .output import build_root_parser, normalize_name
+from .services.query import QueryService
 
 
-def _get_group(groups: dict, name: str) -> dict:
+def _get_group(groups: dict, name: str):
     group = groups.get(name)
     if not group:
         raise SystemExit(f"错误: 未找到代理组: {name}")
     return group
 
 
+def _group_value(group, key: str, default=None):
+    if isinstance(group, ProxyGroup):
+        mapping = {
+            "type": group.type,
+            "now": group.current,
+            "all": group.candidates,
+            "alive": group.alive,
+            "delay": group.delay,
+        }
+        return mapping.get(key, default)
+    return group.get(key, default)
+
+
 def _render_current(groups: dict, group_name: str, raw: bool) -> int:
-    current = _get_group(groups, group_name).get("now")
+    current = _group_value(_get_group(groups, group_name), "now")
     if not current:
         raise SystemExit(f"错误: 代理组 [{group_name}] 当前无可读的 now 状态")
     if raw:
@@ -35,13 +50,15 @@ def _render_current(groups: dict, group_name: str, raw: bool) -> int:
     return 0
 
 
-def _render_list_groups(groups: dict, raw: bool) -> int:
+def _render_list_groups(groups, raw: bool) -> int:
     items = []
-    for name, group in groups.items():
-        group_type = str(group.get("type", "")).lower()
+    iterable = groups.values() if isinstance(groups, dict) else groups
+    for group in iterable:
+        name = group.name if isinstance(group, ProxyGroup) else str(group.get("name", ""))
+        group_type = str(_group_value(group, "type", "")).lower()
         if group_type in {"selector", "select", "fallback", "url-test", "load-balance"}:
             normalized_type = "select" if group_type == "selector" else group_type
-            items.append((name, normalized_type, normalize_name(group.get("now", "-"))))
+            items.append((name, normalized_type, normalize_name(_group_value(group, "now", "-"))))
 
     if raw:
         for name, group_type, _ in items:
@@ -56,8 +73,8 @@ def _render_list_groups(groups: dict, raw: bool) -> int:
 
 def _render_list_nodes(groups: dict, group_name: str, raw: bool) -> int:
     group = _get_group(groups, group_name)
-    current = group.get("now", "")
-    items = group.get("all", [])
+    current = _group_value(group, "now", "")
+    items = _group_value(group, "all", [])
 
     if raw:
         for item in items:
@@ -89,26 +106,27 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
             if not group:
                 print(f"{name}: 缺失")
                 continue
-            history = group.get("history") or []
-            delay = history[-1].get("delay", "-") if history else "-"
+            delay = _group_value(group, "delay", "-")
             print(
-                f"{name}: type={group.get('type', '-')} now={group.get('now', '-')} "
-                f"alive={group.get('alive', '-')} last_delay={delay}"
+                f"{name}: type={_group_value(group, 'type', '-')} now={_group_value(group, 'now', '-')} "
+                f"alive={_group_value(group, 'alive', '-')} last_delay={delay}"
             )
         return 0
 
-    manual_target = _get_group(groups, "AI-MANUAL").get("now", "-")
-    auto_target = _get_group(groups, "AI-AUTO").get("now", "-")
+    manual_target = _group_value(_get_group(groups, "AI-MANUAL"), "now", "-")
+    auto_target = _group_value(_get_group(groups, "AI-AUTO"), "now", "-")
     active_group = auto_target if manual_target == "AI-AUTO" else manual_target
     active = _get_group(groups, active_group)
-    active_node = active.get("now", "-")
-    active_delay = ((active.get("history") or [{}])[-1]).get("delay", "-")
+    active_node = _group_value(active, "now", "-")
+    active_delay = _group_value(active, "delay", "-")
     standby_group = "AI-SG" if active_group == "AI-US" else "AI-US"
     standby = _get_group(groups, standby_group)
-    standby_node = standby.get("now", "-")
-    standby_delay = ((standby.get("history") or [{}])[-1]).get("delay", "-")
-    standby_status = "正常" if standby.get("alive") is True else "异常" if standby.get("alive") is False else "未知"
-    active_status = "正常" if active.get("alive") is True else "异常" if active.get("alive") is False else "未知"
+    standby_node = _group_value(standby, "now", "-")
+    standby_delay = _group_value(standby, "delay", "-")
+    standby_alive = _group_value(standby, "alive")
+    active_alive = _group_value(active, "alive")
+    standby_status = "正常" if standby_alive is True else "异常" if standby_alive is False else "未知"
+    active_status = "正常" if active_alive is True else "异常" if active_alive is False else "未知"
     manual_mode = "手动=自动" if manual_target == "AI-AUTO" else f"手动={manual_target}"
 
     print(
@@ -132,19 +150,8 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
     print("分组状态")
     for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
         group = _get_group(groups, name)
-        print(f"{name:<10} {group.get('type', '-'):<8} 当前: {normalize_name(group.get('now', '-'))}")
+        print(f"{name:<10} {_group_value(group, 'type', '-'):<8} 当前: {normalize_name(_group_value(group, 'now', '-'))}")
     return 0
-
-
-def _switch_group(groups: dict, group_name: str, target_name: str) -> None:
-    group = _get_group(groups, group_name)
-    group_type = str(group.get("type", "")).lower()
-    if group_type not in {"selector", "select"}:
-        raise SystemExit(f"错误: 代理组 [{group_name}] 不是可手动切换的 Selector 类型")
-    if target_name not in group.get("all", []):
-        raise SystemExit(f"错误: 目标 [{target_name}] 不在代理组 [{group_name}] 的候选列表中")
-
-
 def _render_status(raw: bool) -> int:
     snapshot = get_status(default_paths())
     config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
@@ -244,73 +251,74 @@ def _render_logs(lines: int, follow: bool) -> int:
 def run(argv: list[str] | None = None) -> int:
     parser = build_root_parser()
     args: Namespace = parser.parse_args(argv)
-    if args.version:
-        print(__version__)
+    try:
+        if args.version:
+            print(__version__)
+            return 0
+        if args.command == "init":
+            config_file = init_user_layout(default_paths())
+            print(f"已初始化配置: {config_file}")
+            return 0
+        if args.command == "migrate-from-legacy":
+            config_file = migrate_from_legacy(default_paths(), Path(args.legacy_root))
+            print(f"已迁移配置: {config_file}")
+            return 0
+        if args.command == "render":
+            runtime_path = render_runtime(default_paths())
+            print(f"已生成运行配置: {runtime_path}")
+            return 0
+        if args.command == "start":
+            pid = start_process(default_paths())
+            print(f"代理已启动 (PID: {pid})")
+            return 0
+        if args.command == "stop":
+            stopped = stop_process(default_paths())
+            if stopped:
+                print("代理已停止")
+            else:
+                print("代理未运行")
+            return 0
+        if args.command == "restart":
+            pid = restart_process(default_paths())
+            print(f"代理已启动 (PID: {pid})")
+            return 0
+        if args.command == "logs":
+            return _render_logs(args.lines, args.follow)
+        if args.command == "status":
+            return _render_status(args.raw)
+        if args.command == "test":
+            return _render_connectivity_report(run_connectivity_test(default_paths()))
+        if args.command == "test-group":
+            return _render_group_check(test_group(default_paths(), args.group), args.raw)
+        if args.command == "proxy-env":
+            for line in proxy_env_lines(default_paths()):
+                print(line)
+            return 0
+        if args.command == "with-proxy":
+            return run_with_proxy(default_paths(), args.command_args)
+        if args.command == "proxy-shell":
+            print("进入临时代理 shell，退出后代理环境失效")
+            return run_proxy_shell(default_paths(), args.shell_args)
+        if args.command in {"current", "list-groups", "list-nodes", "ai-status"}:
+            service = QueryService(default_paths())
+            if args.command == "current":
+                return _render_current({args.group: service.get_group(args.group)}, args.group, args.raw)
+            if args.command == "list-groups":
+                return _render_list_groups(service.list_groups(), args.raw)
+            if args.command == "list-nodes":
+                return _render_list_nodes({args.group: service.get_group(args.group)}, args.group, args.raw)
+            return _render_ai_status(service.get_ai_status_groups(), args.raw)
+        if args.command == "switch":
+            service = QueryService(default_paths())
+            group = service.switch_group(args.group, args.target)
+            print("切换结果")
+            print(f"代理组: {args.group}")
+            print(f"当前选择: {normalize_name(group.current)}")
+            return 0
         return 0
-    if args.command == "init":
-        config_file = init_user_layout(default_paths())
-        print(f"已初始化配置: {config_file}")
-        return 0
-    if args.command == "migrate-from-legacy":
-        config_file = migrate_from_legacy(default_paths(), Path(args.legacy_root))
-        print(f"已迁移配置: {config_file}")
-        return 0
-    if args.command == "render":
-        runtime_path = render_runtime(default_paths())
-        print(f"已生成运行配置: {runtime_path}")
-        return 0
-    if args.command == "start":
-        pid = start_process(default_paths())
-        print(f"代理已启动 (PID: {pid})")
-        return 0
-    if args.command == "stop":
-        stopped = stop_process(default_paths())
-        if stopped:
-            print("代理已停止")
-        else:
-            print("代理未运行")
-        return 0
-    if args.command == "restart":
-        pid = restart_process(default_paths())
-        print(f"代理已启动 (PID: {pid})")
-        return 0
-    if args.command == "logs":
-        return _render_logs(args.lines, args.follow)
-    if args.command == "status":
-        return _render_status(args.raw)
-    if args.command == "test":
-        return _render_connectivity_report(run_connectivity_test(default_paths()))
-    if args.command == "test-group":
-        return _render_group_check(test_group(default_paths(), args.group), args.raw)
-    if args.command == "proxy-env":
-        for line in proxy_env_lines(default_paths()):
-            print(line)
-        return 0
-    if args.command == "with-proxy":
-        return run_with_proxy(default_paths(), args.command_args)
-    if args.command == "proxy-shell":
-        print("进入临时代理 shell，退出后代理环境失效")
-        return run_proxy_shell(default_paths(), args.shell_args)
-    if args.command in {"current", "list-groups", "list-nodes", "ai-status"}:
-        groups = proxies_data(default_paths())
-        if args.command == "current":
-            return _render_current(groups, args.group, args.raw)
-        if args.command == "list-groups":
-            return _render_list_groups(groups, args.raw)
-        if args.command == "list-nodes":
-            return _render_list_nodes(groups, args.group, args.raw)
-        return _render_ai_status(groups, args.raw)
-    if args.command == "switch":
-        paths = default_paths()
-        groups = proxies_data(paths)
-        _switch_group(groups, args.group, args.target)
-        update_proxy(paths, args.group, args.target)
-        groups = proxies_data(paths)
-        print("切换结果")
-        print(f"代理组: {args.group}")
-        print(f"当前选择: {normalize_name(_get_group(groups, args.group).get('now', '-'))}")
-        return 0
-    return 0
+    except (APIUnavailableError, ProcessOwnershipError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def main() -> None:

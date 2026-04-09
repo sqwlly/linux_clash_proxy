@@ -24,6 +24,15 @@ cproxy init
 
 - `~/.config/cproxy/config.yaml`
 
+常见可调项：
+
+```yaml
+program-path: /usr/local/bin/mihomo
+api-timeout: 2
+test-timeout: 5000
+connectivity-timeout: 5
+```
+
 ## 首次启动
 
 ```bash
@@ -67,6 +76,11 @@ cproxy test-group "AI-AUTO"
 cproxy test-group "AI-AUTO" --raw
 ```
 
+后端策略：
+
+- `current/list-groups/list-nodes`：API 优先，API 不可达时回退 `runtime.yaml`
+- `ai-status/test-group/switch`：只依赖 API
+
 ## 命令级代理
 
 输出环境变量：
@@ -103,6 +117,11 @@ cproxy logs --lines 200
 cproxy status
 cproxy status --raw
 ```
+
+说明：
+
+- `test` 会先校验当前运行进程是否属于 `cproxy`
+- `stop` 和 `restart` 也会做同样的 ownership 校验
 
 ## 用户级 systemd
 

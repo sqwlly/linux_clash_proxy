@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import tomllib
+
 
 def test_install_script_prefers_pipx_and_initializes_user_layout(tmp_path: Path):
     fake_bin = tmp_path / "bin"
@@ -79,3 +81,9 @@ exit 1
     log_text = python_log.read_text(encoding="utf-8")
     assert "-m pip install --user --editable /root/clash_proxy" in log_text
     assert "安装完成" in result.stdout
+
+
+def test_pyproject_declares_runtime_dependencies():
+    data = tomllib.loads(Path("/root/clash_proxy/pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = data["project"].get("dependencies", [])
+    assert "PyYAML>=6" in dependencies

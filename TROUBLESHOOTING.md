@@ -62,11 +62,19 @@ cproxy status --raw
 program-path: /usr/local/bin/mihomo
 ```
 
+如果 API 处于坏链路、但你不想让查询命令等待过久，可显式缩短：
+
+```yaml
+api-timeout: 2
+```
+
 如果要看启动失败前后的上下文，直接查看：
 
 ```bash
 cproxy logs --lines 200
 ```
+
+如果此前遗留了 stale pidfile，新版本不会直接复用它，也不会误杀同 PID 的无关进程。
 
 ## 4. AI 流量没有走代理
 
@@ -108,6 +116,11 @@ cproxy test-group "AI-AUTO"
    cproxy test-group "AI-US"
    cproxy test-group "AI-SG"
    ```
+
+补充边界：
+
+- `current/list-groups/list-nodes` 在 API 不可达时仍可用于查看静态 runtime 状态
+- `ai-status` 仍然必须依赖 API，因为它需要实时 `alive/delay`
 
 ## 5. `with-proxy` 没生效
 
@@ -162,6 +175,12 @@ cproxy status
 - 本地代理进程已经启动
 - `mixed-port` 配置正确
 
+此外还依赖：
+
+- 当前 PID 与 ownership 元数据匹配
+
+如果 stderr 提示“不属于 cproxy 管理的进程”，说明你当前的 pidfile 已陈旧，或目标进程不是由 `cproxy start` 拉起。
+
 如果你需要自定义探测地址，可在 `~/.config/cproxy/config.yaml` 里配置：
 
 ```yaml
@@ -171,6 +190,8 @@ connectivity-test-urls:
 ip-check-urls:
   - https://api.ip.sb/ip
   - https://ifconfig.me/ip
+connectivity-timeout: 5
+test-timeout: 5000
 ```
 
 ## 8. 从旧目录迁移后配置不见了

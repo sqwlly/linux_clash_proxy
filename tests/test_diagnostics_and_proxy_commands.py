@@ -112,10 +112,31 @@ def test_diagnostics_and_proxy_commands(tmp_path: Path):
 
     try:
         config_dir = tmp_path / ".config" / "cproxy"
+        data_dir = tmp_path / ".local" / "share" / "cproxy"
         state_dir = tmp_path / ".local" / "state" / "cproxy"
         config_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
         state_dir.mkdir(parents=True)
-        (state_dir / "cproxy.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+        runtime_path = data_dir / "runtime.yaml"
+        runtime_path.write_text("port: 7890\n", encoding="utf-8")
+        owned_proc = tmp_path / "owned-proc.sh"
+        owned_proc.write_text(
+            """#!/bin/bash
+trap 'exit 0' TERM INT
+while true; do
+  sleep 1
+done
+""",
+            encoding="utf-8",
+        )
+        owned_proc.chmod(0o755)
+        managed_process = subprocess.Popen([str(owned_proc), str(runtime_path)])
+        (state_dir / "cproxy.pid").write_text(f"{managed_process.pid}\n", encoding="utf-8")
+        (state_dir / "cproxy-process.json").write_text(
+            json.dumps({"pid": managed_process.pid, "program": str(owned_proc), "runtime": str(runtime_path)}) + "\n",
+            encoding="utf-8",
+        )
 
         (config_dir / "config.yaml").write_text(
             f"""
@@ -173,6 +194,9 @@ ip-check-urls:
         assert "可用: 3/3" in test_result.stdout
         assert "出口 IP: 203.0.113.7" in test_result.stdout
     finally:
+        if "managed_process" in locals():
+            managed_process.terminate()
+            managed_process.wait(timeout=5)
         api_server.shutdown()
         api_thread.join()
         proxy_server.shutdown()

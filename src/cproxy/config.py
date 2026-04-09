@@ -38,6 +38,10 @@ def pid_file(paths: AppPaths) -> Path:
     return paths.state_dir / "cproxy.pid"
 
 
+def process_meta_file(paths: AppPaths) -> Path:
+    return paths.state_dir / "cproxy-process.json"
+
+
 def log_file(paths: AppPaths) -> Path:
     return paths.state_dir / "cproxy.log"
 

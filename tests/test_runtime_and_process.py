@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -184,3 +185,32 @@ rules:
     )
     assert status_stopped.returncode == 0
     assert "状态: 未运行" in status_stopped.stdout
+
+
+def test_stop_does_not_kill_unowned_process_from_stale_pidfile(tmp_path: Path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["HOME"] = str(tmp_path)
+
+    state_dir = tmp_path / ".local" / "state" / "cproxy"
+    state_dir.mkdir(parents=True)
+
+    sleeper = subprocess.Popen(["/bin/sh", "-c", "sleep 30"])
+    try:
+        (state_dir / "cproxy.pid").write_text(f"{sleeper.pid}\n", encoding="utf-8")
+
+        stop_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "stop"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=env,
+        )
+
+        time.sleep(0.2)
+        assert stop_result.returncode != 0
+        assert "不属于 cproxy 管理的进程" in stop_result.stderr
+        assert sleeper.poll() is None
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)

@@ -7,6 +7,7 @@ name = "cproxy"
 version = "0.1.0"
 description = "User-level CLI for managing Mihomo proxy workflows"
 requires-python = ">=3.11"
+dependencies = ["PyYAML>=6"]
 
 [project.scripts]
 cproxy = "cproxy.cli:main"

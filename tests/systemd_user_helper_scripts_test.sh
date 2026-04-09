@@ -34,5 +34,9 @@ assert_file_contains "$INSTALL_SCRIPT" "systemctl --user enable --now cproxy-ref
 assert_file_contains "$GENERATE_SCRIPT" "%h/.config/systemd/user/" "用户级生成脚本应输出 drop-in 目录"
 assert_file_contains "$GENERATE_SCRIPT" "EnvironmentFile=%h/.config/cproxy/cproxy-command.env" "用户级生成脚本应包含代理环境文件"
 assert_file_contains "$GENERATE_SCRIPT" "After=cproxy.service" "用户级生成脚本应让目标服务依赖 cproxy.service"
+if grep -Fq "/root/clash_proxy" "$INSTALL_SCRIPT"; then
+    echo "ASSERTION FAILED: 用户级安装脚本不应包含仓库绝对路径" >&2
+    exit 1
+fi
 
 echo "systemd_user_helper_scripts_test: PASS"

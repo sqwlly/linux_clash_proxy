@@ -1,6 +1,5 @@
 [Unit]
 Description=Periodically render cproxy runtime config
-Documentation=file:/root/clash_proxy/README.md
 
 [Timer]
 Unit=cproxy-refresh.service
