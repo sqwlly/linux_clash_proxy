@@ -1,228 +1,124 @@
-# Clash Proxy 故障排查
-
-这份文档只覆盖当前项目最常见的 4 类问题：
-
-- AI 流量没有走代理
-- 节点失效或自动切换异常
-- `systemd` 服务/定时器状态异常
-- 命令级代理没有生效
+# cproxy 故障排查
 
 ## 1. 先做最小体检
 
 优先执行：
 
 ```bash
-./proxy.sh status
-./proxy.sh ai-status
-systemctl status clash-proxy.service --no-pager -l
-systemctl status clash-proxy-refresh.timer --no-pager -l
+cproxy status
+cproxy ai-status
+cproxy test-group "AI-AUTO"
+cproxy logs --lines 50
 ```
 
 你应该重点看：
 
-- `status` 是否显示运行配置是 `runtime.yaml`
+- `status` 是否显示 `运行配置状态: 已就绪`
+- `status` 是否显示 `状态: 运行中`
 - `ai-status` 是否能看出 `AI-MANUAL -> AI-AUTO -> AI-US/AI-SG` 的当前链路
-- `clash-proxy.service` 是否是 `active (running)`
-- `clash-proxy-refresh.timer` 是否是 `active (waiting)`
+- `test-group "AI-AUTO"` 是否能测出至少一个可用区域
 
-## 2. AI 流量没有走代理
+## 2. 命令不存在或安装后找不到 `cproxy`
 
-### 现象
-
-- `chatgpt.com`
-- `openai.com`
-- `anthropic.com`
-- `gemini.google.com`
-
-这些域名访问失败，或者日志看起来没有走 `AI-MANUAL`
-
-### 排查命令
+排查：
 
 ```bash
-./proxy.sh ai-status
-./proxy.sh current "AI-MANUAL"
-./proxy.sh test-group "AI-AUTO"
-./proxy.sh current "AI-MANUAL" --raw
-curl -x "http://127.0.0.1:7890" -I -s --connect-timeout 8 "https://chatgpt.com" >/dev/null
-tail -n 20 /root/clash_proxy/clash.log
+which cproxy
+pipx list | rg cproxy
 ```
 
-### 期望结果
+如果你是用仓库脚本安装：
 
-- `AI-MANUAL` 默认是 `AI-AUTO`
-- `AI-AUTO` 应该指向 `AI-US` 或 `AI-SG`
-- `test-group "AI-AUTO"` 应该能测出延迟
-- 如果你要在脚本里判断结果，优先使用 `current --raw`、`ai-status --raw`、`test-group --raw`
-- 日志里应出现类似：
-
-```text
-match DomainSuffix(chatgpt.com) using AI-MANUAL[...]
+```bash
+./scripts/install.sh
 ```
 
-### 常见原因
+如果 `pipx` 已安装但命令仍不可见，通常是 PATH 没更新。处理：
 
-1. 你改了 `config.yaml`，但没重新生成运行配置  
+```bash
+pipx ensurepath
+exec "$SHELL" -l
+```
+
+## 3. `start` 失败或状态一直是未运行
+
+排查：
+
+```bash
+cproxy render
+cproxy start
+cproxy status --raw
+```
+
+重点看：
+
+- `~/.local/share/cproxy/runtime.yaml` 是否存在
+- `program-path` 是否在 `config.yaml` 里配置正确
+- `PID` 是否出现
+
+如果你本机 `mihomo` 不在 PATH，可在 `~/.config/cproxy/config.yaml` 里显式设置：
+
+```yaml
+program-path: /usr/local/bin/mihomo
+```
+
+如果要看启动失败前后的上下文，直接查看：
+
+```bash
+cproxy logs --lines 200
+```
+
+## 4. AI 流量没有走代理
+
+排查：
+
+```bash
+cproxy ai-status
+cproxy current "AI-MANUAL"
+cproxy test-group "AI-AUTO"
+```
+
+期望结果：
+
+- `AI-MANUAL` 默认指向 `AI-AUTO`
+- `AI-AUTO` 当前指向 `AI-US` 或 `AI-SG`
+- `test-group "AI-AUTO"` 能测出延迟
+
+常见原因：
+
+1. 改了 `config.yaml` 后没有重新渲染  
    处理：
 
    ```bash
-   ./proxy.sh render
-   ./proxy.sh restart
+   cproxy render
+   cproxy restart
    ```
 
-   如果本地 `config.yaml` 丢失，再执行：
-
-   ```bash
-   cp ./config.example.yaml ./config.yaml
-   ```
-
-2. `AI-MANUAL` 被你手动切到了不想要的组  
+2. 你把 `AI-MANUAL` 手动切到了固定区域  
    处理：
 
    ```bash
-   ./proxy.sh switch "AI-MANUAL" "AI-AUTO"
+   cproxy switch "AI-MANUAL" "AI-AUTO"
    ```
 
-3. 美国/新加坡节点都不可用  
+3. 美国和新加坡区域都不可用  
    处理：
 
    ```bash
-   ./proxy.sh test-group "AI-US"
-   ./proxy.sh test-group "AI-SG"
+   cproxy test-group "AI-US"
+   cproxy test-group "AI-SG"
    ```
 
-4. 日志里命中的不是 `AI-MANUAL`  
-   处理：
+## 5. `with-proxy` 没生效
 
-   ```bash
-   ./proxy.sh render
-   ./proxy.sh restart
-   rg -n "openai.com|chatgpt.com|anthropic.com|claude.ai|gemini.google.com|RULE-SET,ChinaMax|GEOIP,CN|MATCH,SSRDOG" /root/clash_proxy/runtime.yaml
-   ```
-
-## 3. 节点失效或自动切换异常
-
-### 排查命令
+排查：
 
 ```bash
-./proxy.sh ai-status
-./proxy.sh test-group "AI-AUTO"
-./proxy.sh test-group "AI-US"
-./proxy.sh test-group "AI-SG"
-./proxy.sh list-nodes "AI-MANUAL"
+cproxy proxy-env
+cproxy with-proxy env | rg "^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)="
 ```
 
-### 判断逻辑
-
-- `AI-US` 慢或失败，但 `AI-SG` 正常：应切到新加坡链路
-- 两边都失败：问题不是切换策略，而是节点池本身
-- `AI-MANUAL` 如果不是 `AI-AUTO`，说明你处于手动模式
-
-### 恢复到自动模式
-
-```bash
-./proxy.sh switch "AI-MANUAL" "AI-AUTO"
-```
-
-## 4. 大陆流量不该走代理却走了
-
-### 排查命令
-
-```bash
-rg -n "RULE-SET,ChinaMax|GEOIP,CN|MATCH,SSRDOG" /root/clash_proxy/runtime.yaml
-tail -n 30 /root/clash_proxy/clash.log
-```
-
-### 期望结果
-
-`runtime.yaml` 里应存在：
-
-```text
-RULE-SET,ChinaMax,DIRECT
-GEOIP,CN,DIRECT,no-resolve
-MATCH,SSRDOG
-```
-
-并且顺序应满足：
-
-- `ChinaMax` 在 `MATCH` 前
-- `GEOIP,CN` 在 `MATCH` 前
-
-### 修复
-
-```bash
-./proxy.sh render
-./proxy.sh restart
-```
-
-## 5. `systemd` 服务异常
-
-### 排查命令
-
-```bash
-systemctl status clash-proxy.service --no-pager -l
-systemctl show clash-proxy.service -p UnitFileState -p ActiveState -p SubState
-journalctl -u clash-proxy.service -n 100 --no-pager
-```
-
-### 关注点
-
-- `UnitFileState=enabled`
-- `ActiveState=active`
-- 主进程命令里应包含：
-
-```text
-/usr/local/bin/mihomo -f /root/clash_proxy/runtime.yaml -d /root/clash_proxy
-```
-
-### 常见处理
-
-```bash
-./proxy.sh render
-systemctl restart clash-proxy.service
-```
-
-如果 unit 文件被你手工改乱了：
-
-```bash
-sudo /root/clash_proxy/systemd/install-systemd.sh
-```
-
-## 6. 定时器不执行
-
-### 排查命令
-
-```bash
-systemctl status clash-proxy-refresh.timer --no-pager -l
-systemctl list-timers clash-proxy-refresh.timer --no-pager
-systemctl status clash-proxy-refresh.service --no-pager -l
-journalctl -u clash-proxy-refresh.service -n 100 --no-pager
-```
-
-### 期望结果
-
-- timer 是 `active (waiting)`
-- `list-timers` 能看到下一次触发时间
-- refresh service 通常是 `inactive (dead)`，但最近一次应 `Succeeded`
-
-### 修复
-
-```bash
-sudo /root/clash_proxy/systemd/install-systemd.sh
-systemctl restart clash-proxy-refresh.timer
-```
-
-## 7. `with-proxy` 没生效
-
-### 排查命令
-
-```bash
-./proxy.sh proxy-env
-./proxy.sh with-proxy env | rg "^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)="
-```
-
-### 期望结果
-
-至少应看到：
+期望结果至少包含：
 
 ```text
 HTTP_PROXY=http://127.0.0.1:7890
@@ -231,30 +127,117 @@ ALL_PROXY=socks5h://127.0.0.1:7890
 NO_PROXY=127.0.0.1,localhost
 ```
 
-### 常见原因
+如果环境变量存在但命令仍不走代理，通常是命令本身忽略标准代理环境变量。处理方式：
 
-1. 命令本身不认环境代理变量  
-   处理：改用该命令自身的代理参数，或者包一层 `curl/git` 之类确认代理是否真的可用。
+- 改用该命令自带的代理参数
+- 先用 `curl` 或 `git` 验证当前代理本身是否可用
 
-2. 代理本地端口没起来  
-   处理：
+## 6. `proxy-shell` 没按预期工作
 
-   ```bash
-   ./proxy.sh status
-   systemctl status clash-proxy.service --no-pager -l
-   ```
-
-## 8. 升级后的推荐检查
-
-每次你更新项目后，建议按这个顺序做：
+默认用法：
 
 ```bash
-./tests/proxy_env_test.sh
-./tests/systemd_proxy_examples_test.sh
-./tests/systemd_helper_scripts_test.sh
-./tests/review_fixes_test.sh
-./proxy.sh render
-./proxy.sh ai-status
-systemctl status clash-proxy.service --no-pager -l
-systemctl status clash-proxy-refresh.timer --no-pager -l
+cproxy proxy-shell
 ```
+
+如果你要给 shell 传自己的参数，并且参数以 `-` 开头，使用：
+
+```bash
+cproxy proxy-shell -- -c 'env | rg PROXY'
+```
+
+这是 `argparse` 的标准分隔方式，不是 `cproxy` 特有约束。
+
+## 7. `test` 检查失败
+
+排查：
+
+```bash
+cproxy test
+cproxy status
+```
+
+`test` 依赖两件事：
+
+- 本地代理进程已经启动
+- `mixed-port` 配置正确
+
+如果你需要自定义探测地址，可在 `~/.config/cproxy/config.yaml` 里配置：
+
+```yaml
+connectivity-test-urls:
+  - https://www.google.com
+  - https://github.com
+ip-check-urls:
+  - https://api.ip.sb/ip
+  - https://ifconfig.me/ip
+```
+
+## 8. 从旧目录迁移后配置不见了
+
+迁移命令只会复制旧目录里的 `config.yaml`：
+
+```bash
+cproxy migrate-from-legacy /root/clash_proxy
+```
+
+它不会迁移这些内容：
+
+- `runtime.yaml`
+- 旧日志
+- PID 文件
+- 临时文件
+
+迁移后正确流程是：
+
+```bash
+cproxy render
+cproxy start
+cproxy status
+```
+
+## 9. 运行配置与原始配置不一致
+
+这是预期行为。`runtime.yaml` 不是手工维护文件，而是 `render` 的产物。
+
+每次你修改 `~/.config/cproxy/config.yaml` 后，都应该执行：
+
+```bash
+cproxy render
+cproxy restart
+```
+
+如果你要验证 AI 规则是否已经注入，看：
+
+- `~/.local/share/cproxy/runtime.yaml`
+
+重点检查：
+
+- `AI-MANUAL`
+- `AI-AUTO`
+- `AI-US`
+- `AI-SG`
+- `DOMAIN-SUFFIX,openai.com,AI-MANUAL`
+- `GEOIP,CN,DIRECT,no-resolve`
+
+## 10. 用户级 systemd 没启动
+
+安装：
+
+```bash
+./systemd-user/install-systemd-user.sh
+```
+
+排查：
+
+```bash
+systemctl --user status cproxy.service --no-pager -l
+systemctl --user status cproxy-refresh.timer --no-pager -l
+journalctl --user -u cproxy.service -n 100 --no-pager
+```
+
+关注点：
+
+- `cproxy.service` 应为 `active`
+- `cproxy-refresh.timer` 应为 `active (waiting)`
+- 如果命令找不到，先确认 `~/.local/bin` 已在 PATH 中

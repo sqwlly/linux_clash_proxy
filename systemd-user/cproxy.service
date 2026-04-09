@@ -1,0 +1,20 @@
+[Unit]
+Description=cproxy user service
+Documentation=file:/root/clash_proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStartPre=%h/.local/bin/cproxy render
+ExecStart=%h/.local/bin/cproxy start
+ExecStop=%h/.local/bin/cproxy stop
+ExecReload=%h/.local/bin/cproxy restart
+PIDFile=%h/.local/state/cproxy/cproxy.pid
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=default.target

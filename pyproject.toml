@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cproxy"
+version = "0.1.0"
+description = "User-level CLI for managing Mihomo proxy workflows"
+requires-python = ">=3.11"
+
+[project.scripts]
+cproxy = "cproxy.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
