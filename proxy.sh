@@ -815,6 +815,7 @@ status() {
     local config_state
     local status_text
     local api_text
+    local ai_mode="-"
     local ai_summary="-"
 
     if [ "${1:-}" = "--raw" ]; then
@@ -863,7 +864,7 @@ status() {
 
         if api_available; then
             api_text="${GREEN}可访问${NC}"
-            ai_summary="$(api_request "GET" "/proxies" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+            readarray -t ai_status_lines < <(api_request "GET" "/proxies" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
 import json
 import os
 import sys
@@ -875,10 +876,28 @@ manual_target = (data.get("AI-MANUAL") or {}).get("now", "-")
 auto_target = (data.get("AI-AUTO") or {}).get("now", "-")
 
 active_group = auto_target if manual_target == "AI-AUTO" else manual_target
-active_node = (data.get(active_group) or {}).get("now", "-")
-print(f"{active_group} -> {display_name(active_node)}")
-')"
-            ai_summary="${ai_summary:--}"
+active = data.get(active_group) or {}
+active_node = active.get("now", "-")
+history = active.get("history") or []
+delay = "-"
+if history:
+    delay = history[-1].get("delay", "-")
+
+auto_mode = manual_target == "AI-AUTO"
+mode_label = "自动切换" if auto_mode else f"固定 {manual_target}"
+summary = f"{active_group} -> {display_name(active_node)}"
+if delay not in (None, "-"):
+    summary = f"{summary} ({delay}ms)"
+
+print(mode_label)
+print(summary)
+')
+            if [ "${#ai_status_lines[@]}" -ge 1 ] && [ -n "${ai_status_lines[0]}" ]; then
+                ai_mode="${ai_status_lines[0]}"
+            fi
+            if [ "${#ai_status_lines[@]}" -ge 2 ] && [ -n "${ai_status_lines[1]}" ]; then
+                ai_summary="${ai_status_lines[1]}"
+            fi
         else
             api_text="${RED}不可访问${NC}"
         fi
@@ -916,6 +935,7 @@ print(f"{active_group} -> {display_name(active_node)}")
         echo "运行摘要"
         echo -e "状态: $status_text"
         echo -e "API: $api_text"
+        echo -e "AI 路由模式: $ai_mode"
         echo -e "AI 当前出口: $ai_summary"
         echo -e "运行配置状态: $config_state"
         echo ""
@@ -1474,12 +1494,14 @@ def format_delay(value):
 manual_target = get_current(ai_manual)
 auto_target = get_current(ai_auto)
 
-if manual_target == ai_auto:
+auto_mode = manual_target == ai_auto
+
+if auto_mode:
     active_group = auto_target
-    manual_mode = "手动=自动"
+    mode_label = "自动切换"
 else:
     active_group = manual_target
-    manual_mode = f"手动={manual_target}"
+    mode_label = f"固定 {manual_target}"
 
 active_node = get_current(active_group)
 active_delay = get_delay(active_group)
@@ -1497,14 +1519,14 @@ standby_delay = get_delay(standby_group)
 standby_status = get_status(standby_group)
 
 print(
-    f"AI 路由: {manual_mode}  当前出口={display_name(active_node)}  "
+    f"AI 路由: {mode_label}  当前出口={display_name(active_node)}  "
     f"区域={active_group}  延迟={format_delay(active_delay)}  状态={active_status}"
 )
 print()
 print("当前链路")
 print(ai_manual)
 
-if manual_target == ai_auto:
+if auto_mode:
     print(f"└─ {ai_auto}")
     print(f"   └─ {active_group}")
     print(f"      └─ {display_name(active_node)} ({format_delay(active_delay)})")

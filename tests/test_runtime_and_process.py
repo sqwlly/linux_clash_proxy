@@ -1,8 +1,11 @@
+import json
 import os
 import subprocess
 import sys
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from threading import Thread
 
 
 def test_render_creates_runtime_and_status_reports_not_running(tmp_path: Path):
@@ -72,6 +75,156 @@ rules:
     assert "运行摘要" in status_result.stdout
     assert "状态: 未运行" in status_result.stdout
     assert "运行配置状态: 已就绪" in status_result.stdout
+
+
+def test_status_reports_ai_route_mode_and_delay_when_api_available(tmp_path: Path):
+    state = {
+        "AI-MANUAL": {
+            "type": "Selector",
+            "now": "AI-AUTO",
+            "alive": True,
+            "all": ["AI-AUTO", "AI-US", "AI-SG"],
+            "history": [],
+        },
+        "AI-AUTO": {
+            "type": "Fallback",
+            "now": "AI-US",
+            "alive": True,
+            "all": ["AI-US", "AI-SG"],
+            "history": [],
+        },
+        "AI-US": {
+            "type": "Fallback",
+            "now": "🇺🇸 United States丨01",
+            "alive": True,
+            "all": ["🇺🇸 United States丨01"],
+            "history": [{"delay": 95}],
+        },
+        "AI-SG": {
+            "type": "Fallback",
+            "now": "🇸🇬 Singapore丨01",
+            "alive": True,
+            "all": ["🇸🇬 Singapore丨01"],
+            "history": [{"delay": 101}],
+        },
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/version":
+                self._send({"version": "test"})
+                return
+            if self.path == "/proxies":
+                self._send({"proxies": state})
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def _send(self, data):
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["HOME"] = str(tmp_path)
+
+    fake_bin = tmp_path / "fake-mihomo.sh"
+    fake_bin.write_text(
+        """#!/bin/bash
+trap 'exit 0' TERM INT
+while true; do
+  sleep 1
+done
+""",
+        encoding="utf-8",
+    )
+    fake_bin.chmod(0o755)
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        f"""
+mixed-port: 7890
+external-controller: 127.0.0.1:{server.server_port}
+program-path: {fake_bin}
+proxy-groups:
+  - name: SSRDOG
+    type: select
+    proxies:
+      - Auto
+      - DIRECT
+  - name: Auto
+    type: fallback
+    proxies:
+      - ProxyA
+  - name: 🇺🇸 United States
+    type: select
+    proxies:
+      - 🇺🇸 United States丨01
+  - name: 🇸🇬 Singapore
+    type: select
+    proxies:
+      - 🇸🇬 Singapore丨01
+rules:
+  - RULE-SET,ChinaMax,DIRECT
+  - MATCH,SSRDOG
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    try:
+        render_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "render"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=env,
+        )
+        assert render_result.returncode == 0
+
+        start_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "start"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=env,
+        )
+        assert start_result.returncode == 0
+
+        status_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "status"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=env,
+        )
+
+        assert status_result.returncode == 0
+        assert "状态: 运行中" in status_result.stdout
+        assert "AI 路由模式: 自动切换" in status_result.stdout
+        assert "AI 当前出口: AI-US -> United States 01 (95ms)" in status_result.stdout
+    finally:
+        subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "stop"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=env,
+        )
+        server.shutdown()
+        thread.join()
 
 
 def test_start_stop_restart_manage_user_process(tmp_path: Path):

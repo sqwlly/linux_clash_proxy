@@ -41,6 +41,39 @@ def _group_value(group, key: str, default=None):
     return group.get(key, default)
 
 
+def _format_delay_label(delay) -> str:
+    return f"{delay}ms" if isinstance(delay, int) else "-"
+
+
+def _resolve_ai_route(groups: dict) -> dict[str, object]:
+    manual_target = _group_value(_get_group(groups, "AI-MANUAL"), "now", "-")
+    auto_target = _group_value(_get_group(groups, "AI-AUTO"), "now", "-")
+    auto_mode = manual_target == "AI-AUTO"
+    active_group = auto_target if auto_mode else manual_target
+    active = _get_group(groups, active_group)
+    active_node = _group_value(active, "now", "-")
+    active_delay = _group_value(active, "delay", "-")
+    active_alive = _group_value(active, "alive")
+    standby_group = "AI-SG" if active_group == "AI-US" else "AI-US"
+    standby = _get_group(groups, standby_group)
+    standby_node = _group_value(standby, "now", "-")
+    standby_delay = _group_value(standby, "delay", "-")
+    standby_alive = _group_value(standby, "alive")
+
+    return {
+        "auto_mode": auto_mode,
+        "mode_label": "自动切换" if auto_mode else f"固定 {manual_target}",
+        "active_group": active_group,
+        "active_node": active_node,
+        "active_delay": active_delay,
+        "active_alive": active_alive,
+        "standby_group": standby_group,
+        "standby_node": standby_node,
+        "standby_delay": standby_delay,
+        "standby_alive": standby_alive,
+    }
+
+
 def _render_current(groups: dict, group_name: str, raw: bool) -> int:
     current = _group_value(_get_group(groups, group_name), "now")
     if not current:
@@ -115,49 +148,60 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
             )
         return 0
 
-    manual_target = _group_value(_get_group(groups, "AI-MANUAL"), "now", "-")
-    auto_target = _group_value(_get_group(groups, "AI-AUTO"), "now", "-")
-    active_group = auto_target if manual_target == "AI-AUTO" else manual_target
-    active = _get_group(groups, active_group)
-    active_node = _group_value(active, "now", "-")
-    active_delay = _group_value(active, "delay", "-")
-    standby_group = "AI-SG" if active_group == "AI-US" else "AI-US"
-    standby = _get_group(groups, standby_group)
-    standby_node = _group_value(standby, "now", "-")
-    standby_delay = _group_value(standby, "delay", "-")
-    standby_alive = _group_value(standby, "alive")
-    active_alive = _group_value(active, "alive")
+    route = _resolve_ai_route(groups)
+    active_group = str(route["active_group"])
+    active_node = route["active_node"]
+    active_delay = route["active_delay"]
+    active_alive = route["active_alive"]
+    standby_group = str(route["standby_group"])
+    standby_node = route["standby_node"]
+    standby_delay = route["standby_delay"]
+    standby_alive = route["standby_alive"]
     standby_status = "正常" if standby_alive is True else "异常" if standby_alive is False else "未知"
     active_status = "正常" if active_alive is True else "异常" if active_alive is False else "未知"
-    manual_mode = "手动=自动" if manual_target == "AI-AUTO" else f"手动={manual_target}"
 
     print(
-        f"AI 路由: {manual_mode}  当前出口={normalize_name(active_node)}  "
-        f"区域={active_group}  延迟={active_delay}ms  状态={active_status}"
+        f"AI 路由: {route['mode_label']}  当前出口={normalize_name(active_node)}  "
+        f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={active_status}"
     )
     print()
     print("当前链路")
     print("AI-MANUAL")
-    if manual_target == "AI-AUTO":
+    if bool(route["auto_mode"]):
         print("└─ AI-AUTO")
         print(f"   └─ {active_group}")
-        print(f"      └─ {normalize_name(active_node)} ({active_delay}ms)")
+        print(f"      └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
     else:
         print(f"└─ {active_group}")
-        print(f"   └─ {normalize_name(active_node)} ({active_delay}ms)")
+        print(f"   └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
     print()
     print("备用路径")
-    print(f"{standby_group} -> {normalize_name(standby_node)} ({standby_delay}ms, {standby_status})")
+    print(f"{standby_group} -> {normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {standby_status})")
     print()
     print("分组状态")
     for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
         group = _get_group(groups, name)
         print(f"{name:<10} {_group_value(group, 'type', '-'):<8} 当前: {normalize_name(_group_value(group, 'now', '-'))}")
     return 0
+
+
 def _render_status(raw: bool) -> int:
     snapshot = get_status(default_paths())
     config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
     status_text = "运行中" if snapshot.running else "未运行"
+    api_text = "不可访问"
+    ai_mode = "-"
+    ai_summary = "-"
+
+    try:
+        route = _resolve_ai_route(QueryService(default_paths()).get_ai_status_groups())
+        api_text = "可访问"
+        ai_mode = str(route["mode_label"])
+        ai_summary = f"{route['active_group']} -> {normalize_name(route['active_node'])}"
+        if isinstance(route["active_delay"], int):
+            ai_summary = f"{ai_summary} ({route['active_delay']}ms)"
+    except APIUnavailableError:
+        pass
 
     if raw:
         print("版本: 0.1.0")
@@ -173,6 +217,9 @@ def _render_status(raw: bool) -> int:
 
     print("运行摘要")
     print(f"状态: {status_text}")
+    print(f"API: {api_text}")
+    print(f"AI 路由模式: {ai_mode}")
+    print(f"AI 当前出口: {ai_summary}")
     print(f"运行配置状态: {config_state}")
     print()
     print("连接与资源")

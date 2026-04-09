@@ -96,14 +96,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 port_file = sys.argv[1]
 payload = {
     "proxies": {
-        "AI-MANUAL": {"type": "Selector", "now": "AI-AUTO", "alive": True, "all": ["AI-AUTO", "AI-US", "AI-SG"]},
-        "AI-AUTO": {"type": "Fallback", "now": "AI-US", "alive": True, "all": ["AI-US", "AI-SG"]},
-        "AI-US": {"type": "Fallback", "now": "🇺🇸 United States丨01", "alive": True, "all": ["🇺🇸 United States丨01"]},
-        "AI-SG": {"type": "Fallback", "now": "🇸🇬 Singapore丨01", "alive": True, "all": ["🇸🇬 Singapore丨01"]},
+        "AI-MANUAL": {"type": "Selector", "now": "AI-AUTO", "alive": True, "all": ["AI-AUTO", "AI-US", "AI-SG"], "history": []},
+        "AI-AUTO": {"type": "Fallback", "now": "AI-US", "alive": True, "all": ["AI-US", "AI-SG"], "history": []},
+        "AI-US": {"type": "Fallback", "now": "🇺🇸 United States丨01", "alive": True, "all": ["🇺🇸 United States丨01"], "history": [{"delay": 95}]},
+        "AI-SG": {"type": "Fallback", "now": "🇸🇬 Singapore丨01", "alive": True, "all": ["🇸🇬 Singapore丨01"], "history": [{"delay": 102}]},
         "SSRDOG": {"type": "Selector", "now": "Auto", "alive": True, "all": ["Auto", "DIRECT"]},
         "Auto": {"type": "Fallback", "now": "🇭🇰 Hong Kong丨01", "alive": True, "all": ["🇭🇰 Hong Kong丨01"]},
-        "🇺🇸 United States": {"type": "Selector", "now": "🇺🇸 United States丨01", "alive": True, "all": ["🇺🇸 United States丨01"]},
-        "🇸🇬 Singapore": {"type": "Selector", "now": "🇸🇬 Singapore丨01", "alive": True, "all": ["🇸🇬 Singapore丨01"]},
+        "🇺🇸 United States": {"type": "Selector", "now": "🇺🇸 United States丨01", "alive": True, "all": ["🇺🇸 United States丨01"], "history": [{"delay": 95}]},
+        "🇸🇬 Singapore": {"type": "Selector", "now": "🇸🇬 Singapore丨01", "alive": True, "all": ["🇸🇬 Singapore丨01"], "history": [{"delay": 102}]},
     }
 }
 
@@ -205,7 +205,8 @@ status_output="$(
 assert_contains "$status_output" "运行摘要" "status 应输出运行摘要区块"
 assert_contains "$status_output" "连接与资源" "status 应输出连接与资源区块"
 assert_contains "$status_output" "配置路径" "status 应输出配置路径区块"
-assert_contains "$status_output" "AI 当前出口: AI-US -> United States 01" "status 应展示 AI 当前实际出口"
+assert_contains "$status_output" "AI 路由模式: 自动切换" "status 应展示 AI 当前路由模式"
+assert_contains "$status_output" "AI 当前出口: AI-US -> United States 01 (95ms)" "status 应展示 AI 当前实际出口及延迟"
 assert_contains "$status_output" "连接数: 3" "status 应展示连接数"
 assert_contains "$status_output" "内存: 59MB" "status 应展示规整后的内存值"
 
