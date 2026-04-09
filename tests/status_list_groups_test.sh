@@ -216,9 +216,9 @@ status_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" status
 )"
 
-assert_contains "$status_output" "运行摘要" "status 应输出运行摘要区块"
-assert_contains "$status_output" "连接与资源" "status 应输出连接与资源区块"
-assert_contains "$status_output" "配置路径" "status 应输出配置路径区块"
+assert_contains "$status_output" "摘要" "status 应输出摘要区块"
+assert_contains "$status_output" "资源" "status 应输出资源区块"
+assert_contains "$status_output" "路径" "status 应输出路径区块"
 assert_contains "$status_output" "AI 路由模式: 自动切换" "status 应展示 AI 当前路由模式"
 assert_contains "$status_output" "AI 当前出口: AI-US -> United States 01 (95ms)" "status 应展示 AI 当前实际出口及延迟"
 assert_contains "$status_output" "连接数: 3" "status 应展示连接数"
@@ -229,6 +229,8 @@ list_groups_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" list-groups
 )"
 
+assert_contains "$list_groups_output" "摘要" "list-groups 应输出摘要区块"
+assert_contains "$list_groups_output" "列表" "list-groups 应输出列表区块"
 assert_contains "$list_groups_output" "组名" "list-groups 应输出表头"
 assert_contains "$list_groups_output" "类型" "list-groups 应输出类型列"
 assert_contains "$list_groups_output" "当前选择" "list-groups 应输出当前选择列"

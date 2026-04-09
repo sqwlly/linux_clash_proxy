@@ -45,6 +45,10 @@ def _format_delay_label(delay) -> str:
     return f"{delay}ms" if isinstance(delay, int) else "-"
 
 
+def _print_section(title: str) -> None:
+    print(title)
+
+
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
     manual_target = _group_value(_get_group(groups, "AI-MANUAL"), "now", "-")
     auto_target = _group_value(_get_group(groups, "AI-AUTO"), "now", "-")
@@ -100,6 +104,11 @@ def _render_list_groups(groups, raw: bool) -> int:
             print(f"{name}\t{group_type}")
         return 0
 
+    _print_section("摘要")
+    print(f"总组数: {len(items)}")
+    print(f"可切换组数: {len(items)}")
+    print()
+    _print_section("列表")
     print(f"{'组名':<20} {'类型':<12} 当前选择")
     for name, group_type, current in items:
         print(f"{name:<20} {group_type:<12} {current}")
@@ -117,9 +126,12 @@ def _render_list_nodes(groups: dict, group_name: str, raw: bool) -> int:
             print(f"{prefix}{item}")
         return 0
 
+    _print_section("摘要")
+    print(f"目标组: {group_name}")
     print(f"当前选择: {normalize_name(current)}")
+    print(f"候选数: {len(items)}")
     print()
-    print("候选列表")
+    _print_section("列表")
     for item in items:
         label = "当前" if item == current else "候选"
         print(f"{label}  {normalize_name(item)}")
@@ -164,18 +176,19 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
     standby_status = "正常" if standby_alive is True else "异常" if standby_alive is False else "未知"
     active_status = "正常" if active_alive is True else "异常" if active_alive is False else "未知"
 
+    _print_section("摘要")
     print(
         f"AI 路由: {route['mode_label']}  当前出口={normalize_name(active_node)}  "
         f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={active_status}"
     )
     print(f"AI 探测: {_probe_summary_status(probe_report)}")
     print()
-    print("OpenAI 连通性")
+    _print_section("连通性")
     for item in probe_report.results:
         label = "正常" if item.ok else "失败"
         print(f"{label}  {item.name}  {item.url}")
     print()
-    print("当前链路")
+    _print_section("链路")
     print("AI-MANUAL")
     if bool(route["auto_mode"]):
         print("└─ AI-AUTO")
@@ -185,10 +198,10 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         print(f"└─ {active_group}")
         print(f"   └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
     print()
-    print("备用路径")
+    _print_section("备用")
     print(f"{standby_group} -> {normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {standby_status})")
     print()
-    print("分组状态")
+    _print_section("分组")
     for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
         group = _get_group(groups, name)
         print(f"{name:<10} {_group_value(group, 'type', '-'):<8} 当前: {normalize_name(_group_value(group, 'now', '-'))}")
@@ -234,18 +247,18 @@ def _render_status(raw: bool) -> int:
             print(f"PID: {snapshot.pid}")
         return 0
 
-    print("运行摘要")
+    _print_section("摘要")
     print(f"状态: {status_text}")
     print(f"API: {api_text}")
     print(f"AI 路由模式: {ai_mode}")
     print(f"AI 当前出口: {ai_summary}")
     print(f"运行配置状态: {config_state}")
     print()
-    print("连接与资源")
+    _print_section("资源")
     print(f"代理端口: {snapshot.port}")
     print(f"控制接口: {snapshot.controller}")
     print()
-    print("配置路径")
+    _print_section("路径")
     print(f"原始配置: {snapshot.source_config}")
     print(f"运行配置: {snapshot.runtime_config}")
     if snapshot.pid:
@@ -263,13 +276,13 @@ def _render_group_check(report: GroupCheckReport, raw: bool) -> int:
     best = min(ok_items, key=lambda item: item.delay) if ok_items else None
     worst = max(ok_items, key=lambda item: item.delay) if ok_items else None
 
-    print("检查摘要")
+    _print_section("摘要")
     print(f"目标组: {report.group_name}")
     print(f"可用: {len(ok_items)}/{len(report.results)}")
     print(f"最佳: {best.name} ({best.delay}ms)" if best else "最佳: -")
     print(f"最慢: {worst.name} ({worst.delay}ms)" if worst else "最慢: -")
     print()
-    print("检查结果")
+    _print_section("结果")
     for item in report.results:
         if item.ok and item.delay is not None:
             print(f"正常  {item.name}  {item.delay}ms")
@@ -280,12 +293,12 @@ def _render_group_check(report: GroupCheckReport, raw: bool) -> int:
 
 def _render_connectivity_report(report: ConnectivityReport) -> int:
     passed = sum(1 for item in report.results if item.ok)
-    print("检查摘要")
+    _print_section("摘要")
     print("目标: 代理连通性")
     print(f"可用: {passed}/{len(report.results)}")
     print(f"出口 IP: {report.exit_ip or '-'}")
     print()
-    print("检查结果")
+    _print_section("结果")
     for item in report.results:
         if item.ok:
             print(f"正常  {item.name}  {item.detail}")

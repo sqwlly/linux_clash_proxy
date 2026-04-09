@@ -162,9 +162,10 @@ ip-check-urls:
 
         test_group_result = _run(env, "test-group", "AI-AUTO")
         assert test_group_result.returncode == 0
-        assert "检查摘要" in test_group_result.stdout
+        assert "摘要" in test_group_result.stdout
         assert "目标组: AI-AUTO" in test_group_result.stdout
         assert "最佳: AI-SG (89ms)" in test_group_result.stdout
+        assert "结果" in test_group_result.stdout
         assert "正常  AI-US  96ms" in test_group_result.stdout
 
         test_group_raw = _run(env, "test-group", "AI-AUTO", "--raw")
@@ -190,10 +191,11 @@ ip-check-urls:
 
         test_result = _run(env, "test")
         assert test_result.returncode == 0
-        assert "检查摘要" in test_result.stdout
+        assert "摘要" in test_result.stdout
         assert "目标: 代理连通性" in test_result.stdout
         assert "可用: 4/4" in test_result.stdout
         assert "出口 IP: 203.0.113.7" in test_result.stdout
+        assert "结果" in test_result.stdout
         assert "正常  GeoIP 数据" in test_result.stdout
     finally:
         if "managed_process" in locals():

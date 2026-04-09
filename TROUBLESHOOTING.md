@@ -15,8 +15,10 @@ cproxy logs --lines 50
 
 - `status` 是否显示 `运行配置状态: 已就绪`
 - `status` 是否显示 `状态: 运行中`
+- `status` 是否按 `摘要 / 资源 / 路径` 三段展示
 - `status` 是否显示 `AI 路由模式` 与 `AI 当前出口`
 - `ai-status` 是否显示 `AI 探测: 正常 / 部分异常 / 失败`
+- `ai-status` 是否按 `摘要 / 连通性 / 链路 / 备用 / 分组` 展示
 - `ai-status` 是否能看出 `AI-MANUAL -> AI-AUTO -> AI-US/AI-SG` 的当前链路
 - `test-group "AI-AUTO"` 是否能测出至少一个可用区域
 

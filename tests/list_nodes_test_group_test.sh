@@ -158,8 +158,9 @@ list_nodes_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" list-nodes "AI-MANUAL"
 )"
 
+assert_contains "$list_nodes_output" "摘要" "list-nodes 应输出摘要区块"
+assert_contains "$list_nodes_output" "列表" "list-nodes 应输出列表区块"
 assert_contains "$list_nodes_output" "当前选择: AI-AUTO" "list-nodes 应显示当前选择"
-assert_contains "$list_nodes_output" "候选列表" "list-nodes 应输出候选列表区块"
 assert_contains "$list_nodes_output" "当前  AI-AUTO" "list-nodes 应标识当前候选项"
 assert_contains "$list_nodes_output" "候选  United States" "list-nodes 应展示规整后的候选名称"
 
@@ -167,8 +168,8 @@ test_group_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" test-group "AI-AUTO"
 )"
 
-assert_contains "$test_group_output" "检查摘要" "test-group 应输出检查摘要区块"
-assert_contains "$test_group_output" "检查结果" "test-group 应输出检查结果区块"
+assert_contains "$test_group_output" "摘要" "test-group 应输出摘要区块"
+assert_contains "$test_group_output" "结果" "test-group 应输出结果区块"
 assert_contains "$test_group_output" "可用: 2/2" "test-group 应展示可用统计"
 assert_contains "$test_group_output" "最佳: AI-SG (92ms)" "test-group 应展示最佳节点"
 assert_contains "$test_group_output" "最慢: AI-US (320ms)" "test-group 应展示最慢节点"

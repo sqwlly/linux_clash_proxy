@@ -73,7 +73,9 @@ rules:
     )
 
     assert status_result.returncode == 0
-    assert "运行摘要" in status_result.stdout
+    assert "摘要" in status_result.stdout
+    assert "资源" in status_result.stdout
+    assert "路径" in status_result.stdout
     assert "状态: 未运行" in status_result.stdout
     assert "运行配置状态: 已就绪" in status_result.stdout
 

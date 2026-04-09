@@ -145,22 +145,26 @@ def test_query_commands_use_api_output(tmp_path: Path):
 
         groups_result = _run(env, "list-groups")
         assert groups_result.returncode == 0
+        assert "摘要" in groups_result.stdout
+        assert "列表" in groups_result.stdout
         assert "当前选择" in groups_result.stdout
         assert "AI-MANUAL" in groups_result.stdout
 
         nodes_result = _run(env, "list-nodes", "AI-MANUAL")
         assert nodes_result.returncode == 0
+        assert "摘要" in nodes_result.stdout
+        assert "列表" in nodes_result.stdout
         assert "当前选择: AI-AUTO" in nodes_result.stdout
-        assert "候选列表" in nodes_result.stdout
 
         ai_status_result = _run(env, "ai-status")
         assert ai_status_result.returncode == 0
+        assert "摘要" in ai_status_result.stdout
         assert "AI 路由:" in ai_status_result.stdout
         assert "AI 探测: 部分异常" in ai_status_result.stdout
-        assert "OpenAI 连通性" in ai_status_result.stdout
+        assert "连通性" in ai_status_result.stdout
         assert "正常  ChatGPT Web  http://probe.local/chatgpt" in ai_status_result.stdout
         assert "失败  OpenAI API  http://probe.local/openai-api" in ai_status_result.stdout
-        assert "当前链路" in ai_status_result.stdout
+        assert "链路" in ai_status_result.stdout
 
         ai_status_raw = _run(env, "ai-status", "--raw")
         assert ai_status_raw.returncode == 0
@@ -215,12 +219,13 @@ def test_query_commands_fall_back_to_runtime_when_api_unavailable(tmp_path: Path
 
     groups_result = _run(env, "list-groups")
     assert groups_result.returncode == 0
+    assert "摘要" in groups_result.stdout
     assert "AI-MANUAL" in groups_result.stdout
     assert "AI-AUTO" in groups_result.stdout
 
     nodes_result = _run(env, "list-nodes", "AI-MANUAL")
     assert nodes_result.returncode == 0
-    assert "候选列表" in nodes_result.stdout
+    assert "列表" in nodes_result.stdout
     assert "AI-US" in nodes_result.stdout
 
     current_result = _run(env, "current", "AI-MANUAL")

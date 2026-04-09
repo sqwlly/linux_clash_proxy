@@ -831,10 +831,6 @@ status() {
         config_state="${GREEN}已就绪${NC}"
     fi
 
-    if [ "$raw_mode" -ne 1 ]; then
-        print_info "=== Mihomo 代理状态 ==="
-    fi
-
     if is_running; then
         local pid
         local elapsed
@@ -932,14 +928,14 @@ print(summary)
             return 0
         fi
 
-        echo "运行摘要"
+        echo "摘要"
         echo -e "状态: $status_text"
         echo -e "API: $api_text"
         echo -e "AI 路由模式: $ai_mode"
         echo -e "AI 当前出口: $ai_summary"
         echo -e "运行配置状态: $config_state"
         echo ""
-        echo "连接与资源"
+        echo "资源"
         echo -e "代理端口: $port"
         echo -e "控制接口: $controller"
         echo -e "连接数: $connections"
@@ -953,7 +949,7 @@ print(summary)
             echo -e "日志: $log_size"
         fi
         echo ""
-        echo "配置路径"
+        echo "路径"
         echo -e "原始配置: $SOURCE_CONFIG_FILE"
         echo -e "运行配置: $RUNTIME_CONFIG_FILE"
         if [ -n "$running_config" ] && [ "$running_config" != "$RUNTIME_CONFIG_FILE" ]; then
@@ -975,16 +971,16 @@ print(summary)
             return 0
         fi
 
-        echo "运行摘要"
+        echo "摘要"
         echo -e "状态: $status_text"
         echo -e "API: $api_text"
         echo -e "运行配置状态: $config_state"
         echo ""
-        echo "连接与资源"
+        echo "资源"
         echo -e "代理端口: $port"
         echo -e "控制接口: $controller"
         echo ""
-        echo "配置路径"
+        echo "路径"
         echo -e "原始配置: $SOURCE_CONFIG_FILE"
         echo -e "运行配置: $RUNTIME_CONFIG_FILE"
     fi
@@ -1016,8 +1012,6 @@ test() {
     local api
     local port
 
-    print_info "=== 代理连接测试 ==="
-
     if ! is_running; then
         print_error "代理未运行，无法测试"
         return 1
@@ -1031,41 +1025,45 @@ test() {
     port="$(get_proxy_port)"
     proxy_url="http://127.0.0.1:$port"
 
+    local results_output=""
+
     total=$((total + 1))
-    echo -n "[$total] 测试 Google: "
     if curl -x "$proxy_url" -I -s --connect-timeout 5 "https://www.google.com" >/dev/null 2>&1; then
-        print_success "成功"
         passed=$((passed + 1))
+        results_output="${results_output}正常  https://www.google.com  成功"$'\n'
     else
-        print_error "失败"
+        results_output="${results_output}失败  https://www.google.com  失败"$'\n'
     fi
 
     total=$((total + 1))
-    echo -n "[$total] 测试 GitHub: "
     if curl -x "$proxy_url" -I -s --connect-timeout 5 "https://github.com" >/dev/null 2>&1; then
-        print_success "成功"
         passed=$((passed + 1))
+        results_output="${results_output}正常  https://github.com  成功"$'\n'
     else
-        print_error "失败"
+        results_output="${results_output}失败  https://github.com  失败"$'\n'
     fi
 
     total=$((total + 1))
-    echo -n "[$total] 获取出口 IP: "
     for api in "https://api.ip.sb/ip" "https://ifconfig.me/ip" "https://icanhazip.com"; do
         ip=$(curl -x "$proxy_url" -s --connect-timeout 5 "$api" 2>/dev/null | tr -d '[:space:]')
         if [ -n "$ip" ]; then
-            print_success "$ip"
             passed=$((passed + 1))
+            results_output="${results_output}正常  出口 IP  ${ip}"$'\n'
             break
         fi
     done
 
     if [ -z "$ip" ]; then
-        print_error "获取失败"
+        results_output="${results_output}失败  出口 IP  获取失败"$'\n'
     fi
 
+    echo "摘要"
+    echo "目标: 代理连通性"
+    echo "可用: $passed/$total"
+    echo "出口 IP: ${ip:--}"
     echo ""
-    echo -e "测试结果: ${GREEN}${passed}/${total}${NC} 通过"
+    echo "结果"
+    printf '%s' "$results_output"
 
     if [ "$passed" -eq "$total" ]; then
         return 0
@@ -1103,8 +1101,6 @@ PY
         return $?
     fi
 
-    print_info "=== 可切换代理组 ==="
-
     if api_available; then
         local proxies_json
         proxies_json="$(api_request "GET" "/proxies")" || return 1
@@ -1135,7 +1131,7 @@ def display_name(value):
     text = " ".join(text.split())
     return text
 
-print(f"{'组名':<20} {'类型':<12} 当前选择")
+items = []
 for group in data.get("proxy-groups", []):
     if not isinstance(group, dict):
         continue
@@ -1144,6 +1140,15 @@ for group in data.get("proxy-groups", []):
     if group_type not in {"select", "fallback", "url-test", "load-balance"}:
         continue
     current = display_name((proxies.get(group_name) or {}).get("now", "-"))
+    items.append((group_name, group_type, current))
+
+print("摘要")
+print(f"总组数: {len(items)}")
+print(f"可切换组数: {len(items)}")
+print()
+print("列表")
+print(f"{'组名':<20} {'类型':<12} 当前选择")
+for group_name, group_type, current in items:
     print(f"{group_name:<20} {group_type:<12} {current}")
 PY
         return $?
@@ -1156,13 +1161,22 @@ import yaml
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
 
-print(f"{'组名':<20} {'类型':<12} 当前选择")
+items = []
 for group in data.get("proxy-groups", []):
     if not isinstance(group, dict):
         continue
     group_type = str(group.get("type", "")).lower()
     if group_type in {"select", "fallback", "url-test", "load-balance"}:
-        print(f"{group.get('name', ''):<20} {group_type:<12} -")
+        items.append((group.get("name", ""), group_type, "-"))
+
+print("摘要")
+print(f"总组数: {len(items)}")
+print(f"可切换组数: {len(items)}")
+print()
+print("列表")
+print(f"{'组名':<20} {'类型':<12} 当前选择")
+for name, group_type, current in items:
+    print(f"{name:<20} {group_type:<12} {current}")
 PY
 }
 
@@ -1203,7 +1217,6 @@ for item in group.get("all", []):
             return $?
         fi
 
-        print_info "=== 组 [$group_name] 的候选项 ==="
         printf '%s' "$proxies_json" | python3 -c '
 import json
 import re
@@ -1231,10 +1244,14 @@ def display_name(value):
     return text
 
 current = group.get("now", "")
+items = group.get("all", [])
+print("摘要")
+print(f"目标组: {group_name}")
 print(f"当前选择: {display_name(current)}")
+print(f"候选数: {len(items)}")
 print()
-print("候选列表")
-for item in group.get("all", []):
+print("列表")
+for item in items:
     label = "当前" if item == current else "候选"
     print(f"{label}  {display_name(item)}")
 ' "$group_name"
@@ -1245,7 +1262,6 @@ for item in group.get("all", []):
         return 1
     fi
 
-    print_info "=== 组 [$group_name] 的候选项（静态配置） ==="
     python3 - "$RUNTIME_CONFIG_FILE" "$group_name" <<'PY'
 import sys
 import re
@@ -1271,10 +1287,14 @@ def display_name(value):
 
 for group in data.get("proxy-groups", []):
     if isinstance(group, dict) and group.get("name") == group_name:
+        items = list(group.get("proxies", []))
+        print("摘要")
+        print(f"目标组: {group_name}")
         print("当前选择: -")
+        print(f"候选数: {len(items)}")
         print()
-        print("候选列表")
-        for item in group.get("proxies", []):
+        print("列表")
+        for item in items:
             print(f"候选  {display_name(item)}")
         break
 else:
@@ -1433,10 +1453,6 @@ ai_status() {
     chatgpt_url="$(get_yaml_value "$config_file" "ai-chatgpt-url" "https://chatgpt.com")"
     openai_api_url="$(get_yaml_value "$config_file" "ai-openai-api-url" "https://api.openai.com/v1/models")"
 
-    if [ "$raw_mode" -ne 1 ]; then
-        print_info "=== AI 路由状态 ==="
-    fi
-
     PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
 import json
 import os
@@ -1575,18 +1591,19 @@ if raw_mode == "1":
         )
     raise SystemExit(0)
 
+print("摘要")
 print(
     f"AI 路由: {mode_label}  当前出口={display_name(active_node)}  "
     f"区域={active_group}  延迟={format_delay(active_delay)}  状态={active_status}"
 )
 print(f"AI 探测: {probe_status}")
 print()
-print("OpenAI 连通性")
+print("连通性")
 for item in probe_results:
     label = "正常" if item["ok"] else "失败"
     print(label + "  " + str(item["name"]) + "  " + str(item["url"]))
 print()
-print("当前链路")
+print("链路")
 print(ai_manual)
 
 if auto_mode:
@@ -1599,10 +1616,10 @@ else:
         print(f"   └─ {display_name(active_node)} ({format_delay(active_delay)})")
 
 print()
-print("备用路径")
+print("备用")
 print(f"{standby_group} -> {display_name(standby_node)} ({format_delay(standby_delay)}, {standby_status})")
 print()
-print("分组状态")
+print("分组")
 
 for name in (ai_manual, ai_auto, ai_us, ai_sg):
     print(f"{name:<10} {get_type(name):<8} 当前: {display_name(get_current(name))}")
@@ -1661,9 +1678,6 @@ else:
     ' "$group_name"
 )" || return 1
 
-    if [ "$raw_mode" -ne 1 ]; then
-        print_info "=== 组 [$group_name] 健康检查 ==="
-    fi
     while IFS= read -r member; do
         [ -z "$member" ] && continue
         total=$((total + 1))
@@ -1707,7 +1721,7 @@ print(data.get("delay", "-"))
         return "$exit_code"
     fi
 
-    echo "检查摘要"
+    echo "摘要"
     echo "目标组: $group_name"
     echo "可用: $passed/$total"
     if [ -n "$best_member" ]; then
@@ -1721,7 +1735,7 @@ print(data.get("delay", "-"))
         echo "最慢: -"
     fi
     echo ""
-    echo "检查结果"
+    echo "结果"
     printf '%s' "$results_output"
 
     return "$exit_code"
