@@ -31,11 +31,19 @@ AI_REGION_US="🇺🇸 United States"
 AI_REGION_SG="🇸🇬 Singapore"
 
 # ==================== 颜色定义 ====================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+if [ -t 1 ] || [ "${FORCE_COLOR:-0}" = "1" ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
 
 # ==================== 全局变量 ====================
 CACHED_PID=""
@@ -210,6 +218,28 @@ all_proxy=$all_url
 NO_PROXY=$no_proxy
 no_proxy=$no_proxy
 EOF
+}
+
+python_display_name_def() {
+    cat <<'PY'
+import re
+
+def display_name(value):
+    if value in ("-", None):
+        return "-"
+
+    text = str(value).strip()
+    match = re.match(r"^(\S+)\s+(.+)$", text)
+    if match:
+        prefix, rest = match.groups()
+        if prefix and all(not ch.isalnum() for ch in prefix):
+            text = rest.strip()
+
+    text = text.replace("丨", " ")
+    text = text.replace("|", " ")
+    text = " ".join(text.split())
+    return text
+PY
 }
 
 proxy_env() {
@@ -778,24 +808,30 @@ restart() {
 }
 
 status() {
+    local raw_mode=0
     local port
     local controller
     local running_config
+    local config_state
+    local status_text
+    local api_text
+    local ai_summary="-"
+
+    if [ "${1:-}" = "--raw" ]; then
+        raw_mode=1
+    fi
 
     port="$(get_proxy_port)"
     controller="$(get_controller_addr)"
 
-    print_info "=== Mihomo 代理状态 ==="
-    echo -e "版本: 1.2.0"
-    echo -e "原始配置: $SOURCE_CONFIG_FILE"
-    echo -e "运行配置: $RUNTIME_CONFIG_FILE"
-    echo -e "控制接口: $controller"
-    echo -e "代理端口: $port"
-
     if runtime_needs_refresh; then
-        echo -e "运行配置状态: ${YELLOW}待刷新${NC}"
+        config_state="${YELLOW}待刷新${NC}"
     else
-        echo -e "运行配置状态: ${GREEN}已就绪${NC}"
+        config_state="${GREEN}已就绪${NC}"
+    fi
+
+    if [ "$raw_mode" -ne 1 ]; then
+        print_info "=== Mihomo 代理状态 ==="
     fi
 
     if is_running; then
@@ -808,41 +844,129 @@ status() {
         pid="$(get_pid)"
         running_config="$(get_running_config_path)"
 
-        echo -e "状态: ${GREEN}运行中${NC}"
-        echo -e "PID: $pid"
-        if [ -n "$running_config" ]; then
-            echo -e "实际运行配置: $running_config"
-        fi
+        status_text="${GREEN}运行中${NC}"
 
         elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
         if [ -n "$elapsed" ]; then
             local hours=$((elapsed / 3600))
             local minutes=$(((elapsed % 3600) / 60))
             local seconds=$((elapsed % 60))
-            printf "运行时间: %02dh %02dm %02ds\n" "$hours" "$minutes" "$seconds"
         fi
 
         mem_usage="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
         if [ -n "$mem_usage" ]; then
             local mem_mb=$((mem_usage / 1024))
-            echo -e "内存使用: ${mem_mb}MB"
+            mem_usage="${mem_mb}MB"
         fi
 
         connections=$(ss -tn | grep ":$port" | wc -l)
-        echo -e "当前连接数: $connections"
 
         if api_available; then
-            echo -e "API 状态: ${GREEN}可访问${NC}"
+            api_text="${GREEN}可访问${NC}"
+            ai_summary="$(api_request "GET" "/proxies" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+import json
+import os
+import sys
+
+exec(os.environ["DISPLAY_NAME_PY"])
+data = json.load(sys.stdin).get("proxies", {})
+
+manual_target = (data.get("AI-MANUAL") or {}).get("now", "-")
+auto_target = (data.get("AI-AUTO") or {}).get("now", "-")
+
+active_group = auto_target if manual_target == "AI-AUTO" else manual_target
+active_node = (data.get(active_group) or {}).get("now", "-")
+print(f"{active_group} -> {display_name(active_node)}")
+')"
+            ai_summary="${ai_summary:--}"
         else
-            echo -e "API 状态: ${RED}不可访问${NC}"
+            api_text="${RED}不可访问${NC}"
         fi
 
         if [ -f "$LOG_FILE" ]; then
             log_size="$(du -h "$LOG_FILE" 2>/dev/null | cut -f1)"
-            echo -e "日志大小: $log_size"
         fi
+
+        if [ "$raw_mode" -eq 1 ]; then
+            echo -e "版本: 1.2.0"
+            echo -e "原始配置: $SOURCE_CONFIG_FILE"
+            echo -e "运行配置: $RUNTIME_CONFIG_FILE"
+            echo -e "控制接口: $controller"
+            echo -e "代理端口: $port"
+            echo -e "运行配置状态: ${config_state}"
+            echo -e "状态: ${status_text}"
+            echo -e "PID: $pid"
+            if [ -n "$running_config" ]; then
+                echo -e "实际运行配置: $running_config"
+            fi
+            if [ -n "${elapsed:-}" ]; then
+                printf "运行时间: %02dh %02dm %02ds\n" "$hours" "$minutes" "$seconds"
+            fi
+            if [ -n "${mem_usage:-}" ]; then
+                echo -e "内存使用: ${mem_usage}"
+            fi
+            echo -e "当前连接数: $connections"
+            echo -e "API 状态: ${api_text}"
+            if [ -n "${log_size:-}" ]; then
+                echo -e "日志大小: $log_size"
+            fi
+            return 0
+        fi
+
+        echo "运行摘要"
+        echo -e "状态: $status_text"
+        echo -e "API: $api_text"
+        echo -e "AI 当前出口: $ai_summary"
+        echo -e "运行配置状态: $config_state"
+        echo ""
+        echo "连接与资源"
+        echo -e "代理端口: $port"
+        echo -e "控制接口: $controller"
+        echo -e "连接数: $connections"
+        if [ -n "${elapsed:-}" ]; then
+            printf "运行时间: %02dh %02dm %02ds\n" "$hours" "$minutes" "$seconds"
+        fi
+        if [ -n "${mem_usage:-}" ]; then
+            echo -e "内存: $mem_usage"
+        fi
+        if [ -n "${log_size:-}" ]; then
+            echo -e "日志: $log_size"
+        fi
+        echo ""
+        echo "配置路径"
+        echo -e "原始配置: $SOURCE_CONFIG_FILE"
+        echo -e "运行配置: $RUNTIME_CONFIG_FILE"
+        if [ -n "$running_config" ]; then
+            echo -e "实际运行配置: $running_config"
+        fi
+        echo -e "PID: $pid"
     else
-        echo -e "状态: ${RED}未运行${NC}"
+        status_text="${RED}未运行${NC}"
+        api_text="${RED}不可访问${NC}"
+
+        if [ "$raw_mode" -eq 1 ]; then
+            echo -e "版本: 1.2.0"
+            echo -e "原始配置: $SOURCE_CONFIG_FILE"
+            echo -e "运行配置: $RUNTIME_CONFIG_FILE"
+            echo -e "控制接口: $controller"
+            echo -e "代理端口: $port"
+            echo -e "运行配置状态: ${config_state}"
+            echo -e "状态: ${status_text}"
+            return 0
+        fi
+
+        echo "运行摘要"
+        echo -e "状态: $status_text"
+        echo -e "API: $api_text"
+        echo -e "运行配置状态: $config_state"
+        echo ""
+        echo "连接与资源"
+        echo -e "代理端口: $port"
+        echo -e "控制接口: $controller"
+        echo ""
+        echo "配置路径"
+        echo -e "原始配置: $SOURCE_CONFIG_FILE"
+        echo -e "运行配置: $RUNTIME_CONFIG_FILE"
     fi
 }
 
@@ -931,13 +1055,18 @@ test() {
 }
 
 list_groups() {
+    local raw_mode=0
+
+    if [ "${1:-}" = "--raw" ]; then
+        raw_mode=1
+    fi
+
     if ! ensure_runtime_config; then
         return 1
     fi
 
-    print_info "=== 可切换代理组 ==="
-
-    python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+    if [ "$raw_mode" -eq 1 ]; then
+        python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
 import sys
 import yaml
 
@@ -951,22 +1080,91 @@ for group in data.get("proxy-groups", []):
     if group_type in {"select", "fallback", "url-test", "load-balance"}:
         print(f"{group.get('name', '')}\t{group_type}")
 PY
+        return $?
+    fi
+
+    print_info "=== 可切换代理组 ==="
+
+    if api_available; then
+        local proxies_json
+        proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+        PROXIES_JSON="$proxies_json" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+import json
+import os
+import re
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = yaml.safe_load(fh) or {}
+
+proxies = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
+
+def display_name(value):
+    if value in ("-", None):
+        return "-"
+    text = str(value).strip()
+    match = re.match(r"^(\S+)\s+(.+)$", text)
+    if match:
+        prefix, rest = match.groups()
+        if prefix and all(not ch.isalnum() for ch in prefix):
+            text = rest.strip()
+    text = text.replace("丨", " ")
+    text = text.replace("|", " ")
+    text = " ".join(text.split())
+    return text
+
+print(f"{'组名':<20} {'类型':<12} 当前选择")
+for group in data.get("proxy-groups", []):
+    if not isinstance(group, dict):
+        continue
+    group_name = group.get("name", "")
+    group_type = str(group.get("type", "")).lower()
+    if group_type not in {"select", "fallback", "url-test", "load-balance"}:
+        continue
+    current = display_name((proxies.get(group_name) or {}).get("now", "-"))
+    print(f"{group_name:<20} {group_type:<12} {current}")
+PY
+        return $?
+    fi
+
+    python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = yaml.safe_load(fh) or {}
+
+print(f"{'组名':<20} {'类型':<12} 当前选择")
+for group in data.get("proxy-groups", []):
+    if not isinstance(group, dict):
+        continue
+    group_type = str(group.get("type", "")).lower()
+    if group_type in {"select", "fallback", "url-test", "load-balance"}:
+        print(f"{group.get('name', ''):<20} {group_type:<12} -")
+PY
 }
 
 list_nodes() {
     local group_name="$1"
+    local raw_mode=0
 
     if [ -z "$group_name" ]; then
         print_error "错误: 请指定代理组名称"
         return 1
     fi
 
+    if [ "${2:-}" = "--raw" ]; then
+        raw_mode=1
+    fi
+
     if api_available; then
         local proxies_json
         proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-        print_info "=== 组 [$group_name] 的候选项 ==="
-        printf '%s' "$proxies_json" | python3 -c '
+        if [ "$raw_mode" -eq 1 ]; then
+            printf '%s' "$proxies_json" | python3 -c '
 import json
 import sys
 
@@ -982,6 +1180,44 @@ for item in group.get("all", []):
     prefix = "* " if item == current else "  "
     print(f"{prefix}{item}")
 ' "$group_name"
+            return $?
+        fi
+
+        print_info "=== 组 [$group_name] 的候选项 ==="
+        printf '%s' "$proxies_json" | python3 -c '
+import json
+import re
+import sys
+
+group_name = sys.argv[1]
+data = json.load(sys.stdin)
+group = data.get("proxies", {}).get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+
+def display_name(value):
+    if value in ("-", None):
+        return "-"
+    text = str(value).strip()
+    match = re.match(r"^(\S+)\s+(.+)$", text)
+    if match:
+        prefix, rest = match.groups()
+        if prefix and all(not ch.isalnum() for ch in prefix):
+            text = rest.strip()
+    text = text.replace("丨", " ")
+    text = text.replace("|", " ")
+    text = " ".join(text.split())
+    return text
+
+current = group.get("now", "")
+print(f"当前选择: {display_name(current)}")
+print()
+print("候选列表")
+for item in group.get("all", []):
+    label = "当前" if item == current else "候选"
+    print(f"{label}  {display_name(item)}")
+' "$group_name"
         return $?
     fi
 
@@ -992,16 +1228,34 @@ for item in group.get("all", []):
     print_info "=== 组 [$group_name] 的候选项（静态配置） ==="
     python3 - "$RUNTIME_CONFIG_FILE" "$group_name" <<'PY'
 import sys
+import re
 import yaml
 
 config_path, group_name = sys.argv[1:3]
 with open(config_path, "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
 
+def display_name(value):
+    if value in ("-", None):
+        return "-"
+    text = str(value).strip()
+    match = re.match(r"^(\S+)\s+(.+)$", text)
+    if match:
+        prefix, rest = match.groups()
+        if prefix and all(not ch.isalnum() for ch in prefix):
+            text = rest.strip()
+    text = text.replace("丨", " ")
+    text = text.replace("|", " ")
+    text = " ".join(text.split())
+    return text
+
 for group in data.get("proxy-groups", []):
     if isinstance(group, dict) and group.get("name") == group_name:
+        print("当前选择: -")
+        print()
+        print("候选列表")
         for item in group.get("proxies", []):
-            print(f"  {item}")
+            print(f"候选  {display_name(item)}")
         break
 else:
     raise SystemExit(f"错误: 未找到代理组: {group_name}")
@@ -1010,10 +1264,15 @@ PY
 
 current_group() {
     local group_name="$1"
+    local raw_mode=0
 
     if [ -z "$group_name" ]; then
         print_error "错误: 请指定代理组名称"
         return 1
+    fi
+
+    if [ "${2:-}" = "--raw" ]; then
+        raw_mode=1
     fi
 
     if ! require_api; then
@@ -1023,7 +1282,8 @@ current_group() {
     local proxies_json
     proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-    printf '%s' "$proxies_json" | python3 -c '
+    if [ "$raw_mode" -eq 1 ]; then
+        printf '%s' "$proxies_json" | python3 -c '
 import json
 import sys
 
@@ -1037,6 +1297,28 @@ if not group:
 current = group.get("now")
 if current:
     print(current)
+else:
+    raise SystemExit(f"错误: 代理组 [{group_name}] 当前无可读的 now 状态，请确认该组类型支持读取当前选择")
+' "$group_name"
+        return $?
+    fi
+
+    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+import json
+import os
+import sys
+
+exec(os.environ["DISPLAY_NAME_PY"])
+group_name = sys.argv[1]
+data = json.load(sys.stdin)
+group = data.get("proxies", {}).get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+
+current = group.get("now")
+if current:
+    print(f"当前选择: {display_name(current)}")
 else:
     raise SystemExit(f"错误: 代理组 [{group_name}] 当前无可读的 now 状态，请确认该组类型支持读取当前选择")
 ' "$group_name"
@@ -1083,11 +1365,36 @@ if target_name not in group.get("all", []):
     encoded_group="$(urlencode "$group_name")"
 
     api_request "PUT" "/proxies/${encoded_group}" "{\"name\":\"${target_name//\"/\\\"}\"}" >/dev/null || return 1
-    print_success "已切换 [$group_name] -> [$target_name]"
+    proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+    print_success "切换结果"
+    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+import json
+import os
+import sys
+
+exec(os.environ["DISPLAY_NAME_PY"])
+group_name = sys.argv[1]
+data = json.load(sys.stdin).get("proxies", {})
+group = data.get(group_name)
+
+if not group:
+    raise SystemExit(f"错误: 未找到代理组: {group_name}")
+
+current = group.get("now", "-")
+print(f"代理组: {group_name}")
+print(f"当前选择: {display_name(current)}")
+' "$group_name"
     return 0
 }
 
 ai_status() {
+    local raw_mode=0
+
+    if [ "${1:-}" = "--raw" ]; then
+        raw_mode=1
+    fi
+
     if ! require_api; then
         return 1
     fi
@@ -1095,8 +1402,8 @@ ai_status() {
     local proxies_json
     proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-    print_info "=== AI 专用路由状态 ==="
-    printf '%s' "$proxies_json" | python3 -c '
+    if [ "$raw_mode" -eq 1 ]; then
+        printf '%s' "$proxies_json" | python3 -c '
 import json
 import sys
 
@@ -1122,19 +1429,124 @@ def describe(name):
 for name in (ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg):
     describe(name)
 ' "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG"
+        return $?
+    fi
+
+    print_info "=== AI 路由状态 ==="
+
+    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+import json
+import os
+import sys
+
+exec(os.environ["DISPLAY_NAME_PY"])
+ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg = sys.argv[1:7]
+data = json.load(sys.stdin).get("proxies", {})
+
+def get_group(name):
+    return data.get(name) or {}
+
+def get_current(name):
+    return get_group(name).get("now", "-")
+
+def get_type(name):
+    return get_group(name).get("type", "-")
+
+def get_delay(name):
+    history = get_group(name).get("history") or []
+    if not history:
+        return "-"
+    return history[-1].get("delay", "-")
+
+def get_status(name):
+    alive = get_group(name).get("alive")
+    if alive is True:
+        return "正常"
+    if alive is False:
+        return "异常"
+    return "未知"
+
+def format_delay(value):
+    if value in ("-", None):
+        return "-"
+    return f"{value}ms"
+
+manual_target = get_current(ai_manual)
+auto_target = get_current(ai_auto)
+
+if manual_target == ai_auto:
+    active_group = auto_target
+    manual_mode = "手动=自动"
+else:
+    active_group = manual_target
+    manual_mode = f"手动={manual_target}"
+
+active_node = get_current(active_group)
+active_delay = get_delay(active_group)
+active_status = get_status(active_group)
+
+if active_group == ai_us:
+    standby_group = ai_sg
+elif active_group == ai_sg:
+    standby_group = ai_us
+else:
+    standby_group = ai_sg
+
+standby_node = get_current(standby_group)
+standby_delay = get_delay(standby_group)
+standby_status = get_status(standby_group)
+
+print(
+    f"AI 路由: {manual_mode}  当前出口={display_name(active_node)}  "
+    f"区域={active_group}  延迟={format_delay(active_delay)}  状态={active_status}"
+)
+print()
+print("当前链路")
+print(ai_manual)
+
+if manual_target == ai_auto:
+    print(f"└─ {ai_auto}")
+    print(f"   └─ {active_group}")
+    print(f"      └─ {display_name(active_node)} ({format_delay(active_delay)})")
+else:
+    print(f"└─ {active_group}")
+    if active_node != active_group:
+        print(f"   └─ {display_name(active_node)} ({format_delay(active_delay)})")
+
+print()
+print("备用路径")
+print(f"{standby_group} -> {display_name(standby_node)} ({format_delay(standby_delay)}, {standby_status})")
+print()
+print("分组状态")
+
+for name in (ai_manual, ai_auto, ai_us, ai_sg):
+    print(f"{name:<10} {get_type(name):<8} 当前: {display_name(get_current(name))}")
+' "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG"
 }
 
 test_group() {
     local group_name="$1"
+    local raw_mode=0
     local candidates
     local member
     local result
     local delay
+    local total=0
+    local passed=0
+    local best_member=""
+    local best_delay=""
+    local worst_member=""
+    local worst_delay=""
+    local results_output=""
     local exit_code=0
 
     if [ -z "$group_name" ]; then
         print_error "错误: 用法: $0 test-group <group>"
         return 1
+    fi
+
+    if [ "${2:-}" = "--raw" ]; then
+        raw_mode=1
     fi
 
     if ! require_api; then
@@ -1164,10 +1576,12 @@ else:
     ' "$group_name"
 )" || return 1
 
-    print_info "=== 组 [$group_name] 健康检查 ==="
+    if [ "$raw_mode" -ne 1 ]; then
+        print_info "=== 组 [$group_name] 健康检查 ==="
+    fi
     while IFS= read -r member; do
         [ -z "$member" ] && continue
-        printf "%s: " "$member"
+        total=$((total + 1))
         if result="$(api_delay_test "$member" "$TEST_URL" "$TEST_TIMEOUT" 2>/dev/null)"; then
             delay="$(printf '%s' "$result" | python3 -c '
 import json
@@ -1176,12 +1590,54 @@ import sys
 data = json.load(sys.stdin)
 print(data.get("delay", "-"))
 ')"
-            print_success "${delay}ms"
+            passed=$((passed + 1))
+            if [ -z "$best_delay" ] || [ "$delay" -lt "$best_delay" ]; then
+                best_delay="$delay"
+                best_member="$member"
+            fi
+            if [ -z "$worst_delay" ] || [ "$delay" -gt "$worst_delay" ]; then
+                worst_delay="$delay"
+                worst_member="$member"
+            fi
+            results_output="${results_output}正常  ${member}  ${delay}ms"$'\n'
         else
-            print_error "失败"
+            results_output="${results_output}失败  ${member}  -"$'\n'
             exit_code=1
         fi
     done <<<"$candidates"
+
+    if [ "$raw_mode" -eq 1 ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            status="${line%%  *}"
+            rest="${line#*  }"
+            name="${rest%%  *}"
+            value="${rest##*  }"
+            if [ "$status" = "正常" ]; then
+                echo "${name}: ${value}"
+            else
+                echo "${name}: 失败"
+            fi
+        done <<<"$results_output"
+        return "$exit_code"
+    fi
+
+    echo "检查摘要"
+    echo "目标组: $group_name"
+    echo "可用: $passed/$total"
+    if [ -n "$best_member" ]; then
+        echo "最佳: $best_member (${best_delay}ms)"
+    else
+        echo "最佳: -"
+    fi
+    if [ -n "$worst_member" ]; then
+        echo "最慢: $worst_member (${worst_delay}ms)"
+    else
+        echo "最慢: -"
+    fi
+    echo ""
+    echo "检查结果"
+    printf '%s' "$results_output"
 
     return "$exit_code"
 }
@@ -1192,23 +1648,29 @@ ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
 
 用法: $0 {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|proxy-env|with-proxy|proxy-shell}
 
-命令:
+配置与进程:
+  render                    - 从原始配置生成运行配置
   start                     - 渲染运行配置并启动代理
   stop                      - 停止代理
   restart                   - 渲染运行配置并重启代理
   status                    - 查看详细状态
   logs                      - 查看实时日志
-  test                      - 测试代理连通性
-  render                    - 从原始配置生成运行配置
+
+AI 路由控制:
   list-groups               - 列出可切换代理组
   list-nodes <group>        - 列出代理组候选项
   current <group>           - 查看代理组当前选择
   switch <group> <node>     - 手动切换 Selector 代理组
   ai-status                 - 查看 AI 专用路由状态
-  test-group <group>        - 测试代理组或节点健康情况
+
+命令级代理:
   proxy-env                 - 输出命令级代理环境变量
   with-proxy <cmd...>       - 仅为单条命令注入代理环境
   proxy-shell               - 打开临时代理 shell
+
+诊断与排障:
+  test-group <group>        - 测试代理组或节点健康情况
+  test                      - 测试代理连通性
 
 环境变量:
   PROG_PATH                 - mihomo 可执行文件路径
@@ -1224,16 +1686,26 @@ ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
   PROXY_NO_PROXY            - 覆盖默认 NO_PROXY 列表
 
 示例:
+  # 配置与进程
   $0 render
   $0 start
+
+  # AI 路由控制
   $0 list-groups
   $0 list-nodes "$AI_MANUAL_GROUP"
+  $0 current "$AI_MANUAL_GROUP"
   $0 switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
   $0 switch "$AI_REGION_US" "🇺🇸 United States丨02"
   $0 ai-status
+
+  # 命令级代理
   $0 proxy-env
   $0 with-proxy curl https://chatgpt.com
   $0 proxy-shell
+
+  # 诊断与排障
+  $0 test-group "$AI_AUTO_GROUP"
+  $0 test
 
 EOF
 }
@@ -1252,7 +1724,8 @@ main() {
             restart
             ;;
         status)
-            status
+            shift
+            status "$@"
             ;;
         logs)
             logs
@@ -1264,26 +1737,28 @@ main() {
             render
             ;;
         list-groups)
-            list_groups
+            shift
+            list_groups "$@"
             ;;
         list-nodes)
             shift
-            list_nodes "$1"
+            list_nodes "$1" "$2"
             ;;
         current)
             shift
-            current_group "$1"
+            current_group "$1" "$2"
             ;;
         switch)
             shift
             switch_group "$1" "$2"
             ;;
         ai-status)
-            ai_status
+            shift
+            ai_status "$@"
             ;;
         test-group)
             shift
-            test_group "$1"
+            test_group "$1" "$2"
             ;;
         proxy-env)
             proxy_env

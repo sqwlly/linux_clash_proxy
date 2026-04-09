@@ -12,6 +12,11 @@
 ./proxy.sh with-proxy curl https://chatgpt.com
 ```
 
+说明：
+
+- 默认输出面向人类阅读，优先展示摘要、链路和状态
+- 如果要给脚本消费，给查询命令追加 `--raw`
+
 ## 首次初始化
 
 ```bash
@@ -55,7 +60,15 @@ AI-MANUAL -> AI-AUTO -> AI-US / AI-SG
 ```bash
 ./proxy.sh ai-status
 ./proxy.sh current "AI-MANUAL"
+./proxy.sh ai-status --raw
+./proxy.sh current "AI-MANUAL" --raw
 ```
+
+说明：
+
+- `ai-status` 默认展示 `摘要 + 当前链路 + 备用路径 + 分组状态`
+- `current` 默认展示 `当前选择: ...`
+- `--raw` 会返回纯值或旧式平铺格式，适合脚本调用
 
 查看候选项：
 
@@ -63,7 +76,13 @@ AI-MANUAL -> AI-AUTO -> AI-US / AI-SG
 ./proxy.sh list-nodes "AI-MANUAL"
 ./proxy.sh list-nodes "AI-US"
 ./proxy.sh list-nodes "AI-SG"
+./proxy.sh list-nodes "AI-MANUAL" --raw
 ```
+
+说明：
+
+- `list-nodes` 默认展示 `当前选择 + 候选列表`
+- `list-nodes --raw` 返回纯候选列表
 
 切到新加坡：
 
@@ -76,6 +95,10 @@ AI-MANUAL -> AI-AUTO -> AI-US / AI-SG
 ```bash
 ./proxy.sh switch "AI-MANUAL" "AI-AUTO"
 ```
+
+说明：
+
+- `switch` 默认会输出 `切换结果 / 代理组 / 当前选择`
 
 ## 命令级代理
 
@@ -105,7 +128,31 @@ AI-MANUAL -> AI-AUTO -> AI-US / AI-SG
 ./proxy.sh test-group "AI-AUTO"
 ./proxy.sh test-group "AI-US"
 ./proxy.sh test-group "AI-SG"
+./proxy.sh test-group "AI-AUTO" --raw
 ```
+
+说明：
+
+- `test-group` 默认展示 `检查摘要 + 检查结果`
+- `test-group --raw` 返回逐行延迟结果
+
+## 脚本消费
+
+适合脚本消费的查询命令：
+
+```bash
+./proxy.sh status --raw
+./proxy.sh ai-status --raw
+./proxy.sh list-groups --raw
+./proxy.sh list-nodes "AI-MANUAL" --raw
+./proxy.sh current "AI-MANUAL" --raw
+./proxy.sh test-group "AI-AUTO" --raw
+```
+
+说明：
+
+- `--raw` 不改变命令逻辑，只切换输出格式
+- 默认模式适合终端阅读，`--raw` 适合 shell 脚本、管道和自动化
 
 ## 关键结论
 

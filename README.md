@@ -24,6 +24,11 @@ cp ./config.example.yaml ./config.yaml
 ./proxy.sh ai-status
 ```
 
+说明：
+
+- 默认输出面向人类阅读，优先展示摘要和链路
+- 如果你要给 shell 脚本消费，可在查询命令后追加 `--raw`
+
 临时让单条命令走代理：
 
 ```bash
@@ -121,6 +126,7 @@ cp ./config.example.yaml ./config.yaml
 ./proxy.sh stop
 ./proxy.sh restart
 ./proxy.sh status
+./proxy.sh status --raw
 ./proxy.sh logs
 ./proxy.sh test
 ```
@@ -129,12 +135,17 @@ cp ./config.example.yaml ./config.yaml
 
 ```bash
 ./proxy.sh list-groups
+./proxy.sh list-groups --raw
 ./proxy.sh list-nodes "AI-MANUAL"
+./proxy.sh list-nodes "AI-MANUAL" --raw
 ./proxy.sh current "AI-MANUAL"
+./proxy.sh current "AI-MANUAL" --raw
 ./proxy.sh switch "AI-MANUAL" "AI-SG"
 ./proxy.sh switch "AI-MANUAL" "AI-AUTO"
 ./proxy.sh ai-status
+./proxy.sh ai-status --raw
 ./proxy.sh test-group "AI-AUTO"
+./proxy.sh test-group "AI-AUTO" --raw
 ```
 
 ### 命令级代理
@@ -151,6 +162,27 @@ cp ./config.example.yaml ./config.yaml
 - `with-proxy` 只给单条命令注入代理环境
 - `proxy-shell` 会打开一个临时带代理环境的子 shell，退出后失效
 - 默认不会修改你当前登录 shell 的全局代理环境
+
+### 输出模式
+
+查询命令现在默认输出面向人类阅读：
+
+- `status`：`运行摘要 + 连接与资源 + 配置路径`
+- `ai-status`：`摘要 + 当前链路 + 备用路径 + 分组状态`
+- `list-groups`：`组名 / 类型 / 当前选择`
+- `list-nodes`：`当前选择 + 候选列表`
+- `test-group`：`检查摘要 + 检查结果`
+
+如果你要在脚本里消费这些命令，建议显式使用 `--raw`：
+
+```bash
+./proxy.sh status --raw
+./proxy.sh ai-status --raw
+./proxy.sh list-groups --raw
+./proxy.sh list-nodes "AI-MANUAL" --raw
+./proxy.sh current "AI-MANUAL" --raw
+./proxy.sh test-group "AI-AUTO" --raw
+```
 
 ## 推荐运维流程
 
@@ -186,6 +218,14 @@ cp ./config.example.yaml ./config.yaml
 
 ```bash
 ./proxy.sh ai-status
+./proxy.sh current "AI-MANUAL"
+```
+
+如果你只想拿纯值或旧式平铺格式给脚本处理：
+
+```bash
+./proxy.sh ai-status --raw
+./proxy.sh current "AI-MANUAL" --raw
 ```
 
 ## 关于 ChinaMax 顺序

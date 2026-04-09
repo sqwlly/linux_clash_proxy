@@ -21,7 +21,7 @@ systemctl status clash-proxy-refresh.timer --no-pager -l
 你应该重点看：
 
 - `status` 是否显示运行配置是 `runtime.yaml`
-- `ai-status` 是否显示 `AI-MANUAL -> AI-AUTO -> AI-US/AI-SG`
+- `ai-status` 是否能看出 `AI-MANUAL -> AI-AUTO -> AI-US/AI-SG` 的当前链路
 - `clash-proxy.service` 是否是 `active (running)`
 - `clash-proxy-refresh.timer` 是否是 `active (waiting)`
 
@@ -42,6 +42,7 @@ systemctl status clash-proxy-refresh.timer --no-pager -l
 ./proxy.sh ai-status
 ./proxy.sh current "AI-MANUAL"
 ./proxy.sh test-group "AI-AUTO"
+./proxy.sh current "AI-MANUAL" --raw
 curl -x "http://127.0.0.1:7890" -I -s --connect-timeout 8 "https://chatgpt.com" >/dev/null
 tail -n 20 /root/clash_proxy/clash.log
 ```
@@ -51,6 +52,7 @@ tail -n 20 /root/clash_proxy/clash.log
 - `AI-MANUAL` 默认是 `AI-AUTO`
 - `AI-AUTO` 应该指向 `AI-US` 或 `AI-SG`
 - `test-group "AI-AUTO"` 应该能测出延迟
+- 如果你要在脚本里判断结果，优先使用 `current --raw`、`ai-status --raw`、`test-group --raw`
 - 日志里应出现类似：
 
 ```text
