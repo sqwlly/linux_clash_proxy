@@ -102,6 +102,18 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert "代理组: AI-MANUAL" in switch_result.stdout
         assert "当前选择: AI-SG" in switch_result.stdout
 
+        color_env = env.copy()
+        color_env["FORCE_COLOR"] = "1"
+        color_switch_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "switch", "AI-MANUAL", "AI-US"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=color_env,
+        )
+        assert color_switch_result.returncode == 0
+        assert "\x1b[" in color_switch_result.stdout
+
         current_result = subprocess.run(
             [sys.executable, "-m", "cproxy.cli", "current", "AI-MANUAL"],
             capture_output=True,
@@ -111,7 +123,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         )
 
         assert current_result.returncode == 0
-        assert "当前选择: AI-SG" in current_result.stdout
+        assert "当前选择: AI-US" in current_result.stdout
     finally:
         server.shutdown()
         thread.join()

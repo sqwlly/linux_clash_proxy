@@ -32,16 +32,20 @@ AI_REGION_SG="🇸🇬 Singapore"
 
 # ==================== 颜色定义 ====================
 if [ -t 1 ] || [ "${FORCE_COLOR:-0}" = "1" ]; then
+    BOLD='\033[1m'
     RED='\033[0;31m'
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
     BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
     NC='\033[0m'
 else
+    BOLD=''
     RED=''
     GREEN=''
     YELLOW=''
     BLUE=''
+    CYAN=''
     NC=''
 fi
 
@@ -71,6 +75,14 @@ print_info() {
 
 print_success() {
     echo -e "${GREEN}$*${NC}"
+}
+
+print_section() {
+    echo -e "${BOLD}${BLUE}$*${NC}"
+}
+
+accent_text() {
+    echo -e "${CYAN}$*${NC}"
 }
 
 check_python_yaml() {
@@ -928,14 +940,14 @@ print(summary)
             return 0
         fi
 
-        echo "摘要"
+        print_section "摘要"
         echo -e "状态: $status_text"
         echo -e "API: $api_text"
         echo -e "AI 路由模式: $ai_mode"
         echo -e "AI 当前出口: $ai_summary"
         echo -e "运行配置状态: $config_state"
         echo ""
-        echo "资源"
+        print_section "资源"
         echo -e "代理端口: $port"
         echo -e "控制接口: $controller"
         echo -e "连接数: $connections"
@@ -949,7 +961,7 @@ print(summary)
             echo -e "日志: $log_size"
         fi
         echo ""
-        echo "路径"
+        print_section "路径"
         echo -e "原始配置: $SOURCE_CONFIG_FILE"
         echo -e "运行配置: $RUNTIME_CONFIG_FILE"
         if [ -n "$running_config" ] && [ "$running_config" != "$RUNTIME_CONFIG_FILE" ]; then
@@ -971,16 +983,16 @@ print(summary)
             return 0
         fi
 
-        echo "摘要"
+        print_section "摘要"
         echo -e "状态: $status_text"
         echo -e "API: $api_text"
         echo -e "运行配置状态: $config_state"
         echo ""
-        echo "资源"
+        print_section "资源"
         echo -e "代理端口: $port"
         echo -e "控制接口: $controller"
         echo ""
-        echo "路径"
+        print_section "路径"
         echo -e "原始配置: $SOURCE_CONFIG_FILE"
         echo -e "运行配置: $RUNTIME_CONFIG_FILE"
     fi
@@ -992,7 +1004,7 @@ logs() {
         return 1
     fi
 
-    print_info "=== 实时日志 (Ctrl+C 退出) ==="
+    print_section "日志"
     echo -e "日志文件: $LOG_FILE"
     echo ""
 
@@ -1057,12 +1069,12 @@ test() {
         results_output="${results_output}失败  出口 IP  获取失败"$'\n'
     fi
 
-    echo "摘要"
+    print_section "摘要"
     echo "目标: 代理连通性"
     echo "可用: $passed/$total"
     echo "出口 IP: ${ip:--}"
     echo ""
-    echo "结果"
+    print_section "结果"
     printf '%s' "$results_output"
 
     if [ "$passed" -eq "$total" ]; then
@@ -1105,7 +1117,7 @@ PY
         local proxies_json
         proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-        PROXIES_JSON="$proxies_json" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+        PROXIES_JSON="$proxies_json" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
 import json
 import os
 import re
@@ -1116,6 +1128,12 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
 
 proxies = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
+bold = os.environ.get("BOLD", "").replace("\\033", "\033")
+blue = os.environ.get("BLUE", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
+
+def section(title):
+    print(f"{bold}{blue}{title}{reset}")
 
 def display_name(value):
     if value in ("-", None):
@@ -1142,11 +1160,11 @@ for group in data.get("proxy-groups", []):
     current = display_name((proxies.get(group_name) or {}).get("now", "-"))
     items.append((group_name, group_type, current))
 
-print("摘要")
+section("摘要")
 print(f"总组数: {len(items)}")
 print(f"可切换组数: {len(items)}")
 print()
-print("列表")
+section("列表")
 print(f"{'组名':<20} {'类型':<12} 当前选择")
 for group_name, group_type, current in items:
     print(f"{group_name:<20} {group_type:<12} {current}")
@@ -1154,12 +1172,20 @@ PY
         return $?
     fi
 
-    python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+    BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
 import sys
 import yaml
 
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
+
+import os
+bold = os.environ.get("BOLD", "").replace("\\033", "\033")
+blue = os.environ.get("BLUE", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
+
+def section(title):
+    print(f"{bold}{blue}{title}{reset}")
 
 items = []
 for group in data.get("proxy-groups", []):
@@ -1169,11 +1195,11 @@ for group in data.get("proxy-groups", []):
     if group_type in {"select", "fallback", "url-test", "load-balance"}:
         items.append((group.get("name", ""), group_type, "-"))
 
-print("摘要")
+section("摘要")
 print(f"总组数: {len(items)}")
 print(f"可切换组数: {len(items)}")
 print()
-print("列表")
+section("列表")
 print(f"{'组名':<20} {'类型':<12} 当前选择")
 for name, group_type, current in items:
     print(f"{name:<20} {group_type:<12} {current}")
@@ -1217,10 +1243,18 @@ for item in group.get("all", []):
             return $?
         fi
 
-        printf '%s' "$proxies_json" | python3 -c '
+        printf '%s' "$proxies_json" | BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 -c '
 import json
+import os
 import re
 import sys
+
+bold = os.environ.get("BOLD", "").replace("\\033", "\033")
+blue = os.environ.get("BLUE", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
+
+def section(title):
+    print(f"{bold}{blue}{title}{reset}")
 
 group_name = sys.argv[1]
 data = json.load(sys.stdin)
@@ -1245,12 +1279,12 @@ def display_name(value):
 
 current = group.get("now", "")
 items = group.get("all", [])
-print("摘要")
+section("摘要")
 print(f"目标组: {group_name}")
 print(f"当前选择: {display_name(current)}")
 print(f"候选数: {len(items)}")
 print()
-print("列表")
+section("列表")
 for item in items:
     label = "当前" if item == current else "候选"
     print(f"{label}  {display_name(item)}")
@@ -1262,10 +1296,18 @@ for item in items:
         return 1
     fi
 
-    python3 - "$RUNTIME_CONFIG_FILE" "$group_name" <<'PY'
+    BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" "$group_name" <<'PY'
 import sys
 import re
 import yaml
+import os
+
+bold = os.environ.get("BOLD", "").replace("\\033", "\033")
+blue = os.environ.get("BLUE", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
+
+def section(title):
+    print(f"{bold}{blue}{title}{reset}")
 
 config_path, group_name = sys.argv[1:3]
 with open(config_path, "r", encoding="utf-8") as fh:
@@ -1288,12 +1330,12 @@ def display_name(value):
 for group in data.get("proxy-groups", []):
     if isinstance(group, dict) and group.get("name") == group_name:
         items = list(group.get("proxies", []))
-        print("摘要")
+        section("摘要")
         print(f"目标组: {group_name}")
         print("当前选择: -")
         print(f"候选数: {len(items)}")
         print()
-        print("列表")
+        section("列表")
         for item in items:
             print(f"候选  {display_name(item)}")
         break
@@ -1343,12 +1385,14 @@ else:
         return $?
     fi
 
-    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" CYAN="$CYAN" NC="$NC" python3 -c '
 import json
 import os
 import sys
 
 exec(os.environ["DISPLAY_NAME_PY"])
+cyan = os.environ.get("CYAN", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
 group_name = sys.argv[1]
 data = json.load(sys.stdin)
 group = data.get("proxies", {}).get(group_name)
@@ -1358,7 +1402,7 @@ if not group:
 
 current = group.get("now")
 if current:
-    print(f"当前选择: {display_name(current)}")
+    print(f"当前选择: {cyan}{display_name(current)}{reset}")
 else:
     raise SystemExit(f"错误: 代理组 [{group_name}] 当前无可读的 now 状态，请确认该组类型支持读取当前选择")
 ' "$group_name"
@@ -1407,13 +1451,15 @@ if target_name not in group.get("all", []):
     api_request "PUT" "/proxies/${encoded_group}" "{\"name\":\"${target_name//\"/\\\"}\"}" >/dev/null || return 1
     proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-    print_success "切换结果"
-    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+    print_section "切换结果"
+    printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" CYAN="$CYAN" NC="$NC" python3 -c '
 import json
 import os
 import sys
 
 exec(os.environ["DISPLAY_NAME_PY"])
+cyan = os.environ.get("CYAN", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
 group_name = sys.argv[1]
 data = json.load(sys.stdin).get("proxies", {})
 group = data.get(group_name)
@@ -1423,7 +1469,7 @@ if not group:
 
 current = group.get("now", "-")
 print(f"代理组: {group_name}")
-print(f"当前选择: {display_name(current)}")
+print(f"当前选择: {cyan}{display_name(current)}{reset}")
 ' "$group_name"
     return 0
 }
@@ -1453,7 +1499,7 @@ ai_status() {
     chatgpt_url="$(get_yaml_value "$config_file" "ai-chatgpt-url" "https://chatgpt.com")"
     openai_api_url="$(get_yaml_value "$config_file" "ai-openai-api-url" "https://api.openai.com/v1/models")"
 
-    PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
+    PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 -c '
 import json
 import os
 import socket
@@ -1462,8 +1508,14 @@ from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
 exec(os.environ["DISPLAY_NAME_PY"])
+bold = os.environ.get("BOLD", "").replace("\\033", "\033")
+blue = os.environ.get("BLUE", "").replace("\\033", "\033")
+reset = os.environ.get("NC", "").replace("\\033", "\033")
 raw_mode, ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg, proxy_url, probe_timeout, chatgpt_url, openai_api_url = sys.argv[1:12]
 data = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
+
+def section(title):
+    print(f"{bold}{blue}{title}{reset}")
 
 def get_group(name):
     return data.get(name) or {}
@@ -1591,19 +1643,19 @@ if raw_mode == "1":
         )
     raise SystemExit(0)
 
-print("摘要")
+section("摘要")
 print(
     f"AI 路由: {mode_label}  当前出口={display_name(active_node)}  "
     f"区域={active_group}  延迟={format_delay(active_delay)}  状态={active_status}"
 )
 print(f"AI 探测: {probe_status}")
 print()
-print("连通性")
+section("连通性")
 for item in probe_results:
     label = "正常" if item["ok"] else "失败"
     print(label + "  " + str(item["name"]) + "  " + str(item["url"]))
 print()
-print("链路")
+section("链路")
 print(ai_manual)
 
 if auto_mode:
@@ -1616,10 +1668,10 @@ else:
         print(f"   └─ {display_name(active_node)} ({format_delay(active_delay)})")
 
 print()
-print("备用")
+section("备用")
 print(f"{standby_group} -> {display_name(standby_node)} ({format_delay(standby_delay)}, {standby_status})")
 print()
-print("分组")
+section("分组")
 
 for name in (ai_manual, ai_auto, ai_us, ai_sg):
     print(f"{name:<10} {get_type(name):<8} 当前: {display_name(get_current(name))}")

@@ -199,6 +199,12 @@ cproxy migrate-from-legacy /root/clash_proxy
 
 其中不同命令只显示自己需要的区块，`--raw` 保持原始稳定格式。
 
+着色规则：
+
+- 默认仅在真实终端输出时启用
+- 可通过 `FORCE_COLOR=1 cproxy status` 强制开启
+- 脚本场景优先使用 `--raw`
+
 适合脚本消费的命令：
 
 ```bash

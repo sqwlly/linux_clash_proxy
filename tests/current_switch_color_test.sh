@@ -186,6 +186,11 @@ current_output="$(
 )"
 assert_contains "$current_output" "当前选择: AI-AUTO" "current 应输出摘要式当前选择"
 
+current_color_output="$(
+    env FORCE_COLOR=1 "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
+)"
+assert_contains "$current_color_output" $'\033[' "FORCE_COLOR=1 时 current 应输出 ANSI 转义"
+
 switch_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" switch "AI-MANUAL" "AI-SG"
 )"
@@ -193,9 +198,14 @@ assert_contains "$switch_output" "切换结果" "switch 应输出切换结果区
 assert_contains "$switch_output" "代理组: AI-MANUAL" "switch 应展示目标代理组"
 assert_contains "$switch_output" "当前选择: AI-SG" "switch 应展示切换后的当前选择"
 
+switch_color_output="$(
+    env FORCE_COLOR=1 "${COMMON_ENV[@]}" "$SCRIPT" switch "AI-MANUAL" "AI-US"
+)"
+assert_contains "$switch_color_output" $'\033[' "FORCE_COLOR=1 时 switch 应输出 ANSI 转义"
+
 current_after_switch="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
 )"
-assert_contains "$current_after_switch" "当前选择: AI-SG" "切换后 current 应反映新状态"
+assert_contains "$current_after_switch" "当前选择: AI-US" "切换后 current 应反映新状态"
 
 echo "current_switch_color_test: PASS"

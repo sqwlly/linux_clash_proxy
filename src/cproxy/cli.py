@@ -20,6 +20,14 @@ from .runtime import render_runtime
 from .output import build_root_parser, normalize_name
 from .services.query import QueryService
 
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_BLUE = "\033[34m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_CYAN = "\033[36m"
+
 
 def _get_group(groups: dict, name: str):
     group = groups.get(name)
@@ -45,8 +53,37 @@ def _format_delay_label(delay) -> str:
     return f"{delay}ms" if isinstance(delay, int) else "-"
 
 
+def _color_enabled() -> bool:
+    return sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
+
+
+def _style(text: object, *codes: str) -> str:
+    content = str(text)
+    if not _color_enabled() or not codes:
+        return content
+    return f"{''.join(codes)}{content}{ANSI_RESET}"
+
+
+def _section_title(title: str) -> str:
+    return _style(title, ANSI_BOLD, ANSI_BLUE)
+
+
+def _accent(text: object) -> str:
+    return _style(text, ANSI_CYAN)
+
+
+def _status_color(text: str) -> str:
+    if text in {"正常", "运行中", "可访问", "已就绪"}:
+        return _style(text, ANSI_GREEN)
+    if text in {"部分异常", "待刷新", "未知"}:
+        return _style(text, ANSI_YELLOW)
+    if text in {"失败", "异常", "未运行", "不可访问"}:
+        return _style(text, ANSI_RED)
+    return text
+
+
 def _print_section(title: str) -> None:
-    print(title)
+    print(_section_title(title))
 
 
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
@@ -85,7 +122,7 @@ def _render_current(groups: dict, group_name: str, raw: bool) -> int:
     if raw:
         print(current)
     else:
-        print(f"当前选择: {normalize_name(current)}")
+        print(f"当前选择: {_accent(normalize_name(current))}")
     return 0
 
 
@@ -128,7 +165,7 @@ def _render_list_nodes(groups: dict, group_name: str, raw: bool) -> int:
 
     _print_section("摘要")
     print(f"目标组: {group_name}")
-    print(f"当前选择: {normalize_name(current)}")
+    print(f"当前选择: {_accent(normalize_name(current))}")
     print(f"候选数: {len(items)}")
     print()
     _print_section("列表")
@@ -181,11 +218,11 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         f"AI 路由: {route['mode_label']}  当前出口={normalize_name(active_node)}  "
         f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={active_status}"
     )
-    print(f"AI 探测: {_probe_summary_status(probe_report)}")
+    print(f"AI 探测: {_status_color(_probe_summary_status(probe_report))}")
     print()
     _print_section("连通性")
     for item in probe_report.results:
-        label = "正常" if item.ok else "失败"
+        label = _status_color("正常" if item.ok else "失败")
         print(f"{label}  {item.name}  {item.url}")
     print()
     _print_section("链路")
@@ -199,7 +236,7 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         print(f"   └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
     print()
     _print_section("备用")
-    print(f"{standby_group} -> {normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {standby_status})")
+    print(f"{standby_group} -> {normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {_status_color(standby_status)})")
     print()
     _print_section("分组")
     for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
@@ -248,11 +285,11 @@ def _render_status(raw: bool) -> int:
         return 0
 
     _print_section("摘要")
-    print(f"状态: {status_text}")
-    print(f"API: {api_text}")
+    print(f"状态: {_status_color(status_text)}")
+    print(f"API: {_status_color(api_text)}")
     print(f"AI 路由模式: {ai_mode}")
-    print(f"AI 当前出口: {ai_summary}")
-    print(f"运行配置状态: {config_state}")
+    print(f"AI 当前出口: {_accent(ai_summary)}")
+    print(f"运行配置状态: {_status_color(config_state)}")
     print()
     _print_section("资源")
     print(f"代理端口: {snapshot.port}")
@@ -285,9 +322,9 @@ def _render_group_check(report: GroupCheckReport, raw: bool) -> int:
     _print_section("结果")
     for item in report.results:
         if item.ok and item.delay is not None:
-            print(f"正常  {item.name}  {item.delay}ms")
+            print(f"{_status_color('正常')}  {item.name}  {item.delay}ms")
         else:
-            print(f"失败  {item.name}  -")
+            print(f"{_status_color('失败')}  {item.name}  -")
     return 0 if len(ok_items) == len(report.results) else 1
 
 
@@ -301,9 +338,9 @@ def _render_connectivity_report(report: ConnectivityReport) -> int:
     _print_section("结果")
     for item in report.results:
         if item.ok:
-            print(f"正常  {item.name}  {item.detail}")
+            print(f"{_status_color('正常')}  {item.name}  {item.detail}")
         else:
-            print(f"失败  {item.name}  {item.detail}")
+            print(f"{_status_color('失败')}  {item.name}  {item.detail}")
     return 0 if passed == len(report.results) else 1
 
 
@@ -415,7 +452,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "with-proxy":
             return run_with_proxy(default_paths(), args.command_args)
         if args.command == "proxy-shell":
-            print("进入临时代理 shell，退出后代理环境失效")
+            print(_section_title("进入临时代理 shell，退出后代理环境失效"))
             return run_proxy_shell(default_paths(), args.shell_args)
         if args.command in {"current", "list-groups", "list-nodes", "ai-status"}:
             service = QueryService(default_paths())
@@ -429,9 +466,9 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "switch":
             service = QueryService(default_paths())
             group = service.switch_group(args.group, args.target)
-            print("切换结果")
+            print(_section_title("切换结果"))
             print(f"代理组: {args.group}")
-            print(f"当前选择: {normalize_name(group.current)}")
+            print(f"当前选择: {_accent(normalize_name(group.current))}")
             return 0
         return 0
     except (APIUnavailableError, ProcessOwnershipError, FileNotFoundError, RuntimeError, ValueError) as exc:
