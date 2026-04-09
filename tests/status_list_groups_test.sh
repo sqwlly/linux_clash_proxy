@@ -44,6 +44,20 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local message="$3"
+
+    if [[ "$haystack" == *"$needle"* ]]; then
+        echo "ASSERTION FAILED: $message" >&2
+        echo "Did not expect to find: $needle" >&2
+        echo "Actual output:" >&2
+        printf '%s\n' "$haystack" >&2
+        exit 1
+    fi
+}
+
 mkdir -p "$STUB_DIR"
 
 cat >"$STUB_DIR/ps" <<'EOF'
@@ -209,6 +223,7 @@ assert_contains "$status_output" "AI 路由模式: 自动切换" "status 应展�
 assert_contains "$status_output" "AI 当前出口: AI-US -> United States 01 (95ms)" "status 应展示 AI 当前实际出口及延迟"
 assert_contains "$status_output" "连接数: 3" "status 应展示连接数"
 assert_contains "$status_output" "内存: 59MB" "status 应展示规整后的内存值"
+assert_not_contains "$status_output" "实际运行配置:" "status 在路径相同时不应重复展示实际运行配置"
 
 list_groups_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" list-groups

@@ -915,7 +915,7 @@ print(summary)
             echo -e "运行配置状态: ${config_state}"
             echo -e "状态: ${status_text}"
             echo -e "PID: $pid"
-            if [ -n "$running_config" ]; then
+            if [ -n "$running_config" ] && [ "$running_config" != "$RUNTIME_CONFIG_FILE" ]; then
                 echo -e "实际运行配置: $running_config"
             fi
             if [ -n "${elapsed:-}" ]; then
@@ -956,7 +956,7 @@ print(summary)
         echo "配置路径"
         echo -e "原始配置: $SOURCE_CONFIG_FILE"
         echo -e "运行配置: $RUNTIME_CONFIG_FILE"
-        if [ -n "$running_config" ]; then
+        if [ -n "$running_config" ] && [ "$running_config" != "$RUNTIME_CONFIG_FILE" ]; then
             echo -e "实际运行配置: $running_config"
         fi
         echo -e "PID: $pid"
