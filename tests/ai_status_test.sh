@@ -38,9 +38,16 @@ assert_contains() {
 python3 - "$PORT_FILE" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port_file = sys.argv[1]
+request_counts = {
+    "http://probe.local/flaky-openai": 0,
+}
+first_failure_at = {
+    "http://probe.local/flaky-openai": None,
+}
 payload = {
     "proxies": {
         "AI-MANUAL": {
@@ -96,6 +103,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "http://probe.local/openai-api":
             self._send_text(502, "bad gateway")
+            return
+        if self.path == "http://probe.local/flaky-openai":
+            request_counts[self.path] += 1
+            if request_counts[self.path] == 1:
+                first_failure_at[self.path] = time.monotonic()
+                self._send_text(502, "bad gateway")
+                return
+            if time.monotonic() - first_failure_at[self.path] < 0.15:
+                self._send_text(502, "retry too fast")
+                return
+            self._send_text(200, "ok")
             return
 
         self.send_response(404)
@@ -169,5 +187,21 @@ assert_contains "$ai_status_output" "自动切换" "ai-status 应明确展示当
 assert_contains "$ai_status_output" "当前出口=United States 01" "ai-status 应将当前节点名称规整为自然空格分隔"
 assert_contains "$ai_status_output" "AI-SG -> Singapore 01" "ai-status 应展示备用路径的实际节点"
 assert_contains "$ai_status_output" "当前: United States 01" "ai-status 应在分组状态中展示规整后的节点名"
+
+cat >"$CONFIG_FILE" <<EOF
+external-controller: 127.0.0.1:${PORT}
+mixed-port: ${PORT}
+ai-chatgpt-url: http://probe.local/chatgpt
+ai-openai-api-url: http://probe.local/flaky-openai
+EOF
+
+ai_status_retry_output="$(
+    RUNTIME_CONFIG_FILE="$CONFIG_FILE" \
+    SOURCE_CONFIG_FILE="$CONFIG_FILE" \
+    "$SCRIPT" ai-status
+)"
+
+assert_contains "$ai_status_retry_output" "AI 探测: 正常" "ai-status 在瞬时 5xx 后应通过重试恢复为正常"
+assert_contains "$ai_status_retry_output" "正常  OpenAI API  http://probe.local/flaky-openai" "ai-status 应在重试成功后展示 OpenAI API 正常"
 
 echo "ai_status_test: PASS"

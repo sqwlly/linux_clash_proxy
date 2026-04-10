@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import time
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -27,6 +28,9 @@ DEFAULT_AI_PROBE_TARGETS = [
     ("ChatGPT Web", "https://chatgpt.com"),
     ("OpenAI API", "https://api.openai.com/v1/models"),
 ]
+DEFAULT_AI_PROBE_TIMEOUT = 8
+DEFAULT_AI_PROBE_RETRIES = 2
+DEFAULT_AI_PROBE_BACKOFFS = (0.2, 0.5)
 
 
 def _config_list(config: dict, key: str, defaults: Iterable[str]) -> list[str]:
@@ -71,6 +75,26 @@ def _probe_failure_detail(exc: Exception) -> str:
     if text:
         return text
     return "连接失败"
+
+
+def _probe_target(opener, url: str, timeout: int) -> tuple[bool, str]:
+    for attempt in range(DEFAULT_AI_PROBE_RETRIES + 1):
+        request = Request(url, headers={"User-Agent": "cproxy/0.1.0"})
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                status = getattr(response, "status", response.getcode())
+            return True, f"HTTP {status}" if status else "成功"
+        except HTTPError as exc:
+            ok = 400 <= exc.code < 500
+            if ok or attempt == DEFAULT_AI_PROBE_RETRIES:
+                return ok, f"HTTP {exc.code}"
+            time.sleep(DEFAULT_AI_PROBE_BACKOFFS[attempt])
+        except (URLError, OSError) as exc:
+            if attempt == DEFAULT_AI_PROBE_RETRIES:
+                return False, _probe_failure_detail(exc)
+            time.sleep(DEFAULT_AI_PROBE_BACKOFFS[attempt])
+
+    return False, "连接失败"
 
 
 class DiagnosticsService:
@@ -143,7 +167,11 @@ class DiagnosticsService:
 
     def run_ai_probe(self) -> AIProbeReport:
         config = read_config(self.paths)
-        timeout = _config_int(config, "ai-probe-timeout", _config_int(config, "connectivity-timeout", 5))
+        timeout = _config_int(
+            config,
+            "ai-probe-timeout",
+            _config_int(config, "connectivity-timeout", DEFAULT_AI_PROBE_TIMEOUT),
+        )
         targets = [
             ("ChatGPT Web", _config_str(config, "ai-chatgpt-url", DEFAULT_AI_PROBE_TARGETS[0][1])),
             ("OpenAI API", _config_str(config, "ai-openai-api-url", DEFAULT_AI_PROBE_TARGETS[1][1])),
@@ -152,15 +180,6 @@ class DiagnosticsService:
 
         results: list[AIProbeResult] = []
         for name, url in targets:
-            request = Request(url, headers={"User-Agent": "cproxy/0.1.0"})
-            try:
-                with opener.open(request, timeout=timeout) as response:
-                    status = getattr(response, "status", response.getcode())
-                detail = f"HTTP {status}" if status else "成功"
-                results.append(AIProbeResult(name=name, url=url, ok=True, detail=detail))
-            except HTTPError as exc:
-                ok = 400 <= exc.code < 500
-                results.append(AIProbeResult(name=name, url=url, ok=ok, detail=f"HTTP {exc.code}"))
-            except (URLError, OSError) as exc:
-                results.append(AIProbeResult(name=name, url=url, ok=False, detail=_probe_failure_detail(exc)))
+            ok, detail = _probe_target(opener, url, timeout)
+            results.append(AIProbeResult(name=name, url=url, ok=ok, detail=detail))
         return AIProbeReport(results=results)

@@ -5,7 +5,14 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
+from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
+
+sys.path.insert(0, "/root/clash_proxy/src")
+
+from cproxy.config import default_paths
+from cproxy.services import diagnostics as diagnostics_module
+from cproxy.services.diagnostics import DiagnosticsService
 
 
 class _ApiHandler(BaseHTTPRequestHandler):
@@ -269,3 +276,146 @@ ip-check-urls:
         api_thread.join()
         proxy_server.shutdown()
         proxy_thread.join()
+
+
+def test_ai_probe_uses_8_second_timeout_by_default(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\n",
+        encoding="utf-8",
+    )
+
+    captured: list[int] = []
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self):
+            return self.status
+
+    class _Opener:
+        def open(self, request, timeout):
+            captured.append(timeout)
+            return _Response()
+
+    monkeypatch.setattr("cproxy.services.diagnostics._proxy_opener", lambda paths: _Opener())
+
+    report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
+
+    assert len(report.results) == 2
+    assert captured == [8, 8]
+
+
+def test_ai_probe_retries_transient_failures(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\n",
+        encoding="utf-8",
+    )
+
+    attempts = {
+        "http://probe.local/chatgpt": 0,
+        "http://probe.local/openai-api": 0,
+    }
+
+    class _Response:
+        def __init__(self, status: int):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self):
+            return self.status
+
+    class _Opener:
+        def open(self, request, timeout):
+            url = request.full_url
+            attempts[url] += 1
+            if url == "http://probe.local/chatgpt" and attempts[url] == 1:
+                raise OSError("temporary failure")
+            if url == "http://probe.local/openai-api" and attempts[url] == 1:
+                from urllib.error import HTTPError
+
+                raise HTTPError(url, 502, "bad gateway", hdrs=None, fp=None)
+            return _Response(200)
+
+    monkeypatch.setattr("cproxy.services.diagnostics._proxy_opener", lambda paths: _Opener())
+
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        "mixed-port: 7890\n"
+        "ai-chatgpt-url: http://probe.local/chatgpt\n"
+        "ai-openai-api-url: http://probe.local/openai-api\n",
+        encoding="utf-8",
+    )
+
+    report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
+
+    assert [item.ok for item in report.results] == [True, True]
+    assert attempts == {
+        "http://probe.local/chatgpt": 2,
+        "http://probe.local/openai-api": 2,
+    }
+
+
+def test_ai_probe_waits_between_retries(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\n"
+        "ai-chatgpt-url: http://probe.local/chatgpt\n",
+        encoding="utf-8",
+    )
+
+    sleeps: list[float] = []
+    attempts = {
+        "http://probe.local/chatgpt": 0,
+        "http://probe.local/openai-api": 0,
+    }
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self):
+            return self.status
+
+    class _Opener:
+        def open(self, request, timeout):
+            url = request.full_url
+            attempts[url] += 1
+            if url == "http://probe.local/chatgpt" and attempts[url] < 3:
+                raise OSError("temporary failure")
+            return _Response()
+
+    monkeypatch.setattr("cproxy.services.diagnostics._proxy_opener", lambda paths: _Opener())
+    monkeypatch.setattr(diagnostics_module, "time", SimpleNamespace(sleep=sleeps.append), raising=False)
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\n"
+        "ai-chatgpt-url: http://probe.local/chatgpt\n"
+        "ai-openai-api-url: http://probe.local/openai-api\n",
+        encoding="utf-8",
+    )
+
+    report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
+
+    assert report.results[0].ok is True
+    assert attempts["http://probe.local/chatgpt"] == 3
+    assert sleeps == [0.2, 0.5]

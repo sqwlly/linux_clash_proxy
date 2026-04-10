@@ -210,14 +210,14 @@ cproxy test-group "AI-AUTO" --raw
 
 - `render` 后、`start` 前，`current/list-groups/list-nodes` 仍然可用
 - `ai-status/switch/test-group` 仍要求 Mihomo API 可访问
-- `ai-status` 会额外通过本地代理探测 `chatgpt.com` 与 `api.openai.com/v1/models`
+- `ai-status` 会额外通过本地代理探测 `chatgpt.com` 与 `api.openai.com/v1/models`，失败时会做最多 2 次轻量重试
 
 如需覆盖默认探测地址，可在 `config.yaml` 里配置：
 
 ```yaml
 ai-chatgpt-url: https://chatgpt.com
 ai-openai-api-url: https://api.openai.com/v1/models
-ai-probe-timeout: 5
+ai-probe-timeout: 8
 ```
 
 ## AI 路由设计

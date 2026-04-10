@@ -1496,7 +1496,7 @@ ai_status() {
 
     config_file="$(get_read_config_file)"
     proxy_http_url="$(get_proxy_http_url)"
-    probe_timeout="$(get_yaml_value "$config_file" "ai-probe-timeout" "$(get_yaml_value "$config_file" "connectivity-timeout" "5")")"
+    probe_timeout="$(get_yaml_value "$config_file" "ai-probe-timeout" "$(get_yaml_value "$config_file" "connectivity-timeout" "8")")"
     chatgpt_url="$(get_yaml_value "$config_file" "ai-chatgpt-url" "https://chatgpt.com")"
     openai_api_url="$(get_yaml_value "$config_file" "ai-openai-api-url" "https://api.openai.com/v1/models")"
 
@@ -1505,6 +1505,7 @@ import json
 import os
 import socket
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -1514,6 +1515,7 @@ blue = os.environ.get("BLUE", "").replace("\\033", "\033")
 reset = os.environ.get("NC", "").replace("\\033", "\033")
 raw_mode, ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg, proxy_url, probe_timeout, chatgpt_url, openai_api_url = sys.argv[1:12]
 data = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
+probe_backoffs = (0.2, 0.5)
 
 def section(title):
     print(f"{bold}{blue}{title}{reset}")
@@ -1557,20 +1559,32 @@ def probe_failure_detail(exc):
         return text
     return "连接失败"
 
+def probe_target(opener, url):
+    for attempt in range(3):
+        request = Request(url, headers={"User-Agent": "cproxy/1.2.0"})
+        try:
+            with opener.open(request, timeout=int(probe_timeout)) as response:
+                status = getattr(response, "status", response.getcode())
+            return True, f"HTTP {status}" if status else "成功"
+        except HTTPError as exc:
+            ok = 400 <= exc.code < 500
+            if ok or attempt == 2:
+                return ok, f"HTTP {exc.code}"
+            time.sleep(probe_backoffs[attempt])
+        except (URLError, OSError) as exc:
+            if attempt == 2:
+                return False, probe_failure_detail(exc)
+            time.sleep(probe_backoffs[attempt])
+
+    return False, "连接失败"
+
 def probe_targets():
     opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
     results = []
 
     for name, url in (("ChatGPT Web", chatgpt_url), ("OpenAI API", openai_api_url)):
-        request = Request(url, headers={"User-Agent": "cproxy/1.2.0"})
-        try:
-            with opener.open(request, timeout=int(probe_timeout)) as response:
-                status = getattr(response, "status", response.getcode())
-            results.append({"name": name, "url": url, "ok": True, "detail": f"HTTP {status}" if status else "成功"})
-        except HTTPError as exc:
-            results.append({"name": name, "url": url, "ok": 400 <= exc.code < 500, "detail": f"HTTP {exc.code}"})
-        except (URLError, OSError) as exc:
-            results.append({"name": name, "url": url, "ok": False, "detail": probe_failure_detail(exc)})
+        ok, detail = probe_target(opener, url)
+        results.append({"name": name, "url": url, "ok": ok, "detail": detail})
 
     return results
 
