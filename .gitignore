@@ -3,11 +3,13 @@
 .codex
 
 clash.log
+clash.log.*
 cache.db
 mihomo.pid
 config.yaml
 runtime.yaml
 mihomo.gz
+.venv/
 
 .DS_Store
 __pycache__/
