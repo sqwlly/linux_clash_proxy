@@ -86,6 +86,13 @@ else
     NC=''
 fi
 
+ICON_ENABLED=1
+case "${CPROXY_ICONS:-1}" in
+    0|false|False|FALSE|no|No|NO|off|Off|OFF)
+        ICON_ENABLED=0
+        ;;
+esac
+
 # ==================== 全局变量 ====================
 CACHED_PID=""
 
@@ -116,6 +123,51 @@ print_success() {
 
 print_section() {
     echo -e "${BOLD}${BLUE}$*${NC}"
+}
+
+section_label() {
+    local icon="$1"
+    local text="$2"
+
+    if [ "$ICON_ENABLED" -eq 1 ]; then
+        printf "%s %s" "$icon" "$text"
+    else
+        printf "%s" "$text"
+    fi
+}
+
+status_icon() {
+    case "$1" in
+        运行中)
+            printf "●"
+            ;;
+        未运行)
+            printf "○"
+            ;;
+        可访问|已就绪)
+            printf "✓"
+            ;;
+        待刷新|未知)
+            printf "!"
+            ;;
+        不可访问|失败|异常)
+            printf "✗"
+            ;;
+        *)
+            printf "•"
+            ;;
+    esac
+}
+
+status_label() {
+    local plain="$1"
+    local colored="$2"
+
+    if [ "$ICON_ENABLED" -eq 1 ]; then
+        printf "%s %s" "$(status_icon "$plain")" "$colored"
+    else
+        printf "%s" "$colored"
+    fi
 }
 
 accent_text() {
@@ -985,34 +1037,34 @@ print(summary)
             return 0
         fi
 
-        print_section "摘要"
-        echo -e "状态: $status_text"
-        echo -e "API: $api_text"
-        echo -e "AI 路由模式: $ai_mode"
-        echo -e "AI 当前出口: $ai_summary"
-        echo -e "运行配置状态: $config_state"
+        print_section "$(section_label "◆" "Clash Proxy")"
+        echo -e "状态        $(status_label "$status_text_plain" "$status_text")"
+        echo -e "API         $(status_label "$api_text_plain" "$api_text")"
+        echo -e "运行配置    $(status_label "$config_state_plain" "$config_state")"
+        echo -e "AI 路由     $ai_mode"
+        echo -e "当前出口    $ai_summary"
         echo ""
-        print_section "资源"
-        echo -e "代理端口: $port"
-        echo -e "控制接口: $controller"
-        echo -e "连接数: $connections"
+        print_section "$(section_label "▸" "资源")"
+        echo -e "代理端口    $port"
+        echo -e "控制接口    $controller"
+        echo -e "连接数      $connections"
         if [ -n "${elapsed:-}" ]; then
-            printf "运行时间: %02dh %02dm %02ds\n" "$hours" "$minutes" "$seconds"
+            printf "运行时间    %02dh %02dm %02ds\n" "$hours" "$minutes" "$seconds"
         fi
         if [ -n "${mem_usage:-}" ]; then
-            echo -e "内存: $mem_usage"
+            echo -e "内存        $mem_usage"
         fi
         if [ -n "${log_size:-}" ]; then
-            echo -e "日志: $log_size"
+            echo -e "日志        $log_size"
         fi
         echo ""
-        print_section "路径"
-        echo -e "原始配置: $SOURCE_CONFIG_FILE"
-        echo -e "运行配置: $RUNTIME_CONFIG_FILE"
+        print_section "$(section_label "▸" "路径")"
+        echo -e "原始配置    $SOURCE_CONFIG_FILE"
+        echo -e "运行配置    $RUNTIME_CONFIG_FILE"
         if [ -n "$running_config" ] && [ "$running_config" != "$RUNTIME_CONFIG_FILE" ]; then
-            echo -e "实际运行配置: $running_config"
+            echo -e "实际配置    $running_config"
         fi
-        echo -e "PID: $pid"
+        echo -e "PID         $pid"
     else
         status_text_plain="未运行"
         api_text_plain="不可访问"
@@ -1030,18 +1082,18 @@ print(summary)
             return 0
         fi
 
-        print_section "摘要"
-        echo -e "状态: $status_text"
-        echo -e "API: $api_text"
-        echo -e "运行配置状态: $config_state"
+        print_section "$(section_label "◆" "Clash Proxy")"
+        echo -e "状态        $(status_label "$status_text_plain" "$status_text")"
+        echo -e "API         $(status_label "$api_text_plain" "$api_text")"
+        echo -e "运行配置    $(status_label "$config_state_plain" "$config_state")"
         echo ""
-        print_section "资源"
-        echo -e "代理端口: $port"
-        echo -e "控制接口: $controller"
+        print_section "$(section_label "▸" "资源")"
+        echo -e "代理端口    $port"
+        echo -e "控制接口    $controller"
         echo ""
-        print_section "路径"
-        echo -e "原始配置: $SOURCE_CONFIG_FILE"
-        echo -e "运行配置: $RUNTIME_CONFIG_FILE"
+        print_section "$(section_label "▸" "路径")"
+        echo -e "原始配置    $SOURCE_CONFIG_FILE"
+        echo -e "运行配置    $RUNTIME_CONFIG_FILE"
     fi
 }
 

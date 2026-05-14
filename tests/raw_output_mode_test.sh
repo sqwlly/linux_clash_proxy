@@ -317,6 +317,23 @@ assert_contains "$status_raw" "状态: 运行中" "status --raw 应输出旧式�
 assert_not_contains "$status_raw" "运行摘要" "status --raw 不应输出新区块"
 assert_not_contains "$status_raw" "=== Mihomo 代理状态 ===" "status --raw 不应输出人类标题"
 assert_not_contains "$status_raw" "实际运行配置:" "status --raw 在路径相同时不应重复展示实际运行配置"
+assert_not_contains "$status_raw" "● 运行中" "status --raw 不应输出 icon"
+
+status_output="$(
+    env -u NO_COLOR CPROXY_COLOR=never "${COMMON_ENV[@]}" "$SCRIPT" status
+)"
+assert_contains "$status_output" "◆ Clash Proxy" "status 默认应输出产品化标题"
+assert_contains "$status_output" "状态        ● 运行中" "status 默认应输出状态 icon"
+assert_contains "$status_output" "API         ✓ 可访问" "status 默认应输出 API icon"
+assert_contains "$status_output" "运行配置    ✓ 已就绪" "status 默认应输出运行配置 icon"
+assert_contains "$status_output" "▸ 资源" "status 默认应输出资源分区 icon"
+
+status_no_icons="$(
+    env -u NO_COLOR CPROXY_COLOR=never CPROXY_ICONS=0 "${COMMON_ENV[@]}" "$SCRIPT" status
+)"
+assert_contains "$status_no_icons" "Clash Proxy" "关闭 icon 后仍应输出标题"
+assert_not_contains "$status_no_icons" "● 运行中" "CPROXY_ICONS=0 应关闭状态 icon"
+assert_not_contains "$status_no_icons" "✓ 可访问" "CPROXY_ICONS=0 应关闭 API icon"
 
 ai_status_raw="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" ai-status --raw

@@ -44,6 +44,9 @@ clash-proxy-update --dry-run config_1.yaml
 clash-proxy-update --apply config_1.yaml
 ```
 
+`clash-proxy status` 默认显示彩色、带 icon 的产品化状态面板；脚本消费继续使用
+`clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
+
 如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
 
 ```bash
