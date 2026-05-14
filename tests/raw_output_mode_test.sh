@@ -343,6 +343,8 @@ assert_contains "$ai_status_raw" "AI-PROBE: 部分异常" "ai-status --raw 应�
 assert_contains "$ai_status_raw" "AI-PROBE-ITEM: name=ChatGPT Web ok=True detail=HTTP 200 url=http://probe.local/chatgpt" "ai-status --raw 应输出 ChatGPT Web 探测结果"
 assert_not_contains "$ai_status_raw" "当前链路" "ai-status --raw 不应输出新区块"
 assert_not_contains "$ai_status_raw" "=== AI 路由状态 ===" "ai-status --raw 不应输出人类标题"
+assert_not_contains "$ai_status_raw" "◆ AI Routing" "ai-status --raw 不应输出产品化标题"
+assert_not_contains "$ai_status_raw" "✓ 正常" "ai-status --raw 不应输出状态 icon"
 
 test_group_raw="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" test-group "AI-AUTO" --raw

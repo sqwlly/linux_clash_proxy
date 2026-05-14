@@ -1599,7 +1599,7 @@ ai_status() {
     chatgpt_url="$(get_yaml_value "$config_file" "ai-chatgpt-url" "https://chatgpt.com")"
     openai_api_url="$(get_yaml_value "$config_file" "ai-openai-api-url" "https://api.openai.com/v1/models")"
 
-    PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 -c '
+    PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" ICON_ENABLED="$ICON_ENABLED" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 -c '
 import json
 import os
 import socket
@@ -1612,12 +1612,64 @@ exec(os.environ["DISPLAY_NAME_PY"])
 bold = os.environ.get("BOLD", "").replace("\\033", "\033")
 blue = os.environ.get("BLUE", "").replace("\\033", "\033")
 reset = os.environ.get("NC", "").replace("\\033", "\033")
+icons_enabled = os.environ.get("ICON_ENABLED", "1") == "1"
 raw_mode, ai_manual, ai_auto, ai_us, ai_sg, region_us, region_sg, proxy_url, probe_timeout, chatgpt_url, openai_api_url = sys.argv[1:12]
 data = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
 probe_backoffs = (0.2, 0.5)
 
 def section(title):
     print(f"{bold}{blue}{title}{reset}")
+
+def section_title(icon, title):
+    return f"{icon} {title}" if icons_enabled else title
+
+def status_icon(status):
+    if not icons_enabled:
+        return ""
+    return {
+        "正常": "✓",
+        "可访问": "✓",
+        "运行中": "●",
+        "部分异常": "!",
+        "未知": "?",
+        "异常": "✗",
+        "失败": "✗",
+        "不可访问": "✗",
+    }.get(str(status), "•")
+
+def status_label(status):
+    prefix = status_icon(status)
+    return f"{prefix} {status}" if prefix else str(status)
+
+def country_icon_for_group(name):
+    if not icons_enabled:
+        return ""
+    if name in (ai_us, region_us):
+        return "🇺🇸"
+    if name in (ai_sg, region_sg):
+        return "🇸🇬"
+    return ""
+
+def leading_symbol(value):
+    if not icons_enabled or value in ("-", None):
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    first = text.split(maxsplit=1)[0]
+    if first and all(not ch.isalnum() for ch in first):
+        return first
+    return ""
+
+def group_label(name):
+    flag = country_icon_for_group(name)
+    return f"{flag} {name}" if flag else name
+
+def node_label(value, group="-"):
+    name = display_name(value)
+    flag = country_icon_for_group(group) or leading_symbol(value)
+    return f"{flag} {name}" if flag and name != "-" else name
 
 def get_group(name):
     return data.get(name) or {}
@@ -1757,38 +1809,39 @@ if raw_mode == "1":
         )
     raise SystemExit(0)
 
-section("摘要")
-print(
-    f"AI 路由: {mode_label}  当前出口={display_name(active_node)}  "
-    f"区域={active_group}  延迟={format_delay(active_delay)}  状态={active_status}"
-)
-print(f"AI 探测: {probe_status}")
+section(section_title("◆", "AI Routing"))
+print(f"模式        {mode_label}")
+print(f"当前出口    {node_label(active_node, active_group)}")
+print(f"区域        {group_label(active_group)}")
+print(f"延迟        {format_delay(active_delay)}")
+print(f"路由状态    {status_label(active_status)}")
+print(f"AI 探测     {status_label(probe_status)}")
 print()
-section("连通性")
+section(section_title("▸", "连通性"))
 for item in probe_results:
     label = "正常" if item["ok"] else "失败"
-    print(label + "  " + str(item["name"]) + "  " + str(item["url"]))
+    print(status_label(label) + "  " + str(item["name"]) + "  " + str(item["url"]))
 print()
-section("链路")
+section(section_title("▸", "链路"))
 print(ai_manual)
 
 if auto_mode:
     print(f"└─ {ai_auto}")
-    print(f"   └─ {active_group}")
-    print(f"      └─ {display_name(active_node)} ({format_delay(active_delay)})")
+    print(f"   └─ {group_label(active_group)}")
+    print(f"      └─ {node_label(active_node, active_group)} ({format_delay(active_delay)})")
 else:
-    print(f"└─ {active_group}")
+    print(f"└─ {group_label(active_group)}")
     if active_node != active_group:
-        print(f"   └─ {display_name(active_node)} ({format_delay(active_delay)})")
+        print(f"   └─ {node_label(active_node, active_group)} ({format_delay(active_delay)})")
 
 print()
-section("备用")
-print(f"{standby_group} -> {display_name(standby_node)} ({format_delay(standby_delay)}, {standby_status})")
+section(section_title("▸", "备用"))
+print(f"{group_label(standby_group)} -> {node_label(standby_node, standby_group)} ({format_delay(standby_delay)}, {status_label(standby_status)})")
 print()
-section("分组")
+section(section_title("▸", "分组"))
 
 for name in (ai_manual, ai_auto, ai_us, ai_sg):
-    print(f"{name:<10} {get_type(name):<8} 当前: {display_name(get_current(name))}")
+    print(f"{group_label(name):<13} {get_type(name):<8} 当前: {node_label(get_current(name), name)}")
 ' "$raw_mode" "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" "$AI_REGION_US" "$AI_REGION_SG" "$proxy_http_url" "$probe_timeout" "$chatgpt_url" "$openai_api_url"
 }
 

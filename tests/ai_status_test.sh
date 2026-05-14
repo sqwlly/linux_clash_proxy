@@ -35,6 +35,20 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local message="$3"
+
+    if [[ "$haystack" == *"$needle"* ]]; then
+        echo "ASSERTION FAILED: $message" >&2
+        echo "Did not expect to find: $needle" >&2
+        echo "Actual output:" >&2
+        printf '%s\n' "$haystack" >&2
+        exit 1
+    fi
+}
+
 python3 - "$PORT_FILE" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
 import sys
@@ -174,19 +188,29 @@ ai_status_output="$(
     "$SCRIPT" ai-status
 )"
 
-assert_contains "$ai_status_output" "摘要" "ai-status 应输出摘要区块"
-assert_contains "$ai_status_output" "AI 路由:" "ai-status 应输出顶部摘要"
-assert_contains "$ai_status_output" "AI 探测: 部分异常" "ai-status 应输出 OpenAI 探测汇总"
+assert_contains "$ai_status_output" "◆ AI Routing" "ai-status 应输出产品化摘要区块"
+assert_contains "$ai_status_output" "当前出口    🇺🇸 United States 01" "ai-status 应输出带国家 icon 的当前出口"
+assert_contains "$ai_status_output" "AI 探测     ! 部分异常" "ai-status 应输出带 icon 的 OpenAI 探测汇总"
 assert_contains "$ai_status_output" "连通性" "ai-status 应输出 OpenAI 连通性区块"
-assert_contains "$ai_status_output" "正常  ChatGPT Web  http://probe.local/chatgpt" "ai-status 应展示 ChatGPT Web 探测结果"
-assert_contains "$ai_status_output" "失败  OpenAI API  http://probe.local/openai-api" "ai-status 应展示 OpenAI API 探测结果"
+assert_contains "$ai_status_output" "✓ 正常  ChatGPT Web  http://probe.local/chatgpt" "ai-status 应展示 ChatGPT Web 探测结果"
+assert_contains "$ai_status_output" "✗ 失败  OpenAI API  http://probe.local/openai-api" "ai-status 应展示 OpenAI API 探测结果"
 assert_contains "$ai_status_output" "链路" "ai-status 应输出当前链路区块"
 assert_contains "$ai_status_output" "备用" "ai-status 应输出备用路径区块"
 assert_contains "$ai_status_output" "分组" "ai-status 应输出分组状态区块"
 assert_contains "$ai_status_output" "自动切换" "ai-status 应明确展示当前是否处于自动模式"
-assert_contains "$ai_status_output" "当前出口=United States 01" "ai-status 应将当前节点名称规整为自然空格分隔"
-assert_contains "$ai_status_output" "AI-SG -> Singapore 01" "ai-status 应展示备用路径的实际节点"
-assert_contains "$ai_status_output" "当前: United States 01" "ai-status 应在分组状态中展示规整后的节点名"
+assert_contains "$ai_status_output" "🇸🇬 AI-SG -> 🇸🇬 Singapore 01" "ai-status 应展示备用路径的国家 icon"
+assert_contains "$ai_status_output" "当前: 🇺🇸 United States 01" "ai-status 应在分组状态中展示带 icon 的节点名"
+
+ai_status_no_icons="$(
+    CPROXY_ICONS=0 \
+    RUNTIME_CONFIG_FILE="$CONFIG_FILE" \
+    SOURCE_CONFIG_FILE="$CONFIG_FILE" \
+    "$SCRIPT" ai-status
+)"
+assert_contains "$ai_status_no_icons" "AI Routing" "关闭 icon 后仍应输出 AI Routing 标题"
+assert_contains "$ai_status_no_icons" "当前出口    United States 01" "关闭 icon 后应保留规整节点名"
+assert_not_contains "$ai_status_no_icons" "🇺🇸" "CPROXY_ICONS=0 应关闭国家 icon"
+assert_not_contains "$ai_status_no_icons" "✓ 正常" "CPROXY_ICONS=0 应关闭状态 icon"
 
 cat >"$CONFIG_FILE" <<EOF
 external-controller: 127.0.0.1:${PORT}
@@ -201,7 +225,7 @@ ai_status_retry_output="$(
     "$SCRIPT" ai-status
 )"
 
-assert_contains "$ai_status_retry_output" "AI 探测: 正常" "ai-status 在瞬时 5xx 后应通过重试恢复为正常"
-assert_contains "$ai_status_retry_output" "正常  OpenAI API  http://probe.local/flaky-openai" "ai-status 应在重试成功后展示 OpenAI API 正常"
+assert_contains "$ai_status_retry_output" "AI 探测     ✓ 正常" "ai-status 在瞬时 5xx 后应通过重试恢复为正常"
+assert_contains "$ai_status_retry_output" "✓ 正常  OpenAI API  http://probe.local/flaky-openai" "ai-status 应在重试成功后展示 OpenAI API 正常"
 
 echo "ai_status_test: PASS"

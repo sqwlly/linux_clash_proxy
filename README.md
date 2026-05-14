@@ -311,6 +311,8 @@ clash-proxy status --raw
 
 `clash-proxy status` 默认显示彩色、带 icon 的产品化状态面板；自动化脚本应使用
 `clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
+`clash-proxy ai-status` 同样默认展示状态 icon 和国家 icon，方便直接识别当前 AI
+出口区域。
 
 本机可用这些只读命令确认当前运行入口：
 
