@@ -40,6 +40,7 @@ sudo ./scripts/install-system-commands.sh
 ```bash
 clash-proxy status
 clash-proxy status --raw
+clash-proxy menu
 clash-proxy-update --dry-run config_1.yaml
 clash-proxy-update --apply config_1.yaml
 ```
@@ -48,6 +49,8 @@ clash-proxy-update --apply config_1.yaml
 `clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
 `clash-proxy ai-status` 也会默认展示状态 icon 和 `[US]`、`[SG]` 国家徽标，便于直接识别当前 AI
 出口区域。
+`clash-proxy menu` 会进入交互式控制台，可直接选择查看状态、切换 AI 路由、
+重新渲染并重启等常用操作。
 
 如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
 

@@ -216,13 +216,13 @@ status_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" status
 )"
 
-assert_contains "$status_output" "摘要" "status 应输出摘要区块"
-assert_contains "$status_output" "资源" "status 应输出资源区块"
-assert_contains "$status_output" "路径" "status 应输出路径区块"
-assert_contains "$status_output" "AI 路由模式: 自动切换" "status 应展示 AI 当前路由模式"
-assert_contains "$status_output" "AI 当前出口: AI-US -> United States 01 (95ms)" "status 应展示 AI 当前实际出口及延迟"
-assert_contains "$status_output" "连接数: 3" "status 应展示连接数"
-assert_contains "$status_output" "内存: 59MB" "status 应展示规整后的内存值"
+assert_contains "$status_output" "◆ Clash Proxy" "status 应输出产品化标题"
+assert_contains "$status_output" "▸ 资源" "status 应输出资源区块"
+assert_contains "$status_output" "▸ 路径" "status 应输出路径区块"
+assert_contains "$status_output" "AI 路由     自动切换" "status 应展示 AI 当前路由模式"
+assert_contains "$status_output" "当前出口    AI-US -> United States 01 (95ms)" "status 应展示 AI 当前实际出口及延迟"
+assert_contains "$status_output" "连接数      3" "status 应展示连接数"
+assert_contains "$status_output" "内存        59MB" "status 应展示规整后的内存值"
 assert_not_contains "$status_output" "实际运行配置:" "status 在路径相同时不应重复展示实际运行配置"
 
 list_groups_output="$(
@@ -236,5 +236,15 @@ assert_contains "$list_groups_output" "类型" "list-groups 应输出类型列"
 assert_contains "$list_groups_output" "当前选择" "list-groups 应输出当前选择列"
 assert_contains "$list_groups_output" "AI-MANUAL" "list-groups 应包含 AI-MANUAL"
 assert_contains "$list_groups_output" "United States 01" "list-groups 应展示规整后的当前节点名称"
+assert_contains "$list_groups_output" "[US] United States" "list-groups 应用稳定文本徽标展示国家组"
+assert_not_contains "$list_groups_output" "🇺🇸 United States" "list-groups 不应依赖 emoji 国家前缀"
+
+menu_output="$(
+    printf 'q\n' | env "${COMMON_ENV[@]}" "$SCRIPT" menu
+)"
+
+assert_contains "$menu_output" "Clash Proxy Console" "menu 应输出交互式控制台标题"
+assert_contains "$menu_output" "状态面板" "menu 应提供状态面板入口"
+assert_contains "$menu_output" "AI 路由面板" "menu 应提供 AI 状态入口"
 
 echo "status_list_groups_test: PASS"

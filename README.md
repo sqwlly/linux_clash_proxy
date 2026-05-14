@@ -307,12 +307,15 @@ sudo ./scripts/install-system-commands.sh --with-cproxy-alias
 ```bash
 clash-proxy status
 clash-proxy status --raw
+clash-proxy menu
 ```
 
 `clash-proxy status` 默认显示彩色、带 icon 的产品化状态面板；自动化脚本应使用
 `clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
 `clash-proxy ai-status` 同样默认展示状态 icon 和 `[US]`、`[SG]` 国家徽标，方便直接识别当前 AI
 出口区域。
+`clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行
+常用维护动作。
 
 本机可用这些只读命令确认当前运行入口：
 

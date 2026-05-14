@@ -6,21 +6,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${BINDIR:-${PREFIX}/bin}"
+LIBDIR="${LIBDIR:-${PREFIX}/lib/clash-proxy}"
 DRY_RUN=0
 WITH_CPROXY_ALIAS=0
 
 usage() {
     cat <<EOF
-Usage: $0 [--dry-run] [--prefix PATH] [--bindir PATH] [--with-cproxy-alias]
+Usage: $0 [--dry-run] [--prefix PATH] [--bindir PATH] [--libdir PATH] [--with-cproxy-alias]
 
 Install root-level Clash Proxy command wrappers:
-  clash-proxy         -> ./proxy.sh
-  clash-proxy-update  -> ./update_config.sh
+  clash-proxy         -> ../lib/clash-proxy/proxy.sh
+  clash-proxy-update  -> ../lib/clash-proxy/update_config.sh
 
 Options:
   --dry-run             Print actions without writing files.
   --prefix PATH         Install under PATH/bin. Default: /usr/local.
   --bindir PATH         Install directly into PATH. Overrides --prefix.
+  --libdir PATH         Install script payloads into PATH. Default: PREFIX/lib/clash-proxy.
   --with-cproxy-alias   Also install cproxy and cproxy-update aliases.
   -h, --help            Show this help.
 EOF
@@ -39,6 +41,7 @@ while [ "$#" -gt 0 ]; do
             fi
             PREFIX="$2"
             BINDIR="${PREFIX}/bin"
+            LIBDIR="${PREFIX}/lib/clash-proxy"
             shift 2
             ;;
         --bindir)
@@ -47,6 +50,14 @@ while [ "$#" -gt 0 ]; do
                 exit 2
             fi
             BINDIR="$2"
+            shift 2
+            ;;
+        --libdir)
+            if [ "$#" -lt 2 ]; then
+                echo "错误: --libdir 需要路径参数" >&2
+                exit 2
+            fi
+            LIBDIR="$2"
             shift 2
             ;;
         --with-cproxy-alias)
@@ -111,12 +122,26 @@ write_wrapper() {
     {
         printf '%s\n' '#!/bin/sh'
         printf '%s\n' 'WRAPPER_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
-        printf 'exec "${WRAPPER_DIR}/%s" "$@"\n' "$relative_target"
+        printf 'CLASH_PROXY_CLI_NAME="%s" exec "${WRAPPER_DIR}/%s" "$@"\n' "$command_name" "$relative_target"
     } > "$temp_file"
 
     install -m 755 "$temp_file" "$destination"
     rm -f "$temp_file"
     echo "installed ${command_name} -> $(basename "$target")"
+}
+
+install_payload() {
+    local source="$1"
+    local name="$2"
+    local destination="${LIBDIR}/${name}"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN install payload ${name}"
+        return
+    fi
+
+    install -m 755 "$source" "$destination"
+    echo "installed payload ${name}"
 }
 
 warn_shadowed_command() {
@@ -140,14 +165,18 @@ main() {
 
     if [ "$DRY_RUN" -eq 0 ]; then
         install -d -m 755 "$BINDIR"
+        install -d -m 755 "$LIBDIR"
     fi
 
-    write_wrapper "clash-proxy" "${PROJECT_DIR}/proxy.sh"
-    write_wrapper "clash-proxy-update" "${PROJECT_DIR}/update_config.sh"
+    install_payload "${PROJECT_DIR}/proxy.sh" "proxy.sh"
+    install_payload "${PROJECT_DIR}/update_config.sh" "update_config.sh"
+
+    write_wrapper "clash-proxy" "${LIBDIR}/proxy.sh"
+    write_wrapper "clash-proxy-update" "${LIBDIR}/update_config.sh"
 
     if [ "$WITH_CPROXY_ALIAS" -eq 1 ]; then
-        write_wrapper "cproxy" "${PROJECT_DIR}/proxy.sh"
-        write_wrapper "cproxy-update" "${PROJECT_DIR}/update_config.sh"
+        write_wrapper "cproxy" "${LIBDIR}/proxy.sh"
+        write_wrapper "cproxy-update" "${LIBDIR}/update_config.sh"
         warn_shadowed_command "cproxy"
         warn_shadowed_command "cproxy-update"
     fi

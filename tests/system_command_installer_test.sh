@@ -34,20 +34,28 @@ if ! grep -Fq "DRY-RUN install clash-proxy -> proxy.sh" <<< "$dry_run_output"; t
     echo "ASSERTION FAILED: dry-run should list clash-proxy action" >&2
     exit 1
 fi
+if ! grep -Fq "DRY-RUN install payload proxy.sh" <<< "$dry_run_output"; then
+    echo "ASSERTION FAILED: dry-run should list proxy.sh payload action" >&2
+    exit 1
+fi
 
-"$INSTALLER" --bindir "${TMP_DIR}/bin" >/dev/null
+"$INSTALLER" --bindir "${TMP_DIR}/bin" --libdir "${TMP_DIR}/lib/clash-proxy" >/dev/null
 
 test -x "${TMP_DIR}/bin/clash-proxy"
 test -x "${TMP_DIR}/bin/clash-proxy-update"
+test -x "${TMP_DIR}/lib/clash-proxy/proxy.sh"
+test -x "${TMP_DIR}/lib/clash-proxy/update_config.sh"
 test ! -e "${TMP_DIR}/bin/cproxy"
 test ! -e "${TMP_DIR}/bin/cproxy-update"
 
 assert_file_contains "${TMP_DIR}/bin/clash-proxy" 'WRAPPER_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"' "clash-proxy 应基于自身位置解析目标"
 assert_file_contains "${TMP_DIR}/bin/clash-proxy" 'exec "${WRAPPER_DIR}/' "clash-proxy 应使用相对目标"
+assert_file_contains "${TMP_DIR}/bin/clash-proxy" 'CLASH_PROXY_CLI_NAME="clash-proxy"' "clash-proxy 应向帮助输出传递稳定命令名"
 assert_file_contains "${TMP_DIR}/bin/clash-proxy" 'proxy.sh" "$@"' "clash-proxy 应转发到 root 生产入口"
+assert_file_contains "${TMP_DIR}/bin/clash-proxy" '../lib/clash-proxy/proxy.sh' "clash-proxy 应指向安装后的 lib payload"
 assert_file_contains "${TMP_DIR}/bin/clash-proxy-update" 'update_config.sh" "$@"' "clash-proxy-update 应转发到安全更新入口"
 
-"$INSTALLER" --bindir "${TMP_DIR}/bin" --with-cproxy-alias >/dev/null
+"$INSTALLER" --bindir "${TMP_DIR}/bin" --libdir "${TMP_DIR}/lib/clash-proxy" --with-cproxy-alias >/dev/null
 
 test -x "${TMP_DIR}/bin/cproxy"
 test -x "${TMP_DIR}/bin/cproxy-update"

@@ -325,6 +325,25 @@ python_display_name_def() {
     cat <<'PY'
 import re
 
+FLAG_BADGES = {
+    "🇭🇰": "[HK]",
+    "🇨🇳": "[TW]",
+    "🇯🇵": "[JP]",
+    "🇰🇷": "[KR]",
+    "🇸🇬": "[SG]",
+    "🇨🇦": "[CA]",
+    "🇺🇸": "[US]",
+    "🇬🇧": "[GB]",
+    "🇹🇷": "[TR]",
+    "🇳🇱": "[NL]",
+    "🇫🇷": "[FR]",
+    "🇩🇪": "[DE]",
+    "🇻🇳": "[VN]",
+    "🇲🇾": "[MY]",
+    "🇹🇭": "[TH]",
+    "🇵🇭": "[PH]",
+}
+
 def display_name(value):
     if value in ("-", None):
         return "-"
@@ -340,6 +359,18 @@ def display_name(value):
     text = text.replace("|", " ")
     text = " ".join(text.split())
     return text
+
+def display_label(value):
+    if value in ("-", None):
+        return "-"
+
+    raw = str(value).strip()
+    name = display_name(raw)
+    prefix = ""
+    first = raw.split(maxsplit=1)[0] if raw else ""
+    prefix = FLAG_BADGES.get(first, "")
+
+    return f"{prefix} {name}" if prefix else name
 PY
 }
 
@@ -1216,12 +1247,13 @@ PY
         local proxies_json
         proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-        PROXIES_JSON="$proxies_json" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+        PROXIES_JSON="$proxies_json" DISPLAY_NAME_PY="$(python_display_name_def)" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
 import json
 import os
-import re
 import sys
 import yaml
+
+exec(os.environ["DISPLAY_NAME_PY"])
 
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
@@ -1234,20 +1266,6 @@ reset = os.environ.get("NC", "").replace("\\033", "\033")
 def section(title):
     print(f"{bold}{blue}{title}{reset}")
 
-def display_name(value):
-    if value in ("-", None):
-        return "-"
-    text = str(value).strip()
-    match = re.match(r"^(\S+)\s+(.+)$", text)
-    if match:
-        prefix, rest = match.groups()
-        if prefix and all(not ch.isalnum() for ch in prefix):
-            text = rest.strip()
-    text = text.replace("丨", " ")
-    text = text.replace("|", " ")
-    text = " ".join(text.split())
-    return text
-
 items = []
 for group in data.get("proxy-groups", []):
     if not isinstance(group, dict):
@@ -1256,8 +1274,8 @@ for group in data.get("proxy-groups", []):
     group_type = str(group.get("type", "")).lower()
     if group_type not in {"select", "fallback", "url-test", "load-balance"}:
         continue
-    current = display_name((proxies.get(group_name) or {}).get("now", "-"))
-    items.append((group_name, group_type, current))
+    current = display_label((proxies.get(group_name) or {}).get("now", "-"))
+    items.append((display_label(group_name), group_type, current))
 
 section("摘要")
 print(f"总组数: {len(items)}")
@@ -1271,14 +1289,16 @@ PY
         return $?
     fi
 
-    BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+    DISPLAY_NAME_PY="$(python_display_name_def)" BOLD="$BOLD" BLUE="$BLUE" NC="$NC" python3 - "$RUNTIME_CONFIG_FILE" <<'PY'
+import os
 import sys
 import yaml
+
+exec(os.environ["DISPLAY_NAME_PY"])
 
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
 
-import os
 bold = os.environ.get("BOLD", "").replace("\\033", "\033")
 blue = os.environ.get("BLUE", "").replace("\\033", "\033")
 reset = os.environ.get("NC", "").replace("\\033", "\033")
@@ -1292,7 +1312,7 @@ for group in data.get("proxy-groups", []):
         continue
     group_type = str(group.get("type", "")).lower()
     if group_type in {"select", "fallback", "url-test", "load-balance"}:
-        items.append((group.get("name", ""), group_type, "-"))
+        items.append((display_label(group.get("name", "")), group_type, "-"))
 
 section("摘要")
 print(f"总组数: {len(items)}")
@@ -1671,10 +1691,7 @@ def node_label(value, group="-"):
     badge = country_badge_for_group(group)
     if not badge and icons_enabled:
         symbol = leading_symbol(value)
-        if symbol == "🇺🇸":
-            badge = "[US]"
-        elif symbol == "🇸🇬":
-            badge = "[SG]"
+        badge = FLAG_BADGES.get(symbol, "")
     return f"{badge} {name}" if badge and name != "-" else name
 
 def get_group(name):
@@ -1966,11 +1983,72 @@ print(data.get("delay", "-"))
     return "$exit_code"
 }
 
+interactive_menu() {
+    local choice
+
+    while true; do
+        echo ""
+        print_section "$(section_label "◆" "Clash Proxy Console")"
+        echo "1) 状态面板"
+        echo "2) AI 路由面板"
+        echo "3) 自动 AI 路由"
+        echo "4) 固定 US"
+        echo "5) 固定 SG"
+        echo "6) 代理组列表"
+        echo "7) 连通性测试"
+        echo "8) 重新渲染并重启"
+        echo "q) 退出"
+        printf "选择: "
+
+        if ! IFS= read -r choice; then
+            echo ""
+            return 0
+        fi
+
+        case "$choice" in
+            1)
+                status
+                ;;
+            2)
+                ai_status
+                ;;
+            3)
+                switch_group "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
+                ;;
+            4)
+                switch_group "$AI_MANUAL_GROUP" "$AI_US_GROUP"
+                ;;
+            5)
+                switch_group "$AI_MANUAL_GROUP" "$AI_SG_GROUP"
+                ;;
+            6)
+                list_groups
+                ;;
+            7)
+                test
+                ;;
+            8)
+                restart
+                ;;
+            q|Q|quit|exit)
+                return 0
+                ;;
+            "")
+                continue
+                ;;
+            *)
+                print_warn "未知选择: $choice"
+                ;;
+        esac
+    done
+}
+
 usage() {
+    local cli_name="${CLASH_PROXY_CLI_NAME:-clash-proxy}"
     cat << EOF
 ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
 
-用法: $0 {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|proxy-env|with-proxy|proxy-shell}
+用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|menu|proxy-env|with-proxy|proxy-shell}
 
 配置与进程:
   render                    - 从原始配置生成运行配置
@@ -1986,6 +2064,7 @@ AI 路由控制:
   current <group>           - 查看代理组当前选择
   switch <group> <node>     - 手动切换 Selector 代理组
   ai-status                 - 查看 AI 专用路由状态
+  menu                      - 打开交互式控制台
 
 命令级代理:
   proxy-env                 - 输出命令级代理环境变量
@@ -2011,25 +2090,25 @@ AI 路由控制:
 
 示例:
   # 配置与进程
-  $0 render
-  $0 start
+  ${cli_name} render
+  ${cli_name} start
 
   # AI 路由控制
-  $0 list-groups
-  $0 list-nodes "$AI_MANUAL_GROUP"
-  $0 current "$AI_MANUAL_GROUP"
-  $0 switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
-  $0 switch "$AI_REGION_US" "🇺🇸 United States丨02"
-  $0 ai-status
+  ${cli_name} list-groups
+  ${cli_name} list-nodes "$AI_MANUAL_GROUP"
+  ${cli_name} current "$AI_MANUAL_GROUP"
+  ${cli_name} switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
+  ${cli_name} ai-status
+  ${cli_name} menu
 
   # 命令级代理
-  $0 proxy-env
-  $0 with-proxy curl https://chatgpt.com
-  $0 proxy-shell
+  ${cli_name} proxy-env
+  ${cli_name} with-proxy curl https://chatgpt.com
+  ${cli_name} proxy-shell
 
   # 诊断与排障
-  $0 test-group "$AI_AUTO_GROUP"
-  $0 test
+  ${cli_name} test-group "$AI_AUTO_GROUP"
+  ${cli_name} test
 
 EOF
 }
@@ -2083,6 +2162,9 @@ main() {
         test-group)
             shift
             test_group "$1" "$2"
+            ;;
+        menu|interactive)
+            interactive_menu
             ;;
         proxy-env)
             proxy_env
