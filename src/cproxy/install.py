@@ -11,6 +11,8 @@ DEFAULT_CONFIG = """mixed-port: 7890
 external-controller: 127.0.0.1:9090
 mode: rule
 log-level: info
+output-color: always
+output-icons: true
 proxies: []
 proxy-groups: []
 rules: []

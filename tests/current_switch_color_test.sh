@@ -176,21 +176,38 @@ COMMON_ENV=(
 )
 
 help_output="$(
-    env "${COMMON_ENV[@]}" "$SCRIPT" --help
+    env -u NO_COLOR "${COMMON_ENV[@]}" "$SCRIPT" --help
 )"
-assert_not_contains "$help_output" $'\033[' "--help 非 TTY 输出不应包含 ANSI 转义"
-assert_not_contains "$help_output" '\033[' "--help 非 TTY 输出不应包含字面量颜色转义"
+assert_contains "$help_output" $'\033[' "--help 默认应输出 ANSI 转义"
+assert_not_contains "$help_output" '\033[' "--help 不应输出字面量颜色转义"
 
 current_output="$(
-    env "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
+    env -u NO_COLOR "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
 )"
 assert_contains "$current_output" "摘要" "current 应输出摘要区块"
-assert_contains "$current_output" "当前选择: AI-AUTO" "current 应输出摘要式当前选择"
+assert_contains "$current_output" "当前选择:" "current 应输出摘要式当前选择"
+assert_contains "$current_output" "AI-AUTO" "current 应输出当前选择值"
+assert_contains "$current_output" $'\033[' "current 默认应输出 ANSI 转义"
 
 current_color_output="$(
     env FORCE_COLOR=1 "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
 )"
 assert_contains "$current_color_output" $'\033[' "FORCE_COLOR=1 时 current 应输出 ANSI 转义"
+
+current_color_mode_output="$(
+    env -u NO_COLOR CPROXY_COLOR=always "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
+)"
+assert_contains "$current_color_mode_output" $'\033[' "CPROXY_COLOR=always 时 current 应输出 ANSI 转义"
+
+current_no_color_output="$(
+    env -u NO_COLOR FORCE_COLOR=1 CPROXY_COLOR=never "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
+)"
+assert_not_contains "$current_no_color_output" $'\033[' "CPROXY_COLOR=never 应关闭 ANSI 转义"
+
+current_no_color_env_output="$(
+    env NO_COLOR=1 "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
+)"
+assert_not_contains "$current_no_color_env_output" $'\033[' "NO_COLOR=1 应关闭 ANSI 转义"
 
 switch_output="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" switch "AI-MANUAL" "AI-SG"
@@ -207,6 +224,7 @@ assert_contains "$switch_color_output" $'\033[' "FORCE_COLOR=1 时 switch 应输
 current_after_switch="$(
     env "${COMMON_ENV[@]}" "$SCRIPT" current "AI-MANUAL"
 )"
-assert_contains "$current_after_switch" "当前选择: AI-US" "切换后 current 应反映新状态"
+assert_contains "$current_after_switch" "当前选择:" "切换后 current 应输出当前选择"
+assert_contains "$current_after_switch" "AI-US" "切换后 current 应反映新状态"
 
 echo "current_switch_color_test: PASS"

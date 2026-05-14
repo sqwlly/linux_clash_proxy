@@ -81,13 +81,15 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         config_dir.mkdir(parents=True)
         (config_dir / "config.yaml").write_text(
             f"external-controller: 127.0.0.1:{server.server_port}\n"
-            "mixed-port: 7890\n",
+            "mixed-port: 7890\n"
+            "output-icons: true\n",
             encoding="utf-8",
         )
 
         env = os.environ.copy()
         env["PYTHONPATH"] = "/root/clash_proxy/src"
         env["HOME"] = str(tmp_path)
+        env.pop("NO_COLOR", None)
 
         switch_result = subprocess.run(
             [sys.executable, "-m", "cproxy.cli", "switch", "AI-MANUAL", "AI-SG"],
@@ -100,7 +102,9 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert switch_result.returncode == 0
         assert "结果" in switch_result.stdout
         assert "代理组: AI-MANUAL" in switch_result.stdout
-        assert "当前选择: AI-SG" in switch_result.stdout
+        assert "当前选择:" in switch_result.stdout
+        assert "AI-SG" in switch_result.stdout
+        assert "\x1b[" in switch_result.stdout
 
         color_env = env.copy()
         color_env["FORCE_COLOR"] = "1"
@@ -114,6 +118,18 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert color_switch_result.returncode == 0
         assert "\x1b[" in color_switch_result.stdout
 
+        no_color_env = color_env.copy()
+        no_color_env["CPROXY_COLOR"] = "never"
+        no_color_switch_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "switch", "AI-MANUAL", "AI-SG"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=no_color_env,
+        )
+        assert no_color_switch_result.returncode == 0
+        assert "\x1b[" not in no_color_switch_result.stdout
+
         current_result = subprocess.run(
             [sys.executable, "-m", "cproxy.cli", "current", "AI-MANUAL"],
             capture_output=True,
@@ -124,7 +140,45 @@ def test_switch_updates_remote_selection(tmp_path: Path):
 
         assert current_result.returncode == 0
         assert "摘要" in current_result.stdout
-        assert "当前选择: AI-US" in current_result.stdout
+        assert "当前选择:" in current_result.stdout
+        assert "AI-SG" in current_result.stdout
+
+        status_env = env.copy()
+        status_env["CPROXY_COLOR"] = "never"
+        status_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "status"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=status_env,
+        )
+        assert status_result.returncode == 0
+        assert "状态: ○ 未运行" in status_result.stdout
+        assert "API: ✓ 可访问" in status_result.stdout
+
+        no_icons_env = status_env.copy()
+        no_icons_env["CPROXY_ICONS"] = "0"
+        no_icons_status_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "status"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=no_icons_env,
+        )
+        assert no_icons_status_result.returncode == 0
+        assert "状态: 未运行" in no_icons_status_result.stdout
+        assert "○ 未运行" not in no_icons_status_result.stdout
+
+        raw_status_result = subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "status", "--raw"],
+            capture_output=True,
+            text=True,
+            cwd="/root/clash_proxy",
+            env=env,
+        )
+        assert raw_status_result.returncode == 0
+        assert "○ 未运行" not in raw_status_result.stdout
+        assert "✓ 可访问" not in raw_status_result.stdout
     finally:
         server.shutdown()
         thread.join()

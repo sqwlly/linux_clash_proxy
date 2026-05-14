@@ -31,14 +31,51 @@ AI_REGION_US="🇺🇸 United States"
 AI_REGION_SG="🇸🇬 Singapore"
 
 # ==================== 颜色定义 ====================
-if [ -t 1 ] || [ "${FORCE_COLOR:-0}" = "1" ]; then
-    BOLD='\033[1m'
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'
-    BLUE='\033[0;34m'
-    CYAN='\033[0;36m'
-    NC='\033[0m'
+if [ -n "${CPROXY_COLOR:-}" ]; then
+    COLOR_MODE="$CPROXY_COLOR"
+elif [ "${FORCE_COLOR:-0}" = "1" ]; then
+    COLOR_MODE="always"
+elif [ -n "${NO_COLOR:-}" ]; then
+    COLOR_MODE="never"
+else
+    COLOR_MODE="always"
+fi
+COLOR_ENABLED=0
+case "$COLOR_MODE" in
+    always)
+        COLOR_ENABLED=1
+        ;;
+    never)
+        COLOR_ENABLED=0
+        ;;
+    auto|"")
+        if [ "${FORCE_COLOR:-0}" = "1" ]; then
+            COLOR_ENABLED=1
+        elif [ -n "${NO_COLOR:-}" ]; then
+            COLOR_ENABLED=0
+        elif [ -t 1 ]; then
+            COLOR_ENABLED=1
+        fi
+        ;;
+    *)
+        if [ "${FORCE_COLOR:-0}" = "1" ]; then
+            COLOR_ENABLED=1
+        elif [ -n "${NO_COLOR:-}" ]; then
+            COLOR_ENABLED=0
+        elif [ -t 1 ]; then
+            COLOR_ENABLED=1
+        fi
+        ;;
+esac
+
+if [ "$COLOR_ENABLED" -eq 1 ]; then
+    BOLD=$'\033[1m'
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    NC=$'\033[0m'
 else
     BOLD=''
     RED=''
@@ -825,8 +862,11 @@ status() {
     local controller
     local running_config
     local config_state
+    local config_state_plain
     local status_text
+    local status_text_plain
     local api_text
+    local api_text_plain
     local ai_mode="-"
     local ai_summary="-"
 
@@ -838,8 +878,10 @@ status() {
     controller="$(get_controller_addr)"
 
     if runtime_needs_refresh; then
+        config_state_plain="待刷新"
         config_state="${YELLOW}待刷新${NC}"
     else
+        config_state_plain="已就绪"
         config_state="${GREEN}已就绪${NC}"
     fi
 
@@ -853,7 +895,8 @@ status() {
         pid="$(get_pid)"
         running_config="$(get_running_config_path)"
 
-        status_text="${GREEN}运行中${NC}"
+        status_text_plain="运行中"
+        status_text="${GREEN}${status_text_plain}${NC}"
 
         elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
         if [ -n "$elapsed" ]; then
@@ -871,7 +914,8 @@ status() {
         connections=$(ss -tn | grep ":$port" | wc -l)
 
         if api_available; then
-            api_text="${GREEN}可访问${NC}"
+            api_text_plain="可访问"
+            api_text="${GREEN}${api_text_plain}${NC}"
             readarray -t ai_status_lines < <(api_request "GET" "/proxies" | DISPLAY_NAME_PY="$(python_display_name_def)" python3 -c '
 import json
 import os
@@ -907,7 +951,8 @@ print(summary)
                 ai_summary="${ai_status_lines[1]}"
             fi
         else
-            api_text="${RED}不可访问${NC}"
+            api_text_plain="不可访问"
+            api_text="${RED}${api_text_plain}${NC}"
         fi
 
         if [ -f "$LOG_FILE" ]; then
@@ -920,8 +965,8 @@ print(summary)
             echo -e "运行配置: $RUNTIME_CONFIG_FILE"
             echo -e "控制接口: $controller"
             echo -e "代理端口: $port"
-            echo -e "运行配置状态: ${config_state}"
-            echo -e "状态: ${status_text}"
+            echo -e "运行配置状态: ${config_state_plain}"
+            echo -e "状态: ${status_text_plain}"
             echo -e "PID: $pid"
             if [ -n "$running_config" ] && [ "$running_config" != "$RUNTIME_CONFIG_FILE" ]; then
                 echo -e "实际运行配置: $running_config"
@@ -933,7 +978,7 @@ print(summary)
                 echo -e "内存使用: ${mem_usage}"
             fi
             echo -e "当前连接数: $connections"
-            echo -e "API 状态: ${api_text}"
+            echo -e "API 状态: ${api_text_plain}"
             if [ -n "${log_size:-}" ]; then
                 echo -e "日志大小: $log_size"
             fi
@@ -969,8 +1014,10 @@ print(summary)
         fi
         echo -e "PID: $pid"
     else
-        status_text="${RED}未运行${NC}"
-        api_text="${RED}不可访问${NC}"
+        status_text_plain="未运行"
+        api_text_plain="不可访问"
+        status_text="${RED}${status_text_plain}${NC}"
+        api_text="${RED}${api_text_plain}${NC}"
 
         if [ "$raw_mode" -eq 1 ]; then
             echo -e "版本: 1.2.0"
@@ -978,8 +1025,8 @@ print(summary)
             echo -e "运行配置: $RUNTIME_CONFIG_FILE"
             echo -e "控制接口: $controller"
             echo -e "代理端口: $port"
-            echo -e "运行配置状态: ${config_state}"
-            echo -e "状态: ${status_text}"
+            echo -e "运行配置状态: ${config_state_plain}"
+            echo -e "状态: ${status_text_plain}"
             return 0
         fi
 

@@ -201,9 +201,19 @@ cproxy migrate-from-legacy /root/clash_proxy
 
 着色规则：
 
-- 默认仅在真实终端输出时启用
+- 默认启用
 - 可通过 `FORCE_COLOR=1 cproxy status` 强制开启
+- 可通过 `CPROXY_COLOR=always|never|auto` 明确控制
+- 可通过 `NO_COLOR=1` 禁用颜色
+- `cproxy` 默认启用状态 icon，可通过 `CPROXY_ICONS=0` 或配置 `output-icons: false` 关闭
 - 脚本场景优先使用 `--raw`
+
+对应配置项：
+
+```yaml
+output-color: always
+output-icons: true
+```
 
 适合脚本消费的命令：
 

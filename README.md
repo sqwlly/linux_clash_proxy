@@ -178,7 +178,16 @@ cproxy test
 - 默认输出优先给结论，再给明细
 - 区块标题统一使用 `摘要 / 资源 / 路径 / 连通性 / 链路 / 备用 / 分组 / 列表 / 结果`
 - `--raw` 仍保持脚本友好，不引入这些人类阅读区块
-- 颜色默认只在 TTY 启用；如需强制开启可设置 `FORCE_COLOR=1`
+- 颜色默认开启；可用 `FORCE_COLOR=1` 或 `CPROXY_COLOR=always` 显式强制开启
+- 可用 `NO_COLOR=1` 或 `CPROXY_COLOR=never` 禁用颜色
+- `cproxy` 默认启用状态 icon；可用 `CPROXY_ICONS=0` 或 `output-icons: false` 关闭
+
+`cproxy` 也可以在配置里设置输出偏好：
+
+```yaml
+output-color: always   # auto / always / never
+output-icons: true
+```
 
 `test` 还会额外检查：
 
@@ -252,13 +261,86 @@ ai-probe-timeout: 8
 
 - `proxy.sh` 仍保留在仓库内，便于对照和渐进迁移
 
-这不影响 `cproxy` 作为用户级 CLI 使用，但文档和运维入口应优先以 `cproxy` 为准。
+这不影响 `cproxy` 作为用户级 CLI 使用，但当前生产运行态不能只看
+`cproxy`。截至 2026-05-14，本机只读核验显示当前 active 的生产入口仍是
+root 级 `clash-proxy.service`，并由 `/root/clash_proxy/proxy.sh` 管理。
 
 另外，`cproxy` 只管理自己启动的 mihomo 进程：
 
 - `start` 会写入 PID 和 ownership 元数据
 - `stop/restart/status/test` 会校验该进程是否仍属于当前 `cproxy`
 - stale pidfile 不会再误杀无关进程
+
+## 生产入口识别
+
+当前仓库同时存在两套入口，排查运行态时必须先确认正在使用哪一套：
+
+- root 级生产入口：`/etc/systemd/system/clash-proxy.service`
+- root 级管理脚本：`/root/clash_proxy/proxy.sh`
+- root 级运行配置：`/root/clash_proxy/runtime.yaml`
+- root 级 PID：`/root/clash_proxy/mihomo.pid`
+- 用户级 `cproxy` 入口：`systemd-user/cproxy.service`
+- 用户级 `cproxy` 路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
+
+本机可用这些只读命令确认当前运行入口：
+
+```bash
+systemctl cat clash-proxy.service --no-pager
+systemctl is-active clash-proxy.service
+systemctl --user is-active cproxy.service
+ps -p "$(cat /root/clash_proxy/mihomo.pid)" -o "pid=,ppid=,args="
+```
+
+当前核验结果是：root 级 `clash-proxy.service` 为 `active`，用户级
+`cproxy.service` 为 `inactive`，mihomo 进程参数为
+`/usr/local/bin/mihomo -f /root/clash_proxy/runtime.yaml -d /root/clash_proxy`。
+因此生产排障应优先看 root 级 unit、`proxy.sh`、root 级 `runtime.yaml` 和
+`mihomo.pid`；`cproxy status` 只代表用户级 XDG 入口的状态。
+
+## 安全更新流程
+
+root 级生产入口当前仍以 restart 作为生效边界。安全更新应保持以下顺序：
+
+1. 先确认入口：用上面的只读命令确认当前是否仍由 `clash-proxy.service` 管理。
+2. 只修改原始配置或订阅产物，不手工编辑 `runtime.yaml`。
+3. 先 dry-run 候选配置：
+
+   ```bash
+   /root/clash_proxy/update_config.sh --dry-run /root/clash_proxy/config_1.yaml
+   ```
+
+4. 需要应用时再执行：
+
+   ```bash
+   /root/clash_proxy/update_config.sh --apply /root/clash_proxy/config_1.yaml
+   ```
+
+5. `--apply` 写入源配置后会进入受控 refresh 流程；也可以等待 systemd path/timer 触发。
+
+`systemd/clash-proxy-refresh.sh` 的现有流程是：备份当前 `runtime.yaml`，render，
+比较 hash，执行 `mihomo -t`，仅在校验通过且配置变化时 restart 服务，并在 API
+探活失败后回滚上一份 runtime 并尝试恢复服务。API 探活会检查 `/version` 和
+`/proxies` 中的 `AI-MANUAL`、`AI-AUTO`、`AI-US`、`AI-SG`。
+
+root 级 systemd 安装还提供 `clash-proxy-refresh.path` 和
+`clash-proxy-refresh.timer`。`.path` 监听 `/root/clash_proxy/config.yaml` 变化后
+触发 refresh，timer 作为周期性兜底。
+
+`update_config.sh` 不再注入 AI groups/rules；AI 路由由 `proxy.sh render` 统一生成。
+默认模式是 `--dry-run`，只校验候选 YAML，不写源配置、不触发 refresh。
+
+## Mihomo 热 reload 评估
+
+当前仓库证据不足以把 Mihomo 热 reload 作为替代 restart 的生产方案：
+
+- `mihomo -h` 只展示 `-f`、`-d`、`-t`、`-v`、controller override 等启动和校验参数，没有 CLI 级 reload 参数。
+- `clash-proxy.service` 的 `ExecReload` 当前等价于 `/root/clash_proxy/proxy.sh restart`。
+- `proxy.sh restart` 当前实现是 `stop` 后 `start`。
+- `systemd/clash-proxy-refresh.sh` 的安全边界依赖 restart 后 API 探活和失败回滚，没有热 reload 回滚实现。
+
+结论：热 reload 可以作为后续小范围实验方向，但当前不适合作为生产替代方案。
+在补齐可验证入口、失败回滚、运行态一致性检查和测试前，继续使用现有
+render + `mihomo -t` + restart 流程更可控。
 
 ## 用户级 systemd
 
@@ -289,3 +371,4 @@ systemctl --user status cproxy-refresh.timer --no-pager -l
 - [TROUBLESHOOTING.md](/root/clash_proxy/TROUBLESHOOTING.md)
 - [docs/plans/2026-04-09-cproxy-distribution-design.md](/root/clash_proxy/docs/plans/2026-04-09-cproxy-distribution-design.md)
 - [docs/plans/2026-04-09-cproxy-distribution-implementation.md](/root/clash_proxy/docs/plans/2026-04-09-cproxy-distribution-implementation.md)
+- [docs/plans/2026-05-14-production-entry-and-reload-evaluation.md](/root/clash_proxy/docs/plans/2026-05-14-production-entry-and-reload-evaluation.md)

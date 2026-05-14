@@ -26,10 +26,15 @@ assert_file_contains() {
 
 assert_file_contains "$INSTALL_SCRIPT" "/etc/systemd/system/clash-proxy.service" "安装脚本应安装主服务"
 assert_file_contains "$INSTALL_SCRIPT" "/etc/systemd/system/clash-proxy-refresh.timer" "安装脚本应安装定时器"
+assert_file_contains "$INSTALL_SCRIPT" "/etc/systemd/system/clash-proxy-refresh.path" "安装脚本应安装 path 单元"
 assert_file_contains "$INSTALL_SCRIPT" "/etc/default/clash-proxy-command.example" "安装脚本应始终安装 example 环境文件"
 assert_file_contains "$INSTALL_SCRIPT" 'if [ ! -f "${DEFAULT_ENV_DIR}/clash-proxy-command" ]' "安装脚本只应在正式环境文件不存在时初始化它"
 assert_file_contains "$INSTALL_SCRIPT" "systemctl enable --now clash-proxy.service" "安装脚本应启用主服务"
 assert_file_contains "$INSTALL_SCRIPT" "systemctl enable --now clash-proxy-refresh.timer" "安装脚本应启用定时器"
+assert_file_contains "$INSTALL_SCRIPT" "systemctl enable --now clash-proxy-refresh.path" "安装脚本应启用 path 单元"
+
+assert_file_contains "${PROJECT_DIR}/systemd/clash-proxy-refresh.path" "PathChanged=/root/clash_proxy/config.yaml" "path 单元应监听 root 级 config.yaml"
+assert_file_contains "${PROJECT_DIR}/systemd/clash-proxy-refresh.path" "Unit=clash-proxy-refresh.service" "path 单元应触发 refresh service"
 
 assert_file_contains "$GENERATE_SCRIPT" "/etc/systemd/system/" "生成脚本应输出 drop-in 目录"
 assert_file_contains "$GENERATE_SCRIPT" "EnvironmentFile=/etc/default/clash-proxy-command" "生成脚本应包含代理环境文件"

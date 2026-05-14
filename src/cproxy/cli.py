@@ -3,19 +3,19 @@ from __future__ import annotations
 import os
 import sys
 from argparse import Namespace
+from functools import lru_cache
 from pathlib import Path
 
 from . import __version__
 from .api import APIUnavailableError
 from .backend.models import AIProbeReport, ProxyGroup
-from .config import default_paths
+from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe, run_connectivity_test, test_group
 from .geodata import check_country_mmdb
 from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config, migrate_from_legacy
 from .logs import follow_lines, read_recent_lines
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .process import ProcessOwnershipError, get_status, restart_process, start_process, stop_process
-from .config import log_file
 from .runtime import render_runtime
 from .output import build_root_parser, normalize_name
 from .services.query import QueryService
@@ -27,6 +27,23 @@ ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
 ANSI_RED = "\033[31m"
 ANSI_CYAN = "\033[36m"
+
+POSITIVE_STATUSES = {"正常", "运行中", "可访问", "已就绪"}
+WARNING_STATUSES = {"部分异常", "待刷新", "未知"}
+NEGATIVE_STATUSES = {"失败", "异常", "未运行", "不可访问"}
+STATUS_ICONS = {
+    "正常": "✓",
+    "运行中": "●",
+    "可访问": "✓",
+    "已就绪": "✓",
+    "部分异常": "!",
+    "待刷新": "!",
+    "未知": "?",
+    "失败": "✗",
+    "异常": "✗",
+    "未运行": "○",
+    "不可访问": "✗",
+}
 
 
 def _get_group(groups: dict, name: str):
@@ -53,8 +70,69 @@ def _format_delay_label(delay) -> str:
     return f"{delay}ms" if isinstance(delay, int) else "-"
 
 
+@lru_cache(maxsize=1)
+def _output_config() -> dict:
+    try:
+        return read_config(default_paths())
+    except Exception:
+        return {}
+
+
+def _truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _falsey(value: object) -> bool:
+    return str(value).strip().lower() in {"0", "false", "no", "off"}
+
+
+def _color_mode() -> str:
+    env_mode = os.environ.get("CPROXY_COLOR")
+    if env_mode:
+        normalized = env_mode.strip().lower()
+        if normalized in {"auto", "always", "never"}:
+            return normalized
+
+    if os.environ.get("FORCE_COLOR") == "1":
+        return "always"
+    if os.environ.get("NO_COLOR"):
+        return "never"
+
+    config_mode = str(_output_config().get("output-color", "always")).strip().lower()
+    if config_mode in {"auto", "always", "never"}:
+        return config_mode
+    return "always"
+
+
 def _color_enabled() -> bool:
-    return sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
+    mode = _color_mode()
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def _icons_enabled() -> bool:
+    env_icons = os.environ.get("CPROXY_ICONS")
+    if env_icons:
+        if _truthy(env_icons):
+            return True
+        if _falsey(env_icons):
+            return False
+
+    config = _output_config()
+    if "output-icons" not in config and os.environ.get("NO_COLOR"):
+        return False
+
+    config_icons = config.get("output-icons", True)
+    if isinstance(config_icons, bool):
+        return config_icons
+    if _truthy(config_icons):
+        return True
+    if _falsey(config_icons):
+        return False
+    return False
 
 
 def _style(text: object, *codes: str) -> str:
@@ -73,13 +151,24 @@ def _accent(text: object) -> str:
 
 
 def _status_color(text: str) -> str:
-    if text in {"正常", "运行中", "可访问", "已就绪"}:
+    if text in POSITIVE_STATUSES:
         return _style(text, ANSI_GREEN)
-    if text in {"部分异常", "待刷新", "未知"}:
+    if text in WARNING_STATUSES:
         return _style(text, ANSI_YELLOW)
-    if text in {"失败", "异常", "未运行", "不可访问"}:
+    if text in NEGATIVE_STATUSES:
         return _style(text, ANSI_RED)
     return text
+
+
+def _status_label(text: str) -> str:
+    label = _status_color(text)
+    if not _icons_enabled():
+        return label
+
+    icon = STATUS_ICONS.get(text)
+    if not icon:
+        return label
+    return f"{icon} {label}"
 
 
 def _print_section(title: str) -> None:
@@ -217,13 +306,13 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
     _print_section("摘要")
     print(
         f"AI 路由: {route['mode_label']}  当前出口={normalize_name(active_node)}  "
-        f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={active_status}"
+        f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={_status_label(active_status)}"
     )
-    print(f"AI 探测: {_status_color(_probe_summary_status(probe_report))}")
+    print(f"AI 探测: {_status_label(_probe_summary_status(probe_report))}")
     print()
     _print_section("连通性")
     for item in probe_report.results:
-        label = _status_color("正常" if item.ok else "失败")
+        label = _status_label("正常" if item.ok else "失败")
         print(f"{label}  {item.name}  {item.url}")
     print()
     _print_section("链路")
@@ -237,7 +326,7 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         print(f"   └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
     print()
     _print_section("备用")
-    print(f"{standby_group} -> {normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {_status_color(standby_status)})")
+    print(f"{standby_group} -> {normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {_status_label(standby_status)})")
     print()
     _print_section("分组")
     for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
@@ -286,11 +375,11 @@ def _render_status(raw: bool) -> int:
         return 0
 
     _print_section("摘要")
-    print(f"状态: {_status_color(status_text)}")
-    print(f"API: {_status_color(api_text)}")
+    print(f"状态: {_status_label(status_text)}")
+    print(f"API: {_status_label(api_text)}")
     print(f"AI 路由模式: {ai_mode}")
     print(f"AI 当前出口: {_accent(ai_summary)}")
-    print(f"运行配置状态: {_status_color(config_state)}")
+    print(f"运行配置状态: {_status_label(config_state)}")
     print()
     _print_section("资源")
     print(f"代理端口: {snapshot.port}")
@@ -323,9 +412,9 @@ def _render_group_check(report: GroupCheckReport, raw: bool) -> int:
     _print_section("结果")
     for item in report.results:
         if item.ok and item.delay is not None:
-            print(f"{_status_color('正常')}  {item.name}  {item.delay}ms")
+            print(f"{_status_label('正常')}  {item.name}  {item.delay}ms")
         else:
-            print(f"{_status_color('失败')}  {item.name}  -")
+            print(f"{_status_label('失败')}  {item.name}  -")
     return 0 if len(ok_items) == len(report.results) else 1
 
 
@@ -339,9 +428,9 @@ def _render_connectivity_report(report: ConnectivityReport) -> int:
     _print_section("结果")
     for item in report.results:
         if item.ok:
-            print(f"{_status_color('正常')}  {item.name}  {item.detail}")
+            print(f"{_status_label('正常')}  {item.name}  {item.detail}")
         else:
-            print(f"{_status_color('失败')}  {item.name}  {item.detail}")
+            print(f"{_status_label('失败')}  {item.name}  {item.detail}")
     return 0 if passed == len(report.results) else 1
 
 

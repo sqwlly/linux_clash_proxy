@@ -249,6 +249,23 @@ cproxy render
 cproxy restart
 ```
 
+如果你使用 root 级 `clash-proxy.service`，定时器会执行
+`/root/clash_proxy/systemd/clash-proxy-refresh.sh`。该脚本在检测到
+`runtime.yaml` 变化后，会先用 `mihomo -t` 校验新运行配置；只有校验通过才重启服务。
+重启后如果 Mihomo API 探活失败，脚本会把 `runtime.yaml` 回滚到上一份可用版本，并尝试恢复服务。
+root 级安装还提供 `clash-proxy-refresh.path`，用于在 `/root/clash_proxy/config.yaml`
+变化后触发同一条 refresh 链路。
+
+如果你要应用候选配置，优先使用：
+
+```bash
+/root/clash_proxy/update_config.sh --dry-run /root/clash_proxy/config_1.yaml
+/root/clash_proxy/update_config.sh --apply /root/clash_proxy/config_1.yaml
+```
+
+`update_config.sh` 默认只 dry-run，不写 `config.yaml`；`--apply` 会写入源配置并调用
+refresh 脚本，失败时恢复上一份源配置。
+
 如果你要验证 AI 规则是否已经注入，看：
 
 - `~/.local/share/cproxy/runtime.yaml`
