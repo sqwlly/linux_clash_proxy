@@ -279,8 +279,35 @@ root 级 `clash-proxy.service`，并由 `/root/clash_proxy/proxy.sh` 管理。
 - root 级管理脚本：`/root/clash_proxy/proxy.sh`
 - root 级运行配置：`/root/clash_proxy/runtime.yaml`
 - root 级 PID：`/root/clash_proxy/mihomo.pid`
+- root 级系统命令：`clash-proxy`、`clash-proxy-update`
 - 用户级 `cproxy` 入口：`systemd-user/cproxy.service`
 - 用户级 `cproxy` 路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
+
+可用下面的一键脚本安装 root 级系统命令：
+
+```bash
+sudo ./scripts/install-system-commands.sh
+```
+
+默认安装：
+
+- `clash-proxy`：转发到仓库内 `proxy.sh`
+- `clash-proxy-update`：转发到仓库内 `update_config.sh`
+
+如果确实需要把 `cproxy` 和 `cproxy-update` 也指向 root 生产入口，使用显式别名模式：
+
+```bash
+sudo ./scripts/install-system-commands.sh --with-cproxy-alias
+```
+
+默认不覆盖 `cproxy`，因为仓库里还保留了用户级 Python CLI。若
+`cproxy status` 显示 `运行配置状态: 待刷新`，先确认它看的是否是
+`~/.local/share/cproxy/runtime.yaml`；生产入口状态应优先使用：
+
+```bash
+clash-proxy status
+clash-proxy status --raw
+```
 
 本机可用这些只读命令确认当前运行入口：
 

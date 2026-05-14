@@ -22,6 +22,39 @@ pipx install /path/to/clash_proxy
 
 如果缺失，会打印警告，但不会阻塞安装。
 
+## root 生产系统命令
+
+当前生产入口仍是 root 级 `proxy.sh`。在仓库根目录运行：
+
+```bash
+sudo ./scripts/install-system-commands.sh
+```
+
+默认安装：
+
+- `clash-proxy`：转发到仓库内 `proxy.sh`
+- `clash-proxy-update`：转发到仓库内 `update_config.sh`
+
+常用命令：
+
+```bash
+clash-proxy status
+clash-proxy status --raw
+clash-proxy-update --dry-run config_1.yaml
+clash-proxy-update --apply config_1.yaml
+```
+
+如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
+
+```bash
+sudo ./scripts/install-system-commands.sh --with-cproxy-alias
+```
+
+注意：`cproxy status` 属于用户级 XDG 入口，使用 `~/.config/cproxy` 和
+`~/.local/share/cproxy`。如果未初始化用户级 runtime，它会显示
+`运行配置状态: 待刷新`，这不代表 root 生产入口不可用。生产排障优先使用
+`clash-proxy status` 或在仓库根目录运行 `./proxy.sh status`。
+
 ## 初始化
 
 ```bash

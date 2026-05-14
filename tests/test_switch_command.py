@@ -155,6 +155,9 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert status_result.returncode == 0
         assert "状态: ○ 未运行" in status_result.stdout
         assert "API: ✓ 可访问" in status_result.stdout
+        assert "API 可能来自其它 Mihomo 实例" in status_result.stdout
+        assert "clash-proxy status" in status_result.stdout
+        assert "cproxy render" in status_result.stdout
 
         no_icons_env = status_env.copy()
         no_icons_env["CPROXY_ICONS"] = "0"
@@ -179,6 +182,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert raw_status_result.returncode == 0
         assert "○ 未运行" not in raw_status_result.stdout
         assert "✓ 可访问" not in raw_status_result.stdout
+        assert "API 可能来自其它 Mihomo 实例" not in raw_status_result.stdout
     finally:
         server.shutdown()
         thread.join()

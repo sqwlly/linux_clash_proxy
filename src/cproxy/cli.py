@@ -390,6 +390,13 @@ def _render_status(raw: bool) -> int:
     print(f"运行配置: {snapshot.runtime_config}")
     if snapshot.pid:
         print(f"PID: {snapshot.pid}")
+    if not snapshot.running and api_text == "可访问":
+        print()
+        _print_section("提示")
+        print("当前用户级 cproxy 未运行，API 可能来自其它 Mihomo 实例。")
+        print("生产入口状态请优先查看 clash-proxy status 或在仓库根目录运行 ./proxy.sh status。")
+    if not snapshot.runtime_ready:
+        print("如需使用用户级 cproxy，请先运行 cproxy render 生成运行配置。")
     return 0
 
 
