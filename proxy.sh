@@ -21,6 +21,8 @@ LOCK_FILE="${CONFIG_DIR}/.lock"
 TEST_URL="${TEST_URL:-https://cp.cloudflare.com/generate_204}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-5000}"
 PROXY_NO_PROXY_DEFAULT="${PROXY_NO_PROXY_DEFAULT:-127.0.0.1,localhost}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+SYSTEMD_SERVICE_NAME="${SYSTEMD_SERVICE_NAME:-clash-proxy.service}"
 
 # ==================== AI 规则配置 ====================
 AI_MANUAL_GROUP="AI-MANUAL"
@@ -411,6 +413,15 @@ proxy_shell() {
 
     print_info "进入临时代理 shell，退出后代理环境失效"
     with_proxy "$shell_bin" -l
+}
+
+restart_managed_service() {
+    if command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 && "$SYSTEMCTL_BIN" is-enabled "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1; then
+        "$SYSTEMCTL_BIN" restart "$SYSTEMD_SERVICE_NAME"
+        return $?
+    fi
+
+    restart
 }
 
 urlencode() {
@@ -2028,7 +2039,7 @@ interactive_menu() {
                 test
                 ;;
             8)
-                restart
+                restart_managed_service
                 ;;
             q|Q|quit|exit)
                 return 0

@@ -54,6 +54,7 @@ assert_file_contains "${TMP_DIR}/bin/clash-proxy" 'CLASH_PROXY_CLI_NAME="clash-p
 assert_file_contains "${TMP_DIR}/bin/clash-proxy" 'proxy.sh" "$@"' "clash-proxy 应转发到 root 生产入口"
 assert_file_contains "${TMP_DIR}/bin/clash-proxy" '../lib/clash-proxy/proxy.sh' "clash-proxy 应指向安装后的 lib payload"
 assert_file_contains "${TMP_DIR}/bin/clash-proxy-update" 'update_config.sh" "$@"' "clash-proxy-update 应转发到安全更新入口"
+assert_file_contains "${TMP_DIR}/bin/clash-proxy-update" "PROJECT_DIR=\"${PROJECT_DIR}\"" "clash-proxy-update 应保留真实项目目录"
 
 "$INSTALLER" --bindir "${TMP_DIR}/bin" --libdir "${TMP_DIR}/lib/clash-proxy" --with-cproxy-alias >/dev/null
 

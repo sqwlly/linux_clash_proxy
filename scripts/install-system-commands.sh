@@ -109,9 +109,13 @@ write_wrapper() {
     local target="$2"
     local destination="${BINDIR}/${command_name}"
     local relative_target
+    local project_dir_env=""
     local temp_file
 
     relative_target="$(relative_to_bindir "$target")"
+    if [ "$command_name" = "clash-proxy-update" ] || [ "$command_name" = "cproxy-update" ]; then
+        project_dir_env="PROJECT_DIR=\"${PROJECT_DIR}\" "
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "DRY-RUN install ${command_name} -> $(basename "$target")"
@@ -122,7 +126,7 @@ write_wrapper() {
     {
         printf '%s\n' '#!/bin/sh'
         printf '%s\n' 'WRAPPER_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
-        printf 'CLASH_PROXY_CLI_NAME="%s" exec "${WRAPPER_DIR}/%s" "$@"\n' "$command_name" "$relative_target"
+        printf '%sCLASH_PROXY_CLI_NAME="%s" exec "${WRAPPER_DIR}/%s" "$@"\n' "$project_dir_env" "$command_name" "$relative_target"
     } > "$temp_file"
 
     install -m 755 "$temp_file" "$destination"

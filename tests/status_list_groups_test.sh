@@ -100,7 +100,19 @@ cat >"$STUB_DIR/du" <<'EOF'
 printf '8.0K\t%s\n' "${2:-$1}"
 EOF
 
-chmod +x "$STUB_DIR/ps" "$STUB_DIR/ss" "$STUB_DIR/du"
+cat >"$STUB_DIR/systemctl" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = "is-enabled" ] && [ "${2:-}" = "clash-proxy.service" ]; then
+    exit 0
+fi
+if [ "${1:-}" = "restart" ] && [ "${2:-}" = "clash-proxy.service" ]; then
+    echo "systemctl restart clash-proxy.service"
+    exit 0
+fi
+exit 1
+EOF
+
+chmod +x "$STUB_DIR/ps" "$STUB_DIR/ss" "$STUB_DIR/du" "$STUB_DIR/systemctl"
 
 python3 - "$PORT_FILE" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
@@ -246,5 +258,11 @@ menu_output="$(
 assert_contains "$menu_output" "Clash Proxy Console" "menu 应输出交互式控制台标题"
 assert_contains "$menu_output" "状态面板" "menu 应提供状态面板入口"
 assert_contains "$menu_output" "AI 路由面板" "menu 应提供 AI 状态入口"
+
+menu_restart_output="$(
+    printf '8\nq\n' | env "${COMMON_ENV[@]}" "$SCRIPT" menu
+)"
+
+assert_contains "$menu_restart_output" "systemctl restart clash-proxy.service" "menu 重启应优先走 systemd 管理入口"
 
 echo "status_list_groups_test: PASS"
