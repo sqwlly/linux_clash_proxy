@@ -189,7 +189,7 @@ ai_status_output="$(
 )"
 
 assert_contains "$ai_status_output" "◆ AI Routing" "ai-status 应输出产品化摘要区块"
-assert_contains "$ai_status_output" "当前出口    🇺🇸 United States 01" "ai-status 应输出带国家 icon 的当前出口"
+assert_contains "$ai_status_output" "当前出口    [US] United States 01" "ai-status 应输出稳定国家徽标的当前出口"
 assert_contains "$ai_status_output" "AI 探测     ! 部分异常" "ai-status 应输出带 icon 的 OpenAI 探测汇总"
 assert_contains "$ai_status_output" "连通性" "ai-status 应输出 OpenAI 连通性区块"
 assert_contains "$ai_status_output" "✓ 正常  ChatGPT Web  http://probe.local/chatgpt" "ai-status 应展示 ChatGPT Web 探测结果"
@@ -198,8 +198,8 @@ assert_contains "$ai_status_output" "链路" "ai-status 应输出当前链路区
 assert_contains "$ai_status_output" "备用" "ai-status 应输出备用路径区块"
 assert_contains "$ai_status_output" "分组" "ai-status 应输出分组状态区块"
 assert_contains "$ai_status_output" "自动切换" "ai-status 应明确展示当前是否处于自动模式"
-assert_contains "$ai_status_output" "🇸🇬 AI-SG -> 🇸🇬 Singapore 01" "ai-status 应展示备用路径的国家 icon"
-assert_contains "$ai_status_output" "当前: 🇺🇸 United States 01" "ai-status 应在分组状态中展示带 icon 的节点名"
+assert_contains "$ai_status_output" "[SG] AI-SG -> [SG] Singapore 01" "ai-status 应展示备用路径的国家徽标"
+assert_contains "$ai_status_output" "当前: [US] United States 01" "ai-status 应在分组状态中展示带徽标的节点名"
 
 ai_status_no_icons="$(
     CPROXY_ICONS=0 \
@@ -209,7 +209,7 @@ ai_status_no_icons="$(
 )"
 assert_contains "$ai_status_no_icons" "AI Routing" "关闭 icon 后仍应输出 AI Routing 标题"
 assert_contains "$ai_status_no_icons" "当前出口    United States 01" "关闭 icon 后应保留规整节点名"
-assert_not_contains "$ai_status_no_icons" "🇺🇸" "CPROXY_ICONS=0 应关闭国家 icon"
+assert_not_contains "$ai_status_no_icons" "[US]" "CPROXY_ICONS=0 应关闭国家徽标"
 assert_not_contains "$ai_status_no_icons" "✓ 正常" "CPROXY_ICONS=0 应关闭状态 icon"
 
 cat >"$CONFIG_FILE" <<EOF

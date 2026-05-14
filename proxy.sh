@@ -1641,13 +1641,13 @@ def status_label(status):
     prefix = status_icon(status)
     return f"{prefix} {status}" if prefix else str(status)
 
-def country_icon_for_group(name):
+def country_badge_for_group(name):
     if not icons_enabled:
         return ""
     if name in (ai_us, region_us):
-        return "🇺🇸"
+        return "[US]"
     if name in (ai_sg, region_sg):
-        return "🇸🇬"
+        return "[SG]"
     return ""
 
 def leading_symbol(value):
@@ -1663,13 +1663,19 @@ def leading_symbol(value):
     return ""
 
 def group_label(name):
-    flag = country_icon_for_group(name)
-    return f"{flag} {name}" if flag else name
+    badge = country_badge_for_group(name)
+    return f"{badge} {name}" if badge else name
 
 def node_label(value, group="-"):
     name = display_name(value)
-    flag = country_icon_for_group(group) or leading_symbol(value)
-    return f"{flag} {name}" if flag and name != "-" else name
+    badge = country_badge_for_group(group)
+    if not badge and icons_enabled:
+        symbol = leading_symbol(value)
+        if symbol == "🇺🇸":
+            badge = "[US]"
+        elif symbol == "🇸🇬":
+            badge = "[SG]"
+    return f"{badge} {name}" if badge and name != "-" else name
 
 def get_group(name):
     return data.get(name) or {}
