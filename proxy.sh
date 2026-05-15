@@ -2010,19 +2010,18 @@ resolve_stable_probe_group() {
     local proxies_json
     proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-    PROXIES_JSON="$proxies_json" python3 - "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_SG_GROUP" <<'PY'
+    PROXIES_JSON="$proxies_json" python3 - "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" <<'PY'
 import json
 import os
 import sys
 
-ai_manual, ai_auto, ai_sg = sys.argv[1:4]
+ai_manual, ai_auto, ai_us, ai_sg = sys.argv[1:5]
 groups = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
-manual_target = (groups.get(ai_manual) or {}).get("now") or ai_sg
-active_group = (groups.get(ai_auto) or {}).get("now") if manual_target == ai_auto else manual_target
-group = groups.get(active_group)
-
-if isinstance(group, dict) and group.get("all"):
-    print(active_group)
+for candidate in (ai_manual, ai_auto, ai_us, ai_sg):
+    group = groups.get(candidate)
+    if isinstance(group, dict) and group.get("all"):
+        print(candidate)
+        break
 else:
     print(ai_sg)
 PY
@@ -2401,7 +2400,7 @@ AI 路由控制:
   current <group>           - 查看代理组当前选择
   switch <group> <node>     - 手动切换 Selector 代理组
   ai-status                 - 查看 AI 专用路由状态
-  probe-stable-node [group] - 多轮探测并推荐更稳定的节点，默认 group 为当前 AI 出口组
+  probe-stable-node [group] - 多轮探测并推荐更稳定的节点，默认 group 为 AI-MANUAL
   probe-stable-node [group] --switch - 推荐节点稳定且明显更优时才自动切换
   ai-use [profile]          - 按 codex/chatgpt/github/claude 场景探测并切换
   shadow-probe [profile]    - 只探测并记录历史，不切换

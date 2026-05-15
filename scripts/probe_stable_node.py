@@ -7,12 +7,13 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from math import ceil
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
-DEFAULT_GROUP = "AI-SG"
+DEFAULT_GROUP = "AI-MANUAL"
 DEFAULT_URL = "https://chatgpt.com/backend-api/codex/responses/compact"
 DEFAULT_TIMEOUT_MS = 8000
 REQUEST_TIMEOUT_SECONDS = 10
@@ -58,6 +59,7 @@ PROFILES = {
 class GroupState:
     current: str | None
     candidates: list[str]
+    switch_paths: dict[str, list[tuple[str, str]]]
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,65 @@ def request_json(controller: str, secret: str, path: str, method: str = "GET", p
         raise RuntimeError(f"API 请求失败: {path}: {exc}") from exc
 
 
+def group_candidates(proxies: dict, group_name: str) -> list[str]:
+    group = proxies.get(group_name)
+    if not isinstance(group, dict):
+        return []
+
+    candidates = group.get("all") or group.get("proxies") or []
+    return [str(item) for item in candidates if str(item)]
+
+
+def collect_leaf_candidates(proxies: dict, group_name: str) -> tuple[list[str], dict[str, list[tuple[str, str]]]]:
+    candidates: list[str] = []
+    switch_paths: dict[str, list[tuple[str, str]]] = {}
+
+    def visit(name: str, path: list[tuple[str, str]], seen: set[str]) -> None:
+        children = group_candidates(proxies, name)
+        if not children:
+            if name not in switch_paths:
+                candidates.append(name)
+                switch_paths[name] = path
+            return
+
+        if name in seen:
+            return
+
+        next_seen = seen | {name}
+        for child in children:
+            visit(child, [*path, (name, child)], next_seen)
+
+    visit(group_name, [], set())
+    if not candidates:
+        return [group_name], {group_name: []}
+    return candidates, switch_paths
+
+
+def resolve_current_leaf(proxies: dict, group_name: str) -> str | None:
+    name = group_name
+    seen: set[str] = set()
+
+    while True:
+        if name in seen:
+            return name
+        seen.add(name)
+
+        group = proxies.get(name)
+        if not isinstance(group, dict):
+            return name if name != group_name else None
+
+        current = group.get("now")
+        if not current:
+            return None
+
+        current_name = str(current)
+        if group_candidates(proxies, current_name):
+            name = current_name
+            continue
+
+        return current_name
+
+
 def load_group_state(controller: str, secret: str, group_name: str) -> GroupState:
     payload = request_json(controller, secret, "/proxies")
     proxies = payload.get("proxies") if isinstance(payload, dict) else None
@@ -174,13 +235,11 @@ def load_group_state(controller: str, secret: str, group_name: str) -> GroupStat
     if not isinstance(group, dict):
         raise RuntimeError(f"未找到代理组或节点: {group_name}")
 
-    current = group.get("now")
-    candidates = group.get("all") or group.get("proxies") or []
-    if not candidates:
-        candidates = [group_name]
+    candidates, switch_paths = collect_leaf_candidates(proxies, group_name)
     return GroupState(
-        current=str(current) if current else None,
-        candidates=[str(item) for item in candidates],
+        current=resolve_current_leaf(proxies, group_name),
+        candidates=candidates,
+        switch_paths=switch_paths,
     )
 
 
@@ -201,6 +260,27 @@ def probe_delay(controller: str, secret: str, node: str, url: str, timeout: int)
 
 def switch_group(controller: str, secret: str, group: str, target: str) -> None:
     request_json(controller, secret, f"/proxies/{quote(group, safe='')}", method="PUT", payload={"name": target})
+
+
+def switch_to_candidate(controller: str, secret: str, group_state: GroupState, target: str) -> None:
+    path = group_state.switch_paths.get(target)
+    if path is None:
+        raise RuntimeError(f"未找到推荐节点的切换路径: {target}")
+
+    for group, next_target in reversed(path):
+        switch_group(controller, secret, group, next_target)
+
+
+def active_candidates_after_round(results: dict[str, dict], current: str | None) -> set[str]:
+    summaries = [
+        ProbeSummary(name=name, delays=list(item["delays"]), failures=int(item["failures"]))
+        for name, item in results.items()
+    ]
+    active_count = max(1, ceil(len(summaries) / 2))
+    active = {item.name for item in sorted(summaries, key=lambda value: value.rank_key())[:active_count]}
+    if current and current in results:
+        active.add(current)
+    return active
 
 
 def normalize_name(value: object) -> str:
@@ -355,7 +435,7 @@ def summarize(
     url: str,
     rounds: int,
     timeout: int,
-) -> tuple[list[ProbeSummary], str | None]:
+) -> tuple[list[ProbeSummary], GroupState]:
     if rounds < 1:
         raise RuntimeError("--rounds 必须大于等于 1")
     if timeout < 1000:
@@ -363,20 +443,30 @@ def summarize(
 
     group_state = load_group_state(controller, secret, group)
     results = {name: {"delays": [], "failures": 0} for name in group_state.candidates}
+    active = set(group_state.candidates)
 
-    for _ in range(rounds):
+    for round_index in range(rounds):
         for name in group_state.candidates:
+            if name not in active:
+                continue
+
             delay = probe_delay(controller, secret, name, url, timeout)
             if delay is None:
                 results[name]["failures"] += 1
             else:
                 results[name]["delays"].append(delay)
 
+        if round_index < rounds - 1 and len(active) > 1:
+            active = active_candidates_after_round(
+                {name: results[name] for name in active},
+                group_state.current,
+            )
+
     summaries = [
         ProbeSummary(name=name, delays=list(item["delays"]), failures=int(item["failures"]))
         for name, item in results.items()
     ]
-    return summaries, group_state.current
+    return summaries, group_state
 
 
 def render_raw(
@@ -477,11 +567,12 @@ def main() -> int:
     options = resolve_options(args)
     rounds = resolve_rounds(args, options)
     try:
-        summaries, current = summarize(args.controller, args.secret, args.group, options.url, rounds, args.timeout)
+        summaries, group_state = summarize(args.controller, args.secret, args.group, options.url, rounds, args.timeout)
     except RuntimeError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 
+    current = group_state.current
     successful = [item for item in summaries if item.success_count > 0]
     best = min(successful, key=lambda value: value.rank_key()) if successful else None
     verdict = stability_verdict(best, rounds, options.strategy)
@@ -501,7 +592,7 @@ def main() -> int:
                 print("错误: 没有可切换的成功节点", file=sys.stderr)
                 return 1
             try:
-                switch_group(args.controller, args.secret, args.group, best.name)
+                switch_to_candidate(args.controller, args.secret, group_state, best.name)
             except RuntimeError as exc:
                 print(f"错误: 切换失败: {exc}", file=sys.stderr)
                 return 1
