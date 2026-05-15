@@ -24,7 +24,7 @@ PROXY_NO_PROXY_DEFAULT="${PROXY_NO_PROXY_DEFAULT:-127.0.0.1,localhost}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SYSTEMD_SERVICE_NAME="${SYSTEMD_SERVICE_NAME:-clash-proxy.service}"
 STABLE_PROBE_URL="${STABLE_PROBE_URL:-}"
-STABLE_PROBE_ROUNDS="${STABLE_PROBE_ROUNDS:-3}"
+STABLE_PROBE_ROUNDS="${STABLE_PROBE_ROUNDS:-}"
 STABLE_PROBE_TIMEOUT="${STABLE_PROBE_TIMEOUT:-8000}"
 STABLE_PROBE_PROFILE="${STABLE_PROBE_PROFILE:-codex}"
 STABLE_PROBE_HISTORY_FILE="${STABLE_PROBE_HISTORY_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/clash_proxy/stable_probe_history.jsonl}"
@@ -2136,10 +2136,12 @@ probe_stable_node() {
         --secret "$(get_api_secret)"
         --group "$group_name"
         --profile "$profile"
-        --rounds "$rounds"
         --timeout "$timeout"
         --history-file "$STABLE_PROBE_HISTORY_FILE"
     )
+    if [ -n "$rounds" ]; then
+        args+=(--rounds "$rounds")
+    fi
     if [ -n "$probe_url" ]; then
         args+=(--url "$probe_url")
     fi
@@ -2431,7 +2433,7 @@ AI 路由控制:
   TEST_TIMEOUT              - 健康检查超时毫秒
   STABLE_PROBE_URL          - 稳定性探测目标 URL
   STABLE_PROBE_PROFILE      - 稳定性探测默认场景
-  STABLE_PROBE_ROUNDS       - 稳定性探测轮数
+  STABLE_PROBE_ROUNDS       - 覆盖稳定性探测轮数；为空时由 profile/strategy 决定
   STABLE_PROBE_TIMEOUT      - 稳定性探测单次超时毫秒
   STABLE_PROBE_HISTORY_FILE - 稳定性探测历史 JSONL 路径
   PROXY_NO_PROXY            - 覆盖默认 NO_PROXY 列表

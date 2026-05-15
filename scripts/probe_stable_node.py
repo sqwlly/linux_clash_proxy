@@ -14,7 +14,6 @@ from urllib.request import Request, urlopen
 
 DEFAULT_GROUP = "AI-SG"
 DEFAULT_URL = "https://chatgpt.com/backend-api/codex/responses/compact"
-DEFAULT_ROUNDS = 3
 DEFAULT_TIMEOUT_MS = 8000
 REQUEST_TIMEOUT_SECONDS = 10
 
@@ -22,6 +21,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 @dataclass(frozen=True)
 class Strategy:
     min_rounds: int
+    default_rounds: int
     max_delay_ms: int
     max_avg_ms: int
     min_improvement_ms: int
@@ -29,9 +29,9 @@ class Strategy:
 
 
 STRATEGIES = {
-    "conservative": Strategy(3, 3000, 1500, 100, 0.20),
-    "balanced": Strategy(3, 3500, 1800, 75, 0.15),
-    "aggressive": Strategy(3, 4500, 2200, 50, 0.10),
+    "conservative": Strategy(5, 5, 3000, 1500, 100, 0.20),
+    "balanced": Strategy(3, 3, 3500, 1800, 75, 0.15),
+    "aggressive": Strategy(3, 3, 4500, 2200, 50, 0.10),
 }
 
 PROFILES = {
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=sorted(PROFILES), default="codex")
     parser.add_argument("--strategy", choices=sorted(STRATEGIES), default=None)
     parser.add_argument("--url", default=None)
-    parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
+    parser.add_argument("--rounds", type=int, default=None)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MS)
     parser.add_argument("--switch", action="store_true", help="Switch the probed group to the best node.")
     parser.add_argument("--record-history", action="store_true", help="Append probe result to the history file.")
@@ -140,6 +140,12 @@ def resolve_options(args: argparse.Namespace) -> ResolvedOptions:
         strategy_name=strategy_name,
         strategy=strategy,
     )
+
+
+def resolve_rounds(args: argparse.Namespace, options: ResolvedOptions) -> int:
+    if args.rounds is not None:
+        return int(args.rounds)
+    return options.strategy.default_rounds
 
 
 def request_json(controller: str, secret: str, path: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -303,6 +309,7 @@ def record_history(
     history_file: str,
     options: ResolvedOptions,
     args: argparse.Namespace,
+    rounds: int,
     current: str | None,
     best: ProbeSummary | None,
     verdict: StabilityVerdict,
@@ -324,7 +331,7 @@ def record_history(
         "strategy": options.strategy_name,
         "group": args.group,
         "url": options.url,
-        "rounds": args.rounds,
+        "rounds": rounds,
         "timeout_ms": args.timeout,
         "current": current,
         "current_stable": current_verdict.stable,
@@ -335,7 +342,7 @@ def record_history(
         "switch_requested": bool(args.switch),
         "switched": switched,
         "skip_reason": skip_reason,
-        "nodes": [summary_payload(item, args.rounds, options.strategy) for item in summaries],
+        "nodes": [summary_payload(item, rounds, options.strategy) for item in summaries],
     }
     with open(history_file, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
@@ -374,6 +381,7 @@ def summarize(
 
 def render_raw(
     options: ResolvedOptions,
+    rounds: int,
     group: str,
     url: str,
     current: str | None,
@@ -388,6 +396,7 @@ def render_raw(
     print(f"GROUP\t{group}")
     print(f"PROFILE\t{options.profile}")
     print(f"STRATEGY\t{options.strategy_name}")
+    print(f"ROUNDS\t{rounds}")
     print(f"URL\t{url}")
     print(f"CURRENT\t{current or '-'}")
     print(f"CURRENT_STABLE\t{'true' if current_verdict.stable else 'false'}\t{current_verdict.reason}")
@@ -415,6 +424,7 @@ def render_raw(
 
 def render_human(
     options: ResolvedOptions,
+    rounds: int,
     group: str,
     url: str,
     current: str | None,
@@ -430,6 +440,7 @@ def render_human(
     print(f"目标组: {group}")
     print(f"场景: {options.profile}")
     print(f"策略: {options.strategy_name}")
+    print(f"轮数: {rounds}")
     print(f"目标 URL: {url}")
     print(f"当前: {normalize_name(current)}")
     print(f"当前稳定: {'是' if current_verdict.stable else '否'} ({current_verdict.reason})")
@@ -464,17 +475,18 @@ def render_human(
 def main() -> int:
     args = parse_args()
     options = resolve_options(args)
+    rounds = resolve_rounds(args, options)
     try:
-        summaries, current = summarize(args.controller, args.secret, args.group, options.url, args.rounds, args.timeout)
+        summaries, current = summarize(args.controller, args.secret, args.group, options.url, rounds, args.timeout)
     except RuntimeError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 
     successful = [item for item in summaries if item.success_count > 0]
     best = min(successful, key=lambda value: value.rank_key()) if successful else None
-    verdict = stability_verdict(best, args.rounds, options.strategy)
+    verdict = stability_verdict(best, rounds, options.strategy)
     current_summary = find_summary(summaries, current)
-    current_verdict = stability_verdict(current_summary, args.rounds, options.strategy)
+    current_verdict = stability_verdict(current_summary, rounds, options.strategy)
     switched = False
     skip_reason = ""
 
@@ -501,6 +513,7 @@ def main() -> int:
                 args.history_file,
                 options,
                 args,
+                rounds,
                 current,
                 best,
                 verdict,
@@ -515,6 +528,7 @@ def main() -> int:
     if args.raw:
         render_raw(
             options,
+            rounds,
             args.group,
             options.url,
             current,
@@ -529,6 +543,7 @@ def main() -> int:
     else:
         render_human(
             options,
+            rounds,
             args.group,
             options.url,
             current,

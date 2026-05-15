@@ -318,7 +318,7 @@ clash-proxy menu
 `clash-proxy probe-stable-node` 会对当前 AI 出口组的候选节点做多轮只读延迟探测，并按成功率、失败数、
 最大延迟、平均延迟和抖动计算 `score`，推荐更稳定的节点；加上 `--switch` 后只有推荐节点满足稳定门槛且明显优于当前稳定节点才会自动切换。
 内置 `conservative`、`balanced`、`aggressive` 三档策略，以及 `codex`、`chatgpt`、`github`、`claude` 场景预设。
-默认 `codex` 场景使用保守策略：至少 3 轮、全成功、0 失败、最大延迟不超过 3000ms、平均延迟不超过 1500ms；如果当前节点也稳定，
+默认 `codex` 场景使用保守策略：至少 5 轮、全成功、0 失败、最大延迟不超过 3000ms、平均延迟不超过 1500ms；如果当前节点也稳定，
 推荐节点还需要带来至少 100ms 或 20% 的平均延迟改善。可用 `--profile`、`--strategy`、`--url`、`--rounds`、`--timeout` 覆盖；
 降低 `--rounds` 不会降低自动切换的最少轮数要求。
 `clash-proxy ai-use codex` 会按场景探测并切换，`clash-proxy shadow-probe codex` 只记录历史不切换，
