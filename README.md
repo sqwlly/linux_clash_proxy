@@ -322,6 +322,7 @@ clash-proxy menu
 推荐节点还需要带来至少 100ms 或 20% 的平均延迟改善。可用 `--profile`、`--strategy`、`--url`、`--rounds`、`--timeout` 覆盖；
 降低 `--rounds` 不会降低自动切换的最少轮数要求。
 `clash-proxy ai-use codex` 会按场景探测并切换，`clash-proxy shadow-probe codex` 只记录历史不切换，
+`clash-proxy shadow-history` 会摘要展示最近探测历史。
 `clash-proxy guard codex` 只选择稳定出口，不启动 `codex`；也可以用 `clash-proxy guard codex -- <cmd>` 包裹一条命令。`clash-proxy ai-connections`
 展示 AI/GitHub 相关活动连接，`clash-proxy incident codex` 输出故障排查报告。
 `clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行

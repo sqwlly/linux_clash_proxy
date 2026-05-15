@@ -2227,6 +2227,63 @@ ai_connections() {
     python3 "${args[@]}"
 }
 
+shadow_history() {
+    local raw_mode=0
+    local limit=5
+    local helper=""
+    local args=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --raw)
+                raw_mode=1
+                shift
+                ;;
+            --limit)
+                if [ "$#" -lt 2 ]; then
+                    print_error "错误: --limit 需要参数"
+                    return 1
+                fi
+                limit="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "用法: ${CLASH_PROXY_CLI_NAME:-clash-proxy} shadow-history [--limit N] [--raw]"
+                return 0
+                ;;
+            *)
+                print_error "错误: 未知参数: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    for candidate in "$SCRIPT_DIR/ai_tools.py" "$SCRIPT_DIR/scripts/ai_tools.py" "$CONFIG_DIR/scripts/ai_tools.py"; do
+        if [ -f "$candidate" ]; then
+            helper="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$helper" ]; then
+        print_error "错误: 缺少 AI 诊断 helper: ai_tools.py"
+        return 1
+    fi
+
+    args=(
+        "$helper"
+        --controller "$(get_controller_url)"
+        --secret "$(get_api_secret)"
+        history
+        --history-file "$STABLE_PROBE_HISTORY_FILE"
+        --limit "$limit"
+    )
+    if [ "$raw_mode" -eq 1 ]; then
+        args+=(--raw)
+    fi
+    python3 "${args[@]}"
+}
+
 incident_ai() {
     local profile="codex"
 
@@ -2254,11 +2311,7 @@ incident_ai() {
     ai_connections --raw || true
     echo
     echo "[recent-probe-history]"
-    if [ -f "$STABLE_PROBE_HISTORY_FILE" ]; then
-        tail -n 5 "$STABLE_PROBE_HISTORY_FILE"
-    else
-        echo "-"
-    fi
+    shadow_history --raw --limit 5 || true
 }
 
 interactive_menu() {
@@ -2330,7 +2383,7 @@ usage() {
     cat << EOF
 ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
 
-用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|ai-use|shadow-probe|guard|ai-connections|incident|menu|proxy-env|with-proxy|proxy-shell}
+用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|ai-use|shadow-probe|shadow-history|guard|ai-connections|incident|menu|proxy-env|with-proxy|proxy-shell}
 
 配置与进程:
   render                    - 从原始配置生成运行配置
@@ -2350,6 +2403,7 @@ AI 路由控制:
   probe-stable-node [group] --switch - 推荐节点稳定且明显更优时才自动切换
   ai-use [profile]          - 按 codex/chatgpt/github/claude 场景探测并切换
   shadow-probe [profile]    - 只探测并记录历史，不切换
+  shadow-history [--limit N] - 查看最近稳定探测历史摘要
   guard [profile] [-- <cmd>] - 先选择稳定 AI 出口；带命令时再注入代理执行
   ai-connections [--raw]    - 查看 AI/GitHub 相关活动连接
   incident [profile]        - 输出 AI 出口故障排查报告
@@ -2396,6 +2450,7 @@ AI 路由控制:
   ${cli_name} probe-stable-node --switch
   ${cli_name} ai-use codex
   ${cli_name} shadow-probe codex
+  ${cli_name} shadow-history
   ${cli_name} guard codex
   ${cli_name} guard codex -- curl https://chatgpt.com
   ${cli_name} ai-connections
@@ -2475,6 +2530,10 @@ main() {
         shadow-probe)
             shift
             shadow_probe "$@"
+            ;;
+        shadow-history)
+            shift
+            shadow_history "$@"
             ;;
         guard)
             shift
