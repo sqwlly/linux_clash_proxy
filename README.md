@@ -307,7 +307,7 @@ sudo ./scripts/install-system-commands.sh --with-cproxy-alias
 ```bash
 clash-proxy status
 clash-proxy status --raw
-clash-proxy probe-stable-node AI-SG
+clash-proxy probe-stable-node --switch
 clash-proxy menu
 ```
 
@@ -315,9 +315,10 @@ clash-proxy menu
 `clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
 `clash-proxy ai-status` 同样默认展示状态 icon 和 `[US]`、`[SG]` 国家徽标，方便直接识别当前 AI
 出口区域。
-`clash-proxy probe-stable-node AI-SG` 会对候选节点做多轮只读延迟探测，并按成功率、失败数、
-最大延迟和平均延迟推荐更稳定的节点。默认目标是 ChatGPT Codex compact 接口，可用
-`--url`、`--rounds`、`--timeout` 覆盖。
+`clash-proxy probe-stable-node` 会对当前 AI 出口组的候选节点做多轮只读延迟探测，并按成功率、失败数、
+最大延迟和平均延迟推荐更稳定的节点；加上 `--switch` 后只有推荐节点满足稳定门槛才会自动切换。默认门槛是
+至少 3 轮、全成功、0 失败、最大延迟不超过 3000ms、平均延迟不超过 1500ms。默认目标是
+ChatGPT Codex compact 接口，可用 `--url`、`--rounds`、`--timeout` 覆盖；降低 `--rounds` 不会降低自动切换的最少轮数要求。
 `clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行
 常用维护动作。
 

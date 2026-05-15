@@ -105,10 +105,13 @@ CACHED_PID=""
 
 # ==================== 信号处理 ====================
 cleanup() {
+    local exit_code="${1:-$?}"
     rm -f "$LOCK_FILE" 2>/dev/null
-    exit 0
+    exit "$exit_code"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup "$?"' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
 
 # ==================== 工具函数 ====================
 
@@ -2001,12 +2004,35 @@ print(data.get("delay", "-"))
     return "$exit_code"
 }
 
+resolve_stable_probe_group() {
+    local proxies_json
+    proxies_json="$(api_request "GET" "/proxies")" || return 1
+
+    PROXIES_JSON="$proxies_json" python3 - "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_SG_GROUP" <<'PY'
+import json
+import os
+import sys
+
+ai_manual, ai_auto, ai_sg = sys.argv[1:4]
+groups = json.loads(os.environ["PROXIES_JSON"]).get("proxies", {})
+manual_target = (groups.get(ai_manual) or {}).get("now") or ai_sg
+active_group = (groups.get(ai_auto) or {}).get("now") if manual_target == ai_auto else manual_target
+group = groups.get(active_group)
+
+if isinstance(group, dict) and group.get("all"):
+    print(active_group)
+else:
+    print(ai_sg)
+PY
+}
+
 probe_stable_node() {
-    local group_name="$AI_SG_GROUP"
+    local group_name=""
     local probe_url="$STABLE_PROBE_URL"
     local rounds="$STABLE_PROBE_ROUNDS"
     local timeout="$STABLE_PROBE_TIMEOUT"
     local raw_mode=0
+    local switch_mode=0
     local helper=""
     local args=()
 
@@ -2014,6 +2040,10 @@ probe_stable_node() {
         case "$1" in
             --raw)
                 raw_mode=1
+                shift
+                ;;
+            --switch)
+                switch_mode=1
                 shift
                 ;;
             --url)
@@ -2041,7 +2071,7 @@ probe_stable_node() {
                 shift 2
                 ;;
             -h|--help)
-                echo "用法: ${CLASH_PROXY_CLI_NAME:-clash-proxy} probe-stable-node [group] [--url URL] [--rounds N] [--timeout MS] [--raw]"
+                echo "用法: ${CLASH_PROXY_CLI_NAME:-clash-proxy} probe-stable-node [group] [--url URL] [--rounds N] [--timeout MS] [--switch] [--raw]"
                 return 0
                 ;;
             -*)
@@ -2057,6 +2087,10 @@ probe_stable_node() {
 
     if ! require_api; then
         return 1
+    fi
+
+    if [ -z "$group_name" ]; then
+        group_name="$(resolve_stable_probe_group)" || return 1
     fi
 
     for candidate in "$SCRIPT_DIR/probe_stable_node.py" "$SCRIPT_DIR/scripts/probe_stable_node.py" "$CONFIG_DIR/scripts/probe_stable_node.py"; do
@@ -2083,6 +2117,9 @@ probe_stable_node() {
     if [ "$raw_mode" -eq 1 ]; then
         args+=(--raw)
     fi
+    if [ "$switch_mode" -eq 1 ]; then
+        args+=(--switch)
+    fi
 
     python3 "${args[@]}"
 }
@@ -2099,7 +2136,7 @@ interactive_menu() {
         echo "4) 固定 US"
         echo "5) 固定 SG"
         echo "6) 代理组列表"
-        echo "7) 探测稳定节点"
+        echo "7) 探测并切换稳定节点"
         echo "8) 连通性测试"
         echo "9) 重新渲染并重启"
         echo "q) 退出"
@@ -2130,7 +2167,7 @@ interactive_menu() {
                 list_groups
                 ;;
             7)
-                probe_stable_node "$AI_SG_GROUP"
+                probe_stable_node --switch
                 ;;
             8)
                 test
@@ -2172,7 +2209,8 @@ AI 路由控制:
   current <group>           - 查看代理组当前选择
   switch <group> <node>     - 手动切换 Selector 代理组
   ai-status                 - 查看 AI 专用路由状态
-  probe-stable-node [group] - 多轮探测并推荐更稳定的节点，默认 group 为 $AI_SG_GROUP
+  probe-stable-node [group] - 多轮探测并推荐更稳定的节点，默认 group 为当前 AI 出口组
+  probe-stable-node [group] --switch - 推荐节点满足稳定门槛后才自动切换
   menu                      - 打开交互式控制台
 
 命令级代理:
@@ -2211,7 +2249,7 @@ AI 路由控制:
   ${cli_name} current "$AI_MANUAL_GROUP"
   ${cli_name} switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
   ${cli_name} ai-status
-  ${cli_name} probe-stable-node "$AI_SG_GROUP"
+  ${cli_name} probe-stable-node --switch
   ${cli_name} menu
 
   # 命令级代理
