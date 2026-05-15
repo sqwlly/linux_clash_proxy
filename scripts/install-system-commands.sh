@@ -163,6 +163,7 @@ warn_shadowed_command() {
 main() {
     require_file "${PROJECT_DIR}/proxy.sh"
     require_file "${PROJECT_DIR}/update_config.sh"
+    require_file "${PROJECT_DIR}/scripts/probe_stable_node.py"
     require_cmd install
     require_cmd mktemp
     require_cmd python3
@@ -174,6 +175,7 @@ main() {
 
     install_payload "${PROJECT_DIR}/proxy.sh" "proxy.sh"
     install_payload "${PROJECT_DIR}/update_config.sh" "update_config.sh"
+    install_payload "${PROJECT_DIR}/scripts/probe_stable_node.py" "probe_stable_node.py"
 
     write_wrapper "clash-proxy" "${LIBDIR}/proxy.sh"
     write_wrapper "clash-proxy-update" "${LIBDIR}/update_config.sh"

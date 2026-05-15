@@ -23,12 +23,17 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-5000}"
 PROXY_NO_PROXY_DEFAULT="${PROXY_NO_PROXY_DEFAULT:-127.0.0.1,localhost}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SYSTEMD_SERVICE_NAME="${SYSTEMD_SERVICE_NAME:-clash-proxy.service}"
+STABLE_PROBE_URL="${STABLE_PROBE_URL:-https://chatgpt.com/backend-api/codex/responses/compact}"
+STABLE_PROBE_ROUNDS="${STABLE_PROBE_ROUNDS:-3}"
+STABLE_PROBE_TIMEOUT="${STABLE_PROBE_TIMEOUT:-8000}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==================== AI 规则配置 ====================
 AI_MANUAL_GROUP="AI-MANUAL"
 AI_AUTO_GROUP="AI-AUTO"
 AI_US_GROUP="AI-US"
 AI_SG_GROUP="AI-SG"
+AI_REGION_JP="🇯🇵 Japan"
 AI_REGION_US="🇺🇸 United States"
 AI_REGION_SG="🇸🇬 Singapore"
 
@@ -638,7 +643,7 @@ render() {
 
     python3 - "$SOURCE_CONFIG_FILE" "$RUNTIME_CONFIG_FILE" \
         "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" \
-        "$AI_REGION_US" "$AI_REGION_SG" "$TEST_URL" <<'PY'
+        "$AI_REGION_JP" "$AI_REGION_US" "$AI_REGION_SG" "$TEST_URL" <<'PY'
 import os
 import sys
 import yaml
@@ -650,10 +655,11 @@ import yaml
     ai_auto_group,
     ai_us_group,
     ai_sg_group,
+    ai_region_jp,
     ai_region_us,
     ai_region_sg,
     test_url,
-) = sys.argv[1:10]
+) = sys.argv[1:11]
 
 AI_RULES = [
     f"DOMAIN-SUFFIX,openai.com,{ai_manual_group}",
@@ -697,7 +703,7 @@ for group in groups:
     if isinstance(group, dict) and group.get("name"):
         group_map[group["name"]] = group
 
-missing_groups = [name for name in (ai_region_us, ai_region_sg) if name not in group_map]
+missing_groups = [name for name in (ai_region_jp, ai_region_us, ai_region_sg) if name not in group_map]
 if missing_groups:
     raise SystemExit(f"错误: 原始配置缺少必需的区域组: {', '.join(missing_groups)}")
 
@@ -741,6 +747,7 @@ ai_groups = [
             ai_auto_group,
             ai_us_group,
             ai_sg_group,
+            ai_region_jp,
             ai_region_us,
             ai_region_sg,
         ],
@@ -1994,6 +2001,92 @@ print(data.get("delay", "-"))
     return "$exit_code"
 }
 
+probe_stable_node() {
+    local group_name="$AI_SG_GROUP"
+    local probe_url="$STABLE_PROBE_URL"
+    local rounds="$STABLE_PROBE_ROUNDS"
+    local timeout="$STABLE_PROBE_TIMEOUT"
+    local raw_mode=0
+    local helper=""
+    local args=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --raw)
+                raw_mode=1
+                shift
+                ;;
+            --url)
+                if [ "$#" -lt 2 ]; then
+                    print_error "错误: --url 需要参数"
+                    return 1
+                fi
+                probe_url="$2"
+                shift 2
+                ;;
+            --rounds)
+                if [ "$#" -lt 2 ]; then
+                    print_error "错误: --rounds 需要参数"
+                    return 1
+                fi
+                rounds="$2"
+                shift 2
+                ;;
+            --timeout)
+                if [ "$#" -lt 2 ]; then
+                    print_error "错误: --timeout 需要参数"
+                    return 1
+                fi
+                timeout="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "用法: ${CLASH_PROXY_CLI_NAME:-clash-proxy} probe-stable-node [group] [--url URL] [--rounds N] [--timeout MS] [--raw]"
+                return 0
+                ;;
+            -*)
+                print_error "错误: 未知参数: $1"
+                return 1
+                ;;
+            *)
+                group_name="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if ! require_api; then
+        return 1
+    fi
+
+    for candidate in "$SCRIPT_DIR/probe_stable_node.py" "$SCRIPT_DIR/scripts/probe_stable_node.py" "$CONFIG_DIR/scripts/probe_stable_node.py"; do
+        if [ -f "$candidate" ]; then
+            helper="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$helper" ]; then
+        print_error "错误: 缺少稳定性探测 helper: probe_stable_node.py"
+        return 1
+    fi
+
+    args=(
+        "$helper"
+        --controller "$(get_controller_url)"
+        --secret "$(get_api_secret)"
+        --group "$group_name"
+        --url "$probe_url"
+        --rounds "$rounds"
+        --timeout "$timeout"
+    )
+    if [ "$raw_mode" -eq 1 ]; then
+        args+=(--raw)
+    fi
+
+    python3 "${args[@]}"
+}
+
 interactive_menu() {
     local choice
 
@@ -2006,8 +2099,9 @@ interactive_menu() {
         echo "4) 固定 US"
         echo "5) 固定 SG"
         echo "6) 代理组列表"
-        echo "7) 连通性测试"
-        echo "8) 重新渲染并重启"
+        echo "7) 探测稳定节点"
+        echo "8) 连通性测试"
+        echo "9) 重新渲染并重启"
         echo "q) 退出"
         printf "选择: "
 
@@ -2036,9 +2130,12 @@ interactive_menu() {
                 list_groups
                 ;;
             7)
-                test
+                probe_stable_node "$AI_SG_GROUP"
                 ;;
             8)
+                test
+                ;;
+            9)
                 restart_managed_service
                 ;;
             q|Q|quit|exit)
@@ -2059,7 +2156,7 @@ usage() {
     cat << EOF
 ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
 
-用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|menu|proxy-env|with-proxy|proxy-shell}
+用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|menu|proxy-env|with-proxy|proxy-shell}
 
 配置与进程:
   render                    - 从原始配置生成运行配置
@@ -2075,6 +2172,7 @@ AI 路由控制:
   current <group>           - 查看代理组当前选择
   switch <group> <node>     - 手动切换 Selector 代理组
   ai-status                 - 查看 AI 专用路由状态
+  probe-stable-node [group] - 多轮探测并推荐更稳定的节点，默认 group 为 $AI_SG_GROUP
   menu                      - 打开交互式控制台
 
 命令级代理:
@@ -2097,6 +2195,9 @@ AI 路由控制:
   START_TIMEOUT             - 启动超时秒数
   TEST_URL                  - 健康检查 URL
   TEST_TIMEOUT              - 健康检查超时毫秒
+  STABLE_PROBE_URL          - 稳定性探测目标 URL
+  STABLE_PROBE_ROUNDS       - 稳定性探测轮数
+  STABLE_PROBE_TIMEOUT      - 稳定性探测单次超时毫秒
   PROXY_NO_PROXY            - 覆盖默认 NO_PROXY 列表
 
 示例:
@@ -2110,6 +2211,7 @@ AI 路由控制:
   ${cli_name} current "$AI_MANUAL_GROUP"
   ${cli_name} switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
   ${cli_name} ai-status
+  ${cli_name} probe-stable-node "$AI_SG_GROUP"
   ${cli_name} menu
 
   # 命令级代理
@@ -2173,6 +2275,10 @@ main() {
         test-group)
             shift
             test_group "$1" "$2"
+            ;;
+        probe-stable-node)
+            shift
+            probe_stable_node "$@"
             ;;
         menu|interactive)
             interactive_menu
