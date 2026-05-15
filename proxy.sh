@@ -23,9 +23,11 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-5000}"
 PROXY_NO_PROXY_DEFAULT="${PROXY_NO_PROXY_DEFAULT:-127.0.0.1,localhost}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SYSTEMD_SERVICE_NAME="${SYSTEMD_SERVICE_NAME:-clash-proxy.service}"
-STABLE_PROBE_URL="${STABLE_PROBE_URL:-https://chatgpt.com/backend-api/codex/responses/compact}"
+STABLE_PROBE_URL="${STABLE_PROBE_URL:-}"
 STABLE_PROBE_ROUNDS="${STABLE_PROBE_ROUNDS:-3}"
 STABLE_PROBE_TIMEOUT="${STABLE_PROBE_TIMEOUT:-8000}"
+STABLE_PROBE_PROFILE="${STABLE_PROBE_PROFILE:-codex}"
+STABLE_PROBE_HISTORY_FILE="${STABLE_PROBE_HISTORY_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/clash_proxy/stable_probe_history.jsonl}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==================== AI 规则配置 ====================
@@ -2028,11 +2030,14 @@ PY
 
 probe_stable_node() {
     local group_name=""
+    local profile="$STABLE_PROBE_PROFILE"
+    local strategy=""
     local probe_url="$STABLE_PROBE_URL"
     local rounds="$STABLE_PROBE_ROUNDS"
     local timeout="$STABLE_PROBE_TIMEOUT"
     local raw_mode=0
     local switch_mode=0
+    local record_history=0
     local helper=""
     local args=()
 
@@ -2045,6 +2050,26 @@ probe_stable_node() {
             --switch)
                 switch_mode=1
                 shift
+                ;;
+            --record-history)
+                record_history=1
+                shift
+                ;;
+            --profile)
+                if [ "$#" -lt 2 ]; then
+                    print_error "错误: --profile 需要参数"
+                    return 1
+                fi
+                profile="$2"
+                shift 2
+                ;;
+            --strategy)
+                if [ "$#" -lt 2 ]; then
+                    print_error "错误: --strategy 需要参数"
+                    return 1
+                fi
+                strategy="$2"
+                shift 2
                 ;;
             --url)
                 if [ "$#" -lt 2 ]; then
@@ -2071,7 +2096,7 @@ probe_stable_node() {
                 shift 2
                 ;;
             -h|--help)
-                echo "用法: ${CLASH_PROXY_CLI_NAME:-clash-proxy} probe-stable-node [group] [--url URL] [--rounds N] [--timeout MS] [--switch] [--raw]"
+                echo "用法: ${CLASH_PROXY_CLI_NAME:-clash-proxy} probe-stable-node [group] [--profile NAME] [--strategy NAME] [--url URL] [--rounds N] [--timeout MS] [--switch] [--record-history] [--raw]"
                 return 0
                 ;;
             -*)
@@ -2110,18 +2135,130 @@ probe_stable_node() {
         --controller "$(get_controller_url)"
         --secret "$(get_api_secret)"
         --group "$group_name"
-        --url "$probe_url"
+        --profile "$profile"
         --rounds "$rounds"
         --timeout "$timeout"
+        --history-file "$STABLE_PROBE_HISTORY_FILE"
     )
+    if [ -n "$probe_url" ]; then
+        args+=(--url "$probe_url")
+    fi
+    if [ -n "$strategy" ]; then
+        args+=(--strategy "$strategy")
+    fi
     if [ "$raw_mode" -eq 1 ]; then
         args+=(--raw)
     fi
     if [ "$switch_mode" -eq 1 ]; then
         args+=(--switch)
     fi
+    if [ "$record_history" -eq 1 ]; then
+        args+=(--record-history)
+    fi
 
     python3 "${args[@]}"
+}
+
+ai_use() {
+    local profile="codex"
+
+    if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+        profile="$1"
+        shift
+    fi
+
+    probe_stable_node --profile "$profile" --switch "$@"
+}
+
+shadow_probe() {
+    local profile="codex"
+
+    if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+        profile="$1"
+        shift
+    fi
+
+    probe_stable_node --profile "$profile" --record-history "$@"
+}
+
+guard_ai() {
+    local profile="codex"
+
+    if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then
+        profile="$1"
+        shift
+    fi
+    if [ "${1:-}" = "--" ]; then
+        shift
+    fi
+
+    probe_stable_node --profile "$profile" --switch || return 1
+    if [ "$#" -eq 0 ]; then
+        return 0
+    fi
+    with_proxy "$@"
+}
+
+ai_connections() {
+    local raw_mode=0
+    local helper=""
+    local args=()
+
+    if [ "${1:-}" = "--raw" ]; then
+        raw_mode=1
+    fi
+
+    for candidate in "$SCRIPT_DIR/ai_tools.py" "$SCRIPT_DIR/scripts/ai_tools.py" "$CONFIG_DIR/scripts/ai_tools.py"; do
+        if [ -f "$candidate" ]; then
+            helper="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$helper" ]; then
+        print_error "错误: 缺少 AI 诊断 helper: ai_tools.py"
+        return 1
+    fi
+
+    args=("$helper" --controller "$(get_controller_url)" --secret "$(get_api_secret)" connections)
+    if [ "$raw_mode" -eq 1 ]; then
+        args+=(--raw)
+    fi
+    python3 "${args[@]}"
+}
+
+incident_ai() {
+    local profile="codex"
+
+    if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+        profile="$1"
+    fi
+
+    echo "事件报告"
+    date "+time=%Y-%m-%dT%H:%M:%S%z"
+    echo "profile=$profile"
+    echo
+    echo "[service]"
+    if command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1; then
+        "$SYSTEMCTL_BIN" show "$SYSTEMD_SERVICE_NAME" --property=ActiveState,SubState,MainPID,NRestarts --no-pager 2>/dev/null || true
+    fi
+    pgrep -a "$PROG_NAME" 2>/dev/null || true
+    echo
+    echo "[ai-status]"
+    ai_status --raw || true
+    echo
+    echo "[probe]"
+    probe_stable_node --profile "$profile" --raw || true
+    echo
+    echo "[connections]"
+    ai_connections --raw || true
+    echo
+    echo "[recent-probe-history]"
+    if [ -f "$STABLE_PROBE_HISTORY_FILE" ]; then
+        tail -n 5 "$STABLE_PROBE_HISTORY_FILE"
+    else
+        echo "-"
+    fi
 }
 
 interactive_menu() {
@@ -2193,7 +2330,7 @@ usage() {
     cat << EOF
 ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
 
-用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|menu|proxy-env|with-proxy|proxy-shell}
+用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|ai-use|shadow-probe|guard|ai-connections|incident|menu|proxy-env|with-proxy|proxy-shell}
 
 配置与进程:
   render                    - 从原始配置生成运行配置
@@ -2210,7 +2347,12 @@ AI 路由控制:
   switch <group> <node>     - 手动切换 Selector 代理组
   ai-status                 - 查看 AI 专用路由状态
   probe-stable-node [group] - 多轮探测并推荐更稳定的节点，默认 group 为当前 AI 出口组
-  probe-stable-node [group] --switch - 推荐节点满足稳定门槛后才自动切换
+  probe-stable-node [group] --switch - 推荐节点稳定且明显更优时才自动切换
+  ai-use [profile]          - 按 codex/chatgpt/github/claude 场景探测并切换
+  shadow-probe [profile]    - 只探测并记录历史，不切换
+  guard [profile] [-- <cmd>] - 先选择稳定 AI 出口；带命令时再注入代理执行
+  ai-connections [--raw]    - 查看 AI/GitHub 相关活动连接
+  incident [profile]        - 输出 AI 出口故障排查报告
   menu                      - 打开交互式控制台
 
 命令级代理:
@@ -2234,8 +2376,10 @@ AI 路由控制:
   TEST_URL                  - 健康检查 URL
   TEST_TIMEOUT              - 健康检查超时毫秒
   STABLE_PROBE_URL          - 稳定性探测目标 URL
+  STABLE_PROBE_PROFILE      - 稳定性探测默认场景
   STABLE_PROBE_ROUNDS       - 稳定性探测轮数
   STABLE_PROBE_TIMEOUT      - 稳定性探测单次超时毫秒
+  STABLE_PROBE_HISTORY_FILE - 稳定性探测历史 JSONL 路径
   PROXY_NO_PROXY            - 覆盖默认 NO_PROXY 列表
 
 示例:
@@ -2250,6 +2394,12 @@ AI 路由控制:
   ${cli_name} switch "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP"
   ${cli_name} ai-status
   ${cli_name} probe-stable-node --switch
+  ${cli_name} ai-use codex
+  ${cli_name} shadow-probe codex
+  ${cli_name} guard codex
+  ${cli_name} guard codex -- curl https://chatgpt.com
+  ${cli_name} ai-connections
+  ${cli_name} incident codex
   ${cli_name} menu
 
   # 命令级代理
@@ -2317,6 +2467,26 @@ main() {
         probe-stable-node)
             shift
             probe_stable_node "$@"
+            ;;
+        ai-use)
+            shift
+            ai_use "$@"
+            ;;
+        shadow-probe)
+            shift
+            shadow_probe "$@"
+            ;;
+        guard)
+            shift
+            guard_ai "$@"
+            ;;
+        ai-connections)
+            shift
+            ai_connections "$@"
+            ;;
+        incident)
+            shift
+            incident_ai "$@"
             ;;
         menu|interactive)
             interactive_menu
