@@ -1,7 +1,7 @@
 import io
 import re
 
-from scripts.progress import ProgressBar
+from scripts.progress import ProgressBar, style_text
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -14,8 +14,9 @@ def _strip_ansi(value: str) -> str:
     return ANSI_RE.sub("", value)
 
 
-def test_progress_bar_renders_colored_left_aligned_updates(monkeypatch):
+def test_progress_bar_renders_plain_left_aligned_updates(monkeypatch):
     monkeypatch.setenv("CPROXY_COLOR", "always")
+    monkeypatch.setenv("FORCE_COLOR", "1")
     stream = io.StringIO()
     progress = ProgressBar(total=15, label="轮 1/5", count_width=2, stream=stream)
 
@@ -26,7 +27,7 @@ def test_progress_bar_renders_colored_left_aligned_updates(monkeypatch):
     output = stream.getvalue()
     plain_lines = [_strip_ansi(line) for line in _progress_lines(output)]
     assert "轮 1/5" in output
-    assert "\x1b[" in output
+    assert "\x1b[" not in output
     assert "████████████" in output
     assert "节点 A 120ms" not in output
     assert "节点 B 80ms" not in output
@@ -41,14 +42,11 @@ def test_progress_bar_renders_colored_left_aligned_updates(monkeypatch):
     assert next(iter(line_widths)) <= 36
 
 
-def test_progress_bar_honors_no_color(monkeypatch):
-    monkeypatch.setenv("CPROXY_COLOR", "never")
-    stream = io.StringIO()
-    progress = ProgressBar(total=4, label="轮1/1", stream=stream)
+def test_style_text_keeps_progress_copy_plain(monkeypatch):
+    monkeypatch.setenv("CPROXY_COLOR", "always")
+    monkeypatch.setenv("FORCE_COLOR", "1")
 
-    progress.finish()
-
-    assert "\x1b[" not in stream.getvalue()
+    assert style_text("完成 | 摘要如下", "green") == "完成 | 摘要如下"
 
 
 def test_progress_bar_disabled_is_silent():
