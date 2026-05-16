@@ -193,12 +193,13 @@ def test_probe_stable_node_human_mode_reports_progress(monkeypatch, capsys):
 
     assert rc == 0, stderr
     assert "探测进度: 目标组 AI-MANUAL，候选 3 个，计划 3 轮" in stderr
-    assert "第 1/3 轮 | United States 01 300ms" in stderr
-    assert "第 1/3 轮 | United States 02 80ms" in stderr
-    assert "第 1/3 轮 | Singapore 01 120ms" in stderr
-    assert "第 1/3 轮 | 完成，候选 3 个" in stderr
-    assert "1/3" in stderr
-    assert "3/3" in stderr
+    assert "第 1/3 轮" in stderr
+    assert "United States 01 300ms" in stderr
+    assert "United States 02 80ms" in stderr
+    assert "Singapore 01 120ms" in stderr
+    assert "完成，候选 3 个" in stderr
+    assert " 33%" in stderr
+    assert "100%" in stderr
     assert "探测进度: 下一轮保留 2 个，淘汰 1 个" in stderr
     assert "探测进度: 探测完成" in stderr
     assert "摘要" in stdout
