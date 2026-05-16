@@ -1,68 +1,60 @@
 import copy
+import importlib.util
 import json
-import os
-import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import sys
 from pathlib import Path
-from threading import Thread
 from urllib.parse import unquote, urlsplit
 
 
-class _ProbeHandler(BaseHTTPRequestHandler):
-    payload = {}
-    delays = {}
+def _load_probe_module():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "probe_stable_node.py"
+    script_dir = str(script.parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    spec = importlib.util.spec_from_file_location("probe_stable_node_under_test", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run_probe(monkeypatch, capsys, payload, delays, args):
+    module = _load_probe_module()
+    state_payload = copy.deepcopy(payload)
     puts = []
 
-    def do_GET(self):
-        parsed = urlsplit(self.path)
-        if parsed.path == "/version":
-            self._send({"version": "test"})
-            return
+    def fake_request_json(controller, secret, path, method="GET", payload=None):
+        parsed = urlsplit(path)
+        if method == "GET" and parsed.path == "/proxies":
+            return state_payload
 
-        if parsed.path == "/proxies":
-            self._send(self.payload)
-            return
-
-        if parsed.path.startswith("/proxies/") and parsed.path.endswith("/delay"):
+        if method == "GET" and parsed.path.startswith("/proxies/") and parsed.path.endswith("/delay"):
             target = parsed.path[len("/proxies/") : -len("/delay")]
             target = unquote(target)
-            if target in self.delays:
-                self._send({"delay": self.delays[target]})
-                return
+            if target in delays:
+                return {"delay": delays[target]}
+            raise RuntimeError(f"missing delay: {target}")
 
-        self.send_response(404)
-        self.end_headers()
-
-    def do_PUT(self):
-        parsed = urlsplit(self.path)
-        if parsed.path.startswith("/proxies/"):
+        if method == "PUT" and parsed.path.startswith("/proxies/"):
             group = unquote(parsed.path[len("/proxies/") :])
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length).decode("utf-8")
-            target = json.loads(body).get("name")
-            self.puts.append((group, target))
-            group_state = self.payload["proxies"].get(group)
+            target = payload["name"] if isinstance(payload, dict) else json.loads(payload).get("name")
+            puts.append((group, target))
+            group_state = state_payload["proxies"].get(group)
             if isinstance(group_state, dict):
                 group_state["now"] = target
-            self._send({})
-            return
+            return {}
 
-        self.send_response(404)
-        self.end_headers()
+        raise RuntimeError(f"unexpected request: {method} {path}")
 
-    def _send(self, data):
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        return
+    monkeypatch.setattr(module, "request_json", fake_request_json)
+    monkeypatch.setattr(sys, "argv", ["probe_stable_node.py", "--controller", "http://controller", *args])
+    rc = module.main()
+    captured = capsys.readouterr()
+    return rc, captured.out, captured.err, puts
 
 
-def test_probe_stable_node_defaults_to_all_ai_leaf_nodes_and_switches_path(tmp_path: Path):
+def test_probe_stable_node_defaults_to_all_ai_leaf_nodes_and_switches_path(monkeypatch, capsys):
     payload = {
         "proxies": {
             "AI-MANUAL": {
@@ -103,72 +95,111 @@ def test_probe_stable_node_defaults_to_all_ai_leaf_nodes_and_switches_path(tmp_p
         }
     }
 
-    _ProbeHandler.payload = copy.deepcopy(payload)
-    _ProbeHandler.delays = {
+    delays = {
         "🇺🇸 United States丨01": 300,
         "🇺🇸 United States丨02": 80,
         "🇸🇬 Singapore丨01": 120,
         "🇯🇵 Japan丨01": 200,
     }
-    _ProbeHandler.puts = []
+    rc, stdout, stderr, puts = _run_probe(
+        monkeypatch,
+        capsys,
+        payload,
+        delays,
+        [
+            "--profile",
+            "chatgpt",
+            "--strategy",
+            "aggressive",
+            "--rounds",
+            "3",
+            "--timeout",
+            "1000",
+            "--url",
+            "http://probe.local/ping",
+            "--raw",
+            "--switch",
+        ],
+    )
 
-    server = HTTPServer(("127.0.0.1", 0), _ProbeHandler)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    assert rc == 0, stderr
+    assert "探测进度" not in stderr
+    assert "GROUP\tAI-MANUAL" in stdout
+    assert "CURRENT\t🇯🇵 Japan丨01" in stdout
+    assert "BEST\t🇺🇸 United States丨02" in stdout
+    assert "NODE\t🇺🇸 United States丨01\tsuccess=1/1" in stdout
+    assert "NODE\t🇺🇸 United States丨02" in stdout
+    assert "NODE\t🇸🇬 Singapore丨01" in stdout
+    assert "NODE\t🇯🇵 Japan丨01" in stdout
+    assert "NODE\tAI-AUTO" not in stdout
+    assert "NODE\tAI-US" not in stdout
+    assert "NODE\tAI-SG" not in stdout
+    assert puts == [
+        ("AI-US", "🇺🇸 United States丨02"),
+        ("AI-AUTO", "AI-US"),
+        ("AI-MANUAL", "AI-AUTO"),
+    ]
 
-    try:
-        config_file = tmp_path / "runtime.yaml"
-        config_file.write_text(
-            f"external-controller: 127.0.0.1:{server.server_port}\n"
-            "mixed-port: 7890\n",
-            encoding="utf-8",
-        )
 
-        env = os.environ.copy()
-        env["RUNTIME_CONFIG_FILE"] = str(config_file)
-        env["SOURCE_CONFIG_FILE"] = str(config_file)
-        env["HOME"] = str(tmp_path)
+def test_probe_stable_node_human_mode_reports_progress(monkeypatch, capsys):
+    payload = {
+        "proxies": {
+            "AI-MANUAL": {
+                "type": "Selector",
+                "now": "AI-AUTO",
+                "all": ["AI-AUTO"],
+            },
+            "AI-AUTO": {
+                "type": "Fallback",
+                "now": "AI-US",
+                "all": ["AI-US", "AI-SG"],
+            },
+            "AI-US": {
+                "type": "Fallback",
+                "now": "🇺🇸 United States丨02",
+                "all": ["🇺🇸 United States丨01", "🇺🇸 United States丨02"],
+            },
+            "AI-SG": {
+                "type": "Fallback",
+                "now": "🇸🇬 Singapore丨01",
+                "all": ["🇸🇬 Singapore丨01"],
+            },
+        }
+    }
 
-        script = Path(__file__).resolve().parents[1] / "proxy.sh"
-        result = subprocess.run(
-            [
-                str(script),
-                "probe-stable-node",
-                "--profile",
-                "chatgpt",
-                "--strategy",
-                "aggressive",
-                "--rounds",
-                "3",
-                "--timeout",
-                "1000",
-                "--url",
-                "http://probe.local/ping",
-                "--raw",
-                "--switch",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=script.parent,
-            env=env,
-        )
+    delays = {
+        "🇺🇸 United States丨01": 300,
+        "🇺🇸 United States丨02": 80,
+        "🇸🇬 Singapore丨01": 120,
+    }
+    rc, stdout, stderr, _puts = _run_probe(
+        monkeypatch,
+        capsys,
+        payload,
+        delays,
+        [
+            "--profile",
+            "chatgpt",
+            "--strategy",
+            "aggressive",
+            "--rounds",
+            "3",
+            "--timeout",
+            "1000",
+            "--url",
+            "http://probe.local/ping",
+        ],
+    )
 
-        assert result.returncode == 0, result.stderr
-        assert "GROUP\tAI-MANUAL" in result.stdout
-        assert "CURRENT\t🇯🇵 Japan丨01" in result.stdout
-        assert "BEST\t🇺🇸 United States丨02" in result.stdout
-        assert "NODE\t🇺🇸 United States丨01\tsuccess=1/1" in result.stdout
-        assert "NODE\t🇺🇸 United States丨02" in result.stdout
-        assert "NODE\t🇸🇬 Singapore丨01" in result.stdout
-        assert "NODE\t🇯🇵 Japan丨01" in result.stdout
-        assert "NODE\tAI-AUTO" not in result.stdout
-        assert "NODE\tAI-US" not in result.stdout
-        assert "NODE\tAI-SG" not in result.stdout
-        assert _ProbeHandler.puts == [
-            ("AI-US", "🇺🇸 United States丨02"),
-            ("AI-AUTO", "AI-US"),
-            ("AI-MANUAL", "AI-AUTO"),
-        ]
-    finally:
-        server.shutdown()
-        thread.join()
+    assert rc == 0, stderr
+    assert "探测进度: 目标组 AI-MANUAL，候选 3 个，计划 3 轮" in stderr
+    assert "第 1/3 轮 | United States 01 300ms" in stderr
+    assert "第 1/3 轮 | United States 02 80ms" in stderr
+    assert "第 1/3 轮 | Singapore 01 120ms" in stderr
+    assert "第 1/3 轮 | 完成，候选 3 个" in stderr
+    assert "1/3" in stderr
+    assert "3/3" in stderr
+    assert "探测进度: 下一轮保留 2 个，淘汰 1 个" in stderr
+    assert "探测进度: 探测完成" in stderr
+    assert "摘要" in stdout
+    assert "推荐: United States 02" in stdout

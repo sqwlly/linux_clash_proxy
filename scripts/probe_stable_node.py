@@ -12,6 +12,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from progress import ProgressBar
+
 
 DEFAULT_GROUP = "AI-MANUAL"
 DEFAULT_URL = "https://chatgpt.com/backend-api/codex/responses/compact"
@@ -435,6 +437,7 @@ def summarize(
     url: str,
     rounds: int,
     timeout: int,
+    show_progress: bool = False,
 ) -> tuple[list[ProbeSummary], GroupState]:
     if rounds < 1:
         raise RuntimeError("--rounds 必须大于等于 1")
@@ -444,28 +447,45 @@ def summarize(
     group_state = load_group_state(controller, secret, group)
     results = {name: {"delays": [], "failures": 0} for name in group_state.candidates}
     active = set(group_state.candidates)
+    if show_progress:
+        print(f"探测进度: 目标组 {group}，候选 {len(group_state.candidates)} 个，计划 {rounds} 轮", file=sys.stderr)
 
     for round_index in range(rounds):
-        for name in group_state.candidates:
-            if name not in active:
-                continue
+        round_candidates = [name for name in group_state.candidates if name in active]
+        progress = ProgressBar(
+            total=len(round_candidates),
+            label=f"第 {round_index + 1}/{rounds} 轮",
+            enabled=show_progress,
+        )
 
+        for index, name in enumerate(round_candidates, start=1):
             delay = probe_delay(controller, secret, name, url, timeout)
             if delay is None:
                 results[name]["failures"] += 1
+                progress_result = "失败"
             else:
                 results[name]["delays"].append(delay)
+                progress_result = format_delay(delay)
+
+            progress.update(index, f"{normalize_name(name)} {progress_result}")
+
+        progress.finish(f"完成，候选 {len(round_candidates)} 个")
 
         if round_index < rounds - 1 and len(active) > 1:
+            before_count = len(active)
             active = active_candidates_after_round(
                 {name: results[name] for name in active},
                 group_state.current,
             )
+            if show_progress:
+                print(f"探测进度: 下一轮保留 {len(active)} 个，淘汰 {before_count - len(active)} 个", file=sys.stderr)
 
     summaries = [
         ProbeSummary(name=name, delays=list(item["delays"]), failures=int(item["failures"]))
         for name, item in results.items()
     ]
+    if show_progress:
+        print("探测进度: 探测完成", file=sys.stderr)
     return summaries, group_state
 
 
@@ -567,7 +587,15 @@ def main() -> int:
     options = resolve_options(args)
     rounds = resolve_rounds(args, options)
     try:
-        summaries, group_state = summarize(args.controller, args.secret, args.group, options.url, rounds, args.timeout)
+        summaries, group_state = summarize(
+            args.controller,
+            args.secret,
+            args.group,
+            options.url,
+            rounds,
+            args.timeout,
+            show_progress=not args.raw,
+        )
     except RuntimeError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1

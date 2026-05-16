@@ -164,6 +164,7 @@ main() {
     require_file "${PROJECT_DIR}/proxy.sh"
     require_file "${PROJECT_DIR}/update_config.sh"
     require_file "${PROJECT_DIR}/scripts/probe_stable_node.py"
+    require_file "${PROJECT_DIR}/scripts/progress.py"
     require_file "${PROJECT_DIR}/scripts/ai_tools.py"
     require_cmd install
     require_cmd mktemp
@@ -177,6 +178,7 @@ main() {
     install_payload "${PROJECT_DIR}/proxy.sh" "proxy.sh"
     install_payload "${PROJECT_DIR}/update_config.sh" "update_config.sh"
     install_payload "${PROJECT_DIR}/scripts/probe_stable_node.py" "probe_stable_node.py"
+    install_payload "${PROJECT_DIR}/scripts/progress.py" "progress.py"
     install_payload "${PROJECT_DIR}/scripts/ai_tools.py" "ai_tools.py"
 
     write_wrapper "clash-proxy" "${LIBDIR}/proxy.sh"

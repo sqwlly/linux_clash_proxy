@@ -134,6 +134,7 @@ def test_pyproject_declares_runtime_dependencies():
     data = tomllib.loads(Path("/root/clash_proxy/pyproject.toml").read_text(encoding="utf-8"))
     dependencies = data["project"].get("dependencies", [])
     assert "PyYAML>=6" in dependencies
+    assert "tqdm>=4" in dependencies
 
 
 def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
