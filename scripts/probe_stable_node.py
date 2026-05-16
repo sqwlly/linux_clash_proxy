@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from progress import ProgressBar
+from progress import ProgressBar, style_text
 
 
 DEFAULT_GROUP = "AI-MANUAL"
@@ -447,14 +447,16 @@ def summarize(
     group_state = load_group_state(controller, secret, group)
     results = {name: {"delays": [], "failures": 0} for name in group_state.candidates}
     active = set(group_state.candidates)
+    progress_count_width = len(str(len(group_state.candidates)))
     if show_progress:
-        print(f"探测进度: 目标组 {group}，候选 {len(group_state.candidates)} 个，计划 {rounds} 轮", file=sys.stderr)
+        print(style_text(f"探测 | {group} | {len(group_state.candidates)} 节点 | {rounds} 轮", "cyan"), file=sys.stderr)
 
     for round_index in range(rounds):
         round_candidates = [name for name in group_state.candidates if name in active]
         progress = ProgressBar(
             total=len(round_candidates),
-            label=f"第 {round_index + 1}/{rounds} 轮",
+            label=f"轮 {round_index + 1}/{rounds}",
+            count_width=progress_count_width,
             enabled=show_progress,
         )
 
@@ -462,14 +464,12 @@ def summarize(
             delay = probe_delay(controller, secret, name, url, timeout)
             if delay is None:
                 results[name]["failures"] += 1
-                progress_result = "失败"
             else:
                 results[name]["delays"].append(delay)
-                progress_result = format_delay(delay)
 
-            progress.update(index, f"{normalize_name(name)} {progress_result}")
+            progress.update(index)
 
-        progress.finish(f"完成，候选 {len(round_candidates)} 个")
+        progress.finish()
 
         if round_index < rounds - 1 and len(active) > 1:
             before_count = len(active)
@@ -478,14 +478,14 @@ def summarize(
                 group_state.current,
             )
             if show_progress:
-                print(f"探测进度: 下一轮保留 {len(active)} 个，淘汰 {before_count - len(active)} 个", file=sys.stderr)
+                print(style_text(f"筛选 | 保留 {len(active)} | 淘汰 {before_count - len(active)}", "yellow"), file=sys.stderr)
 
     summaries = [
         ProbeSummary(name=name, delays=list(item["delays"]), failures=int(item["failures"]))
         for name, item in results.items()
     ]
     if show_progress:
-        print("探测进度: 探测完成", file=sys.stderr)
+        print(style_text("完成 | 摘要如下", "green"), file=sys.stderr)
     return summaries, group_state
 
 
