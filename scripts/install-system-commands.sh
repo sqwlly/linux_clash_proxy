@@ -7,6 +7,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${BINDIR:-${PREFIX}/bin}"
 LIBDIR="${LIBDIR:-${PREFIX}/lib/clash-proxy}"
+DEFAULT_TMPDIR="${DEFAULT_TMPDIR:-${PROJECT_DIR}/.tmp}"
 DRY_RUN=0
 WITH_CPROXY_ALIAS=0
 
@@ -126,6 +127,12 @@ write_wrapper() {
     {
         printf '%s\n' '#!/bin/sh'
         printf '%s\n' 'WRAPPER_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
+        printf '%s\n' "DEFAULT_TMPDIR=\"${DEFAULT_TMPDIR}\""
+        printf '%s\n' 'if [ -z "${TMPDIR:-}" ]; then'
+        printf '%s\n' '    mkdir -p "$DEFAULT_TMPDIR" 2>/dev/null || true'
+        printf '%s\n' '    TMPDIR="$DEFAULT_TMPDIR"'
+        printf '%s\n' '    export TMPDIR'
+        printf '%s\n' 'fi'
         printf '%sCLASH_PROXY_CLI_NAME="%s" exec "${WRAPPER_DIR}/%s" "$@"\n' "$project_dir_env" "$command_name" "$relative_target"
     } > "$temp_file"
 
@@ -173,6 +180,7 @@ main() {
     if [ "$DRY_RUN" -eq 0 ]; then
         install -d -m 755 "$BINDIR"
         install -d -m 755 "$LIBDIR"
+        install -d -m 755 "$DEFAULT_TMPDIR"
     fi
 
     install_payload "${PROJECT_DIR}/proxy.sh" "proxy.sh"
