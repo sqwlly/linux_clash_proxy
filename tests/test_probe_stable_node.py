@@ -204,3 +204,20 @@ def test_probe_stable_node_human_mode_reports_progress(monkeypatch, capsys):
     assert "完成 | 摘要如下" in stderr
     assert "摘要" in stdout
     assert "推荐: United States 02" in stdout
+    assert "节点              成功  失败   平均   最大   最小  score" in stdout
+
+
+def test_result_table_lines_are_column_aligned():
+    module = _load_probe_module()
+    summaries = [
+        module.ProbeSummary("Japan 02", [184, 187, 178, 184, 187], 0),
+        module.ProbeSummary("United States 03", [216, 217], 0),
+        module.ProbeSummary("Singapore 04", [355], 0),
+    ]
+
+    assert module.result_table_lines(summaries, module.STRATEGIES["conservative"]) == [
+        "节点              成功  失败   平均   最大   最小  score",
+        "Japan 02           5/5     0  184ms  187ms  178ms     97",
+        "United States 03   2/2     0  216ms  217ms  216ms     96",
+        "Singapore 04       1/1     0  355ms  355ms  355ms     93",
+    ]

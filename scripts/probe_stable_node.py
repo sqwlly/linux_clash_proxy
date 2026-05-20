@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from math import ceil
 from urllib.error import HTTPError, URLError
@@ -303,6 +304,25 @@ def format_delay(value: int | None) -> str:
     return f"{value}ms" if value is not None else "-"
 
 
+def display_width(value: object) -> int:
+    width = 0
+    for char in str(value):
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def pad_right(value: object, width: int) -> str:
+    text = str(value)
+    return text + " " * max(0, width - display_width(text))
+
+
+def pad_left(value: object, width: int) -> str:
+    text = str(value)
+    return " " * max(0, width - display_width(text)) + text
+
+
 def stable_score(summary: ProbeSummary, rounds: int, strategy: Strategy) -> int:
     if rounds < 1:
         return 0
@@ -385,6 +405,50 @@ def summary_payload(summary: ProbeSummary, rounds: int, strategy: Strategy) -> d
         "min_ms": summary.min_delay,
         "score": stable_score(summary, rounds, strategy),
     }
+
+
+def result_table_lines(summaries: list[ProbeSummary], strategy: Strategy) -> list[str]:
+    rows = [
+        {
+            "name": normalize_name(item.name),
+            "success": f"{item.success_count}/{item.total_count}",
+            "failures": str(item.failures),
+            "avg": format_delay(item.avg_delay),
+            "max": format_delay(item.max_delay),
+            "min": format_delay(item.min_delay),
+            "score": str(stable_score(item, item.total_count, strategy)),
+        }
+        for item in sorted(summaries, key=lambda value: value.rank_key())
+    ]
+    headers = {
+        "name": "节点",
+        "success": "成功",
+        "failures": "失败",
+        "avg": "平均",
+        "max": "最大",
+        "min": "最小",
+        "score": "score",
+    }
+    widths = {
+        key: max([display_width(headers[key]), *(display_width(row[key]) for row in rows)])
+        for key in headers
+    }
+    widths["name"] = max(widths["name"], 16)
+
+    def render(values: dict[str, str]) -> str:
+        return "  ".join(
+            [
+                pad_right(values["name"], widths["name"]),
+                pad_left(values["success"], widths["success"]),
+                pad_left(values["failures"], widths["failures"]),
+                pad_left(values["avg"], widths["avg"]),
+                pad_left(values["max"], widths["max"]),
+                pad_left(values["min"], widths["min"]),
+                pad_left(values["score"], widths["score"]),
+            ]
+        )
+
+    return [render(headers), *(render(row) for row in rows)]
 
 
 def record_history(
@@ -570,16 +634,8 @@ def render_human(
         print(f"切换: 未切换 ({skip_reason})")
     print()
     print("结果")
-    for item in sorted(summaries, key=lambda value: value.rank_key()):
-        print(
-            f"{normalize_name(item.name)}  "
-            f"成功 {item.success_count}/{item.total_count}  "
-            f"失败 {item.failures}  "
-            f"平均 {format_delay(item.avg_delay)}  "
-            f"最大 {format_delay(item.max_delay)}  "
-            f"最小 {format_delay(item.min_delay)}  "
-            f"score {stable_score(item, item.total_count, options.strategy)}"
-        )
+    for line in result_table_lines(summaries, options.strategy):
+        print(line)
 
 
 def main() -> int:
