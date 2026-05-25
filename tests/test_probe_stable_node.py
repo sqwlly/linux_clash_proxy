@@ -127,7 +127,7 @@ def test_probe_stable_node_defaults_to_all_ai_leaf_nodes_and_switches_path(monke
     assert "GROUP\tAI-MANUAL" in stdout
     assert "CURRENT\t🇯🇵 Japan丨01" in stdout
     assert "BEST\t🇺🇸 United States丨02" in stdout
-    assert "NODE\t🇺🇸 United States丨01\tsuccess=1/1" in stdout
+    assert "NODE\t🇺🇸 United States丨01\tsuccess=1/3" in stdout
     assert "NODE\t🇺🇸 United States丨02" in stdout
     assert "NODE\t🇸🇬 Singapore丨01" in stdout
     assert "NODE\t🇯🇵 Japan丨01" in stdout
@@ -215,9 +215,23 @@ def test_result_table_lines_are_column_aligned():
         module.ProbeSummary("Singapore 04", [355], 0),
     ]
 
-    assert module.result_table_lines(summaries, module.STRATEGIES["conservative"]) == [
+    assert module.result_table_lines(summaries, 5, module.STRATEGIES["conservative"]) == [
         "节点              成功  失败   平均   最大   最小  score",
         "Japan 02           5/5     0  184ms  187ms  178ms     97",
-        "United States 03   2/2     0  216ms  217ms  216ms     96",
-        "Singapore 04       1/1     0  355ms  355ms  355ms     93",
+        "United States 03   2/5     0  216ms  217ms  216ms     36",
+        "Singapore 04       1/5     0  355ms  355ms  355ms     13",
+    ]
+
+
+def test_result_table_scores_early_eliminated_nodes_against_requested_rounds():
+    module = _load_probe_module()
+    summaries = [
+        module.ProbeSummary("Full", [100, 100, 100, 100, 100], 0),
+        module.ProbeSummary("Early", [80], 0),
+    ]
+
+    assert module.result_table_lines(summaries, 5, module.STRATEGIES["conservative"]) == [
+        "节点              成功  失败   平均   最大   最小  score",
+        "Full               5/5     0  100ms  100ms  100ms     98",
+        "Early              1/5     0   80ms   80ms   80ms     19",
     ]

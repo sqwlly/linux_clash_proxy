@@ -407,16 +407,16 @@ def summary_payload(summary: ProbeSummary, rounds: int, strategy: Strategy) -> d
     }
 
 
-def result_table_lines(summaries: list[ProbeSummary], strategy: Strategy) -> list[str]:
+def result_table_lines(summaries: list[ProbeSummary], rounds: int, strategy: Strategy) -> list[str]:
     rows = [
         {
             "name": normalize_name(item.name),
-            "success": f"{item.success_count}/{item.total_count}",
+            "success": f"{item.success_count}/{rounds}",
             "failures": str(item.failures),
             "avg": format_delay(item.avg_delay),
             "max": format_delay(item.max_delay),
             "min": format_delay(item.min_delay),
-            "score": str(stable_score(item, item.total_count, strategy)),
+            "score": str(stable_score(item, rounds, strategy)),
         }
         for item in sorted(summaries, key=lambda value: value.rank_key())
     ]
@@ -578,9 +578,9 @@ def render_raw(
     if best:
         print(
             "BEST\t"
-            f"{best.name}\tsuccess={best.success_count}/{best.total_count}"
+            f"{best.name}\tsuccess={best.success_count}/{rounds}"
             f"\tfailures={best.failures}\tavg={format_delay(best.avg_delay)}\tmax={format_delay(best.max_delay)}"
-            f"\tscore={stable_score(best, best.total_count, options.strategy)}"
+            f"\tscore={stable_score(best, rounds, options.strategy)}"
         )
         if switched:
             print(f"SWITCH\t{group}\t{best.name}")
@@ -589,10 +589,10 @@ def render_raw(
     for item in sorted(summaries, key=lambda value: value.rank_key()):
         print(
             "NODE\t"
-            f"{item.name}\tsuccess={item.success_count}/{item.total_count}"
+            f"{item.name}\tsuccess={item.success_count}/{rounds}"
             f"\tfailures={item.failures}\tavg={format_delay(item.avg_delay)}"
             f"\tmax={format_delay(item.max_delay)}\tmin={format_delay(item.min_delay)}"
-            f"\tscore={stable_score(item, item.total_count, options.strategy)}"
+            f"\tscore={stable_score(item, rounds, options.strategy)}"
         )
 
 
@@ -621,9 +621,9 @@ def render_human(
     if best:
         print(
             f"推荐: {normalize_name(best.name)} "
-            f"(成功 {best.success_count}/{best.total_count}, "
+            f"(成功 {best.success_count}/{rounds}, "
             f"失败 {best.failures}, 平均 {format_delay(best.avg_delay)}, 最大 {format_delay(best.max_delay)})"
-            f" score={stable_score(best, best.total_count, options.strategy)}"
+            f" score={stable_score(best, rounds, options.strategy)}"
         )
     else:
         print("推荐: -")
@@ -634,7 +634,7 @@ def render_human(
         print(f"切换: 未切换 ({skip_reason})")
     print()
     print("结果")
-    for line in result_table_lines(summaries, options.strategy):
+    for line in result_table_lines(summaries, rounds, options.strategy):
         print(line)
 
 
