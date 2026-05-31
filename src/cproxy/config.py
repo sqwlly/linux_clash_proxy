@@ -16,9 +16,14 @@ class AppPaths:
 
 def default_paths(home: Path | None = None) -> AppPaths:
     base_home = home or Path.home()
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", base_home / ".config"))
-    data_home = Path(os.environ.get("XDG_DATA_HOME", base_home / ".local" / "share"))
-    state_home = Path(os.environ.get("XDG_STATE_HOME", base_home / ".local" / "state"))
+    if home is None:
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", base_home / ".config"))
+        data_home = Path(os.environ.get("XDG_DATA_HOME", base_home / ".local" / "share"))
+        state_home = Path(os.environ.get("XDG_STATE_HOME", base_home / ".local" / "state"))
+    else:
+        config_home = base_home / ".config"
+        data_home = base_home / ".local" / "share"
+        state_home = base_home / ".local" / "state"
     return AppPaths(
         config_dir=config_home / "cproxy",
         data_dir=data_home / "cproxy",

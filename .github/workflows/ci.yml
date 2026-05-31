@@ -20,6 +20,7 @@ jobs:
           if [ ! -e "/root/clash_proxy" ]; then
             sudo ln -s "$GITHUB_WORKSPACE" "/root/clash_proxy"
           fi
+          sudo chmod o+x "/root"
 
       - name: Install package with TUI extra
         run: python -m pip install -e ".[tui]" pytest
@@ -64,7 +65,7 @@ jobs:
         run: cyclonedx-py environment --output-file sbom.cdx.json
 
       - name: Scorecard
-        uses: ossf/scorecard-action@v2
+        uses: ossf/scorecard-action@v2.4.3
         with:
           results_file: scorecard.sarif
           results_format: sarif
