@@ -41,6 +41,13 @@ class ConfigEditorScreen(Widget):
                 yield Label("─", id="config-log", classes="action-status")
 
     def on_mount(self) -> None:
+        if not list(self.app.query("#main-tabs")):
+            self._load_config()
+
+    def refresh_data(self) -> None:
+        if self._modified:
+            self.query_one("#config-log", Label).update("[#f6c177]Config modified; refresh skipped[/]")
+            return
         self._load_config()
 
     def _load_config(self) -> None:

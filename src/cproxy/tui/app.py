@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -47,7 +49,7 @@ class CProxyApp(App):
 
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
-        Binding("ctrl+r", "refresh_all", "Refresh", priority=True),
+        Binding("ctrl+r", "refresh_all", "Refresh Page", priority=True),
         Binding("[", "previous_tab", "Prev Tab", priority=True),
         Binding("]", "next_tab", "Next Tab", priority=True),
         Binding("ctrl+left", "previous_tab", "Prev Tab", priority=True),
@@ -67,6 +69,13 @@ class CProxyApp(App):
     def __init__(self, paths: AppPaths | None = None):
         super().__init__()
         self.paths = paths or default_paths()
+        self._last_refresh_by_tab: dict[str, float] = {}
+
+    def on_mount(self) -> None:
+        self._apply_density_class()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._apply_density_class(event.size.width)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -91,21 +100,41 @@ class CProxyApp(App):
                 yield LogsScreen(self.paths)
         yield Footer()
 
+    def _apply_density_class(self, width: int | None = None) -> None:
+        terminal_width = width if width is not None else self.size.width
+        self.set_class(terminal_width < 100, "compact")
+
     def action_refresh_all(self) -> None:
-        for screen in self.query(DashboardScreen):
-            screen.refresh_data()
-        for screen in self.query(ProxiesScreen):
-            screen.refresh_data()
-        for screen in self.query(ProvidersScreen):
-            screen.refresh_data()
-        for screen in self.query(ConnectionsScreen):
-            screen.refresh_data()
-        for screen in self.query(AIRouteScreen):
-            screen.refresh_data()
+        self._refresh_active_page(force=True)
+
+    def _refresh_active_page(self, force: bool = False) -> None:
+        tabbed = self.query_one(TabbedContent)
+        now = time.monotonic()
+        last_refresh = self._last_refresh_by_tab.get(tabbed.active, 0)
+        if not force and now - last_refresh < 1:
+            return
+        self._last_refresh_by_tab[tabbed.active] = now
+        refresh_targets = {
+            "dashboard": (DashboardScreen, "refresh_data"),
+            "proxies": (ProxiesScreen, "refresh_data"),
+            "providers": (ProvidersScreen, "refresh_data"),
+            "connections": (ConnectionsScreen, "refresh_data"),
+            "ai-route": (AIRouteScreen, "refresh_data"),
+            "subscriptions": (SubscriptionsScreen, "refresh_data"),
+            "config": (ConfigEditorScreen, "refresh_data"),
+            "system-proxy": (SystemProxyScreen, "refresh_data"),
+            "logs": (LogsScreen, "refresh_data"),
+        }
+        target = refresh_targets.get(tabbed.active)
+        if target is None:
+            return
+        target_type, refresh_action = target
+        for screen in self.query(target_type):
+            getattr(screen, refresh_action)()
+            return
 
     def action_switch_tab(self, tab_id: str) -> None:
-        tabbed = self.query_one(TabbedContent)
-        tabbed.active = tab_id
+        self._set_active_tab(tab_id)
 
     def action_next_tab(self) -> None:
         self._move_tab(1)
@@ -117,10 +146,18 @@ class CProxyApp(App):
         tabbed = self.query_one(TabbedContent)
         current = tabbed.active
         if current not in self.TAB_ORDER:
-            tabbed.active = self.TAB_ORDER[0]
+            self._set_active_tab(self.TAB_ORDER[0])
             return
         index = self.TAB_ORDER.index(current)
-        tabbed.active = self.TAB_ORDER[(index + offset) % len(self.TAB_ORDER)]
+        self._set_active_tab(self.TAB_ORDER[(index + offset) % len(self.TAB_ORDER)])
+
+    def _set_active_tab(self, tab_id: str) -> None:
+        tabbed = self.query_one(TabbedContent)
+        tabbed.active = tab_id
+        self.call_later(self._refresh_active_page)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        self.call_later(self._refresh_active_page)
 
     def on_key(self, event: events.Key) -> None:
         focused = self.focused

@@ -75,8 +75,9 @@ class DashboardScreen(Widget):
 
     def refresh_data(self) -> None:
         self._update_status()
-        self._update_ai_route()
-        self._update_traffic()
+        service = QueryService(self.paths)
+        self._update_ai_route(service)
+        self._update_traffic(service)
 
     def _update_status(self) -> None:
         try:
@@ -89,9 +90,8 @@ class DashboardScreen(Widget):
         except Exception as e:
             self.query_one("#dash-status", Label).update(f"[#fb7185]Error: {e}[/]")
 
-    def _update_ai_route(self) -> None:
+    def _update_ai_route(self, service: QueryService) -> None:
         try:
-            service = QueryService(self.paths)
             groups = service.get_ai_status_groups()
             self.query_one("#dash-api-status", Label).update("[#a3e635]● Connected[/]")
 
@@ -129,9 +129,8 @@ class DashboardScreen(Widget):
         except Exception:
             pass
 
-    def _update_traffic(self) -> None:
+    def _update_traffic(self, service: QueryService) -> None:
         try:
-            service = QueryService(self.paths)
             api = service.api
             data = api.request("GET", "/connections")
             upload_total = data.get("uploadTotal", 0)

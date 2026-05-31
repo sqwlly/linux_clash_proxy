@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -155,6 +156,7 @@ class SubscriptionsScreen(Widget):
     def __init__(self, paths: AppPaths, **kwargs):
         super().__init__(**kwargs)
         self.paths = paths
+        self._subscription_running = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -167,17 +169,17 @@ class SubscriptionsScreen(Widget):
                     id="sub-url-input",
                     classes="subscription-input",
                 )
-                yield Input(
-                    placeholder="Group name (optional, e.g. CyberGuard)",
-                    id="sub-group-input",
-                    classes="subscription-input",
-                )
-                yield Input(
-                    placeholder="Attach to selector (optional, e.g. AI-MANUAL)",
-                    id="sub-attach-input",
-                    classes="subscription-input",
-                )
-                with Horizontal(classes="toolbar"):
+                with Horizontal(classes="input-row"):
+                    yield Input(
+                        placeholder="Group name (optional)",
+                        id="sub-group-input",
+                        classes="subscription-input",
+                    )
+                    yield Input(
+                        placeholder="Attach to selector (optional)",
+                        id="sub-attach-input",
+                        classes="subscription-input",
+                    )
                     yield Button("Preview", id="btn-sub-preview", classes="action-button muted-button")
                     yield Button("Apply", id="btn-sub-apply", classes="action-button success-button")
                     yield Button("Validate", id="btn-sub-update", classes="action-button primary-button")
@@ -202,6 +204,10 @@ class SubscriptionsScreen(Widget):
         groups_table.add_columns("Group", "Type", "Nodes", "Attached")
         groups_table.cursor_type = "row"
         groups_table.show_header = True
+        if not list(self.app.query("#main-tabs")):
+            self._load_current_info()
+
+    def refresh_data(self) -> None:
         self._load_current_info()
 
     def _load_current_info(self) -> None:
@@ -241,6 +247,8 @@ class SubscriptionsScreen(Widget):
             self._update_config()
 
     def _import_subscription(self, dry_run: bool) -> None:
+        if self._subscription_running:
+            return
         url_input = self.query_one("#sub-url-input", Input)
         group_input = self.query_one("#sub-group-input", Input)
         attach_input = self.query_one("#sub-attach-input", Input)
@@ -293,33 +301,71 @@ class SubscriptionsScreen(Widget):
             if not dry_run:
                 refresh_script = write_user_refresh_script()
                 env = build_import_update_env(self.paths, refresh_script, clash_proxy)
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-            output.load_text(
-                format_subscription_result(
-                    result.stdout,
-                    result.stderr,
-                    result.returncode,
-                    dry_run=dry_run,
-                    group=group,
-                    attach_to=attach_to,
-                )
-            )
-
-            if result.returncode == 0 and not dry_run:
-                self._load_current_info()
-                self.notify("Subscription imported", severity="information")
-
-        except subprocess.TimeoutExpired:
-            output.load_text("Error: Command timeout (30s)")
+            self._set_subscription_busy(True)
+            threading.Thread(
+                target=self._import_subscription_worker,
+                args=(cmd, env, dry_run, group, attach_to, refresh_script),
+                daemon=True,
+            ).start()
         except Exception as e:
             output.load_text(f"Error: {e}")
+            self._set_subscription_busy(False)
+
+    def _import_subscription_worker(
+        self,
+        cmd: list[str],
+        env: dict[str, str] | None,
+        dry_run: bool,
+        group: str,
+        attach_to: str,
+        refresh_script: Path | None,
+    ) -> None:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+            output_text = format_subscription_result(
+                result.stdout,
+                result.stderr,
+                result.returncode,
+                dry_run=dry_run,
+                group=group,
+                attach_to=attach_to,
+            )
+            self._call_from_subscription_thread(
+                self._finish_import_subscription,
+                output_text,
+                result.returncode == 0 and not dry_run,
+            )
+        except subprocess.TimeoutExpired:
+            self._call_from_subscription_thread(self._fail_subscription_command, "Error: Command timeout (30s)")
+        except Exception as e:
+            self._call_from_subscription_thread(self._fail_subscription_command, f"Error: {e}")
         finally:
             if refresh_script is not None:
                 refresh_script.unlink(missing_ok=True)
 
+    def _finish_import_subscription(self, output_text: str, imported: bool) -> None:
+        if not self.is_mounted:
+            self._subscription_running = False
+            return
+        self.query_one("#sub-output", TextArea).load_text(output_text)
+        self._set_subscription_busy(False)
+        if imported:
+            self._load_current_info()
+            self.notify("Subscription imported", severity="information")
+
+    def _fail_subscription_command(self, output_text: str) -> None:
+        if not self.is_mounted:
+            self._subscription_running = False
+            return
+        self.query_one("#sub-output", TextArea).load_text(output_text)
+        self._set_subscription_busy(False)
+
     def _update_config(self) -> None:
         output = self.query_one("#sub-output", TextArea)
         config_path = config_file(self.paths)
+
+        if self._subscription_running:
+            return
 
         if not config_path.exists():
             output.load_text(f"Config not found: {config_path}")
@@ -333,6 +379,10 @@ class SubscriptionsScreen(Widget):
         cmd = [update_script, "--dry-run", str(config_path)]
         output.load_text(f"Running: {' '.join(cmd)}\n\nPlease wait...")
 
+        self._set_subscription_busy(True)
+        threading.Thread(target=self._validate_config_worker, args=(cmd,), daemon=True).start()
+
+    def _validate_config_worker(self, cmd: list[str]) -> None:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             output_text = ""
@@ -340,6 +390,24 @@ class SubscriptionsScreen(Widget):
                 output_text += result.stdout
             if result.stderr:
                 output_text += "\n" + result.stderr
-            output.load_text(output_text or "Validation passed")
+            self._call_from_subscription_thread(self._finish_validate_config, output_text or "Validation passed")
         except Exception as e:
-            output.load_text(f"Error: {e}")
+            self._call_from_subscription_thread(self._fail_subscription_command, f"Error: {e}")
+
+    def _finish_validate_config(self, output_text: str) -> None:
+        if not self.is_mounted:
+            self._subscription_running = False
+            return
+        self.query_one("#sub-output", TextArea).load_text(output_text)
+        self._set_subscription_busy(False)
+
+    def _call_from_subscription_thread(self, callback, *args) -> None:
+        try:
+            self.app.call_from_thread(callback, *args)
+        except Exception:
+            self._subscription_running = False
+
+    def _set_subscription_busy(self, busy: bool) -> None:
+        self._subscription_running = busy
+        for selector in ("#btn-sub-preview", "#btn-sub-apply", "#btn-sub-update"):
+            self.query_one(selector, Button).disabled = busy

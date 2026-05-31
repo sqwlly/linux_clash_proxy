@@ -25,24 +25,25 @@ class SystemProxyScreen(Widget):
         with Vertical():
             yield Label("System Proxy", classes="page-title")
 
-            with Vertical(classes="panel form-panel"):
-                yield Label("Session", classes="panel-title")
-                with Horizontal(classes="field-row"):
-                    yield Label("HTTP", classes="label-key")
-                    yield Switch(id="switch-http", value=False)
-                    yield Label("─", id="http-proxy-label", classes="metric-value")
-                with Horizontal(classes="field-row"):
-                    yield Label("HTTPS", classes="label-key")
-                    yield Switch(id="switch-https", value=False)
-                    yield Label("─", id="https-proxy-label", classes="metric-value")
-                with Horizontal(classes="field-row"):
-                    yield Label("ALL", classes="label-key")
-                    yield Switch(id="switch-all", value=False)
-                    yield Label("─", id="all-proxy-label", classes="metric-value")
+            with Horizontal(classes="workbench-row compact-row"):
+                with Vertical(classes="panel form-panel split-main"):
+                    yield Label("Session", classes="panel-title")
+                    with Horizontal(classes="field-row"):
+                        yield Label("HTTP", classes="label-key")
+                        yield Switch(id="switch-http", value=False)
+                        yield Label("─", id="http-proxy-label", classes="metric-value")
+                    with Horizontal(classes="field-row"):
+                        yield Label("HTTPS", classes="label-key")
+                        yield Switch(id="switch-https", value=False)
+                        yield Label("─", id="https-proxy-label", classes="metric-value")
+                    with Horizontal(classes="field-row"):
+                        yield Label("ALL", classes="label-key")
+                        yield Switch(id="switch-all", value=False)
+                        yield Label("─", id="all-proxy-label", classes="metric-value")
 
-            with Vertical(classes="panel summary-panel"):
-                yield Label("Environment", classes="panel-title")
-                yield Label("─", id="env-status", classes="current-info")
+                with Vertical(classes="panel summary-panel split-sidebar"):
+                    yield Label("Environment", classes="panel-title")
+                    yield Label("─", id="env-status", classes="current-info")
 
             with Vertical(classes="panel output-panel"):
                 yield Label("Persist", classes="panel-title")
@@ -54,6 +55,10 @@ class SystemProxyScreen(Widget):
                 yield Label("─", id="proxy-action-status", classes="action-status")
 
     def on_mount(self) -> None:
+        if not list(self.app.query("#main-tabs")):
+            self._refresh_status()
+
+    def refresh_data(self) -> None:
         self._refresh_status()
 
     def _get_proxy_addr(self) -> str:

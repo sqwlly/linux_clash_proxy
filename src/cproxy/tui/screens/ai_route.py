@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -23,6 +25,7 @@ class AIRouteScreen(Widget):
     def __init__(self, paths: AppPaths, **kwargs):
         super().__init__(**kwargs)
         self.paths = paths
+        self._probe_running = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -59,7 +62,8 @@ class AIRouteScreen(Widget):
         probe_table = self.query_one("#ai-probe-table", DataTable)
         probe_table.add_columns("Target", "Status", "Detail")
         probe_table.show_header = True
-        self.call_later(self.refresh_data)
+        if not list(self.app.query("#main-tabs")):
+            self.call_later(self.refresh_data)
 
     def refresh_data(self) -> None:
         try:
@@ -129,30 +133,59 @@ class AIRouteScreen(Widget):
             self.action_switch_us_sg()
 
     def action_probe_ai(self) -> None:
+        if self._probe_running:
+            return
+        self._probe_running = True
+        self.query_one("#ai-probe-status", Label).update("[#f6c177]◐ Probing...[/]")
+        self.query_one("#btn-ai-probe", Button).disabled = True
+        threading.Thread(target=self._probe_ai_worker, daemon=True).start()
+
+    def _probe_ai_worker(self) -> None:
         try:
             report = run_ai_probe(self.paths)
-            probe_table = self.query_one("#ai-probe-table", DataTable)
-            probe_table.clear()
-
-            for item in report.results:
-                status = "[#a3e635]● OK[/]" if item.ok else "[#fb7185]○ FAIL[/]"
-                probe_table.add_row(item.name, status, item.detail or item.url)
-
-            ok_count = sum(1 for item in report.results if item.ok)
-            total = len(report.results)
-
-            if ok_count == total:
-                probe_status = f"[#a3e635]● {ok_count}/{total} OK[/]"
-            elif ok_count == 0:
-                probe_status = f"[#fb7185]○ {ok_count}/{total} Failed[/]"
-            else:
-                probe_status = f"[#f6c177]◐ {ok_count}/{total} Partial[/]"
-            self.query_one("#ai-probe-status", Label).update(probe_status)
-
-            self.notify("Probe complete", severity="information")
-
+            self._call_from_probe_thread(self._finish_probe_ai, report)
         except Exception as e:
-            self.notify(f"Probe failed: {e}", severity="error")
+            self._call_from_probe_thread(self._fail_probe_ai, e)
+
+    def _call_from_probe_thread(self, callback, *args) -> None:
+        try:
+            self.app.call_from_thread(callback, *args)
+        except Exception:
+            self._probe_running = False
+
+    def _finish_probe_ai(self, report) -> None:
+        if not self.is_mounted:
+            self._probe_running = False
+            return
+        probe_table = self.query_one("#ai-probe-table", DataTable)
+        probe_table.clear()
+
+        for item in report.results:
+            status = "[#a3e635]● OK[/]" if item.ok else "[#fb7185]○ FAIL[/]"
+            probe_table.add_row(item.name, status, item.detail or item.url)
+
+        ok_count = sum(1 for item in report.results if item.ok)
+        total = len(report.results)
+
+        if ok_count == total:
+            probe_status = f"[#a3e635]● {ok_count}/{total} OK[/]"
+        elif ok_count == 0:
+            probe_status = f"[#fb7185]○ {ok_count}/{total} Failed[/]"
+        else:
+            probe_status = f"[#f6c177]◐ {ok_count}/{total} Partial[/]"
+        self.query_one("#ai-probe-status", Label).update(probe_status)
+        self.query_one("#btn-ai-probe", Button).disabled = False
+        self._probe_running = False
+        self.notify("Probe complete", severity="information")
+
+    def _fail_probe_ai(self, error: Exception) -> None:
+        if not self.is_mounted:
+            self._probe_running = False
+            return
+        self.query_one("#ai-probe-status", Label).update(f"[#fb7185]Probe failed: {error}[/]")
+        self.query_one("#btn-ai-probe", Button).disabled = False
+        self._probe_running = False
+        self.notify(f"Probe failed: {error}", severity="error")
 
     def action_switch_us_sg(self) -> None:
         try:

@@ -13,6 +13,9 @@ from ..widgets import NavigationTextArea as TextArea
 
 
 class LogsScreen(Widget):
+    INITIAL_LINE_LIMIT = 500
+    FOLLOW_LINE_LIMIT = 1000
+
     BINDINGS = [
         Binding("c", "clear_logs", "Clear"),
         Binding("f", "toggle_follow", "Follow"),
@@ -26,6 +29,7 @@ class LogsScreen(Widget):
         self._stop_event = threading.Event()
         self._tail_thread: threading.Thread | None = None
         self._last_pos = 0
+        self._log_lines: list[str] = []
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -51,8 +55,8 @@ class LogsScreen(Widget):
         except Exception:
             pass
 
-        self._load_logs()
-        self._start_tail()
+        if not list(self.app.query("#main-tabs")):
+            self.refresh_data()
 
     def on_unmount(self) -> None:
         self._stop_event.set()
@@ -70,10 +74,10 @@ class LogsScreen(Widget):
         try:
             content = log_path.read_text(encoding="utf-8", errors="replace")
             lines = content.splitlines()
-            max_lines = 500
-            if len(lines) > max_lines:
-                lines = lines[-max_lines:]
+            if len(lines) > self.INITIAL_LINE_LIMIT:
+                lines = lines[-self.INITIAL_LINE_LIMIT:]
 
+            self._log_lines = lines
             viewer.load_text("\n".join(lines))
             self._last_pos = log_path.stat().st_size
 
@@ -84,6 +88,9 @@ class LogsScreen(Widget):
             viewer.load_text(f"Error reading logs: {e}")
 
     def _start_tail(self) -> None:
+        if self._tail_thread and self._tail_thread.is_alive():
+            return
+
         def tail_loop():
             log_path = log_file(self.paths)
             while not self._stop_event.wait(1):
@@ -112,25 +119,27 @@ class LogsScreen(Widget):
         self._tail_thread = threading.Thread(target=tail_loop, daemon=True)
         self._tail_thread.start()
 
+    def refresh_data(self) -> None:
+        self._load_logs()
+        self._start_tail()
+
     def _append_log(self, content: str) -> None:
         viewer = self.query_one("#log-viewer", TextArea)
-        current = viewer.text
-        new_text = current + "\n" + content.rstrip() if current else content.rstrip()
+        new_lines = content.rstrip().splitlines()
+        if not new_lines:
+            return
+        self._log_lines.extend(new_lines)
+        if len(self._log_lines) > self.FOLLOW_LINE_LIMIT:
+            self._log_lines = self._log_lines[-self.FOLLOW_LINE_LIMIT:]
 
-        lines = new_text.splitlines()
-        max_lines = 1000
-        if len(lines) > max_lines:
-            lines = lines[-max_lines:]
-            new_text = "\n".join(lines)
-
-        viewer.load_text(new_text)
+        viewer.load_text("\n".join(self._log_lines))
 
         if self._following:
-            viewer.move_cursor((len(lines), 0))
+            viewer.move_cursor((len(self._log_lines), 0))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-log-clear":
-            self.query_one("#log-viewer", TextArea).load_text("")
+            self._clear_log_viewer()
         elif event.button.id == "btn-log-refresh":
             self._load_logs()
 
@@ -141,6 +150,10 @@ class LogsScreen(Widget):
             self.query_one("#log-status-label", Label).update(status)
 
     def action_clear_logs(self) -> None:
+        self._clear_log_viewer()
+
+    def _clear_log_viewer(self) -> None:
+        self._log_lines = []
         self.query_one("#log-viewer", TextArea).load_text("")
 
     def action_toggle_follow(self) -> None:
@@ -150,4 +163,4 @@ class LogsScreen(Widget):
         self.query_one("#log-status-label", Label).update(status)
 
     def action_refresh_logs(self) -> None:
-        self._load_logs()
+        self.refresh_data()

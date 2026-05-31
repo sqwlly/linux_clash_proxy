@@ -56,7 +56,8 @@ class ProxiesScreen(Widget):
 
     def on_mount(self) -> None:
         self._init_tables()
-        self.call_later(self.refresh_data)
+        if not list(self.app.query("#main-tabs")):
+            self.call_later(self.refresh_data)
 
     def _init_tables(self) -> None:
         groups_table = self.query_one("#groups-table", DataTable)
@@ -70,6 +71,7 @@ class ProxiesScreen(Widget):
         nodes_table.cursor_type = "row"
         nodes_table.show_header = True
         nodes_table.navigation_previous_handler = self.action_focus_groups
+
 
     def refresh_data(self) -> None:
         try:
@@ -133,6 +135,7 @@ class ProxiesScreen(Widget):
 
     def _update_nodes_table(self) -> None:
         nodes_table = self.query_one("#nodes-table", DataTable)
+        previous_node = self._current_node_key(nodes_table)
         nodes_table.clear()
 
         current_label = self.query_one("#current-node", Label)
@@ -152,6 +155,9 @@ class ProxiesScreen(Widget):
             prefix = "[#a3e635]●[/] " if is_current else "  "
             nodes_table.add_row(f"{prefix}{node}", delay, key=node)
 
+        preferred_node = previous_node or self._current_group.current
+        self._move_nodes_cursor(preferred_node)
+
     def _set_current_group(self, group_name: str, focus_nodes: bool) -> None:
         for group in self._groups:
             if group.name == group_name:
@@ -160,6 +166,20 @@ class ProxiesScreen(Widget):
                 if focus_nodes:
                     self.action_focus_nodes()
                 return
+
+    def _current_node_key(self, table: DataTable) -> str | None:
+        if table.cursor_row is None or table.cursor_row >= len(table.ordered_rows):
+            return None
+        return str(table.ordered_rows[table.cursor_row].key.value)
+
+    def _move_nodes_cursor(self, node_name: str | None) -> None:
+        if not self._current_group or not node_name:
+            return
+        try:
+            row_index = self._current_group.candidates.index(node_name)
+        except ValueError:
+            return
+        self.query_one("#nodes-table", DataTable).move_cursor(row=row_index, animate=False)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "groups-table":

@@ -41,11 +41,13 @@ class ProvidersScreen(Widget):
         table.add_columns("Name", "Type", "Vehicle", "Nodes", "Updated")
         table.cursor_type = "row"
         table.show_header = True
-        self.call_later(self.refresh_data)
+        if not list(self.app.query("#main-tabs")):
+            self.call_later(self.refresh_data)
 
     def refresh_data(self) -> None:
         status = self.query_one("#providers-status", Label)
         table = self.query_one("#providers-table", DataTable)
+        previous_provider = self._selected_provider_name()
         table.clear()
 
         try:
@@ -66,6 +68,7 @@ class ProvidersScreen(Widget):
                     provider.updated_at,
                     key=provider.name,
                 )
+            self._move_provider_cursor(previous_provider)
         except APIUnavailableError:
             self._providers = []
             status.update("[#fb7185]○ API unavailable[/]")
@@ -102,3 +105,15 @@ class ProvidersScreen(Widget):
         if table.cursor_row is None or table.cursor_row >= len(self._providers):
             return None
         return self._providers[table.cursor_row]
+
+    def _selected_provider_name(self) -> str | None:
+        provider = self._selected_provider()
+        return provider.name if provider else None
+
+    def _move_provider_cursor(self, provider_name: str | None) -> None:
+        if not provider_name:
+            return
+        for row_index, provider in enumerate(self._providers):
+            if provider.name == provider_name:
+                self.query_one("#providers-table", DataTable).move_cursor(row=row_index, animate=False)
+                return
