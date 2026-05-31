@@ -55,9 +55,9 @@ clash-proxy-update --apply config_1.yaml
 `clash-proxy import-subscription <url>` 支持导入完整 Clash/Mihomo YAML 订阅，也支持把
 Base64 VLESS 节点列表转换为最小可用配置；默认 `--dry-run` 只下载和校验，显式
 `--apply` 才会写入并刷新。
-要把新订阅追加为独立分组，先用
-`clash-proxy import-subscription <url> --merge-dry-run --group CyberGuard`；确认后再用
-`--merge-apply`。同名订阅组默认拒绝覆盖，替换时必须显式加 `--replace-group`。
+要让转换后的订阅配置使用指定分组名，先用
+`clash-proxy import-subscription <url> --dry-run --group CyberGuard`；确认后再用
+`--apply --group CyberGuard`。
 
 如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
 
