@@ -30,9 +30,13 @@ jobs:
 
       - name: Shell tests
         run: |
-          set -e
+          set -euo pipefail
           for test_script in tests/*.sh; do
-            bash "$test_script"
+            echo ">>> Running shell test: $test_script"
+            if ! bash "$test_script"; then
+              echo "Shell test failed: $test_script"
+              exit 1
+            fi
           done
 
       - name: Enterprise TUI audit
