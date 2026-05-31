@@ -1597,7 +1597,7 @@ if target_name not in group.get("all", []):
     api_request "PUT" "/proxies/${encoded_group}" "{\"name\":\"${target_name//\"/\\\"}\"}" >/dev/null || return 1
     proxies_json="$(api_request "GET" "/proxies")" || return 1
 
-    print_section "结果"
+print_section "结果"
     printf '%s' "$proxies_json" | DISPLAY_NAME_PY="$(python_display_name_def)" CYAN="$CYAN" NC="$NC" python3 -c '
 import json
 import os
@@ -1615,7 +1615,7 @@ if not group:
 
 current = group.get("now", "-")
 print(f"代理组: {group_name}")
-print(f"当前选择: {cyan}{display_name(current)}{reset}")
+print(f"当前选择: {display_name(current)}")
 ' "$group_name"
     return 0
 }
