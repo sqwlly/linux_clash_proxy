@@ -2352,6 +2352,7 @@ import_subscription() {
 interactive_import_subscription() {
     local url=""
     local group=""
+    local attach_to=""
     local apply_choice=""
     local mode="--dry-run"
     local args=()
@@ -2368,8 +2369,14 @@ interactive_import_subscription() {
         return 0
     fi
 
-    printf "分组名（可选，仅用于 VLESS 订阅转换）: "
+    printf "分组名（可选；挂载导入时必填）: "
     if ! IFS= read -r group; then
+        echo ""
+        return 0
+    fi
+
+    printf "挂到现有分组（留空则生成独立配置，建议 AI-MANUAL）: "
+    if ! IFS= read -r attach_to; then
         echo ""
         return 0
     fi
@@ -2388,6 +2395,9 @@ interactive_import_subscription() {
     args=("$url" "$mode")
     if [ -n "$group" ]; then
         args+=("--group" "$group")
+    fi
+    if [ -n "$attach_to" ]; then
+        args+=("--attach-to" "$attach_to")
     fi
     import_subscription "${args[@]}"
 }
@@ -2523,6 +2533,7 @@ AI 路由控制:
   # 配置与进程
   ${cli_name} render
   ${cli_name} import-subscription "https://example.com/sub" --dry-run
+  ${cli_name} import-subscription "https://example.com/sub" --dry-run --group CyberGuard --attach-to "$AI_MANUAL_GROUP"
   ${cli_name} start
 
   # AI 路由控制

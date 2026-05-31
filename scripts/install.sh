@@ -21,11 +21,19 @@ install_with_pip() {
     python3 -m pip install --user --editable "$ROOT_DIR"
 }
 
-warn_missing_geodata() {
+ensure_geodata() {
     local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
     local mmdb_path="${data_home}/cproxy/country.mmdb"
+    local bundled_mmdb="${ROOT_DIR}/Country.mmdb"
     if [ -f "$mmdb_path" ]; then
         echo "GeoIP 数据: ${mmdb_path}"
+        return 0
+    fi
+
+    if [ -f "$bundled_mmdb" ]; then
+        mkdir -p "${data_home}/cproxy"
+        cp "$bundled_mmdb" "$mmdb_path"
+        echo "GeoIP 数据: 已从 ${bundled_mmdb} 安装到 ${mmdb_path}"
         return 0
     fi
 
@@ -111,6 +119,26 @@ EOF
     add_logrotate_cron "${logrotate_conf}" "logrotate.*clash_proxy"
 }
 
+install_system_commands() {
+    local installer="${ROOT_DIR}/scripts/install-system-commands.sh"
+
+    if [ "${CPROXY_INSTALL_SYSTEM_COMMANDS:-1}" = "0" ]; then
+        echo "系统命令安装: 已跳过"
+        return 0
+    fi
+
+    if [ ! -f "$installer" ]; then
+        echo "警告: 未找到系统命令安装脚本: ${installer}" >&2
+        return 0
+    fi
+
+    if "$installer"; then
+        echo "系统命令安装: 完成"
+    else
+        echo "警告: 系统命令安装未完成，可稍后手动执行: ${installer}" >&2
+    fi
+}
+
 main() {
     require_cmd python3
 
@@ -123,10 +151,11 @@ main() {
     PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
         python3 -m cproxy.cli init >/dev/null
 
-    warn_missing_geodata
+    ensure_geodata
 
     setup_logrotate
     setup_legacy_logrotate
+    install_system_commands
 
     if PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
         CPROXY_LEGACY_ROOT="${ROOT_DIR}" \

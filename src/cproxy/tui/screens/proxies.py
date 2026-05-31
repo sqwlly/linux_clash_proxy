@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.widget import Widget
+from textual.widgets import Button, DataTable, Label
+
+from ...api import APIUnavailableError
+from ...backend.models import ProxyGroup
+from ...config import AppPaths
+from ...services.query import QueryService
+
+
+class ProxiesScreen(Widget):
+    BINDINGS = [
+        Binding("enter", "activate_row", "Open/Select", priority=True),
+        Binding("right", "focus_nodes", "Nodes", priority=True),
+        Binding("left", "focus_groups", "Groups", priority=True),
+        Binding("escape", "back", "Back", priority=True),
+        Binding("s", "select_node", "Switch"),
+        Binding("t", "test_delay", "Test"),
+        Binding("r", "refresh_data", "Refresh"),
+        Binding("g", "focus_groups", "Groups"),
+        Binding("n", "focus_nodes", "Nodes"),
+    ]
+
+    def __init__(self, paths: AppPaths, **kwargs):
+        super().__init__(**kwargs)
+        self.paths = paths
+        self._groups: list[ProxyGroup] = []
+        self._current_group: ProxyGroup | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Nodes", classes="page-title")
+            with Horizontal():
+                with Vertical(classes="proxy-group-card split-sidebar"):
+                    yield Label("Groups", classes="proxy-group-title")
+                    yield DataTable(id="groups-table")
+                with Vertical(classes="proxy-group-card split-main"):
+                    yield Label("Nodes", classes="proxy-group-title")
+                    yield Label("─", id="current-node", classes="node-current")
+                    yield DataTable(id="nodes-table")
+                    with Horizontal(classes="toolbar"):
+                        yield Button("Switch", id="btn-switch-node", classes="action-button success-button")
+                        yield Button("Test", id="btn-test-delay", classes="action-button primary-button")
+                        yield Button("Refresh", id="btn-refresh-proxies", classes="action-button muted-button")
+                    yield Label("up/down: move  left/esc: groups  right: nodes  enter/s: switch", id="proxy-action-status", classes="action-status")
+
+    def on_mount(self) -> None:
+        self._init_tables()
+        self.call_later(self.refresh_data)
+
+    def _init_tables(self) -> None:
+        groups_table = self.query_one("#groups-table", DataTable)
+        groups_table.add_columns("Name", "Type", "Current")
+        groups_table.cursor_type = "row"
+        groups_table.show_header = True
+
+        nodes_table = self.query_one("#nodes-table", DataTable)
+        nodes_table.add_columns("Node", "Delay")
+        nodes_table.cursor_type = "row"
+        nodes_table.show_header = True
+
+    def refresh_data(self) -> None:
+        try:
+            service = QueryService(self.paths)
+            self._groups = service.list_groups()
+
+            groups_table = self.query_one("#groups-table", DataTable)
+            groups_table.clear()
+
+            rendered_group_count = 0
+            for group in self._groups:
+                group_type = str(group.type).lower()
+                if group_type in {"selector", "select", "fallback", "url-test", "load-balance"}:
+                    groups_table.add_row(
+                        group.name,
+                        group.type,
+                        group.current or "─",
+                        key=group.name,
+                    )
+                    rendered_group_count += 1
+
+            if not rendered_group_count:
+                groups_table.add_row("[#8b98aa]No switchable groups[/]", "─", "─")
+                self._current_group = None
+                self._update_nodes_table()
+                return
+
+            if self._groups and not self._current_group:
+                selectable = [group for group in self._groups if str(group.type).lower() in {"selector", "select"}]
+                fallback = [group for group in self._groups if str(group.type).lower() in {"fallback", "url-test", "load-balance"}]
+                chosen = selectable[0] if selectable else fallback[0] if fallback else None
+                if chosen:
+                    self._current_group = chosen
+                    self._update_nodes_table()
+                    groups_table.move_cursor(row=0, animate=False)
+
+            self.call_later(self.action_focus_groups)
+
+        except Exception as e:
+            groups_table = self.query_one("#groups-table", DataTable)
+            groups_table.clear()
+            groups_table.add_row(f"Error: {e}", "─", "─")
+
+    def _update_nodes_table(self) -> None:
+        nodes_table = self.query_one("#nodes-table", DataTable)
+        nodes_table.clear()
+
+        current_label = self.query_one("#current-node", Label)
+
+        if not self._current_group:
+            current_label.update("[#8b98aa]No group selected[/]")
+            nodes_table.add_row("[#8b98aa]Select a group to view nodes[/]", "─")
+            return
+
+        current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
+
+        for node in self._current_group.candidates:
+            is_current = node == self._current_group.current
+            delay = "─"
+            if is_current and self._current_group.delay:
+                delay = f"{self._current_group.delay}ms"
+            prefix = "[#a3e635]●[/] " if is_current else "  "
+            nodes_table.add_row(f"{prefix}{node}", delay, key=node)
+
+    def _set_current_group(self, group_name: str, focus_nodes: bool) -> None:
+        for group in self._groups:
+            if group.name == group_name:
+                self._current_group = group
+                self._update_nodes_table()
+                if focus_nodes:
+                    self.action_focus_nodes()
+                return
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "groups-table":
+            return
+        group_name = str(event.row_key.value)
+        self._set_current_group(group_name, focus_nodes=False)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "groups-table":
+            self._set_current_group(str(event.row_key.value), focus_nodes=True)
+        elif event.data_table.id == "nodes-table":
+            self.action_select_node()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-switch-node":
+            self.action_select_node()
+        elif event.button.id == "btn-test-delay":
+            self.action_test_delay()
+        elif event.button.id == "btn-refresh-proxies":
+            self.refresh_data()
+
+    def action_focus_groups(self) -> None:
+        self.query_one("#groups-table", DataTable).focus()
+
+    def action_focus_nodes(self) -> None:
+        self.query_one("#nodes-table", DataTable).focus()
+
+    def action_activate_row(self) -> None:
+        focused = getattr(self.app, "focused", None)
+        if isinstance(focused, DataTable) and focused.id == "nodes-table":
+            self.action_select_node()
+        elif isinstance(focused, DataTable) and focused.id == "groups-table":
+            self.action_focus_nodes()
+        else:
+            self.action_focus_groups()
+
+    def action_back(self) -> None:
+        focused = getattr(self.app, "focused", None)
+        if not (isinstance(focused, DataTable) and focused.id == "groups-table"):
+            self.action_focus_groups()
+            self.query_one("#proxy-action-status", Label).update("[#8b98aa]Back to groups[/]")
+
+    def action_select_node(self) -> None:
+        if not self._current_group:
+            return
+
+        nodes_table = self.query_one("#nodes-table", DataTable)
+        if nodes_table.cursor_row is None:
+            self.query_one("#proxy-action-status", Label).update("[#f6c177]No node selected[/]")
+            return
+
+        try:
+            row = nodes_table.ordered_rows[nodes_table.cursor_row]
+            node_name = str(row.key.value)
+
+            if str(self._current_group.type).lower() not in {"selector", "select"}:
+                self.notify(f"Group [{self._current_group.name}] is not selectable", severity="warning")
+                return
+
+            service = QueryService(self.paths)
+            service.switch_group(self._current_group.name, node_name)
+            self.query_one("#proxy-action-status", Label).update(
+                f"[#a3e635]Switched {self._current_group.name} -> {node_name}[/]"
+            )
+            self.notify(f"Switched: {self._current_group.name} → {node_name}", severity="information")
+            self.refresh_data()
+
+        except APIUnavailableError:
+            self.query_one("#proxy-action-status", Label).update("[#fb7185]API unavailable[/]")
+            self.notify("API unavailable", severity="error")
+        except Exception as e:
+            self.query_one("#proxy-action-status", Label).update(f"[#fb7185]Switch failed: {e}[/]")
+            self.notify(f"Switch failed: {e}", severity="error")
+
+    def action_test_delay(self) -> None:
+        if not self._current_group:
+            return
+
+        try:
+            from ...diagnostics import test_group
+            report = test_group(self.paths, self._current_group.name)
+
+            nodes_table = self.query_one("#nodes-table", DataTable)
+            nodes_table.clear()
+
+            current_label = self.query_one("#current-node", Label)
+            current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
+
+            for result in report.results:
+                is_current = result.name == self._current_group.current
+                prefix = "[#a3e635]●[/] " if is_current else "  "
+                if result.ok and result.delay:
+                    if result.delay < 200:
+                        delay = f"[#a3e635]{result.delay}ms[/]"
+                    elif result.delay < 500:
+                        delay = f"[#f6c177]{result.delay}ms[/]"
+                    else:
+                        delay = f"[#fb7185]{result.delay}ms[/]"
+                else:
+                    delay = "[#fb7185]FAIL[/]"
+                nodes_table.add_row(f"{prefix}{result.name}", delay, key=result.name)
+
+            self.notify(f"Test complete: {self._current_group.name}", severity="information")
+
+        except APIUnavailableError:
+            self.notify("API unavailable", severity="error")
+        except Exception as e:
+            self.notify(f"Test failed: {e}", severity="error")

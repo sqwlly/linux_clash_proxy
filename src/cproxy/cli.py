@@ -568,6 +568,10 @@ def run(argv: list[str] | None = None) -> int:
             print(f"代理组: {args.group}")
             print(f"当前选择: {_accent(normalize_name(group.current))}")
             return 0
+        if args.command == "tui":
+            from .tui.app import run_tui
+            run_tui(default_paths())
+            return 0
         return 0
     except (APIUnavailableError, ProcessOwnershipError, FileNotFoundError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

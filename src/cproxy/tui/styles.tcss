@@ -1,0 +1,383 @@
+Screen {
+    background: #111318;
+    color: #d8dee9;
+}
+
+Header {
+    background: #17212b;
+    color: #7dd3fc;
+    height: 1;
+    text-style: bold;
+}
+
+Footer {
+    background: #17212b;
+    color: #7c8798;
+    height: 1;
+}
+
+Footer > .footer--key {
+    color: #f6c177;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+Tabs {
+    background: #111318;
+    color: #8b98aa;
+    height: 3;
+    padding: 0 1;
+}
+
+Tab {
+    color: #8b98aa;
+    background: #111318;
+    padding: 0 1;
+}
+
+Tab:hover {
+    color: #d8dee9;
+    background: #17212b;
+}
+
+Tab.-active {
+    color: #111318;
+    background: #7dd3fc;
+    text-style: bold;
+}
+
+TabbedContent > ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 1 2;
+    height: 1fr;
+}
+
+#main-tabs {
+    height: 1fr;
+}
+
+.status-card {
+    width: 1fr;
+    height: auto;
+    min-height: 10;
+    border: solid #2d3746;
+    padding: 1 2;
+    margin: 0 1 1 0;
+    background: #171c24;
+}
+
+.status-card-title {
+    color: #7dd3fc;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.label-key {
+    color: #8b98aa;
+    width: 13;
+}
+
+.metric-value {
+    color: #d8dee9;
+    background: #111318;
+    border: solid #263241;
+    padding: 0 1;
+    width: 1fr;
+    min-height: 3;
+}
+
+DataTable {
+    height: 1fr;
+    background: #111318;
+    color: #d8dee9;
+    border: solid #263241;
+}
+
+DataTable > .datatable--header {
+    background: #17212b;
+    color: #7dd3fc;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #243244;
+}
+
+DataTable:focus > .datatable--cursor {
+    background: #31435c;
+}
+
+Input {
+    height: 3;
+}
+
+Input:focus {
+    border: tall #5eead4;
+}
+
+TextArea {
+    background: #111318;
+    color: #d8dee9;
+}
+
+TextArea:focus {
+    border: tall #5eead4;
+}
+
+Checkbox {
+    color: #cbd5e1;
+    margin-left: 1;
+    min-width: 16;
+}
+
+Checkbox:focus {
+    color: #5eead4;
+}
+
+Switch {
+    margin-right: 1;
+}
+
+.proxy-group-card {
+    border: solid #2d3746;
+    padding: 1 2;
+    margin: 0 1 1 0;
+    height: 1fr;
+    background: #171c24;
+}
+
+.split-sidebar {
+    width: 2fr;
+}
+
+.split-main {
+    width: 3fr;
+}
+
+.proxy-group-title {
+    color: #7dd3fc;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.node-current {
+    color: #a3e635;
+    text-style: bold;
+    margin-bottom: 1;
+    min-height: 3;
+    background: #111318;
+    border: solid #263241;
+    padding: 1 2;
+}
+
+.ai-route-panel {
+    border: solid #2d3746;
+    padding: 1 2;
+    margin: 0 0 1 0;
+    background: #171c24;
+    width: 1fr;
+    min-height: 8;
+}
+
+.ai-route-title {
+    color: #f6c177;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.log-viewer {
+    height: 1fr;
+    background: #111318;
+    border: solid #2d3746;
+    padding: 0 1;
+}
+
+.config-editor {
+    height: 1fr;
+    border: solid #2d3746;
+    padding: 0 1;
+}
+
+.subscription-input {
+    width: 1fr;
+    margin: 0 0 1 0;
+    background: #111318;
+    color: #d8dee9;
+    border: solid #2d3746;
+}
+
+.subscription-input:focus {
+    border: solid #5eead4;
+}
+
+.action-button {
+    margin: 0 1 0 0;
+    min-width: 12;
+    height: 3;
+    background: #1f2937;
+    color: #d8dee9;
+    border: solid #3a4658;
+}
+
+.action-button:hover {
+    background: #263447;
+    border: solid #5eead4;
+}
+
+.action-button:focus {
+    border: tall #5eead4;
+    text-style: bold;
+}
+
+.action-button.-active {
+    background: #5eead4;
+    color: #111318;
+}
+
+.primary-button {
+    background: #155e75;
+    color: #ecfeff;
+    border: solid #0891b2;
+}
+
+.primary-button:hover {
+    background: #0e7490;
+    border: solid #67e8f9;
+}
+
+.success-button {
+    background: #3f6212;
+    color: #f7fee7;
+    border: solid #65a30d;
+}
+
+.success-button:hover {
+    background: #4d7c0f;
+    border: solid #bef264;
+}
+
+.danger-button {
+    background: #7f1d1d;
+    color: #fff1f2;
+    border: solid #be123c;
+}
+
+.danger-button:hover {
+    background: #991b1b;
+    border: solid #fb7185;
+}
+
+.muted-button {
+    background: #202733;
+    color: #cbd5e1;
+    border: solid #334155;
+}
+
+.notification {
+    dock: bottom;
+    height: 3;
+    background: #7dd3fc;
+    color: #111318;
+    padding: 1;
+}
+
+.notification-error {
+    background: #fb7185;
+}
+
+.notification-success {
+    background: #a3e635;
+}
+
+#dashboard-grid {
+    height: auto;
+}
+
+.dashboard-row {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.field-row {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.page-title {
+    color: #7dd3fc;
+    text-style: bold;
+    background: #111318;
+    border-bottom: solid #263241;
+    margin: 0 0 1 0;
+    padding: 0 0 1 0;
+}
+
+.panel {
+    border: solid #2d3746;
+    background: #171c24;
+    padding: 1 2;
+    margin: 0 0 1 0;
+}
+
+.panel-title {
+    color: #f6c177;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.toolbar {
+    height: auto;
+    margin: 1 0;
+}
+
+.form-panel {
+    height: auto;
+}
+
+.output-panel {
+    height: 1fr;
+}
+
+.output-area {
+    height: 1fr;
+    border: solid #2d3746;
+    background: #111318;
+}
+
+.current-info {
+    color: #d8dee9;
+    background: #111318;
+    border: solid #2d3746;
+    padding: 1 2;
+    min-height: 6;
+}
+
+.path-label {
+    color: #8b98aa;
+    background: #111318;
+    border: solid #263241;
+    padding: 0 1;
+    width: 1fr;
+}
+
+.status-strip {
+    color: #d8dee9;
+    background: #111318;
+    border: solid #263241;
+    padding: 0 1;
+    min-height: 3;
+}
+
+.action-status {
+    color: #d8dee9;
+    background: #111318;
+    border: solid #263241;
+    padding: 0 1;
+    min-height: 3;
+    margin-top: 1;
+}

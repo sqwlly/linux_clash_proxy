@@ -187,3 +187,119 @@ def test_base64_vless_subscription_uses_requested_group_name(monkeypatch, tmp_pa
     assert [group["name"] for group in config["proxy-groups"]] == ["CyberGuard", "CyberGuard-Auto"]
     assert config["proxy-groups"][0]["proxies"] == ["CyberGuard-Auto", "Node 1", "DIRECT"]
     assert config["rules"] == ["MATCH,CyberGuard"]
+
+
+def test_attach_subscription_group_preserves_rules_and_current_candidates(monkeypatch, tmp_path, capsys):
+    module = _load_import_module()
+    update_script = tmp_path / "update_config.sh"
+    update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    current_config = tmp_path / "config.yaml"
+    current_config.write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [{"name": "Existing", "type": "direct"}],
+                "proxy-groups": [
+                    {"name": "AI-MANUAL", "type": "select", "proxies": ["Existing", "DIRECT"]},
+                ],
+                "rules": ["MATCH,AI-MANUAL"],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    decoded = "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test#Node%201"
+    body = base64.b64encode(decoded.encode("utf-8"))
+    captured_configs = []
+
+    def fake_run(command, check):
+        captured_configs.append(yaml.safe_load(Path(command[2]).read_text(encoding="utf-8")))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(body))
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=body.decode("utf-8"), status=200, content_type="", byte_count=len(body)
+        ),
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "import_subscription.py",
+            "https://example.test/sub",
+            "--update-script",
+            str(update_script),
+            "--config-file",
+            str(current_config),
+            "--group",
+            "CyberGuard",
+            "--attach-to",
+            "AI-MANUAL",
+        ],
+    )
+
+    assert module.main() == 0
+    stdout = capsys.readouterr().out
+    assert "订阅挂载完成" in stdout
+    config = captured_configs[0]
+    assert config["rules"] == ["MATCH,AI-MANUAL"]
+    assert config["proxy-groups"][0]["proxies"] == ["Existing", "DIRECT", "CyberGuard"]
+    assert [group["name"] for group in config["proxy-groups"][1:]] == ["CyberGuard", "CyberGuard-Auto"]
+    assert [proxy["name"] for proxy in config["proxies"]] == ["Existing", "CyberGuard/Node 1"]
+
+
+def test_attach_subscription_group_rejects_imported_group_as_parent(monkeypatch, tmp_path, capsys):
+    module = _load_import_module()
+    update_script = tmp_path / "update_config.sh"
+    update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    current_config = tmp_path / "config.yaml"
+    current_config.write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [{"name": "Existing", "type": "direct"}],
+                "proxy-groups": [
+                    {"name": "CyberGuard", "type": "select", "proxies": ["Existing"]},
+                ],
+                "rules": ["MATCH,CyberGuard"],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    decoded = "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test#Node%201"
+    body = base64.b64encode(decoded.encode("utf-8"))
+
+    monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(body))
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=body.decode("utf-8"), status=200, content_type="", byte_count=len(body)
+        ),
+    )
+    monkeypatch.setattr(module.subprocess, "run", lambda command, check: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "import_subscription.py",
+            "https://example.test/sub",
+            "--update-script",
+            str(update_script),
+            "--config-file",
+            str(current_config),
+            "--group",
+            "CyberGuard",
+            "--attach-to",
+            "CyberGuard",
+        ],
+    )
+
+    assert module.main() == 1
+    stderr = capsys.readouterr().err
+    assert "--attach-to must reference an existing parent group" in stderr

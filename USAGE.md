@@ -15,8 +15,11 @@ pipx install /path/to/clash_proxy
 ```
 
 `./scripts/install.sh` 会自动尝试一键部署（等价于 `cproxy bootstrap`）。
+它也会刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；不会默认覆盖
+`cproxy` alias。只想安装用户级 Python `cproxy` 时，可设置
+`CPROXY_INSTALL_SYSTEM_COMMANDS=0`。
 
-安装脚本会检查默认 GeoIP 数据文件：
+安装脚本会把仓库根目录的 `Country.mmdb` 安装到默认 GeoIP 数据文件路径；如果仓库没有该文件，则提示手动放置：
 
 - `~/.local/share/cproxy/country.mmdb`
 
@@ -58,6 +61,10 @@ Base64 VLESS 节点列表转换为最小可用配置；默认 `--dry-run` 只下
 要让转换后的订阅配置使用指定分组名，先用
 `clash-proxy import-subscription <url> --dry-run --group CyberGuard`；确认后再用
 `--apply --group CyberGuard`。
+如果只想导入为可选分组并自己手动选择，使用
+`clash-proxy import-subscription <url> --dry-run --group CyberGuard --attach-to AI-MANUAL`；
+确认后再用 `--apply --group CyberGuard --attach-to AI-MANUAL`。这会把 `CyberGuard`
+加入 `AI-MANUAL` 候选列表，不修改 `MATCH` 规则，也不会自动切换。
 
 如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
 

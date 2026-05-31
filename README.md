@@ -41,7 +41,8 @@ pipx install /path/to/clash_proxy
 - 优先使用 `pipx install --force --editable`
 - 回退到 `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
-- 检查默认 GeoIP 数据文件是否存在
+- 安装仓库自带的 `Country.mmdb` 到默认 GeoIP 数据路径；如果仓库没有该文件，则打印缺失警告
+- 刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；不会默认覆盖 `cproxy` alias
 
 ## GeoIP 数据
 
@@ -58,8 +59,8 @@ pipx install /path/to/clash_proxy
 需要注意：
 
 - 在无代理或受限网络环境下，Mihomo 不一定能自动获取 `country.mmdb`
-- `./scripts/install.sh` 会检查该文件是否存在，但不会强制下载
-- 如果缺失，先手动放到上面的默认路径，再执行 `cproxy test`
+- `./scripts/install.sh` 会优先复用仓库根目录的 `Country.mmdb`
+- 如果仓库没有该文件，先手动放到上面的默认路径，再执行 `cproxy test`
 
 常用可选配置项：
 
@@ -289,6 +290,9 @@ root 级 `clash-proxy.service`，并由 `/root/clash_proxy/proxy.sh` 管理。
 sudo ./scripts/install-system-commands.sh
 ```
 
+`./scripts/install.sh` 也会默认调用该脚本刷新 `clash-proxy` / `clash-proxy-update`；
+如果只想安装用户级 Python `cproxy`，可设置 `CPROXY_INSTALL_SYSTEM_COMMANDS=0`。
+
 默认安装：
 
 - `clash-proxy`：转发到仓库内 `proxy.sh`
@@ -333,6 +337,10 @@ clash-proxy menu
 如果要让转换后的订阅配置使用指定分组名，使用
 `clash-proxy import-subscription <url> --dry-run --group CyberGuard`；生成的配置会使用 `CyberGuard` 和
 `CyberGuard-Auto` 两个组。确认后再用 `--apply --group CyberGuard`。
+如果只想导入后自己手动选择，不希望订阅立即接管默认流量，使用
+`clash-proxy import-subscription <url> --dry-run --group CyberGuard --attach-to AI-MANUAL`；
+它会把 `CyberGuard` 加到 `AI-MANUAL` 候选列表，不修改现有 `MATCH` 规则，也不会执行切换。确认后再用
+`--apply --group CyberGuard --attach-to AI-MANUAL`。
 `clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由、导入订阅或执行
 常用维护动作；菜单里的订阅导入默认也是 dry-run，只有确认立即应用才写入本地配置。
 
@@ -375,6 +383,12 @@ root 级生产入口当前仍以 restart 作为生效边界。安全更新应保
    clash-proxy import-subscription "https://example.com/sub" --dry-run --group CyberGuard
    ```
 
+   如果只导入为可选分组、不切换当前出口，先运行：
+
+   ```bash
+   clash-proxy import-subscription "https://example.com/sub" --dry-run --group CyberGuard --attach-to AI-MANUAL
+   ```
+
 4. 需要应用时再执行：
 
    ```bash
@@ -385,6 +399,12 @@ root 级生产入口当前仍以 restart 作为生效边界。安全更新应保
 
    ```bash
    clash-proxy import-subscription "https://example.com/sub" --apply --group CyberGuard
+   ```
+
+   或者只导入为可选分组、不切换当前出口：
+
+   ```bash
+   clash-proxy import-subscription "https://example.com/sub" --apply --group CyberGuard --attach-to AI-MANUAL
    ```
 
 5. `--apply` 写入源配置后会进入受控 refresh 流程；也可以等待 systemd path/timer 触发。

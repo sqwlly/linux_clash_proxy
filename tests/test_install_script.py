@@ -1,11 +1,13 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import tomllib
 
 
 def _write_fake_python(fake_python: Path, python_log: Path, bootstrap_message: str = "一键部署: 完成") -> None:
+    real_python = sys.executable
     fake_python.write_text(
         f"""#!/bin/bash
 printf '%s\n' "$*" >> "{python_log}"
@@ -23,7 +25,7 @@ if [ "$1" = "-m" ] && [ "$2" = "cproxy.cli" ] && [ "$3" = "bootstrap" ]; then
   echo "{bootstrap_message}"
   exit 0
 fi
-exit 1
+exec "{real_python}" "$@"
 """,
         encoding="utf-8",
     )
@@ -73,6 +75,9 @@ exit 0
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["PYTHONPATH"] = "/root/clash_proxy/src"
     env["CPROXY_LOGROTATE_DIR"] = str(logrotate_dir)
+    env["BINDIR"] = str(tmp_path / "system-bin")
+    env["LIBDIR"] = str(tmp_path / "system-lib")
+    env["DEFAULT_TMPDIR"] = str(tmp_path / "system-tmp")
 
     result = subprocess.run(
         ["/bin/bash", "/root/clash_proxy/scripts/install.sh"],
@@ -89,8 +94,16 @@ exit 0
     log_text = pipx_log.read_text(encoding="utf-8")
     assert "install --force --editable /root/clash_proxy" in log_text
     assert "安装完成" in result.stdout
-    assert "未检测到 GeoIP 数据文件" in result.stderr
-    assert str(tmp_path / ".local" / "share" / "cproxy" / "country.mmdb") in result.stderr
+    country_mmdb = tmp_path / ".local" / "share" / "cproxy" / "country.mmdb"
+    assert country_mmdb.is_file()
+    assert "GeoIP 数据: 已从 /root/clash_proxy/Country.mmdb 安装到" in result.stdout
+    assert str(country_mmdb) in result.stdout
+    assert "未检测到 GeoIP 数据文件" not in result.stderr
+    assert (tmp_path / "system-bin" / "clash-proxy").is_file()
+    assert (tmp_path / "system-bin" / "clash-proxy-update").is_file()
+    assert not (tmp_path / "system-bin" / "cproxy").exists()
+    assert (tmp_path / "system-lib" / "probe_stable_node.py").is_file()
+    assert "系统命令安装: 完成" in result.stdout
 
 
 def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path):
@@ -110,6 +123,9 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["PYTHONPATH"] = "/root/clash_proxy/src"
     env["CPROXY_LOGROTATE_DIR"] = str(logrotate_dir)
+    env["BINDIR"] = str(tmp_path / "system-bin")
+    env["LIBDIR"] = str(tmp_path / "system-lib")
+    env["DEFAULT_TMPDIR"] = str(tmp_path / "system-tmp")
 
     result = subprocess.run(
         ["/bin/bash", "/root/clash_proxy/scripts/install.sh"],
@@ -126,8 +142,16 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     log_text = python_log.read_text(encoding="utf-8")
     assert "-m pip install --user --editable /root/clash_proxy" in log_text
     assert "安装完成" in result.stdout
-    assert "未检测到 GeoIP 数据文件" in result.stderr
-    assert str(tmp_path / ".local" / "share" / "cproxy" / "country.mmdb") in result.stderr
+    country_mmdb = tmp_path / ".local" / "share" / "cproxy" / "country.mmdb"
+    assert country_mmdb.is_file()
+    assert "GeoIP 数据: 已从 /root/clash_proxy/Country.mmdb 安装到" in result.stdout
+    assert str(country_mmdb) in result.stdout
+    assert "未检测到 GeoIP 数据文件" not in result.stderr
+    assert (tmp_path / "system-bin" / "clash-proxy").is_file()
+    assert (tmp_path / "system-bin" / "clash-proxy-update").is_file()
+    assert not (tmp_path / "system-bin" / "cproxy").exists()
+    assert (tmp_path / "system-lib" / "probe_stable_node.py").is_file()
+    assert "系统命令安装: 完成" in result.stdout
 
 
 def test_pyproject_declares_runtime_dependencies():
@@ -156,6 +180,9 @@ def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["PYTHONPATH"] = "/root/clash_proxy/src"
     env["CPROXY_LOGROTATE_DIR"] = str(logrotate_dir)
+    env["BINDIR"] = str(tmp_path / "system-bin")
+    env["LIBDIR"] = str(tmp_path / "system-lib")
+    env["DEFAULT_TMPDIR"] = str(tmp_path / "system-tmp")
 
     result = subprocess.run(
         ["/bin/bash", "/root/clash_proxy/scripts/install.sh"],
@@ -203,3 +230,9 @@ def test_pyproject_declares_subscription_downloader_dependencies():
     data = tomllib.loads(Path("/root/clash_proxy/pyproject.toml").read_text(encoding="utf-8"))
     dependencies = data["project"].get("dependencies", [])
     assert "requests>=2" in dependencies
+
+
+def test_pyproject_packages_tui_stylesheet():
+    data = tomllib.loads(Path("/root/clash_proxy/pyproject.toml").read_text(encoding="utf-8"))
+    package_data = data["tool"]["setuptools"]["package-data"]
+    assert package_data["cproxy.tui"] == ["styles.tcss"]

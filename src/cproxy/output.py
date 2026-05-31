@@ -68,4 +68,6 @@ def build_root_parser() -> ArgumentParser:
 
     proxy_shell_parser = subparsers.add_parser("proxy-shell", help="Open a temporary proxy shell")
     proxy_shell_parser.add_argument("shell_args", nargs=REMAINDER)
+
+    subparsers.add_parser("tui", help="Launch terminal UI dashboard")
     return parser

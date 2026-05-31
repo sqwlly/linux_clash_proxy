@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import os
 import re
 import subprocess
@@ -58,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--dry-run", action="store_true", default=True, help="Validate only. This is the default.")
     mode.add_argument("--apply", action="store_true", help="Apply the downloaded config through update_config.sh.")
     parser.add_argument("--group", default="", help="Group name for generated VLESS subscription configs.")
+    parser.add_argument("--attach-to", default="", help="Add the imported group to an existing selector without switching.")
+    parser.add_argument("--config-file", default="")
     parser.add_argument("--update-script", default="")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
@@ -300,6 +303,92 @@ def converted_config_from_proxies(proxies: list[dict], group_name: str = "") -> 
     }
 
 
+def load_yaml_config(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except Exception as exc:
+        raise RuntimeError(f"failed to read current config: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("current config top-level YAML must be a mapping")
+    for key in ("proxies", "proxy-groups", "rules"):
+        if not isinstance(data.get(key), list):
+            raise RuntimeError(f"current config {key} must be a list")
+    return data
+
+
+def subscription_group_config(proxies: list[dict], group_name: str) -> dict:
+    name = group_name.strip()
+    if not name:
+        raise RuntimeError("--group is required with --attach-to")
+
+    used_names: set[str] = set()
+    renamed = []
+    for proxy in proxies:
+        item = copy.deepcopy(proxy)
+        item["name"] = unique_name(f"{name}/{proxy.get('name') or 'Node'}", used_names)
+        renamed.append(item)
+
+    node_names = [str(proxy["name"]) for proxy in renamed]
+    return {
+        "proxies": renamed,
+        "proxy-groups": [
+            {"name": name, "type": "select", "proxies": [f"{name}-Auto", *node_names, "DIRECT"]},
+            {"name": f"{name}-Auto", "type": "fallback", "proxies": node_names, "url": TEST_URL, "interval": 300},
+        ],
+    }
+
+
+def attach_subscription_group(current: dict, group_config: dict, group_name: str, attach_to: str) -> dict:
+    attach_group_name = attach_to.strip()
+    if not attach_group_name:
+        raise RuntimeError("--attach-to must not be blank")
+
+    managed_group_names = {str(group["name"]) for group in group_config["proxy-groups"]}
+    if attach_group_name in managed_group_names:
+        raise RuntimeError("--attach-to must reference an existing parent group, not the imported group")
+
+    proxy_prefix = f"{group_name}/"
+    merged = copy.deepcopy(current)
+    attach_group = None
+
+    for group in merged["proxy-groups"]:
+        if not isinstance(group, dict):
+            continue
+        if str(group.get("name")) == attach_group_name:
+            attach_group = group
+            break
+    if attach_group is None:
+        raise RuntimeError(f"attach target group not found: {attach_group_name}")
+    if not isinstance(attach_group.get("proxies"), list):
+        raise RuntimeError(f"attach target group proxies must be a list: {attach_group_name}")
+
+    merged["proxy-groups"] = [
+        group
+        for group in merged["proxy-groups"]
+        if not (isinstance(group, dict) and str(group.get("name")) in managed_group_names)
+    ]
+    merged["proxies"] = [
+        proxy
+        for proxy in merged["proxies"]
+        if not (isinstance(proxy, dict) and str(proxy.get("name", "")).startswith(proxy_prefix))
+    ]
+
+    existing_proxy_names = {str(proxy.get("name")) for proxy in merged["proxies"] if isinstance(proxy, dict)}
+    new_proxy_names = {str(proxy["name"]) for proxy in group_config["proxies"]}
+    collisions = sorted(existing_proxy_names & new_proxy_names)
+    if collisions:
+        raise RuntimeError(f"proxy name collision: {', '.join(collisions)}")
+
+    attach_candidates = [str(item) for item in attach_group["proxies"]]
+    if group_name not in attach_candidates:
+        attach_group["proxies"].append(group_name)
+
+    merged["proxies"].extend(group_config["proxies"])
+    merged["proxy-groups"].extend(group_config["proxy-groups"])
+    return merged
+
+
 def candidate_config_from_subscription(text: str, group_name: str = "") -> CandidateConfig:
     try:
         data = validate_full_yaml_config(text)
@@ -336,6 +425,7 @@ def main() -> int:
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     mode = "--apply" if args.apply else "--dry-run"
     update_script = args.update_script or os.path.join(project_dir, "update_config.sh")
+    config_file = args.config_file or os.path.join(project_dir, "config.yaml")
     if not os.path.isfile(update_script):
         print(f"错误: update_config.sh 不存在: {update_script}", file=sys.stderr)
         return 1
@@ -357,13 +447,29 @@ def main() -> int:
         print(f"错误: 订阅导入校验失败: {'; '.join(error for error in errors if error)}", file=sys.stderr)
         return 1
 
-    candidate_file = write_temp_config(candidate.text)
+    attach_to = args.attach_to.strip()
+    try:
+        if attach_to:
+            current = load_yaml_config(config_file)
+            group_config = subscription_group_config(candidate.data["proxies"], args.group)
+            attached = attach_subscription_group(current, group_config, args.group.strip(), attach_to)
+            candidate_text = yaml.safe_dump(attached, allow_unicode=True, sort_keys=False)
+            validate_full_yaml_config(candidate_text)
+            candidate_file = write_temp_config(candidate_text)
+        else:
+            candidate_file = write_temp_config(candidate.text)
+    except RuntimeError as exc:
+        print(f"错误: 订阅导入校验失败: {exc}", file=sys.stderr)
+        return 1
 
     try:
         summary = (
             f"HTTP {content.status}, {content.byte_count} bytes, "
             f"source={candidate.source}, proxies={len(candidate.data['proxies'])}"
         )
+        if attach_to:
+            print(f"订阅挂载完成: {summary}, group={args.group.strip()}, attach_to={attach_to}", flush=True)
+            return run_update_script(update_script, mode, candidate_file)
         print(
             "订阅下载完成: "
             f"{summary}, groups={len(candidate.data['proxy-groups'])}, rules={len(candidate.data['rules'])}",
