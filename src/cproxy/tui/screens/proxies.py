@@ -4,12 +4,15 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
-from textual.widgets import Button, DataTable, Label
+from textual.widgets import Button, Label
 
 from ...api import APIUnavailableError
 from ...backend.models import ProxyGroup
 from ...config import AppPaths
+from ...process import restart_process
+from ...runtime import render_runtime
 from ...services.query import QueryService
+from ..widgets import NavigationDataTable as DataTable
 
 
 class ProxiesScreen(Widget):
@@ -30,22 +33,25 @@ class ProxiesScreen(Widget):
         self.paths = paths
         self._groups: list[ProxyGroup] = []
         self._current_group: ProxyGroup | None = None
+        self._api_available = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label("Nodes", classes="page-title")
-            with Horizontal():
-                with Vertical(classes="proxy-group-card split-sidebar"):
+            with Horizontal(classes="workbench-row"):
+                with Vertical(classes="proxy-group-card split-sidebar proxy-sidebar"):
                     yield Label("Groups", classes="proxy-group-title")
                     yield DataTable(id="groups-table")
-                with Vertical(classes="proxy-group-card split-main"):
+                with Vertical(classes="proxy-group-card split-main proxy-main"):
                     yield Label("Nodes", classes="proxy-group-title")
                     yield Label("─", id="current-node", classes="node-current")
+                    yield Label("─", id="api-status", classes="status-strip")
                     yield DataTable(id="nodes-table")
                     with Horizontal(classes="toolbar"):
                         yield Button("Switch", id="btn-switch-node", classes="action-button success-button")
                         yield Button("Test", id="btn-test-delay", classes="action-button primary-button")
                         yield Button("Refresh", id="btn-refresh-proxies", classes="action-button muted-button")
+                        yield Button("Restart", id="btn-restart-proxy", classes="action-button muted-button")
                     yield Label("up/down: move  left/esc: groups  right: nodes  enter/s: switch", id="proxy-action-status", classes="action-status")
 
     def on_mount(self) -> None:
@@ -66,7 +72,10 @@ class ProxiesScreen(Widget):
     def refresh_data(self) -> None:
         try:
             service = QueryService(self.paths)
-            self._groups = service.list_groups()
+            context = service.load_context(require_api=False)
+            self._api_available = context.api_available
+            self._groups = list(context.groups.values())
+            self._update_api_status()
 
             groups_table = self.query_one("#groups-table", DataTable)
             groups_table.clear()
@@ -98,12 +107,19 @@ class ProxiesScreen(Widget):
                     self._update_nodes_table()
                     groups_table.move_cursor(row=0, animate=False)
 
-            self.call_later(self.action_focus_groups)
-
         except Exception as e:
+            self._api_available = False
+            self._update_api_status()
             groups_table = self.query_one("#groups-table", DataTable)
             groups_table.clear()
             groups_table.add_row(f"Error: {e}", "─", "─")
+
+    def _update_api_status(self) -> None:
+        label = self.query_one("#api-status", Label)
+        if self._api_available:
+            label.update("[#a3e635]● API connected[/]")
+        else:
+            label.update("[#f6c177]○ Runtime view only; start/restart proxy before switching[/]")
 
     def _update_nodes_table(self) -> None:
         nodes_table = self.query_one("#nodes-table", DataTable)
@@ -154,6 +170,8 @@ class ProxiesScreen(Widget):
             self.action_test_delay()
         elif event.button.id == "btn-refresh-proxies":
             self.refresh_data()
+        elif event.button.id == "btn-restart-proxy":
+            self.action_restart_proxy()
 
     def action_focus_groups(self) -> None:
         self.query_one("#groups-table", DataTable).focus()
@@ -175,6 +193,14 @@ class ProxiesScreen(Widget):
         if not (isinstance(focused, DataTable) and focused.id == "groups-table"):
             self.action_focus_groups()
             self.query_one("#proxy-action-status", Label).update("[#8b98aa]Back to groups[/]")
+        else:
+            for tabbed in self.app.query("#main-tabs"):
+                for child in tabbed.walk_children():
+                    if child.__class__.__name__ == "ContentTabs":
+                        child.focus()
+                        return
+                tabbed.focus()
+                return
 
     def action_select_node(self) -> None:
         if not self._current_group:
@@ -183,6 +209,12 @@ class ProxiesScreen(Widget):
         nodes_table = self.query_one("#nodes-table", DataTable)
         if nodes_table.cursor_row is None:
             self.query_one("#proxy-action-status", Label).update("[#f6c177]No node selected[/]")
+            return
+
+        if not self._api_available:
+            self.query_one("#proxy-action-status", Label).update(
+                "[#f6c177]API unavailable; use Restart or run cproxy restart[/]"
+            )
             return
 
         try:
@@ -207,6 +239,17 @@ class ProxiesScreen(Widget):
         except Exception as e:
             self.query_one("#proxy-action-status", Label).update(f"[#fb7185]Switch failed: {e}[/]")
             self.notify(f"Switch failed: {e}", severity="error")
+
+    def action_restart_proxy(self) -> None:
+        status = self.query_one("#proxy-action-status", Label)
+        try:
+            runtime_path = render_runtime(self.paths)
+            pid = restart_process(self.paths)
+            status.update(f"[#a3e635]Restarted PID {pid}; runtime {runtime_path}[/]")
+            self.refresh_data()
+        except Exception as e:
+            status.update(f"[#fb7185]Restart failed: {e}[/]")
+            self.notify(f"Restart failed: {e}", severity="error")
 
     def action_test_delay(self) -> None:
         if not self._current_group:

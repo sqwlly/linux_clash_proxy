@@ -25,7 +25,7 @@ class SystemProxyScreen(Widget):
         with Vertical():
             yield Label("System Proxy", classes="page-title")
 
-            with Vertical(classes="panel"):
+            with Vertical(classes="panel form-panel"):
                 yield Label("Session", classes="panel-title")
                 with Horizontal(classes="field-row"):
                     yield Label("HTTP", classes="label-key")
@@ -40,11 +40,11 @@ class SystemProxyScreen(Widget):
                     yield Switch(id="switch-all", value=False)
                     yield Label("─", id="all-proxy-label", classes="metric-value")
 
-            with Vertical(classes="panel"):
+            with Vertical(classes="panel summary-panel"):
                 yield Label("Environment", classes="panel-title")
                 yield Label("─", id="env-status", classes="current-info")
 
-            with Vertical(classes="panel"):
+            with Vertical(classes="panel output-panel"):
                 yield Label("Persist", classes="panel-title")
                 with Horizontal(classes="toolbar"):
                     yield Button("Set Session", id="btn-set-all", classes="action-button success-button")

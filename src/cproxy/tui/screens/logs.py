@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import threading
-import time
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
-from textual.widgets import Button, Checkbox, Label, TextArea
+from textual.widgets import Button, Checkbox, Label
 
 from ...config import AppPaths, log_file
+from ..widgets import NavigationTextArea as TextArea
 
 
 class LogsScreen(Widget):
@@ -57,7 +57,7 @@ class LogsScreen(Widget):
     def on_unmount(self) -> None:
         self._stop_event.set()
         if self._tail_thread and self._tail_thread.is_alive():
-            self._tail_thread.join(timeout=2)
+            self._tail_thread.join(timeout=0.1)
 
     def _load_logs(self) -> None:
         log_path = log_file(self.paths)
@@ -86,8 +86,7 @@ class LogsScreen(Widget):
     def _start_tail(self) -> None:
         def tail_loop():
             log_path = log_file(self.paths)
-            while not self._stop_event.is_set():
-                time.sleep(1)
+            while not self._stop_event.wait(1):
                 if not self._following:
                     continue
                 if not log_path.exists():

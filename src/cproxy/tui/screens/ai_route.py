@@ -4,12 +4,13 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
-from textual.widgets import Button, DataTable, Label
+from textual.widgets import Button, Label
 
 from ...api import APIUnavailableError
 from ...config import AppPaths
 from ...diagnostics import run_ai_probe
 from ...services.query import QueryService
+from ..widgets import NavigationDataTable as DataTable
 
 
 class AIRouteScreen(Widget):
@@ -28,7 +29,7 @@ class AIRouteScreen(Widget):
             yield Label("AI Route", classes="page-title")
 
             with Horizontal():
-                with Vertical(classes="ai-route-panel"):
+                with Vertical(classes="ai-route-panel ai-selector-panel"):
                     yield Label("Selector", classes="ai-route-title")
                     with Horizontal(classes="field-row"):
                         yield Label("Mode", classes="label-key")
@@ -40,7 +41,7 @@ class AIRouteScreen(Widget):
                         yield Label("Standby", classes="label-key")
                         yield Label("─", id="ai-route-standby", classes="metric-value")
 
-                with Vertical(classes="ai-route-panel"):
+                with Vertical(classes="ai-route-panel ai-chain-panel"):
                     yield Label("Route Chain", classes="ai-route-title")
                     yield Label("─", id="ai-route-chain", classes="current-info")
 

@@ -23,7 +23,7 @@ class DashboardScreen(Widget):
             yield Label("Overview", classes="page-title")
 
             with Horizontal(id="dashboard-grid"):
-                with Vertical(classes="status-card"):
+                with Vertical(classes="status-card runtime-card"):
                     yield Label("Runtime", classes="status-card-title")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("Process", classes="label-key")
@@ -41,7 +41,7 @@ class DashboardScreen(Widget):
                         yield Label("PID", classes="label-key")
                         yield Label("─", id="dash-pid", classes="metric-value")
 
-                with Vertical(classes="status-card"):
+                with Vertical(classes="status-card ai-card"):
                     yield Label("AI Route", classes="status-card-title")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("Mode", classes="label-key")
@@ -53,7 +53,7 @@ class DashboardScreen(Widget):
                         yield Label("Standby", classes="label-key")
                         yield Label("─", id="dash-ai-standby", classes="metric-value")
 
-                with Vertical(classes="status-card"):
+                with Vertical(classes="status-card traffic-card"):
                     yield Label("Traffic", classes="status-card-title")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("Upload", classes="label-key")

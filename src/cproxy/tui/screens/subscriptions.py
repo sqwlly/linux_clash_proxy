@@ -9,9 +9,10 @@ from pathlib import Path
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
-from textual.widgets import Button, Input, Label, TextArea
+from textual.widgets import Button, Label
 
 from ...config import AppPaths, config_file, read_config, runtime_file
+from ..widgets import NavigationInput as Input, NavigationTextArea as TextArea
 
 
 def build_import_subscription_command(
@@ -117,12 +118,12 @@ class SubscriptionsScreen(Widget):
                     yield Button("Apply", id="btn-sub-apply", classes="action-button success-button")
                     yield Button("Validate", id="btn-sub-update", classes="action-button primary-button")
 
-            with Horizontal():
+            with Horizontal(classes="workbench-row"):
                 with Vertical(classes="panel output-panel split-main"):
                     yield Label("Output", classes="panel-title")
                     yield TextArea(id="sub-output", read_only=True, classes="output-area")
 
-                with Vertical(classes="panel split-sidebar"):
+                with Vertical(classes="panel split-sidebar summary-panel"):
                     yield Label("Current Config", classes="panel-title")
                     yield Label("─", id="sub-current-info", classes="current-info")
 

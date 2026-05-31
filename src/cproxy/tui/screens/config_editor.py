@@ -4,10 +4,11 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
-from textual.widgets import Button, Label, TextArea
+from textual.widgets import Button, Label
 
 from ...config import AppPaths, config_file
 from ...runtime import render_runtime
+from ..widgets import NavigationTextArea as TextArea
 
 
 class ConfigEditorScreen(Widget):
