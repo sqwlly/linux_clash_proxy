@@ -51,7 +51,7 @@ clash-proxy-update --apply config_1.yaml
 `clash-proxy ai-status` 也会默认展示状态 icon 和 `[US]`、`[SG]` 国家徽标，便于直接识别当前 AI
 出口区域。
 `clash-proxy menu` 会进入交互式控制台，可直接选择查看状态、切换 AI 路由、
-重新渲染并重启等常用操作。
+导入订阅、重新渲染并重启等常用操作；菜单里的订阅导入默认只做 dry-run。
 `clash-proxy import-subscription <url>` 支持导入完整 Clash/Mihomo YAML 订阅，也支持把
 Base64 VLESS 节点列表转换为最小可用配置；默认 `--dry-run` 只下载和校验，显式
 `--apply` 才会写入并刷新。

@@ -2346,6 +2346,49 @@ import_subscription() {
     python3 "$helper" --update-script "$update_script" "$@"
 }
 
+interactive_import_subscription() {
+    local url=""
+    local group=""
+    local apply_choice=""
+    local mode="--dry-run"
+    local args=()
+
+    echo ""
+    print_section "$(section_label "◆" "导入订阅")"
+    printf "订阅 URL: "
+    if ! IFS= read -r url; then
+        echo ""
+        return 0
+    fi
+    if [ -z "$url" ]; then
+        print_warn "订阅 URL 不能为空"
+        return 0
+    fi
+
+    printf "分组名（可选，仅用于 VLESS 订阅转换）: "
+    if ! IFS= read -r group; then
+        echo ""
+        return 0
+    fi
+
+    printf "立即应用到本地配置? 默认仅 dry-run [y/N]: "
+    if ! IFS= read -r apply_choice; then
+        echo ""
+        return 0
+    fi
+    case "$apply_choice" in
+        y|Y|yes|YES|Yes)
+            mode="--apply"
+            ;;
+    esac
+
+    args=("$url" "$mode")
+    if [ -n "$group" ]; then
+        args+=("--group" "$group")
+    fi
+    import_subscription "${args[@]}"
+}
+
 interactive_menu() {
     local choice
 
@@ -2361,6 +2404,7 @@ interactive_menu() {
         echo "7) 探测并切换稳定节点"
         echo "8) 连通性测试"
         echo "9) 重新渲染并重启"
+        echo "10) 导入订阅"
         echo "q) 退出"
         printf "选择: "
 
@@ -2396,6 +2440,9 @@ interactive_menu() {
                 ;;
             9)
                 restart_managed_service
+                ;;
+            10)
+                interactive_import_subscription
                 ;;
             q|Q|quit|exit)
                 return 0

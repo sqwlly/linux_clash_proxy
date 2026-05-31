@@ -333,8 +333,8 @@ clash-proxy menu
 如果要让转换后的订阅配置使用指定分组名，使用
 `clash-proxy import-subscription <url> --dry-run --group CyberGuard`；生成的配置会使用 `CyberGuard` 和
 `CyberGuard-Auto` 两个组。确认后再用 `--apply --group CyberGuard`。
-`clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行
-常用维护动作。
+`clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由、导入订阅或执行
+常用维护动作；菜单里的订阅导入默认也是 dry-run，只有确认立即应用才写入本地配置。
 
 本机可用这些只读命令确认当前运行入口：
 
