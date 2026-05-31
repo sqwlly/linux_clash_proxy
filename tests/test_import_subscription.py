@@ -1,8 +1,11 @@
 import importlib.util
+import base64
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import yaml
 
 
 def _load_import_module():
@@ -58,6 +61,13 @@ rules:
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=subscription.decode("utf-8"), status=200, content_type="", byte_count=len(subscription)
+        ),
+    )
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     monkeypatch.setattr(
         sys,
@@ -80,6 +90,7 @@ def test_rejects_node_uri_list_without_full_yaml(monkeypatch, tmp_path, capsys):
     update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
     monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(b"ss://example"))
+    monkeypatch.setattr(module, "download_subscription_with_curl", lambda url, max_bytes, timeout: (_ for _ in ()).throw(RuntimeError("no fallback")))
     monkeypatch.setattr(
         sys,
         "argv",
@@ -89,4 +100,49 @@ def test_rejects_node_uri_list_without_full_yaml(monkeypatch, tmp_path, capsys):
     assert module.main() == 1
     stderr = capsys.readouterr().err
     assert "订阅导入校验失败" in stderr
-    assert "top-level YAML must be a mapping" in stderr
+    assert "subscription is not full YAML or Base64 node list" in stderr
+
+
+def test_base64_vless_subscription_converts_to_minimal_yaml(monkeypatch, tmp_path, capsys):
+    module = _load_import_module()
+    update_script = tmp_path / "update_config.sh"
+    update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    decoded = "\n".join(
+        [
+            "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test&fp=chrome&host=edge.example.test&path=%2Fws#Node%201",
+            "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test&fp=chrome&host=edge.example.test&path=%2Fws#剩余流量：100 GB",
+            "vless://uuid2@reality.example.test:8443?type=tcp&security=reality&sni=updates.example.test&fp=chrome&flow=xtls-rprx-vision&pbk=public-key&sid=abcd#Reality%201",
+        ]
+    )
+    body = base64.b64encode(decoded.encode("utf-8"))
+    captured_configs = []
+
+    def fake_run(command, check):
+        captured_configs.append(Path(command[2]).read_text(encoding="utf-8"))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(body))
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=body.decode("utf-8"), status=200, content_type="", byte_count=len(body)
+        ),
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["import_subscription.py", "https://example.test/sub", "--update-script", str(update_script)],
+    )
+
+    assert module.main() == 0
+    stdout = capsys.readouterr().out
+    assert "source=base64-uri-list" in stdout
+    assert "proxies=2, groups=2, rules=1" in stdout
+    config = yaml.safe_load(captured_configs[0])
+    assert [proxy["name"] for proxy in config["proxies"]] == ["Node 1", "Reality 1"]
+    assert config["proxies"][0]["ws-opts"] == {"path": "/ws", "headers": {"Host": "edge.example.test"}}
+    assert config["proxies"][1]["reality-opts"] == {"public-key": "public-key", "short-id": "abcd"}
+    assert config["proxy-groups"][0]["name"] == "PROXY"
+    assert config["rules"] == ["MATCH,PROXY"]

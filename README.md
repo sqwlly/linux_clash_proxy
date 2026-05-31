@@ -328,8 +328,8 @@ clash-proxy menu
 `clash-proxy shadow-history` 会摘要展示最近探测历史。
 `clash-proxy guard codex` 只选择稳定出口，不启动 `codex`；也可以用 `clash-proxy guard codex -- <cmd>` 包裹一条命令。`clash-proxy ai-connections`
 展示 AI/GitHub 相关活动连接，`clash-proxy incident codex` 输出故障排查报告。
-`clash-proxy import-subscription <url>` 会下载完整 Clash/Mihomo YAML 订阅并走安全更新校验；默认 `--dry-run`
-不写入配置，只有显式 `--apply` 才会调用现有 `update_config.sh --apply`。当前不转换 Base64 节点 URI 列表。
+`clash-proxy import-subscription <url>` 会下载完整 Clash/Mihomo YAML 订阅，或把 Base64 VLESS 节点列表转换为最小可用配置后走安全更新校验；默认
+`--dry-run` 不写入配置，只有显式 `--apply` 才会调用现有 `update_config.sh --apply`。当前不转换 `ss://`、`vmess://`、`trojan://` 等其他节点 URI。
 `clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行
 常用维护动作。
 

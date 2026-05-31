@@ -52,8 +52,9 @@ clash-proxy-update --apply config_1.yaml
 出口区域。
 `clash-proxy menu` 会进入交互式控制台，可直接选择查看状态、切换 AI 路由、
 重新渲染并重启等常用操作。
-`clash-proxy import-subscription <url>` 支持导入完整 Clash/Mihomo YAML 订阅；默认
-`--dry-run` 只下载和校验，显式 `--apply` 才会写入并刷新。
+`clash-proxy import-subscription <url>` 支持导入完整 Clash/Mihomo YAML 订阅，也支持把
+Base64 VLESS 节点列表转换为最小可用配置；默认 `--dry-run` 只下载和校验，显式
+`--apply` 才会写入并刷新。
 
 如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
 
