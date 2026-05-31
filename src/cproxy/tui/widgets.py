@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from inspect import isawaitable
+from typing import Callable
 
 from textual import events
 from textual.binding import Binding
@@ -34,21 +35,24 @@ class NavigationTextArea(TextArea):
 
 
 class NavigationDataTable(DataTable):
+    navigation_next_handler: Callable[[], None] | None = None
+    navigation_previous_handler: Callable[[], None] | None = None
+
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "right":
-            self.app.action_focus_next()
+            self._focus_next()
             event.stop()
             return
         if event.key == "left":
-            self.app.action_focus_previous()
+            self._focus_previous()
             event.stop()
             return
         if event.key == "down" and self._at_last_row():
-            self.app.action_focus_next()
+            self._focus_next()
             event.stop()
             return
         if event.key == "up" and self._at_first_row():
-            self.app.action_focus_previous()
+            self._focus_previous()
             event.stop()
             return
 
@@ -61,3 +65,15 @@ class NavigationDataTable(DataTable):
 
     def _at_last_row(self) -> bool:
         return self.row_count <= 0 or self.cursor_row is None or self.cursor_row >= self.row_count - 1
+
+    def _focus_next(self) -> None:
+        if self.navigation_next_handler is not None:
+            self.navigation_next_handler()
+            return
+        self.app.action_focus_next()
+
+    def _focus_previous(self) -> None:
+        if self.navigation_previous_handler is not None:
+            self.navigation_previous_handler()
+            return
+        self.app.action_focus_previous()

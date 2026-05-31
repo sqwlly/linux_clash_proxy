@@ -19,12 +19,12 @@ class _ProxiesApp(App):
         yield ProxiesScreen(self.paths)
 
 
-def _group(current: str = "Node A") -> ProxyGroup:
+def _group(current: str = "Node A", name: str = "AI-MANUAL", candidates: list[str] | None = None) -> ProxyGroup:
     return ProxyGroup(
-        name="AI-MANUAL",
+        name=name,
         type="select",
         current=current,
-        candidates=["Node A", "Node B"],
+        candidates=candidates or ["Node A", "Node B"],
     )
 
 
@@ -149,6 +149,56 @@ def test_proxies_screen_left_right_and_escape_change_focus(monkeypatch, tmp_path
             await pilot.press("right")
             await pilot.press("left")
             assert app.focused is app.query_one("#groups-table", DataTable)
+
+    asyncio.run(run_case())
+
+
+def test_proxies_screen_group_cursor_does_not_rebuild_nodes_until_entering(monkeypatch, tmp_path):
+    class FakeQueryService:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def load_context(self, require_api=False):
+            return SimpleNamespace(
+                groups={
+                    "AI-MANUAL": _group(),
+                    "CyberGuard": _group("Node C", name="CyberGuard", candidates=["Node C", "Node D"]),
+                },
+                api_available=True,
+            )
+
+    monkeypatch.setattr(proxies_module, "QueryService", FakeQueryService)
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+
+    async def run_case():
+        app = _ProxiesApp(paths)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            screen = app.query_one(ProxiesScreen)
+            groups_table = app.query_one("#groups-table", DataTable)
+            nodes_table = app.query_one("#nodes-table", DataTable)
+            groups_table.focus()
+            groups_table.move_cursor(row=0, animate=False)
+
+            updates = []
+            original_update = screen._update_nodes_table
+
+            def counted_update():
+                updates.append(screen._current_group.name if screen._current_group else "")
+                original_update()
+
+            screen._update_nodes_table = counted_update
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            assert updates == []
+            assert screen._current_group.name == "AI-MANUAL"
+
+            await pilot.press("right")
+            await pilot.pause(0.1)
+            assert updates == ["CyberGuard"]
+            assert screen._current_group.name == "CyberGuard"
+            assert app.focused is nodes_table
+            assert "Node C" in str(screen.query_one("#current-node").render())
 
     asyncio.run(run_case())
 

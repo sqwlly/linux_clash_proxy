@@ -63,11 +63,13 @@ class ProxiesScreen(Widget):
         groups_table.add_columns("Name", "Type", "Current")
         groups_table.cursor_type = "row"
         groups_table.show_header = True
+        groups_table.navigation_next_handler = self.action_focus_nodes
 
         nodes_table = self.query_one("#nodes-table", DataTable)
         nodes_table.add_columns("Node", "Delay")
         nodes_table.cursor_type = "row"
         nodes_table.show_header = True
+        nodes_table.navigation_previous_handler = self.action_focus_groups
 
     def refresh_data(self) -> None:
         try:
@@ -163,7 +165,7 @@ class ProxiesScreen(Widget):
         if event.data_table.id != "groups-table":
             return
         group_name = str(event.row_key.value)
-        self._set_current_group(group_name, focus_nodes=False)
+        self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]Selected group: {group_name}[/]")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "groups-table":
@@ -185,6 +187,7 @@ class ProxiesScreen(Widget):
         self.query_one("#groups-table", DataTable).focus()
 
     def action_focus_nodes(self) -> None:
+        self._set_current_group_from_cursor(focus_nodes=False)
         self.query_one("#nodes-table", DataTable).focus()
 
     def action_activate_row(self) -> None:
@@ -195,6 +198,13 @@ class ProxiesScreen(Widget):
             self.action_focus_nodes()
         else:
             self.action_focus_groups()
+
+    def _set_current_group_from_cursor(self, focus_nodes: bool) -> None:
+        groups_table = self.query_one("#groups-table", DataTable)
+        if groups_table.cursor_row is None or groups_table.cursor_row >= len(groups_table.ordered_rows):
+            return
+        row = groups_table.ordered_rows[groups_table.cursor_row]
+        self._set_current_group(str(row.key.value), focus_nodes=focus_nodes)
 
     def action_back(self) -> None:
         focused = getattr(self.app, "focused", None)
