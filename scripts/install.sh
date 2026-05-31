@@ -143,10 +143,23 @@ main() {
     require_cmd python3
 
     if command -v pipx >/dev/null 2>&1; then
-        if install_with_pipx; then
-            :
+        pipx_bin="$(command -v pipx)"
+        python_bin="$(command -v python3)"
+
+        pipx_dir="${pipx_bin%/*}"
+        python_dir="${python_bin%/*}"
+        first_path_entry="${PATH%%:*}"
+
+        # 当 pipx 与当前 python 同目录，或位于 PATH 的优先目录时，尝试使用 pipx；
+        # 否则回退到 pip 安装，避免误用系统级 pipx 造成环境错配。
+        if [ "${pipx_dir}" = "${python_dir}" ] || [ "${pipx_dir}" = "${first_path_entry}" ]; then
+            if install_with_pipx; then
+                :
+            else
+                echo "警告: pipx 安装失败，改用用户 pip 安装" >&2
+                install_with_pip
+            fi
         else
-            echo "警告: pipx 安装失败，改用用户 pip 安装" >&2
             install_with_pip
         fi
     else
