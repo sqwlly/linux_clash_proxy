@@ -791,5 +791,13 @@ def main() -> int:
     return 0 if best else 1
 
 
+def cli() -> int:
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\n已取消", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

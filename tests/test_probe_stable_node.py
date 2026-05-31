@@ -325,3 +325,17 @@ def test_human_mode_previews_switch_skip_reason(monkeypatch, capsys):
     assert rc == 0, stderr
     assert "推荐: Better" in stdout
     assert "切换预览: 不会切换 (当前节点也稳定，平均延迟改善 20ms 未达到 50ms 防抖门槛)" in stdout
+
+
+def test_cli_handles_keyboard_interrupt_without_traceback(monkeypatch, capsys):
+    module = _load_probe_module()
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "main", interrupt)
+
+    assert module.cli() == 130
+    captured = capsys.readouterr()
+    assert "已取消" in captured.err
+    assert "Traceback" not in captured.err

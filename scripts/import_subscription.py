@@ -378,4 +378,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n已取消", file=sys.stderr)
+        raise SystemExit(130)

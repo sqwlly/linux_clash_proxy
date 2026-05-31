@@ -1161,12 +1161,15 @@ logs() {
     echo -e "日志文件: $LOG_FILE"
     echo ""
 
-    trap 'echo -e "\n${YELLOW}日志查看已停止${NC}"; return 0' INT
+    trap 'echo -e "\n${YELLOW}日志查看已停止${NC}"; cleanup 130' INT
 
-    tail -f "$LOG_FILE" 2>/dev/null || {
+    tail -f "$LOG_FILE" 2>/dev/null
+    local rc=$?
+    trap 'cleanup 130' INT
+    if [ "$rc" -ne 0 ]; then
         print_error "无法读取日志文件"
         return 1
-    }
+    fi
 }
 
 test() {
