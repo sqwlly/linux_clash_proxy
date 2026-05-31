@@ -1,7 +1,14 @@
 from pathlib import Path
 
 from cproxy.config import AppPaths
-from cproxy.tui.screens.subscriptions import build_import_subscription_command, build_import_update_env, write_user_refresh_script
+from cproxy.tui.screens.subscriptions import (
+    build_import_subscription_command,
+    build_import_update_env,
+    format_subscription_result,
+    redact_subscription_url,
+    subscription_group_rows,
+    write_user_refresh_script,
+)
 
 
 def test_build_import_subscription_command_includes_attach_target():
@@ -55,3 +62,42 @@ def test_write_user_refresh_script_renders_with_cproxy_paths():
         assert refresh_script.stat().st_mode & 0o700 == 0o700
     finally:
         refresh_script.unlink(missing_ok=True)
+
+
+def test_subscription_group_rows_show_attach_relationships():
+    rows = subscription_group_rows(
+        {
+            "proxy-groups": [
+                {"name": "AI-MANUAL", "type": "select", "proxies": ["AI-AUTO", "CyberGuard"]},
+                {"name": "CyberGuard", "type": "select", "proxies": ["CyberGuard-Auto", "Node A", "DIRECT"]},
+                {"name": "CyberGuard-Auto", "type": "fallback", "proxies": ["Node A", "Node B"]},
+            ]
+        }
+    )
+
+    assert ("AI-MANUAL", "select", "2", "─") in rows
+    assert ("CyberGuard", "select", "3", "AI-MANUAL") in rows
+    assert ("CyberGuard-Auto", "fallback", "2", "CyberGuard") in rows
+
+
+def test_format_subscription_result_summarizes_preview_output():
+    text = format_subscription_result(
+        "订阅挂载完成: HTTP 200, 100 bytes, source=yaml, proxies=3, group=CyberGuard, attach_to=AI-MANUAL\nok",
+        "",
+        0,
+        dry_run=True,
+        group="CyberGuard",
+        attach_to="AI-MANUAL",
+    )
+
+    assert text.startswith("Preview: OK")
+    assert "Group: CyberGuard" in text
+    assert "Attach to: AI-MANUAL" in text
+    assert "Summary: 订阅挂载完成:" in text
+    assert "stdout:" in text
+
+
+def test_redact_subscription_url_hides_query_token():
+    assert redact_subscription_url("https://example.test/api/v1/client/subscribe?token=secret") == (
+        "https://example.test/api/v1/client/subscribe?..."
+    )

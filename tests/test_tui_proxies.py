@@ -60,6 +60,41 @@ def test_proxies_screen_can_switch_selected_node(monkeypatch, tmp_path):
     assert switches == [("AI-MANUAL", "Node B")]
 
 
+def test_proxies_screen_refresh_uses_latest_group_after_switch(monkeypatch, tmp_path):
+    current = {"value": "Node A"}
+
+    class FakeQueryService:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def load_context(self, require_api=False):
+            return SimpleNamespace(groups={"AI-MANUAL": _group(current["value"])}, api_available=True)
+
+        def switch_group(self, group, target):
+            current["value"] = target
+            return _group(target)
+
+    monkeypatch.setattr(proxies_module, "QueryService", FakeQueryService)
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+
+    async def run_case():
+        app = _ProxiesApp(paths)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            screen = app.query_one(ProxiesScreen)
+            nodes_table = screen.query_one("#nodes-table", DataTable)
+            nodes_table.move_cursor(row=1, animate=False)
+            screen.action_select_node()
+            await pilot.pause(0.1)
+            assert "Node B" in str(screen.query_one("#current-node").render())
+            first_row = str(nodes_table.get_row_at(0)[0])
+            second_row = str(nodes_table.get_row_at(1)[0])
+            assert "●" not in first_row
+            assert "●" in second_row
+
+    asyncio.run(run_case())
+
+
 def test_proxies_screen_reports_api_unavailable_without_switching(monkeypatch, tmp_path):
     switches = []
 

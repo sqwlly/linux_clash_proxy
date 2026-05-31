@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -12,7 +13,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Label
 
 from ...config import AppPaths, config_file, read_config, runtime_file
-from ..widgets import NavigationInput as Input, NavigationTextArea as TextArea
+from ..widgets import NavigationDataTable as DataTable, NavigationInput as Input, NavigationTextArea as TextArea
 
 
 def build_import_subscription_command(
@@ -50,6 +51,69 @@ def build_import_update_env(paths: AppPaths, refresh_script: Path, proxy_sh: str
         }
     )
     return env
+
+
+def redact_subscription_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url[:80] + ("..." if len(url) > 80 else "")
+    path = parsed.path
+    if len(path) > 24:
+        path = path[:12] + "..." + path[-8:]
+    query = "..." if parsed.query else ""
+    return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
+
+
+def subscription_group_rows(config: dict) -> list[tuple[str, str, str, str]]:
+    groups = [group for group in config.get("proxy-groups", []) if isinstance(group, dict)]
+    parents_by_child: dict[str, list[str]] = {}
+    for group in groups:
+        parent_name = str(group.get("name", ""))
+        for child in group.get("proxies", []) or []:
+            parents_by_child.setdefault(str(child), []).append(parent_name)
+
+    rows = []
+    for group in groups:
+        name = str(group.get("name", ""))
+        if not name:
+            continue
+        group_type = str(group.get("type", ""))
+        proxies = [str(item) for item in group.get("proxies", []) or []]
+        parents = [parent for parent in parents_by_child.get(name, []) if parent != name]
+        rows.append((name, group_type, str(len(proxies)), ", ".join(parents) or "─"))
+    return rows
+
+
+def format_subscription_result(
+    stdout: str,
+    stderr: str,
+    returncode: int,
+    dry_run: bool,
+    group: str,
+    attach_to: str,
+) -> str:
+    mode = "Preview" if dry_run else "Apply"
+    status = "OK" if returncode == 0 else f"Failed ({returncode})"
+    summary_line = next(
+        (
+            line.strip()
+            for line in stdout.splitlines()
+            if line.strip().startswith(("订阅下载完成:", "订阅挂载完成:"))
+        ),
+        "",
+    )
+    lines = [f"{mode}: {status}"]
+    if group:
+        lines.append(f"Group: {group}")
+    if attach_to:
+        lines.append(f"Attach to: {attach_to}")
+    if summary_line:
+        lines.append(f"Summary: {summary_line}")
+    if stdout.strip():
+        lines.extend(["", "stdout:", stdout.strip()])
+    if stderr.strip():
+        lines.extend(["", "stderr:", stderr.strip()])
+    return "\n".join(lines)
 
 
 def write_user_refresh_script() -> Path:
@@ -124,16 +188,21 @@ class SubscriptionsScreen(Widget):
                     yield TextArea(id="sub-output", read_only=True, classes="output-area")
 
                 with Vertical(classes="panel split-sidebar summary-panel"):
-                    yield Label("Current Config", classes="panel-title")
+                    yield Label("Subscription Groups", classes="panel-title")
                     yield Label("─", id="sub-current-info", classes="current-info")
+                    yield DataTable(id="sub-groups-table")
 
     def on_mount(self) -> None:
-        self._load_current_info()
         output = self.query_one("#sub-output", TextArea)
         try:
             output.theme = "monokai"
         except Exception:
             pass
+        groups_table = self.query_one("#sub-groups-table", DataTable)
+        groups_table.add_columns("Group", "Type", "Nodes", "Attached")
+        groups_table.cursor_type = "row"
+        groups_table.show_header = True
+        self._load_current_info()
 
     def _load_current_info(self) -> None:
         try:
@@ -142,6 +211,7 @@ class SubscriptionsScreen(Widget):
 
             proxies = config.get("proxies", [])
             groups = config.get("proxy-groups", [])
+            group_rows = subscription_group_rows(config)
 
             info_text = "\n".join(
                 [
@@ -153,6 +223,12 @@ class SubscriptionsScreen(Widget):
                 ]
             )
             self.query_one("#sub-current-info", Label).update(info_text)
+            groups_table = self.query_one("#sub-groups-table", DataTable)
+            groups_table.clear()
+            for row in group_rows:
+                groups_table.add_row(*row, key=row[0])
+            if not group_rows:
+                groups_table.add_row("No groups", "─", "0", "─")
         except Exception as e:
             self.query_one("#sub-current-info", Label).update(f"[#fb7185]Error: {e}[/]")
 
@@ -198,7 +274,18 @@ class SubscriptionsScreen(Widget):
             update_script=update_script,
         )
 
-        output.load_text(f"Running: {' '.join(cmd)}\n\nPlease wait...")
+        output.load_text(
+            "\n".join(
+                [
+                    "Previewing subscription..." if dry_run else "Applying subscription...",
+                    f"URL: {redact_subscription_url(url)}",
+                    f"Group: {group or '(from subscription)'}",
+                    f"Attach to: {attach_to or '(not attached)'}",
+                    "",
+                    "Please wait...",
+                ]
+            )
+        )
 
         refresh_script: Path | None = None
         env = None
@@ -207,14 +294,16 @@ class SubscriptionsScreen(Widget):
                 refresh_script = write_user_refresh_script()
                 env = build_import_update_env(self.paths, refresh_script, clash_proxy)
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-            output_text = ""
-            if result.stdout:
-                output_text += result.stdout
-            if result.stderr:
-                output_text += "\n" + result.stderr
-            if result.returncode != 0:
-                output_text += f"\nExit code: {result.returncode}"
-            output.load_text(output_text or "No output")
+            output.load_text(
+                format_subscription_result(
+                    result.stdout,
+                    result.stderr,
+                    result.returncode,
+                    dry_run=dry_run,
+                    group=group,
+                    attach_to=attach_to,
+                )
+            )
 
             if result.returncode == 0 and not dry_run:
                 self._load_current_info()

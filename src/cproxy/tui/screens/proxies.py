@@ -81,6 +81,7 @@ class ProxiesScreen(Widget):
             groups_table.clear()
 
             rendered_group_count = 0
+            rendered_groups: list[ProxyGroup] = []
             for group in self._groups:
                 group_type = str(group.type).lower()
                 if group_type in {"selector", "select", "fallback", "url-test", "load-balance"}:
@@ -91,6 +92,7 @@ class ProxiesScreen(Widget):
                         key=group.name,
                     )
                     rendered_group_count += 1
+                    rendered_groups.append(group)
 
             if not rendered_group_count:
                 groups_table.add_row("[#8b98aa]No switchable groups[/]", "─", "─")
@@ -98,14 +100,20 @@ class ProxiesScreen(Widget):
                 self._update_nodes_table()
                 return
 
-            if self._groups and not self._current_group:
-                selectable = [group for group in self._groups if str(group.type).lower() in {"selector", "select"}]
-                fallback = [group for group in self._groups if str(group.type).lower() in {"fallback", "url-test", "load-balance"}]
+            previous_group_name = self._current_group.name if self._current_group else None
+            chosen = next((group for group in rendered_groups if group.name == previous_group_name), None)
+            if chosen is None:
+                selectable = [group for group in rendered_groups if str(group.type).lower() in {"selector", "select"}]
+                fallback = [
+                    group
+                    for group in rendered_groups
+                    if str(group.type).lower() in {"fallback", "url-test", "load-balance"}
+                ]
                 chosen = selectable[0] if selectable else fallback[0] if fallback else None
-                if chosen:
-                    self._current_group = chosen
-                    self._update_nodes_table()
-                    groups_table.move_cursor(row=0, animate=False)
+            if chosen:
+                self._current_group = chosen
+                self._update_nodes_table()
+                groups_table.move_cursor(row=rendered_groups.index(chosen), animate=False)
 
         except Exception as e:
             self._api_available = False
