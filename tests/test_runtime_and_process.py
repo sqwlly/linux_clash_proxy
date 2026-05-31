@@ -127,6 +127,22 @@ rules:
     assert "secret-file:" not in runtime_text
 
 
+def test_status_prefers_tls_controller_when_configured(tmp_path: Path):
+    from cproxy.backend.process import ProcessBackend
+    from cproxy.config import default_paths
+
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    (paths.config_dir / "config.yaml").write_text(
+        "external-controller: 127.0.0.1:9090\nexternal-controller-tls: 127.0.0.1:9443\n",
+        encoding="utf-8",
+    )
+
+    snapshot = ProcessBackend(paths).status()
+
+    assert snapshot.controller == "127.0.0.1:9443"
+
+
 def test_status_reports_ai_route_mode_and_delay_when_api_available(tmp_path: Path):
     state = {
         "AI-MANUAL": {

@@ -150,7 +150,7 @@ class ProcessBackend:
         return StatusSnapshot(
             source_config=str(config_file(self.paths)),
             runtime_config=str(runtime_file(self.paths)),
-            controller=str(config.get("external-controller", "127.0.0.1:9090")),
+            controller=str(config.get("external-controller-tls") or config.get("external-controller", "127.0.0.1:9090")),
             port=str(config.get("mixed-port", 7890)),
             runtime_ready=runtime_file(self.paths).exists(),
             running=running,
