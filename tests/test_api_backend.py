@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import ssl
 from types import SimpleNamespace
 from urllib.error import URLError
 
@@ -82,6 +83,40 @@ def test_api_backend_prefers_tls_controller(tmp_path):
     backend = APIBackend(default_paths(tmp_path))
 
     assert backend.controller_url() == "https://127.0.0.1:9443"
+
+
+def test_api_backend_allows_self_signed_loopback_tls_controller(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "external-controller-tls: 127.0.0.1:9443\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"version":"test"}'
+
+    def fake_urlopen(request, timeout, context=None):
+        captured["url"] = request.full_url
+        captured["context"] = context
+        return FakeResponse()
+
+    monkeypatch.setattr("cproxy.backend.api.urlopen", fake_urlopen)
+
+    backend = APIBackend(default_paths(tmp_path))
+
+    assert backend.version() == {"version": "test"}
+    assert captured["url"] == "https://127.0.0.1:9443/version"
+    assert isinstance(captured["context"], ssl.SSLContext)
+    assert captured["context"].verify_mode == ssl.CERT_NONE
 
 
 def test_api_backend_rejects_unix_controller(tmp_path):

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from ..config import AppPaths, read_config
@@ -104,13 +106,25 @@ class APIBackend:
 
         request = Request(url, data=body, method=method, headers=headers)
         try:
-            with urlopen(request, timeout=self.request_timeout()) as response:
+            context = self._tls_context(url)
+            if context is None:
+                handle = urlopen(request, timeout=self.request_timeout())
+            else:
+                handle = urlopen(request, timeout=self.request_timeout(), context=context)
+            with handle as response:
                 response_body = response.read().decode("utf-8")
                 if not response_body.strip():
                     return {}
                 return json.loads(response_body)
         except Exception as exc:
             raise APIUnavailableError("错误: Mihomo API 不可访问，请检查 external-controller、secret 或服务状态") from exc
+
+    def _tls_context(self, url: str) -> ssl.SSLContext | None:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
+            return None
+        # Mihomo's loopback TLS controller uses a self-signed certificate by default.
+        return ssl._create_unverified_context()
 
     def _to_proxy_group(self, name: str, payload: dict[str, Any]) -> ProxyGroup:
         history = payload.get("history") or []
