@@ -144,6 +144,21 @@ fi
 
 PORT="$(cat "$PORT_FILE")"
 
+api_ready=0
+for _ in $(seq 1 50); do
+    if curl -fsS --connect-timeout 1 --max-time 1 "http://127.0.0.1:${PORT}/version" >/dev/null 2>&1; then
+        api_ready=1
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$api_ready" -ne 1 ]; then
+    echo "ASSERTION FAILED: 测试 API 服务未就绪" >&2
+    cat "$SERVER_LOG" >&2 || true
+    exit 1
+fi
+
 cat >"$CONFIG_FILE" <<EOF
 external-controller: 127.0.0.1:${PORT}
 mixed-port: 7890
@@ -154,9 +169,11 @@ COMMON_ENV=(
     SOURCE_CONFIG_FILE="$CONFIG_FILE"
 )
 
-list_nodes_output="$(
-    env "${COMMON_ENV[@]}" "$SCRIPT" list-nodes "AI-MANUAL"
-)"
+if ! list_nodes_output="$(env "${COMMON_ENV[@]}" "$SCRIPT" list-nodes "AI-MANUAL")"; then
+    echo "ASSERTION FAILED: list-nodes 命令执行失败" >&2
+    cat "$SERVER_LOG" >&2 || true
+    exit 1
+fi
 
 assert_contains "$list_nodes_output" "摘要" "list-nodes 应输出摘要区块"
 assert_contains "$list_nodes_output" "列表" "list-nodes 应输出列表区块"
@@ -164,9 +181,11 @@ assert_contains "$list_nodes_output" "当前选择: AI-AUTO" "list-nodes 应显�
 assert_contains "$list_nodes_output" "当前  AI-AUTO" "list-nodes 应标识当前候选项"
 assert_contains "$list_nodes_output" "候选  United States" "list-nodes 应展示规整后的候选名称"
 
-test_group_output="$(
-    env "${COMMON_ENV[@]}" "$SCRIPT" test-group "AI-AUTO"
-)"
+if ! test_group_output="$(env "${COMMON_ENV[@]}" "$SCRIPT" test-group "AI-AUTO")"; then
+    echo "ASSERTION FAILED: test-group 命令执行失败" >&2
+    cat "$SERVER_LOG" >&2 || true
+    exit 1
+fi
 
 assert_contains "$test_group_output" "摘要" "test-group 应输出摘要区块"
 assert_contains "$test_group_output" "结果" "test-group 应输出结果区块"
