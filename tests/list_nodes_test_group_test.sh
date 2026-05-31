@@ -39,7 +39,7 @@ python3 - "$PORT_FILE" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 port_file = sys.argv[1]
 
@@ -100,13 +100,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(proxies_payload)
             return
 
-        if self.path.startswith("/proxies/") and self.path.endswith("/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=5000"):
-            target = self.path[len("/proxies/"):].split("/delay", 1)[0]
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/proxies/") and parsed.path.endswith("/delay"):
+            target = parsed.path[len("/proxies/"):].split("/delay", 1)[0]
             target = unquote(target)
-            if target in delay_map:
+            query = parse_qs(parsed.query)
+            if (
+                target in delay_map
+                and query.get("url") == ["https://cp.cloudflare.com/generate_204"]
+                and query.get("timeout") == ["5000"]
+            ):
                 self._send({"delay": delay_map[target]})
                 return
 
+        print(f"unexpected GET {self.path}", flush=True)
         self.send_response(404)
         self.end_headers()
 
@@ -167,10 +174,13 @@ EOF
 COMMON_ENV=(
     RUNTIME_CONFIG_FILE="$CONFIG_FILE"
     SOURCE_CONFIG_FILE="$CONFIG_FILE"
+    NO_PROXY="127.0.0.1,localhost"
+    no_proxy="127.0.0.1,localhost"
 )
 
 if ! list_nodes_output="$(env "${COMMON_ENV[@]}" "$SCRIPT" list-nodes "AI-MANUAL")"; then
     echo "ASSERTION FAILED: list-nodes 命令执行失败" >&2
+    printf '%s\n' "$list_nodes_output" >&2
     cat "$SERVER_LOG" >&2 || true
     exit 1
 fi
@@ -183,6 +193,7 @@ assert_contains "$list_nodes_output" "候选  United States" "list-nodes 应展�
 
 if ! test_group_output="$(env "${COMMON_ENV[@]}" "$SCRIPT" test-group "AI-AUTO")"; then
     echo "ASSERTION FAILED: test-group 命令执行失败" >&2
+    printf '%s\n' "$test_group_output" >&2
     cat "$SERVER_LOG" >&2 || true
     exit 1
 fi
