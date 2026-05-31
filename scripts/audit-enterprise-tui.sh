@@ -98,7 +98,26 @@ check_no_go_rewrite() {
             pass "Go rewrite guard: no Bubble Tea runtime dependency"
         fi
     else
-        warn "Go rewrite guard: ripgrep missing, skipped Bubble Tea dependency scan"
+        local found=0
+        while IFS= read -r -d '' path; do
+            if grep -IEq 'charm\.land/bubbletea|github\.com/charmbracelet/bubbletea' "$path"; then
+                found=1
+                break
+            fi
+        done < <(
+            find "${ROOT_DIR}" \
+                \( -path "${ROOT_DIR}/.git" \
+                -o -path "${ROOT_DIR}/.venv" \
+                -o -path "${ROOT_DIR}/.data" \
+                -o -path "${ROOT_DIR}/docs/enterprise-tui" \) -prune \
+                -o -type f ! -name '*.pyc' ! -name 'deep-research-report.md' -print0
+        )
+
+        if [ "$found" -eq 1 ]; then
+            fail "Go rewrite guard: Bubble Tea dependency found outside source report/docs"
+        else
+            pass "Go rewrite guard: no Bubble Tea runtime dependency"
+        fi
     fi
 }
 

@@ -52,11 +52,16 @@ RUNTIME_CONFIG_FILE="$RUNTIME_CONFIG" \
 PROG_PATH="$MIHOMO_BIN" \
 "$SCRIPT" render >/dev/null
 
-line_openai="$(rg -n 'DOMAIN-SUFFIX,openai.com,AI-MANUAL' "$RUNTIME_CONFIG" | cut -d: -f1)"
-line_chinamax="$(rg -n 'RULE-SET,ChinaMax,DIRECT' "$RUNTIME_CONFIG" | cut -d: -f1)"
-line_geoip_cn="$(rg -n 'GEOIP,CN,DIRECT,no-resolve' "$RUNTIME_CONFIG" | cut -d: -f1)"
-line_match="$(rg -n 'MATCH,SSRDOG' "$RUNTIME_CONFIG" | cut -d: -f1)"
-https_checks="$(rg -c 'url: https://cp.cloudflare.com/generate_204' "$RUNTIME_CONFIG")"
+line_number() {
+    local needle="$1"
+    awk -v needle="$needle" 'index($0, needle) { print NR; exit }' "$RUNTIME_CONFIG"
+}
+
+line_openai="$(line_number 'DOMAIN-SUFFIX,openai.com,AI-MANUAL')"
+line_chinamax="$(line_number 'RULE-SET,ChinaMax,DIRECT')"
+line_geoip_cn="$(line_number 'GEOIP,CN,DIRECT,no-resolve')"
+line_match="$(line_number 'MATCH,SSRDOG')"
+https_checks="$(awk '/url: https:\/\/cp\.cloudflare\.com\/generate_204/ { count++ } END { print count + 0 }' "$RUNTIME_CONFIG")"
 
 if [ -z "$line_openai" ] || [ -z "$line_chinamax" ] || [ -z "$line_geoip_cn" ] || [ -z "$line_match" ]; then
     echo "ASSERTION FAILED: 缺少关键规则" >&2

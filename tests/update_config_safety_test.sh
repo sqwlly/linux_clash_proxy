@@ -20,7 +20,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
 
-    if ! rg -Fq "$needle" "$file"; then
+    if ! grep -Fq "$needle" "$file"; then
         echo "ASSERTION FAILED: $message" >&2
         echo "Expected to find: $needle" >&2
         echo "In file: $file" >&2
@@ -33,7 +33,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
 
-    if [ -f "$file" ] && rg -Fq "$needle" "$file"; then
+    if [ -f "$file" ] && grep -Fq "$needle" "$file"; then
         echo "ASSERTION FAILED: $message" >&2
         echo "Unexpected content: $needle" >&2
         echo "In file: $file" >&2
@@ -114,7 +114,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if rg -Fq "refresh-invalid: true" "$config"; then
+if grep -Fq "refresh-invalid: true" "$config"; then
     exit 1
 fi
 
