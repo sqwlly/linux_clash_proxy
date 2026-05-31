@@ -159,6 +159,8 @@ def test_pyproject_declares_runtime_dependencies():
     dependencies = data["project"].get("dependencies", [])
     assert "PyYAML>=6" in dependencies
     assert "tqdm>=4" in dependencies
+    assert "urllib3>=2.7.0" in dependencies
+    assert "idna>=3.15" in dependencies
 
 
 def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):

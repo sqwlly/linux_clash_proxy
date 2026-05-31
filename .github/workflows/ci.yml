@@ -59,7 +59,9 @@ jobs:
         run: python -m pip install -e ".[tui]" pip-audit cyclonedx-bom
 
       - name: Dependency vulnerabilities
-        run: pip-audit --strict
+        run: |
+          python -m pip freeze --exclude-editable > /tmp/cproxy-audit-requirements.txt
+          pip-audit --strict -r /tmp/cproxy-audit-requirements.txt
 
       - name: SBOM
         run: cyclonedx-py environment --output-file sbom.cdx.json
