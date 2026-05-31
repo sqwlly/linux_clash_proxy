@@ -595,7 +595,7 @@ def run(argv: list[str] | None = None) -> int:
             group = service.switch_group(args.group, args.target)
             print(_section_title("结果"))
             print(f"代理组: {args.group}")
-            print(f"当前选择: {_accent(normalize_name(group.current))}")
+            print(f"当前选择: {normalize_name(group.current)}")
             return 0
         if args.command == "tui":
             from .tui.app import run_tui
