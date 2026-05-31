@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import os
 import re
 import subprocess
@@ -57,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", default=True, help="Validate only. This is the default.")
     mode.add_argument("--apply", action="store_true", help="Apply the downloaded config through update_config.sh.")
+    mode.add_argument("--merge-dry-run", action="store_true", help="Merge into the current config candidate without writing.")
+    mode.add_argument("--merge-apply", action="store_true", help="Merge into the current config and apply through update_config.sh.")
+    parser.add_argument("--group", default="", help="Subscription group name for merge modes.")
+    parser.add_argument("--replace-group", action="store_true", help="Replace an existing managed subscription group.")
+    parser.add_argument("--config-file", default="")
     parser.add_argument("--update-script", default="")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
@@ -297,6 +303,73 @@ def converted_config_from_proxies(proxies: list[dict]) -> dict:
     }
 
 
+def load_yaml_config(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except Exception as exc:
+        raise RuntimeError(f"failed to read current config: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("current config top-level YAML must be a mapping")
+    for key in ("proxies", "proxy-groups", "rules"):
+        if not isinstance(data.get(key), list):
+            raise RuntimeError(f"current config {key} must be a list")
+    return data
+
+
+def subscription_group_config(proxies: list[dict], group_name: str) -> dict:
+    name = group_name.strip()
+    if not name:
+        raise RuntimeError("--group is required for merge modes")
+    prefix = f"{name}/"
+    used_names: set[str] = set()
+    renamed = []
+    for proxy in proxies:
+        item = copy.deepcopy(proxy)
+        item["name"] = unique_name(f"{prefix}{proxy.get('name') or 'Node'}", used_names)
+        renamed.append(item)
+    node_names = [str(proxy["name"]) for proxy in renamed]
+    return {
+        "proxies": renamed,
+        "proxy-groups": [
+            {"name": name, "type": "select", "proxies": [f"{name}-Auto", *node_names, "DIRECT"]},
+            {"name": f"{name}-Auto", "type": "fallback", "proxies": node_names, "url": TEST_URL, "interval": 300},
+        ],
+    }
+
+
+def merge_subscription_group(current: dict, group_config: dict, group_name: str, replace_group: bool) -> dict:
+    group_names = {str(group["name"]) for group in group_config["proxy-groups"]}
+    proxy_prefix = f"{group_name}/"
+    current_group_names = {str(group.get("name")) for group in current["proxy-groups"] if isinstance(group, dict)}
+    current_proxy_names = {str(proxy.get("name")) for proxy in current["proxies"] if isinstance(proxy, dict)}
+    managed_proxy_names = {name for name in current_proxy_names if name.startswith(proxy_prefix)}
+    conflicts = sorted((current_group_names & group_names) | managed_proxy_names)
+    if conflicts and not replace_group:
+        raise RuntimeError(f"subscription group already exists: {', '.join(conflicts)}")
+
+    merged = copy.deepcopy(current)
+    if replace_group:
+        merged["proxy-groups"] = [
+            group for group in merged["proxy-groups"]
+            if not (isinstance(group, dict) and str(group.get("name")) in group_names)
+        ]
+        merged["proxies"] = [
+            proxy for proxy in merged["proxies"]
+            if not (isinstance(proxy, dict) and str(proxy.get("name", "")).startswith(proxy_prefix))
+        ]
+
+    new_proxy_names = {str(proxy["name"]) for proxy in group_config["proxies"]}
+    remaining_names = {str(proxy.get("name")) for proxy in merged["proxies"] if isinstance(proxy, dict)}
+    collisions = sorted(new_proxy_names & remaining_names)
+    if collisions:
+        raise RuntimeError(f"proxy name collision: {', '.join(collisions)}")
+
+    merged["proxies"].extend(group_config["proxies"])
+    merged["proxy-groups"].extend(group_config["proxy-groups"])
+    return merged
+
+
 def candidate_config_from_subscription(text: str) -> CandidateConfig:
     try:
         data = validate_full_yaml_config(text)
@@ -328,10 +401,20 @@ def run_update_script(update_script: str, mode: str, candidate_file: str) -> int
     return subprocess.run(command, check=False).returncode
 
 
+def resolve_mode(args: argparse.Namespace) -> tuple[str, bool]:
+    if args.merge_apply:
+        return "--apply", True
+    if args.merge_dry_run:
+        return "--dry-run", True
+    return ("--apply" if args.apply else "--dry-run"), False
+
+
 def main() -> int:
     args = parse_args()
-    mode = "--apply" if args.apply else "--dry-run"
-    update_script = args.update_script or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "update_config.sh")
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    mode, merge_mode = resolve_mode(args)
+    update_script = args.update_script or os.path.join(project_dir, "update_config.sh")
+    config_file = args.config_file or os.path.join(project_dir, "config.yaml")
     if not os.path.isfile(update_script):
         print(f"错误: update_config.sh 不存在: {update_script}", file=sys.stderr)
         return 1
@@ -353,17 +436,33 @@ def main() -> int:
         print(f"错误: 订阅导入校验失败: {'; '.join(error for error in errors if error)}", file=sys.stderr)
         return 1
 
-    candidate_file = write_temp_config(candidate.text)
+    try:
+        if merge_mode:
+            current = load_yaml_config(config_file)
+            group_config = subscription_group_config(candidate.data["proxies"], args.group)
+            merged = merge_subscription_group(current, group_config, args.group.strip(), args.replace_group)
+            candidate_text = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False)
+            validate_full_yaml_config(candidate_text)
+            candidate_file = write_temp_config(candidate_text)
+        else:
+            candidate_file = write_temp_config(candidate.text)
+    except RuntimeError as exc:
+        print(f"错误: 订阅合并失败: {exc}", file=sys.stderr)
+        return 1
 
     try:
-        print(
-            "订阅下载完成: "
+        summary = (
             f"HTTP {content.status}, {content.byte_count} bytes, "
-            f"source={candidate.source}, "
-            f"proxies={len(candidate.data['proxies'])}, "
-            f"groups={len(candidate.data['proxy-groups'])}, rules={len(candidate.data['rules'])}",
-            flush=True,
+            f"source={candidate.source}, proxies={len(candidate.data['proxies'])}"
         )
+        if merge_mode:
+            print(f"订阅合并完成: {summary}, group={args.group.strip()}, mode={mode}", flush=True)
+        else:
+            print(
+                "订阅下载完成: "
+                f"{summary}, groups={len(candidate.data['proxy-groups'])}, rules={len(candidate.data['rules'])}",
+                flush=True,
+            )
         return run_update_script(update_script, mode, candidate_file)
     finally:
         try:

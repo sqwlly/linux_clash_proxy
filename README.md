@@ -330,6 +330,10 @@ clash-proxy menu
 展示 AI/GitHub 相关活动连接，`clash-proxy incident codex` 输出故障排查报告。
 `clash-proxy import-subscription <url>` 会下载完整 Clash/Mihomo YAML 订阅，或把 Base64 VLESS 节点列表转换为最小可用配置后走安全更新校验；默认
 `--dry-run` 不写入配置，只有显式 `--apply` 才会调用现有 `update_config.sh --apply`。当前不转换 `ss://`、`vmess://`、`trojan://` 等其他节点 URI。
+如果要把新订阅作为独立分组追加到当前源配置，使用
+`clash-proxy import-subscription <url> --merge-dry-run --group CyberGuard`；合并会生成 `CyberGuard` 和
+`CyberGuard-Auto` 两个组，并给节点加 `CyberGuard/` 前缀，默认遇到同名组会拒绝。确认后再用
+`--merge-apply`，替换既有同名订阅组时必须显式加 `--replace-group`。
 `clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行
 常用维护动作。
 
@@ -366,10 +370,22 @@ root 级生产入口当前仍以 restart 作为生效边界。安全更新应保
    clash-proxy import-subscription "https://example.com/sub" --dry-run
    ```
 
+   如果需要作为独立分组合并到当前源配置，先运行：
+
+   ```bash
+   clash-proxy import-subscription "https://example.com/sub" --merge-dry-run --group CyberGuard
+   ```
+
 4. 需要应用时再执行：
 
    ```bash
    /root/clash_proxy/update_config.sh --apply /root/clash_proxy/config_1.yaml
+   ```
+
+   或者对订阅分组合并执行：
+
+   ```bash
+   clash-proxy import-subscription "https://example.com/sub" --merge-apply --group CyberGuard
    ```
 
 5. `--apply` 写入源配置后会进入受控 refresh 流程；也可以等待 systemd path/timer 触发。

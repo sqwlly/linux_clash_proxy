@@ -146,3 +146,174 @@ def test_base64_vless_subscription_converts_to_minimal_yaml(monkeypatch, tmp_pat
     assert config["proxies"][1]["reality-opts"] == {"public-key": "public-key", "short-id": "abcd"}
     assert config["proxy-groups"][0]["name"] == "PROXY"
     assert config["rules"] == ["MATCH,PROXY"]
+
+
+def test_merge_dry_run_adds_subscription_group_without_changing_rules(monkeypatch, tmp_path, capsys):
+    module = _load_import_module()
+    update_script = tmp_path / "update_config.sh"
+    update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    current_config = tmp_path / "config.yaml"
+    current_config.write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [{"name": "Existing", "type": "direct"}],
+                "proxy-groups": [{"name": "MAIN", "type": "select", "proxies": ["Existing"]}],
+                "rules": ["DOMAIN,example.com,MAIN"],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    decoded = "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test#Node%201"
+    body = base64.b64encode(decoded.encode("utf-8"))
+    captured_configs = []
+
+    def fake_run(command, check):
+        captured_configs.append(yaml.safe_load(Path(command[2]).read_text(encoding="utf-8")))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(body))
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=body.decode("utf-8"), status=200, content_type="", byte_count=len(body)
+        ),
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "import_subscription.py",
+            "https://example.test/sub",
+            "--update-script",
+            str(update_script),
+            "--config-file",
+            str(current_config),
+            "--merge-dry-run",
+            "--group",
+            "Cyber",
+        ],
+    )
+
+    assert module.main() == 0
+    stdout = capsys.readouterr().out
+    assert "订阅合并完成" in stdout
+    merged = captured_configs[0]
+    assert [proxy["name"] for proxy in merged["proxies"]] == ["Existing", "Cyber/Node 1"]
+    assert [group["name"] for group in merged["proxy-groups"]] == ["MAIN", "Cyber", "Cyber-Auto"]
+    assert merged["rules"] == ["DOMAIN,example.com,MAIN"]
+
+
+def test_merge_refuses_existing_group_without_replace(monkeypatch, tmp_path, capsys):
+    module = _load_import_module()
+    update_script = tmp_path / "update_config.sh"
+    update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    current_config = tmp_path / "config.yaml"
+    current_config.write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [{"name": "Cyber/Old", "type": "direct"}],
+                "proxy-groups": [{"name": "Cyber", "type": "select", "proxies": ["Cyber/Old"]}],
+                "rules": ["MATCH,Cyber"],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    body = base64.b64encode(b"vless://uuid@example.test:443?type=ws#Node")
+
+    monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(body))
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=body.decode("utf-8"), status=200, content_type="", byte_count=len(body)
+        ),
+    )
+    monkeypatch.setattr(module.subprocess, "run", lambda command, check: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "import_subscription.py",
+            "https://example.test/sub",
+            "--update-script",
+            str(update_script),
+            "--config-file",
+            str(current_config),
+            "--merge-dry-run",
+            "--group",
+            "Cyber",
+        ],
+    )
+
+    assert module.main() == 1
+    assert "subscription group already exists" in capsys.readouterr().err
+
+
+def test_merge_replace_group_replaces_only_managed_subscription_items(monkeypatch, tmp_path):
+    module = _load_import_module()
+    update_script = tmp_path / "update_config.sh"
+    update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    current_config = tmp_path / "config.yaml"
+    current_config.write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [
+                    {"name": "Keep", "type": "direct"},
+                    {"name": "Cyber/Old", "type": "direct"},
+                ],
+                "proxy-groups": [
+                    {"name": "MAIN", "type": "select", "proxies": ["Keep"]},
+                    {"name": "Cyber", "type": "select", "proxies": ["Cyber/Old"]},
+                    {"name": "Cyber-Auto", "type": "fallback", "proxies": ["Cyber/Old"]},
+                ],
+                "rules": ["MATCH,MAIN"],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    body = base64.b64encode(b"vless://uuid@example.test:443?type=ws#New")
+    captured_configs = []
+
+    def fake_run(command, check):
+        captured_configs.append(yaml.safe_load(Path(command[2]).read_text(encoding="utf-8")))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(body))
+    monkeypatch.setattr(
+        module,
+        "download_subscription_with_curl",
+        lambda url, max_bytes, timeout: module.SubscriptionContent(
+            text=body.decode("utf-8"), status=200, content_type="", byte_count=len(body)
+        ),
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "import_subscription.py",
+            "https://example.test/sub",
+            "--update-script",
+            str(update_script),
+            "--config-file",
+            str(current_config),
+            "--merge-dry-run",
+            "--group",
+            "Cyber",
+            "--replace-group",
+        ],
+    )
+
+    assert module.main() == 0
+    merged = captured_configs[0]
+    assert [proxy["name"] for proxy in merged["proxies"]] == ["Keep", "Cyber/New"]
+    assert [group["name"] for group in merged["proxy-groups"]] == ["MAIN", "Cyber", "Cyber-Auto"]
+    assert merged["rules"] == ["MATCH,MAIN"]
