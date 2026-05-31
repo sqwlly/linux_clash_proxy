@@ -6,7 +6,9 @@ from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
 from textual.widgets import Button, Label
 
+from ...audit import write_audit_event
 from ...config import AppPaths, config_file
+from ...process import restart_process
 from ...runtime import render_runtime
 from ..widgets import NavigationTextArea as TextArea
 
@@ -33,7 +35,8 @@ class ConfigEditorScreen(Widget):
                 with Horizontal(classes="toolbar"):
                     yield Button("Save", id="btn-config-save", classes="action-button success-button")
                     yield Button("Render", id="btn-config-render", classes="action-button primary-button")
-                    yield Button("Reload", id="btn-config-reload", classes="action-button muted-button")
+                    yield Button("Restart", id="btn-config-restart", classes="action-button danger-button")
+                    yield Button("Reload File", id="btn-config-reload", classes="action-button muted-button")
                 yield TextArea(id="config-editor", classes="config-editor")
                 yield Label("─", id="config-log", classes="action-status")
 
@@ -68,6 +71,8 @@ class ConfigEditorScreen(Widget):
             self.action_save_config()
         elif event.button.id == "btn-config-render":
             self.action_render_config()
+        elif event.button.id == "btn-config-restart":
+            self.action_restart_config()
         elif event.button.id == "btn-config-reload":
             self._load_config()
 
@@ -104,3 +109,27 @@ class ConfigEditorScreen(Widget):
         except Exception as e:
             log_label.update(f"[#fb7185]Render failed: {e}[/]")
             self.notify(f"Render failed: {e}", severity="error")
+
+    def action_restart_config(self) -> None:
+        log_label = self.query_one("#config-log", Label)
+
+        if self._modified:
+            log_label.update("[#f6c177]Save config before restarting[/]")
+            return
+
+        try:
+            runtime_path = render_runtime(self.paths)
+            pid = restart_process(self.paths)
+            write_audit_event(
+                self.paths,
+                action="config_restart",
+                target=str(runtime_path),
+                result="ok",
+                detail={"pid": pid},
+            )
+            log_label.update(f"[#a3e635]Rendered {runtime_path}; restarted PID {pid}[/]")
+            self.notify("Runtime config rendered and proxy restarted", severity="information")
+
+        except Exception as e:
+            log_label.update(f"[#fb7185]Restart failed: {e}[/]")
+            self.notify(f"Restart failed: {e}", severity="error")

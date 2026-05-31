@@ -15,6 +15,26 @@ class ProxyGroup:
 
 
 @dataclass(frozen=True)
+class ConnectionEntry:
+    id: str
+    host: str
+    process: str
+    rule: str
+    proxy_chain: list[str]
+    upload: int
+    download: int
+
+
+@dataclass(frozen=True)
+class ProviderEntry:
+    name: str
+    type: str
+    vehicle: str
+    proxy_count: int
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class QueryContext:
     groups: dict[str, ProxyGroup]
     api_available: bool

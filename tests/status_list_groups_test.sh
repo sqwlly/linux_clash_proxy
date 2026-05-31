@@ -260,7 +260,7 @@ assert_contains "$menu_output" "状态面板" "menu 应提供状态面板入口"
 assert_contains "$menu_output" "AI 路由面板" "menu 应提供 AI 状态入口"
 
 menu_restart_output="$(
-    printf '8\nq\n' | env "${COMMON_ENV[@]}" "$SCRIPT" menu
+    printf '9\nq\n' | env "${COMMON_ENV[@]}" "$SCRIPT" menu
 )"
 
 assert_contains "$menu_restart_output" "systemctl restart clash-proxy.service" "menu 重启应优先走 systemd 管理入口"

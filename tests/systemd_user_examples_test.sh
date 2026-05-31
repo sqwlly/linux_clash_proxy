@@ -35,6 +35,8 @@ assert_file_contains "$OVERRIDE_EXAMPLE" "Requires=cproxy.service" "用户级 ov
 
 assert_file_contains "$SERVICE_FILE" "ExecStart=%h/.local/bin/cproxy start" "用户级 service 应通过 cproxy 启动"
 assert_file_contains "$SERVICE_FILE" "ExecStop=%h/.local/bin/cproxy stop" "用户级 service 应通过 cproxy 停止"
+assert_file_contains "$SERVICE_FILE" "NoNewPrivileges=yes" "用户级 service 应启用 NoNewPrivileges"
+assert_file_contains "$SERVICE_FILE" "PrivateTmp=yes" "用户级 service 应隔离临时目录"
 if grep -Fq "/root/clash_proxy" "$SERVICE_FILE"; then
     echo "ASSERTION FAILED: 用户级 service 不应包含仓库绝对路径" >&2
     exit 1

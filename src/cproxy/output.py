@@ -57,6 +57,12 @@ def build_root_parser() -> ArgumentParser:
 
     subparsers.add_parser("test", help="Test proxy connectivity")
 
+    security_parser = subparsers.add_parser("security-check", help="Validate local GA security configuration")
+    security_parser.add_argument("--strict", action="store_true", help="Treat warnings as failures")
+
+    support_parser = subparsers.add_parser("support-bundle", help="Write a redacted support bundle")
+    support_parser.add_argument("--output", help="Output tar.gz path")
+
     test_group_parser = subparsers.add_parser("test-group", help="Test group or node health")
     test_group_parser.add_argument("group")
     test_group_parser.add_argument("--raw", action="store_true")

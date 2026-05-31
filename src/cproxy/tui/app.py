@@ -19,6 +19,8 @@ from textual.widgets import (
 from ..config import AppPaths, default_paths
 from .screens.dashboard import DashboardScreen
 from .screens.proxies import ProxiesScreen
+from .screens.providers import ProvidersScreen
+from .screens.connections import ConnectionsScreen
 from .screens.ai_route import AIRouteScreen
 from .screens.subscriptions import SubscriptionsScreen
 from .screens.config_editor import ConfigEditorScreen
@@ -31,7 +33,17 @@ class CProxyApp(App):
     SUB_TITLE = "Mihomo Proxy Manager"
 
     CSS_PATH = "styles.tcss"
-    TAB_ORDER = ["dashboard", "proxies", "ai-route", "subscriptions", "config", "system-proxy", "logs"]
+    TAB_ORDER = [
+        "dashboard",
+        "proxies",
+        "providers",
+        "connections",
+        "ai-route",
+        "subscriptions",
+        "config",
+        "system-proxy",
+        "logs",
+    ]
 
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
@@ -43,11 +55,13 @@ class CProxyApp(App):
         Binding("escape", "back", "Back", priority=True),
         Binding("1", "switch_tab('dashboard')", "Overview"),
         Binding("2", "switch_tab('proxies')", "Nodes"),
-        Binding("3", "switch_tab('ai-route')", "AI Route"),
-        Binding("4", "switch_tab('subscriptions')", "Subs"),
-        Binding("5", "switch_tab('config')", "Config"),
-        Binding("6", "switch_tab('system-proxy')", "Proxy"),
-        Binding("7", "switch_tab('logs')", "Logs"),
+        Binding("3", "switch_tab('providers')", "Providers"),
+        Binding("4", "switch_tab('connections')", "Connections"),
+        Binding("5", "switch_tab('ai-route')", "AI Route"),
+        Binding("6", "switch_tab('subscriptions')", "Subs"),
+        Binding("7", "switch_tab('config')", "Config"),
+        Binding("8", "switch_tab('system-proxy')", "Proxy"),
+        Binding("9", "switch_tab('logs')", "Logs"),
     ]
 
     def __init__(self, paths: AppPaths | None = None):
@@ -61,6 +75,10 @@ class CProxyApp(App):
                 yield DashboardScreen(self.paths)
             with TabPane("Nodes", id="proxies"):
                 yield ProxiesScreen(self.paths)
+            with TabPane("Providers", id="providers"):
+                yield ProvidersScreen(self.paths)
+            with TabPane("Connections", id="connections"):
+                yield ConnectionsScreen(self.paths)
             with TabPane("AI Route", id="ai-route"):
                 yield AIRouteScreen(self.paths)
             with TabPane("Subs", id="subscriptions"):
@@ -77,6 +95,10 @@ class CProxyApp(App):
         for screen in self.query(DashboardScreen):
             screen.refresh_data()
         for screen in self.query(ProxiesScreen):
+            screen.refresh_data()
+        for screen in self.query(ProvidersScreen):
+            screen.refresh_data()
+        for screen in self.query(ConnectionsScreen):
             screen.refresh_data()
         for screen in self.query(AIRouteScreen):
             screen.refresh_data()
@@ -155,6 +177,8 @@ class CProxyApp(App):
         active_id = tabbed.active
         target_ids = {
             "proxies": "#groups-table",
+            "providers": "#providers-table",
+            "connections": "#connections-table",
             "ai-route": "#ai-probe-table",
             "subscriptions": "#sub-url-input",
             "config": "#btn-config-save",

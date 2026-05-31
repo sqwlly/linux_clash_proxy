@@ -68,6 +68,16 @@ pipx install /path/to/clash_proxy
   指定 `mihomo` 可执行文件路径
 - `api-timeout`
   控制 Mihomo API 请求超时，默认 `2` 秒
+- `external-controller-tls`
+  配置后 `cproxy` 优先使用 HTTPS controller，例如 `127.0.0.1:9443`
+- `secret-systemd-credential`
+  从 systemd `$CREDENTIALS_DIRECTORY` 读取指定 credential 文件
+- `secret-file`
+  从本地文件读取 controller secret；优先级高于兼容用的 `secret`
+- `secret-keyring-service`
+  从 Python keyring 后端读取 controller secret，用户名默认 `controller`
+- `audit-journald`
+  为 `true` 时把操作审计同步写入 `systemd-cat`
 - `test-timeout`
   控制 `test-group` 延迟检测超时
 - `connectivity-timeout`
@@ -130,6 +140,8 @@ cproxy logs
 cproxy logs --lines 200
 cproxy status
 cproxy status --raw
+cproxy security-check
+cproxy support-bundle --output /tmp/cproxy-support.tar.gz
 ```
 
 AI 路由控制：
@@ -162,6 +174,15 @@ cproxy proxy-shell -- -c 'env | rg "PROXY"'
 ```bash
 cproxy test
 ```
+
+用户级 TUI：
+
+```bash
+cproxy tui
+cproxy-tui
+```
+
+TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy 和 Logs；其中 Providers 可手动更新 `/providers/proxies`，Connections 可查看 `/connections` 并断开选中连接，断开全部连接需要二次确认。
 
 ## 输出策略
 

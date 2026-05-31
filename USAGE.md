@@ -98,6 +98,14 @@ cproxy bootstrap
 ```yaml
 program-path: /usr/local/bin/mihomo
 api-timeout: 2
+external-controller-tls: 127.0.0.1:9443
+secret-systemd-credential: controller-secret
+# 或使用本地文件引用，避免把真实 secret 写入 YAML:
+# secret-file: ~/.config/cproxy/controller-secret
+# 或使用 Python keyring 后端:
+# secret-keyring-service: cproxy
+# secret-keyring-username: controller
+audit-journald: true
 test-timeout: 5000
 connectivity-timeout: 5
 ```
@@ -112,9 +120,26 @@ cproxy logs --lines 50
 cproxy status
 ```
 
+GA 本地检查和脱敏支持包：
+
+```bash
+cproxy security-check
+cproxy security-check --strict
+cproxy support-bundle --output /tmp/cproxy-support.tar.gz
+```
+
 如果 `cproxy test` 提示缺少 `country.mmdb`，先把该文件放到：
 
 - `~/.local/share/cproxy/country.mmdb`
+
+## 用户级 TUI
+
+```bash
+cproxy tui
+cproxy-tui
+```
+
+TUI 是当前 Python/Textual `cproxy` 的用户级控制台，使用 `~/.config/cproxy`、`~/.local/share/cproxy` 和 `~/.local/state/cproxy`。页签包括 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy 和 Logs。Providers 支持手动更新 `/providers/proxies`；Connections 支持查看 `/connections`、断开选中连接，并对断开全部连接做二次确认。
 
 ## AI 路由
 

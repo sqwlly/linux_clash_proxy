@@ -17,6 +17,8 @@ from .logs import follow_lines, read_recent_lines
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .process import ProcessOwnershipError, get_status, restart_process, start_process, stop_process
 from .runtime import render_runtime
+from .security import validate_controller_security
+from .support import build_support_bundle
 from .output import build_root_parser, normalize_name
 from .services.query import QueryService
 
@@ -499,6 +501,18 @@ def _run_bootstrap() -> int:
     return 0
 
 
+def _render_security_check(strict: bool) -> int:
+    report = validate_controller_security(default_paths())
+    if report.issues:
+        for issue in report.issues:
+            print(f"{issue.severity.upper()}: {issue.code}: {issue.detail}")
+    else:
+        print("OK: security configuration passed")
+    if any(issue.severity == "error" or (strict and issue.severity == "warning") for issue in report.issues):
+        return 1
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = build_root_parser()
     args: Namespace = parser.parse_args(argv)
@@ -541,6 +555,13 @@ def run(argv: list[str] | None = None) -> int:
             return _render_status(args.raw)
         if args.command == "test":
             return _render_connectivity_report(run_connectivity_test(default_paths()))
+        if args.command == "security-check":
+            return _render_security_check(args.strict)
+        if args.command == "support-bundle":
+            output_path = Path(args.output) if args.output else None
+            bundle_path = build_support_bundle(default_paths(), output_path)
+            print(f"已生成支持包: {bundle_path}")
+            return 0
         if args.command == "test-group":
             return _render_group_check(test_group(default_paths(), args.group), args.raw)
         if args.command == "proxy-env":

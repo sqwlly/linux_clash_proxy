@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "master"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Legacy test path
+        run: |
+          if [ ! -e "/root/clash_proxy" ]; then
+            sudo ln -s "$GITHUB_WORKSPACE" "/root/clash_proxy"
+          fi
+
+      - name: Install package with TUI extra
+        run: python -m pip install -e ".[tui]" pytest
+
+      - name: Python tests
+        run: PYTHONPATH="src:." python -m pytest -q
+
+      - name: Shell tests
+        run: |
+          set -e
+          for test_script in tests/*.sh; do
+            bash "$test_script"
+          done
+
+      - name: Enterprise TUI audit
+        run: bash "scripts/audit-enterprise-tui.sh"
+
+      - name: GA artifact smoke
+        run: |
+          bash "scripts/build-ga-artifacts.sh" "/tmp/cproxy-ga"
+          bash "scripts/verify-ga-artifacts.sh" "/tmp/cproxy-ga"
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install audit tools
+        run: python -m pip install -e ".[tui]" pip-audit cyclonedx-bom
+
+      - name: Dependency vulnerabilities
+        run: pip-audit --strict
+
+      - name: SBOM
+        run: cyclonedx-py environment --output-file sbom.cdx.json
+
+      - name: Scorecard
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false

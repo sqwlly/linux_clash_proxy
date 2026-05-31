@@ -108,3 +108,143 @@ def test_query_service_falls_back_to_runtime_models(tmp_path: Path):
     assert group.current == "AI-AUTO"
     assert group.candidates == ["AI-AUTO", "AI-SG"]
     assert group.source == "runtime"
+
+
+def test_query_service_maps_connections_and_providers(tmp_path: Path):
+    from cproxy.config import default_paths
+    from cproxy.services.query import QueryService
+
+    class FakeAPI:
+        def get_connections(self):
+            return {
+                "connections": [
+                    {
+                        "id": "abc",
+                        "metadata": {"host": "example.test", "process": "curl"},
+                        "rule": "DOMAIN-SUFFIX",
+                        "chains": ["Proxy", "Node A"],
+                        "upload": 1024,
+                        "download": "2048",
+                    }
+                ]
+            }
+
+        def get_proxy_providers(self):
+            return {
+                "providers": {
+                    "corp": {
+                        "type": "HTTP",
+                        "vehicleType": "HTTP",
+                        "updatedAt": "2026-05-31T12:00:00Z",
+                        "proxies": [{"name": "Node A"}, {"name": "Node B"}],
+                    }
+                }
+            }
+
+    service = QueryService(default_paths(tmp_path))
+    service.api = FakeAPI()
+
+    connections = service.list_connections()
+    providers = service.list_proxy_providers()
+
+    assert len(connections) == 1
+    assert connections[0].id == "abc"
+    assert connections[0].host == "example.test"
+    assert connections[0].proxy_chain == ["Proxy", "Node A"]
+    assert connections[0].upload == 1024
+    assert connections[0].download == 2048
+
+    assert len(providers) == 1
+    assert providers[0].name == "corp"
+    assert providers[0].proxy_count == 2
+
+
+def test_query_service_writes_audit_for_mutations(tmp_path: Path):
+    from cproxy.audit import audit_log_file
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import default_paths
+    from cproxy.services.query import QueryService
+
+    class FakeAPI:
+        def __init__(self):
+            self.calls = []
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(
+                    name="AI-MANUAL",
+                    type="select",
+                    current="Node A",
+                    candidates=["Node A", "Node B"],
+                )
+            }
+
+        def switch_group(self, group_name, target_name):
+            self.calls.append(("switch", group_name, target_name))
+
+        def close_connection(self, connection_id):
+            self.calls.append(("close", connection_id))
+
+        def close_all_connections(self):
+            self.calls.append(("close_all",))
+
+        def update_proxy_provider(self, name):
+            self.calls.append(("update_provider", name))
+
+    paths = default_paths(tmp_path)
+    service = QueryService(paths)
+    fake_api = FakeAPI()
+    service.api = fake_api
+
+    service.switch_group("AI-MANUAL", "Node B")
+    service.close_connection("conn-1")
+    service.close_all_connections()
+    service.update_proxy_provider("corp")
+
+    audit_lines = audit_log_file(paths).read_text(encoding="utf-8").splitlines()
+    events = [json.loads(line) for line in audit_lines]
+
+    assert [event["action"] for event in events] == [
+        "switch_group",
+        "close_connection",
+        "close_all_connections",
+        "update_proxy_provider",
+    ]
+    assert events[0]["detail"] == {"selected": "Node B"}
+
+
+def test_query_service_writes_audit_for_failed_mutation(tmp_path: Path):
+    from cproxy.audit import audit_log_file
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import default_paths
+    from cproxy.services.query import QueryService
+
+    class FakeAPI:
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(
+                    name="AI-MANUAL",
+                    type="select",
+                    current="Node A",
+                    candidates=["Node A", "Node B"],
+                )
+            }
+
+        def switch_group(self, group_name, target_name):
+            raise RuntimeError("boom")
+
+    paths = default_paths(tmp_path)
+    service = QueryService(paths)
+    service.api = FakeAPI()
+
+    try:
+        service.switch_group("AI-MANUAL", "Node B")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    event = json.loads(audit_log_file(paths).read_text(encoding="utf-8"))
+    assert event["action"] == "switch_group"
+    assert event["result"] == "error"
+    assert event["detail"]["selected"] == "Node B"
