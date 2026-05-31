@@ -41,6 +41,7 @@ sudo ./scripts/install-system-commands.sh
 clash-proxy status
 clash-proxy status --raw
 clash-proxy menu
+clash-proxy import-subscription "https://example.com/sub" --dry-run
 clash-proxy-update --dry-run config_1.yaml
 clash-proxy-update --apply config_1.yaml
 ```
@@ -51,6 +52,8 @@ clash-proxy-update --apply config_1.yaml
 出口区域。
 `clash-proxy menu` 会进入交互式控制台，可直接选择查看状态、切换 AI 路由、
 重新渲染并重启等常用操作。
+`clash-proxy import-subscription <url>` 支持导入完整 Clash/Mihomo YAML 订阅；默认
+`--dry-run` 只下载和校验，显式 `--apply` 才会写入并刷新。
 
 如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
 

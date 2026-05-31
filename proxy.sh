@@ -2315,6 +2315,37 @@ incident_ai() {
     shadow_history --raw --limit 5 || true
 }
 
+import_subscription() {
+    local helper=""
+    local update_script=""
+
+    for candidate in "$SCRIPT_DIR/import_subscription.py" "$SCRIPT_DIR/scripts/import_subscription.py" "$CONFIG_DIR/scripts/import_subscription.py"; do
+        if [ -f "$candidate" ]; then
+            helper="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$helper" ]; then
+        print_error "错误: 缺少订阅导入 helper: import_subscription.py"
+        return 1
+    fi
+
+    for candidate in "$SCRIPT_DIR/update_config.sh" "$CONFIG_DIR/update_config.sh"; do
+        if [ -f "$candidate" ]; then
+            update_script="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$update_script" ]; then
+        print_error "错误: 缺少安全更新脚本: update_config.sh"
+        return 1
+    fi
+
+    python3 "$helper" --update-script "$update_script" "$@"
+}
+
 interactive_menu() {
     local choice
 
@@ -2384,10 +2415,11 @@ usage() {
     cat << EOF
 ${BLUE}Mihomo 代理管理脚本 v1.2.0${NC}
 
-用法: ${cli_name} {start|stop|restart|status|logs|test|render|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|ai-use|shadow-probe|shadow-history|guard|ai-connections|incident|menu|proxy-env|with-proxy|proxy-shell}
+用法: ${cli_name} {start|stop|restart|status|logs|test|render|import-subscription|list-groups|list-nodes|current|switch|ai-status|test-group|probe-stable-node|ai-use|shadow-probe|shadow-history|guard|ai-connections|incident|menu|proxy-env|with-proxy|proxy-shell}
 
 配置与进程:
   render                    - 从原始配置生成运行配置
+  import-subscription <url> - 下载完整 YAML 订阅并校验，默认 dry-run
   start                     - 渲染运行配置并启动代理
   stop                      - 停止代理
   restart                   - 渲染运行配置并重启代理
@@ -2440,6 +2472,7 @@ AI 路由控制:
 示例:
   # 配置与进程
   ${cli_name} render
+  ${cli_name} import-subscription "https://example.com/sub" --dry-run
   ${cli_name} start
 
   # AI 路由控制
@@ -2495,6 +2528,10 @@ main() {
             ;;
         render)
             render
+            ;;
+        import-subscription)
+            shift
+            import_subscription "$@"
             ;;
         list-groups)
             shift

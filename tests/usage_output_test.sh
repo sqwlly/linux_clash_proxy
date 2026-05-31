@@ -26,6 +26,7 @@ assert_contains "$help_output" "AI 路由控制" "usage 应按场景分组展示
 assert_contains "$help_output" "命令级代理" "usage 应按场景分组展示命令级代理命令"
 assert_contains "$help_output" "诊断与排障" "usage 应按场景分组展示诊断与排障命令"
 assert_contains "$help_output" "list-nodes <group>" "usage 应保留节点查看命令"
+assert_contains "$help_output" "import-subscription <url>" "usage 应展示订阅导入命令"
 assert_contains "$help_output" "menu" "usage 应展示交互式控制台命令"
 assert_contains "$help_output" "with-proxy <cmd...>" "usage 应保留命令级代理示例"
 assert_contains "$help_output" "用法: clash-proxy" "usage 应展示稳定命令名"

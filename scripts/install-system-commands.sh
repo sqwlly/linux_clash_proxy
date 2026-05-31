@@ -170,6 +170,7 @@ warn_shadowed_command() {
 main() {
     require_file "${PROJECT_DIR}/proxy.sh"
     require_file "${PROJECT_DIR}/update_config.sh"
+    require_file "${PROJECT_DIR}/scripts/import_subscription.py"
     require_file "${PROJECT_DIR}/scripts/probe_stable_node.py"
     require_file "${PROJECT_DIR}/scripts/probe_history.py"
     require_file "${PROJECT_DIR}/scripts/progress.py"
@@ -186,6 +187,7 @@ main() {
 
     install_payload "${PROJECT_DIR}/proxy.sh" "proxy.sh"
     install_payload "${PROJECT_DIR}/update_config.sh" "update_config.sh"
+    install_payload "${PROJECT_DIR}/scripts/import_subscription.py" "import_subscription.py"
     install_payload "${PROJECT_DIR}/scripts/probe_stable_node.py" "probe_stable_node.py"
     install_payload "${PROJECT_DIR}/scripts/probe_history.py" "probe_history.py"
     install_payload "${PROJECT_DIR}/scripts/progress.py" "progress.py"

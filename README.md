@@ -307,6 +307,7 @@ sudo ./scripts/install-system-commands.sh --with-cproxy-alias
 ```bash
 clash-proxy status
 clash-proxy status --raw
+clash-proxy import-subscription "https://example.com/sub" --dry-run
 clash-proxy probe-stable-node --switch
 clash-proxy menu
 ```
@@ -327,6 +328,8 @@ clash-proxy menu
 `clash-proxy shadow-history` 会摘要展示最近探测历史。
 `clash-proxy guard codex` 只选择稳定出口，不启动 `codex`；也可以用 `clash-proxy guard codex -- <cmd>` 包裹一条命令。`clash-proxy ai-connections`
 展示 AI/GitHub 相关活动连接，`clash-proxy incident codex` 输出故障排查报告。
+`clash-proxy import-subscription <url>` 会下载完整 Clash/Mihomo YAML 订阅并走安全更新校验；默认 `--dry-run`
+不写入配置，只有显式 `--apply` 才会调用现有 `update_config.sh --apply`。当前不转换 Base64 节点 URI 列表。
 `clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由或执行
 常用维护动作。
 
@@ -355,6 +358,12 @@ root 级生产入口当前仍以 restart 作为生效边界。安全更新应保
 
    ```bash
    /root/clash_proxy/update_config.sh --dry-run /root/clash_proxy/config_1.yaml
+   ```
+
+   如果候选配置来自完整 YAML 订阅，也可以先运行：
+
+   ```bash
+   clash-proxy import-subscription "https://example.com/sub" --dry-run
    ```
 
 4. 需要应用时再执行：
