@@ -42,6 +42,10 @@ if ! grep -Fq "DRY-RUN install payload progress.py" <<< "$dry_run_output"; then
     echo "ASSERTION FAILED: dry-run should list progress.py payload action" >&2
     exit 1
 fi
+if ! grep -Fq "DRY-RUN install payload probe_history.py" <<< "$dry_run_output"; then
+    echo "ASSERTION FAILED: dry-run should list probe_history.py payload action" >&2
+    exit 1
+fi
 
 "$INSTALLER" --bindir "${TMP_DIR}/bin" --libdir "${TMP_DIR}/lib/clash-proxy" >/dev/null
 
@@ -49,6 +53,7 @@ test -x "${TMP_DIR}/bin/clash-proxy"
 test -x "${TMP_DIR}/bin/clash-proxy-update"
 test -x "${TMP_DIR}/lib/clash-proxy/proxy.sh"
 test -x "${TMP_DIR}/lib/clash-proxy/update_config.sh"
+test -x "${TMP_DIR}/lib/clash-proxy/probe_history.py"
 test -x "${TMP_DIR}/lib/clash-proxy/progress.py"
 test ! -e "${TMP_DIR}/bin/cproxy"
 test ! -e "${TMP_DIR}/bin/cproxy-update"

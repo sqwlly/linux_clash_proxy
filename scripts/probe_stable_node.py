@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from probe_history import load_history_penalties
 from progress import ProgressBar, style_text
 
 
@@ -70,6 +71,7 @@ class ProbeSummary:
     name: str
     delays: list[int]
     failures: int
+    history_penalty_ms: int = 0
 
     @property
     def success_count(self) -> int:
@@ -97,11 +99,12 @@ class ProbeSummary:
             return None
         return min(self.delays)
 
-    def rank_key(self) -> tuple[int, int, int, int, str]:
+    def rank_key(self) -> tuple[int, int, int, int, int, str]:
         no_success_penalty = 1_000_000
         max_delay = self.max_delay if self.max_delay is not None else no_success_penalty
         avg_delay = self.avg_delay if self.avg_delay is not None else no_success_penalty
-        return (-self.success_count, self.failures, max_delay, avg_delay, self.name)
+        penalty = max(0, self.history_penalty_ms)
+        return (-self.success_count, self.failures, max_delay + penalty, avg_delay + penalty, penalty, self.name)
 
 
 @dataclass(frozen=True)
@@ -274,9 +277,19 @@ def switch_to_candidate(controller: str, secret: str, group_state: GroupState, t
         switch_group(controller, secret, group, next_target)
 
 
-def active_candidates_after_round(results: dict[str, dict], current: str | None) -> set[str]:
+def active_candidates_after_round(
+    results: dict[str, dict],
+    current: str | None,
+    history_penalties: dict[str, int] | None = None,
+) -> set[str]:
+    penalties = history_penalties or {}
     summaries = [
-        ProbeSummary(name=name, delays=list(item["delays"]), failures=int(item["failures"]))
+        ProbeSummary(
+            name=name,
+            delays=list(item["delays"]),
+            failures=int(item["failures"]),
+            history_penalty_ms=penalties.get(name, 0),
+        )
         for name, item in results.items()
     ]
     active_count = max(1, ceil(len(summaries) / 2))
@@ -336,6 +349,7 @@ def stable_score(summary: ProbeSummary, rounds: int, strategy: Strategy) -> int:
         score -= min(20, (summary.max_delay / strategy.max_delay_ms) * 15)
     if summary.max_delay is not None and summary.min_delay is not None:
         score -= min(15, ((summary.max_delay - summary.min_delay) / strategy.max_delay_ms) * 30)
+    score -= min(10, max(0, summary.history_penalty_ms) / 30)
     return max(0, min(100, round(score)))
 
 
@@ -386,6 +400,19 @@ def switch_skip_reason(
     return ""
 
 
+def switch_preview_reason(
+    best: ProbeSummary | None,
+    verdict: StabilityVerdict,
+    current: str | None,
+    current_verdict: StabilityVerdict,
+    current_summary: ProbeSummary | None,
+    strategy: Strategy,
+) -> str:
+    if not verdict.stable:
+        return verdict.reason
+    return switch_skip_reason(best, current, current_verdict, current_summary, strategy)
+
+
 def switch_request_satisfied(switched: bool, skip_reason: str, current_verdict: StabilityVerdict) -> bool:
     return (
         switched
@@ -403,6 +430,7 @@ def summary_payload(summary: ProbeSummary, rounds: int, strategy: Strategy) -> d
         "avg_ms": summary.avg_delay,
         "max_ms": summary.max_delay,
         "min_ms": summary.min_delay,
+        "history_penalty_ms": summary.history_penalty_ms,
         "score": stable_score(summary, rounds, strategy),
     }
 
@@ -501,6 +529,7 @@ def summarize(
     url: str,
     rounds: int,
     timeout: int,
+    history_penalties: dict[str, int] | None = None,
     show_progress: bool = False,
 ) -> tuple[list[ProbeSummary], GroupState]:
     if rounds < 1:
@@ -509,6 +538,7 @@ def summarize(
         raise RuntimeError("--timeout 必须大于等于 1000")
 
     group_state = load_group_state(controller, secret, group)
+    penalties = history_penalties or {}
     results = {name: {"delays": [], "failures": 0} for name in group_state.candidates}
     active = set(group_state.candidates)
     progress_count_width = len(str(len(group_state.candidates)))
@@ -540,12 +570,18 @@ def summarize(
             active = active_candidates_after_round(
                 {name: results[name] for name in active},
                 group_state.current,
+                penalties,
             )
             if show_progress:
                 print(style_text(f"筛选 | 保留 {len(active)} | 淘汰 {before_count - len(active)}", "yellow"), file=sys.stderr)
 
     summaries = [
-        ProbeSummary(name=name, delays=list(item["delays"]), failures=int(item["failures"]))
+        ProbeSummary(
+            name=name,
+            delays=list(item["delays"]),
+            failures=int(item["failures"]),
+            history_penalty_ms=penalties.get(name, 0),
+        )
         for name, item in results.items()
     ]
     if show_progress:
@@ -609,6 +645,7 @@ def render_human(
     switch_requested: bool,
     switched: bool,
     skip_reason: str,
+    preview_reason: str,
 ) -> None:
     print("摘要")
     print(f"目标组: {group}")
@@ -632,6 +669,10 @@ def render_human(
         print(f"切换: 已切换 {group} -> {normalize_name(best.name)}")
     elif switch_requested:
         print(f"切换: 未切换 ({skip_reason})")
+    elif preview_reason:
+        print(f"切换预览: 不会切换 ({preview_reason})")
+    elif best:
+        print(f"切换预览: 会切换到 {normalize_name(best.name)}")
     print()
     print("结果")
     for line in result_table_lines(summaries, rounds, options.strategy):
@@ -642,6 +683,13 @@ def main() -> int:
     args = parse_args()
     options = resolve_options(args)
     rounds = resolve_rounds(args, options)
+    history_penalties = load_history_penalties(
+        args.history_file,
+        args.group,
+        options.profile,
+        options.url,
+        options.strategy.default_rounds,
+    )
     try:
         summaries, group_state = summarize(
             args.controller,
@@ -650,6 +698,7 @@ def main() -> int:
             options.url,
             rounds,
             args.timeout,
+            history_penalties,
             show_progress=not args.raw,
         )
     except RuntimeError as exc:
@@ -664,12 +713,17 @@ def main() -> int:
     current_verdict = stability_verdict(current_summary, rounds, options.strategy)
     switched = False
     skip_reason = ""
+    preview_reason = switch_preview_reason(
+        best,
+        verdict,
+        current,
+        current_verdict,
+        current_summary,
+        options.strategy,
+    )
 
     if args.switch:
-        if not verdict.stable:
-            skip_reason = verdict.reason
-        else:
-            skip_reason = switch_skip_reason(best, current, current_verdict, current_summary, options.strategy)
+        skip_reason = preview_reason
 
         if not skip_reason:
             if best is None:
@@ -729,6 +783,7 @@ def main() -> int:
             args.switch,
             switched,
             skip_reason,
+            preview_reason,
         )
 
     if args.switch and not switch_request_satisfied(switched, skip_reason, current_verdict):

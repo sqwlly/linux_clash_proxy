@@ -235,3 +235,93 @@ def test_result_table_scores_early_eliminated_nodes_against_requested_rounds():
         "Full               5/5     0  100ms  100ms  100ms     98",
         "Early              1/5     0   80ms   80ms   80ms     19",
     ]
+
+
+def test_history_penalty_demotes_recently_unstable_node(monkeypatch, capsys, tmp_path):
+    history_file = tmp_path / "history.jsonl"
+    history_file.write_text(
+        json.dumps(
+            {
+                "profile": "chatgpt",
+                "group": "AI-MANUAL",
+                "url": "http://probe.local/ping",
+                "rounds": 3,
+                "nodes": [
+                    {"name": "Fast", "success": 0, "failures": 3},
+                    {"name": "Clean", "success": 3, "failures": 0},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "proxies": {
+            "AI-MANUAL": {
+                "type": "Selector",
+                "now": "Clean",
+                "all": ["Fast", "Clean"],
+            },
+        }
+    }
+
+    rc, stdout, stderr, _puts = _run_probe(
+        monkeypatch,
+        capsys,
+        payload,
+        {"Fast": 80, "Clean": 90},
+        [
+            "--profile",
+            "chatgpt",
+            "--strategy",
+            "aggressive",
+            "--rounds",
+            "3",
+            "--timeout",
+            "1000",
+            "--url",
+            "http://probe.local/ping",
+            "--history-file",
+            str(history_file),
+            "--raw",
+        ],
+    )
+
+    assert rc == 0, stderr
+    assert "BEST\tClean" in stdout
+    assert "NODE\tFast\tsuccess=1/3" in stdout
+
+
+def test_human_mode_previews_switch_skip_reason(monkeypatch, capsys):
+    payload = {
+        "proxies": {
+            "AI-MANUAL": {
+                "type": "Selector",
+                "now": "Current",
+                "all": ["Current", "Better"],
+            },
+        }
+    }
+
+    rc, stdout, stderr, _puts = _run_probe(
+        monkeypatch,
+        capsys,
+        payload,
+        {"Current": 100, "Better": 80},
+        [
+            "--profile",
+            "chatgpt",
+            "--strategy",
+            "aggressive",
+            "--rounds",
+            "3",
+            "--timeout",
+            "1000",
+            "--url",
+            "http://probe.local/ping",
+        ],
+    )
+
+    assert rc == 0, stderr
+    assert "推荐: Better" in stdout
+    assert "切换预览: 不会切换 (当前节点也稳定，平均延迟改善 20ms 未达到 50ms 防抖门槛)" in stdout
