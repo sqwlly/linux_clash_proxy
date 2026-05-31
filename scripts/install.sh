@@ -143,7 +143,13 @@ main() {
     require_cmd python3
 
     if command -v pipx >/dev/null 2>&1; then
+        pipx_bin="$(command -v pipx)"
+        python_bin="$(command -v python3)"
+        if [ -n "${pipx_bin}" ] && [ -n "${python_bin}" ] && [ "${pipx_bin%/*}" = "${python_bin%/*}" ]; then
         install_with_pipx
+        else
+            install_with_pip
+        fi
     else
         install_with_pip
     fi

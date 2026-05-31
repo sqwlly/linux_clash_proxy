@@ -100,10 +100,18 @@ def _color_mode() -> str:
     if os.environ.get("NO_COLOR"):
         return "never"
 
-    config_mode = str(_output_config().get("output-color", "always")).strip().lower()
-    if config_mode in {"auto", "always", "never"}:
-        return config_mode
-    return "always"
+    config = _output_config()
+    if "output-color" in config:
+        config_mode = str(config.get("output-color")).strip().lower()
+        if config_mode in {"auto", "always", "never"}:
+            return config_mode
+
+    # 如果配置中未显式声明 output-color，在 CLI 侧保持更保守行为：
+    # 无图标输出时按 auto（TTY 自动），有图标时默认恢复为 always，兼容之前的开箱即用体验。
+    if _icons_enabled():
+        return "always"
+
+    return "auto"
 
 
 def _color_enabled() -> bool:
@@ -127,7 +135,7 @@ def _icons_enabled() -> bool:
     if "output-icons" not in config and os.environ.get("NO_COLOR"):
         return False
 
-    config_icons = config.get("output-icons", True)
+    config_icons = config.get("output-icons", False)
     if isinstance(config_icons, bool):
         return config_icons
     if _truthy(config_icons):
