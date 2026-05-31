@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from ..config import AppPaths, config_file, runtime_file
+from .api import APIBackend
 from .models import ProxyGroup
 
 AI_MANUAL_GROUP = "AI-MANUAL"
@@ -14,6 +15,12 @@ AI_SG_GROUP = "AI-SG"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
+SECRET_PROVIDER_KEYS = {
+    "secret-file",
+    "secret-systemd-credential",
+    "secret-keyring-service",
+    "secret-keyring-username",
+}
 
 
 class RuntimeBackend:
@@ -51,6 +58,12 @@ class RuntimeBackend:
 
         with source_path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
+
+        secret = APIBackend(self.paths).api_secret()
+        if secret:
+            data["secret"] = secret
+        for key in SECRET_PROVIDER_KEYS:
+            data.pop(key, None)
 
         groups = data.get("proxy-groups") or []
         if not isinstance(groups, list):

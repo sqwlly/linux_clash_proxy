@@ -80,6 +80,53 @@ rules:
     assert "运行配置状态: 已就绪" in status_result.stdout
 
 
+def test_render_resolves_secret_file_into_runtime_secret(tmp_path: Path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["HOME"] = str(tmp_path)
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    secret_path = config_dir / "controller-secret"
+    secret_path.write_text("runtime-controller-secret\n", encoding="utf-8")
+    (config_dir / "config.yaml").write_text(
+        f"""
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+external-controller-tls: 127.0.0.1:9443
+secret-file: {secret_path}
+proxy-groups:
+  - name: 🇺🇸 United States
+    type: select
+    proxies:
+      - 🇺🇸 United States丨01
+  - name: 🇸🇬 Singapore
+    type: select
+    proxies:
+      - 🇸🇬 Singapore丨01
+rules:
+  - MATCH,DIRECT
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    render_result = subprocess.run(
+        [sys.executable, "-m", "cproxy.cli", "render"],
+        capture_output=True,
+        text=True,
+        cwd="/root/clash_proxy",
+        env=env,
+    )
+
+    runtime_file = tmp_path / ".local" / "share" / "cproxy" / "runtime.yaml"
+    runtime_text = runtime_file.read_text(encoding="utf-8") if runtime_file.exists() else ""
+
+    assert render_result.returncode == 0
+    assert "secret: runtime-controller-secret" in runtime_text
+    assert "secret-file:" not in runtime_text
+
+
 def test_status_reports_ai_route_mode_and_delay_when_api_available(tmp_path: Path):
     state = {
         "AI-MANUAL": {
