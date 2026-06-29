@@ -699,6 +699,11 @@ with open(source_path, "r", encoding="utf-8") as fh:
 if not isinstance(data, dict):
     raise SystemExit("错误: 原始配置格式非法，顶层必须是 YAML 对象")
 
+if not data.get("external-controller"):
+    data["external-controller"] = "127.0.0.1:9090"
+if "secret" not in data:
+    data["secret"] = ""
+
 groups = data.get("proxy-groups") or []
 if not isinstance(groups, list):
     raise SystemExit("错误: proxy-groups 必须是列表")
