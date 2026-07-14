@@ -433,3 +433,136 @@ def test_stop_does_not_kill_unowned_process_from_stale_pidfile(tmp_path: Path):
     finally:
         sleeper.terminate()
         sleeper.wait(timeout=5)
+
+
+def test_render_auto_creates_region_groups_from_proxy_names(tmp_path: Path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["HOME"] = str(tmp_path)
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        """
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: '🇭🇰香港 01'
+    type: ss
+    server: hk.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: secret
+  - name: '🇺🇸美国 01'
+    type: ss
+    server: us.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: secret
+  - name: '🇸🇬新加坡 01'
+    type: ss
+    server: sg.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: secret
+proxy-groups:
+  - name: CyberGuard
+    type: select
+    proxies:
+      - 自动选择
+      - DIRECT
+rules:
+  - MATCH,CyberGuard
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    render_result = subprocess.run(
+        [sys.executable, "-m", "cproxy.cli", "render"],
+        capture_output=True,
+        text=True,
+        cwd="/root/clash_proxy",
+        env=env,
+    )
+
+    runtime_file = tmp_path / ".local" / "share" / "cproxy" / "runtime.yaml"
+    runtime_text = runtime_file.read_text(encoding="utf-8") if runtime_file.exists() else ""
+
+    assert render_result.returncode == 0, render_result.stderr
+    assert runtime_file.is_file()
+    assert "name: 🇺🇸 United States" in runtime_text
+    assert "name: 🇸🇬 Singapore" in runtime_text
+    assert "name: AI-MANUAL" in runtime_text
+    assert "name: AI-AUTO" in runtime_text
+
+
+def test_render_strips_dns_fallback_filter_geosite(tmp_path: Path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["HOME"] = str(tmp_path)
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        """
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - 223.5.5.5
+  fallback:
+    - 1.1.1.1
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    geosite:
+      - gfw
+    ipcidr:
+      - 240.0.0.0/4
+proxies:
+  - name: '🇺🇸美国 01'
+    type: ss
+    server: us.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: secret
+  - name: '🇸🇬新加坡 01'
+    type: ss
+    server: sg.example.com
+    port: 443
+    cipher: aes-256-gcm
+    password: secret
+proxy-groups:
+  - name: 🇺🇸 United States
+    type: select
+    proxies:
+      - '🇺🇸美国 01'
+  - name: 🇸🇬 Singapore
+    type: select
+    proxies:
+      - '🇸🇬新加坡 01'
+rules:
+  - MATCH,DIRECT
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    render_result = subprocess.run(
+        [sys.executable, "-m", "cproxy.cli", "render"],
+        capture_output=True,
+        text=True,
+        cwd="/root/clash_proxy",
+        env=env,
+    )
+
+    runtime_file = tmp_path / ".local" / "share" / "cproxy" / "runtime.yaml"
+    runtime_text = runtime_file.read_text(encoding="utf-8") if runtime_file.exists() else ""
+
+    assert render_result.returncode == 0, render_result.stderr
+    assert runtime_file.is_file()
+    assert "geosite:" not in runtime_text
+    assert "fallback-filter:" in runtime_text

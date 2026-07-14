@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import re
 import yaml
 
 from ..config import AppPaths, config_file, runtime_file
@@ -21,6 +22,53 @@ SECRET_PROVIDER_KEYS = {
     "secret-keyring-service",
     "secret-keyring-username",
 }
+
+# 当原始订阅没有提供标准区域组时，根据节点名称自动归纳生成。
+REGION_PATTERNS = {
+    AI_REGION_US: (r"🇺🇸", r"United States", r"美国", r"\bUS\b", r"\bUSA\b"),
+    AI_REGION_SG: (r"🇸🇬", r"Singapore", r"新加坡", r"\bSG\b"),
+}
+
+
+def _proxy_matches_region(proxy_name: str, patterns: tuple[str, ...]) -> bool:
+    return any(re.search(pat, proxy_name, re.IGNORECASE) for pat in patterns)
+
+
+def _ensure_region_groups(
+    groups: list[dict],
+    group_map: dict[str, dict],
+    proxies: list[dict] | None,
+    required_names: tuple[str, ...],
+) -> None:
+    proxies = proxies or []
+    for name in required_names:
+        if name in group_map:
+            continue
+        patterns = REGION_PATTERNS.get(name)
+        if not patterns:
+            continue
+        members = [
+            str(proxy["name"])
+            for proxy in proxies
+            if isinstance(proxy, dict)
+            and proxy.get("name")
+            and _proxy_matches_region(str(proxy["name"]), patterns)
+        ]
+        if members:
+            group = {"name": name, "type": "select", "proxies": members}
+            groups.append(group)
+            group_map[name] = group
+
+
+def _sanitize_dns_fallback_filter(data: dict) -> None:
+    # 部分订阅的 dns.fallback-filter.geosite 依赖 GeoSite.dat；该文件在本地
+    # 时常损坏或下载超时，会导致 mihomo 启动卡住。清理该字段以保持启动稳定。
+    dns = data.get("dns")
+    if not isinstance(dns, dict):
+        return
+    fallback_filter = dns.get("fallback-filter")
+    if isinstance(fallback_filter, dict):
+        fallback_filter.pop("geosite", None)
 
 
 class RuntimeBackend:
@@ -59,6 +107,8 @@ class RuntimeBackend:
         with source_path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
 
+        _sanitize_dns_fallback_filter(data)
+
         secret = APIBackend(self.paths).api_secret()
         if secret:
             data["secret"] = secret
@@ -70,6 +120,8 @@ class RuntimeBackend:
             raise ValueError("proxy-groups 必须是列表")
 
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
+        _ensure_region_groups(groups, group_map, data.get("proxies"), (AI_REGION_US, AI_REGION_SG))
+
         for required in (AI_REGION_US, AI_REGION_SG):
             if required not in group_map:
                 raise ValueError(f"原始配置缺少必需的区域组: {required}")

@@ -650,6 +650,7 @@ render() {
         "$AI_MANUAL_GROUP" "$AI_AUTO_GROUP" "$AI_US_GROUP" "$AI_SG_GROUP" \
         "$AI_REGION_JP" "$AI_REGION_US" "$AI_REGION_SG" "$TEST_URL" <<'PY'
 import os
+import re
 import sys
 import yaml
 
@@ -693,11 +694,57 @@ AI_CONFLICT_RULES = {
 
 AI_MANAGED_GROUPS = {ai_manual_group, ai_auto_group, ai_us_group, ai_sg_group}
 
+# 当原始订阅没有提供标准区域组时，根据节点名称自动归纳生成。
+REGION_PATTERNS = {
+    ai_region_jp: (r"🇯🇵", r"Japan", r"日本", r"\bJP\b"),
+    ai_region_us: (r"🇺🇸", r"United States", r"美国", r"\bUS\b", r"\bUSA\b"),
+    ai_region_sg: (r"🇸🇬", r"Singapore", r"新加坡", r"\bSG\b"),
+}
+
+
+def _proxy_matches_region(proxy_name, patterns):
+    return any(re.search(pat, proxy_name, re.IGNORECASE) for pat in patterns)
+
+
+def _ensure_region_groups(groups, group_map, proxies, required_names):
+    proxies = proxies or []
+    for name in required_names:
+        if name in group_map:
+            continue
+        patterns = REGION_PATTERNS.get(name)
+        if not patterns:
+            continue
+        members = [
+            str(proxy["name"])
+            for proxy in proxies
+            if isinstance(proxy, dict)
+            and proxy.get("name")
+            and _proxy_matches_region(str(proxy["name"]), patterns)
+        ]
+        if members:
+            group = {"name": name, "type": "select", "proxies": members}
+            groups.append(group)
+            group_map[name] = group
+
+
+def _sanitize_dns_fallback_filter(data):
+    # 部分订阅的 dns.fallback-filter.geosite 依赖 GeoSite.dat；该文件在本地
+    # 时常损坏或下载超时，会导致 mihomo 启动卡住。清理该字段以保持启动稳定。
+    dns = data.get("dns")
+    if not isinstance(dns, dict):
+        return
+    fallback_filter = dns.get("fallback-filter")
+    if isinstance(fallback_filter, dict):
+        fallback_filter.pop("geosite", None)
+
+
 with open(source_path, "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
 
 if not isinstance(data, dict):
     raise SystemExit("错误: 原始配置格式非法，顶层必须是 YAML 对象")
+
+_sanitize_dns_fallback_filter(data)
 
 if not data.get("external-controller"):
     data["external-controller"] = "127.0.0.1:9090"
@@ -712,6 +759,8 @@ group_map = {}
 for group in groups:
     if isinstance(group, dict) and group.get("name"):
         group_map[group["name"]] = group
+
+_ensure_region_groups(groups, group_map, data.get("proxies"), (ai_region_jp, ai_region_us, ai_region_sg))
 
 missing_groups = [name for name in (ai_region_jp, ai_region_us, ai_region_sg) if name not in group_map]
 if missing_groups:
