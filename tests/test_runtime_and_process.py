@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -7,18 +8,30 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
 
+import pytest
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
 
 def test_render_creates_runtime_and_status_reports_not_running(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     config_dir = tmp_path / ".config" / "cproxy"
     config_dir.mkdir(parents=True)
+    controller_port = _free_port()
     (config_dir / "config.yaml").write_text(
-        """
+        f"""
 mixed-port: 7890
-external-controller: 127.0.0.1:9090
+external-controller: 127.0.0.1:{controller_port}
 proxy-groups:
   - name: SSRDOG
     type: select
@@ -49,7 +62,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "render"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
@@ -68,7 +81,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "status"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
@@ -82,7 +95,7 @@ rules:
 
 def test_render_resolves_secret_file_into_runtime_secret(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     config_dir = tmp_path / ".config" / "cproxy"
@@ -115,7 +128,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "render"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
@@ -197,12 +210,11 @@ def test_status_reports_ai_route_mode_and_delay_when_api_available(tmp_path: Pat
         def log_message(self, format, *args):
             return
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    api_port = _free_port()
+    mixed_port = _free_port()
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     fake_bin = tmp_path / "fake-mihomo.sh"
@@ -221,8 +233,8 @@ done
     config_dir.mkdir(parents=True)
     (config_dir / "config.yaml").write_text(
         f"""
-mixed-port: 7890
-external-controller: 127.0.0.1:{server.server_port}
+mixed-port: {mixed_port}
+external-controller: 127.0.0.1:{api_port}
 program-path: {fake_bin}
 proxy-groups:
   - name: SSRDOG
@@ -250,12 +262,14 @@ rules:
         encoding="utf-8",
     )
 
+    server = None
+    thread = None
     try:
         render_result = subprocess.run(
             [sys.executable, "-m", "cproxy.cli", "render"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
         assert render_result.returncode == 0
@@ -264,16 +278,21 @@ rules:
             [sys.executable, "-m", "cproxy.cli", "start"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
         assert start_result.returncode == 0
+
+        # cproxy 先拉起（假）进程，随后模拟 mihomo 自身开始监听 controller
+        server = HTTPServer(("127.0.0.1", api_port), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
 
         status_result = subprocess.run(
             [sys.executable, "-m", "cproxy.cli", "status"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
 
@@ -286,17 +305,27 @@ rules:
             [sys.executable, "-m", "cproxy.cli", "stop"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
-        server.shutdown()
-        thread.join()
+        if server is not None:
+            server.shutdown()
+            thread.join()
 
 
-def test_start_stop_restart_manage_user_process(tmp_path: Path):
+def test_start_stop_restart_manage_user_process(tmp_path: Path, request):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
+    request.addfinalizer(
+        lambda: subprocess.run(
+            [sys.executable, "-m", "cproxy.cli", "stop"],
+            capture_output=True,
+            text=True,
+            cwd=ROOT_DIR,
+            env=env,
+        )
+    )
 
     fake_bin = tmp_path / "fake-mihomo.sh"
     args_log = tmp_path / "args.log"
@@ -314,10 +343,12 @@ done
 
     config_dir = tmp_path / ".config" / "cproxy"
     config_dir.mkdir(parents=True)
+    mixed_port = _free_port()
+    controller_port = _free_port()
     (config_dir / "config.yaml").write_text(
         f"""
-mixed-port: 7890
-external-controller: 127.0.0.1:9090
+mixed-port: {mixed_port}
+external-controller: 127.0.0.1:{controller_port}
 program-path: {fake_bin}
 proxy-groups:
   - name: SSRDOG
@@ -349,7 +380,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "render"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
     assert render_result.returncode == 0
@@ -358,7 +389,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "start"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
     assert start_result.returncode == 0
@@ -368,7 +399,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "status", "--raw"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
     assert status_running.returncode == 0
@@ -379,7 +410,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "restart"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
     assert restart_result.returncode == 0
@@ -389,7 +420,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "stop"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
     assert stop_result.returncode == 0
@@ -399,7 +430,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "status", "--raw"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
     assert status_stopped.returncode == 0
@@ -408,7 +439,7 @@ rules:
 
 def test_stop_does_not_kill_unowned_process_from_stale_pidfile(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     state_dir = tmp_path / ".local" / "state" / "cproxy"
@@ -422,7 +453,7 @@ def test_stop_does_not_kill_unowned_process_from_stale_pidfile(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "stop"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
 
@@ -435,9 +466,59 @@ def test_stop_does_not_kill_unowned_process_from_stale_pidfile(tmp_path: Path):
         sleeper.wait(timeout=5)
 
 
+def test_start_refuses_when_controller_address_already_listening(tmp_path: Path):
+    from cproxy.backend.process import ForeignInstanceError, ProcessBackend
+    from cproxy.config import default_paths, runtime_file
+
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    paths.data_dir.mkdir(parents=True)
+    runtime_file(paths).write_text("mode: rule\n", encoding="utf-8")
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+    try:
+        (paths.config_dir / "config.yaml").write_text(
+            f"external-controller: 127.0.0.1:{port}\nprogram-path: /bin/true\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ForeignInstanceError) as excinfo:
+            ProcessBackend(paths).start()
+        assert "已有服务在监听" in str(excinfo.value)
+        assert "systemctl stop clash-proxy" in str(excinfo.value)
+    finally:
+        listener.close()
+
+
+def test_start_refuses_when_mixed_port_already_listening(tmp_path: Path):
+    from cproxy.backend.process import ForeignInstanceError, ProcessBackend
+    from cproxy.config import default_paths, runtime_file
+
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    paths.data_dir.mkdir(parents=True)
+    runtime_file(paths).write_text("mode: rule\n", encoding="utf-8")
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+    try:
+        (paths.config_dir / "config.yaml").write_text(
+            f"mixed-port: {port}\nprogram-path: /bin/true\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ForeignInstanceError, match="已有服务在监听"):
+            ProcessBackend(paths).start()
+    finally:
+        listener.close()
+
+
 def test_render_auto_creates_region_groups_from_proxy_names(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     config_dir = tmp_path / ".config" / "cproxy"
@@ -482,7 +563,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "render"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
@@ -499,7 +580,7 @@ rules:
 
 def test_render_strips_dns_fallback_filter_geosite(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     config_dir = tmp_path / ".config" / "cproxy"
@@ -555,7 +636,7 @@ rules:
         [sys.executable, "-m", "cproxy.cli", "render"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 

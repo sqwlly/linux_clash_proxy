@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -12,6 +13,10 @@ from .models import ProcessOwner, StatusSnapshot
 
 
 class ProcessOwnershipError(RuntimeError):
+    pass
+
+
+class ForeignInstanceError(RuntimeError):
     pass
 
 
@@ -84,6 +89,52 @@ class ProcessBackend:
             self._cleanup_process_state()
         return running
 
+    @staticmethod
+    def _parse_listen_address(value: object) -> tuple[str, int] | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.isdigit():
+            port = int(text)
+            if not 0 < port < 65536:
+                return None
+            return "127.0.0.1", port
+        host, sep, port_text = text.rpartition(":")
+        if not sep:
+            return None
+        host = host.strip().strip("[]") or "127.0.0.1"
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
+        try:
+            port = int(port_text)
+        except ValueError:
+            return None
+        if not 0 < port < 65536:
+            return None
+        return host, port
+
+    @staticmethod
+    def _port_accepts_connection(address: tuple[str, int]) -> bool:
+        try:
+            with socket.create_connection(address, timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+    def _ensure_no_foreign_instance(self) -> None:
+        config = read_config(self.paths)
+        listen_values: list[tuple[str, object]] = []
+        for key in ("external-controller", "external-controller-tls", "mixed-port", "port"):
+            if config.get(key):
+                listen_values.append((key, config[key]))
+        for label, value in listen_values:
+            address = self._parse_listen_address(value)
+            if address and self._port_accepts_connection(address):
+                raise ForeignInstanceError(
+                    f"错误: {label} 地址 {value} 已有服务在监听，可能是非 cproxy 管理的 mihomo 实例\n"
+                    "提示: 若是旧版系统服务在运行，先执行 systemctl stop clash-proxy 再启动"
+                )
+
     def start(self) -> int:
         self.paths.state_dir.mkdir(parents=True, exist_ok=True)
         self.paths.data_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +147,8 @@ class ProcessBackend:
         runtime = runtime_file(self.paths)
         if not runtime.exists():
             raise FileNotFoundError(f"runtime config not found: {runtime}")
+
+        self._ensure_no_foreign_instance()
 
         with log_file(self.paths).open("a", encoding="utf-8") as log_handle:
             program = self._program_path()

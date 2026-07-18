@@ -1,7 +1,17 @@
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _run(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
@@ -9,12 +19,12 @@ def _run(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
         [sys.executable, "-m", "cproxy.cli", *args],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
 
-def test_bootstrap_auto_migrates_legacy_and_starts_process(tmp_path: Path):
+def test_bootstrap_auto_migrates_legacy_and_starts_process(tmp_path: Path, request):
     fake_bin = tmp_path / "fake-mihomo.sh"
     fake_bin.write_text(
         """#!/bin/bash
@@ -29,10 +39,12 @@ done
 
     legacy_root = tmp_path / "legacy"
     legacy_root.mkdir()
+    mixed_port = _free_port()
+    controller_port = _free_port()
     (legacy_root / "config.yaml").write_text(
         f"""
-mixed-port: 7890
-external-controller: 127.0.0.1:9090
+mixed-port: {mixed_port}
+external-controller: 127.0.0.1:{controller_port}
 program-path: {fake_bin}
 proxy-groups:
   - name: SSRDOG
@@ -61,9 +73,10 @@ rules:
     )
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
     env["CPROXY_LEGACY_ROOT"] = str(legacy_root)
+    request.addfinalizer(lambda: _run(env, "stop"))
 
     bootstrap_result = _run(env, "bootstrap")
     assert bootstrap_result.returncode == 0
@@ -81,7 +94,7 @@ rules:
 
 def test_bootstrap_fails_when_config_empty_and_no_legacy(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
     env["CPROXY_LEGACY_ROOT"] = str(tmp_path / "missing-legacy")
 
