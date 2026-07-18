@@ -14,27 +14,57 @@ require_cmd() {
 }
 
 install_with_pipx() {
-    pipx install --force --editable "$ROOT_DIR"
+    if [ "${CPROXY_EDITABLE:-1}" = "0" ]; then
+        pipx install --force "$ROOT_DIR"
+    else
+        pipx install --force --editable "$ROOT_DIR"
+    fi
 }
 
 install_with_pip() {
-    python3 -m pip install --user --editable "$ROOT_DIR"
+    if [ "${CPROXY_EDITABLE:-1}" = "0" ]; then
+        python3 -m pip install --user "$ROOT_DIR"
+    else
+        python3 -m pip install --user --editable "$ROOT_DIR"
+    fi
 }
 
 ensure_geodata() {
     local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
     local mmdb_path="${data_home}/cproxy/country.mmdb"
     local bundled_mmdb="${ROOT_DIR}/Country.mmdb"
+    local mmdb_url="${CPROXY_GEODATA_URL:-https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb}"
     if [ -f "$mmdb_path" ]; then
         echo "GeoIP 数据: ${mmdb_path}"
         return 0
     fi
 
+    mkdir -p "${data_home}/cproxy"
+
+    # 仓库根目录的 Country.mmdb 已不入库；本机遗留副本仍优先复用
     if [ -f "$bundled_mmdb" ]; then
-        mkdir -p "${data_home}/cproxy"
         cp "$bundled_mmdb" "$mmdb_path"
         echo "GeoIP 数据: 已从 ${bundled_mmdb} 安装到 ${mmdb_path}"
         return 0
+    fi
+
+    if [ "${CPROXY_GEODATA_DOWNLOAD:-1}" != "0" ]; then
+        local tmp_mmdb="${mmdb_path}.tmp.$$"
+        local downloaded=0
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --max-time 120 -o "$tmp_mmdb" "$mmdb_url" && downloaded=1
+        fi
+        if [ "$downloaded" = "0" ] && command -v wget >/dev/null 2>&1; then
+            wget -q -O "$tmp_mmdb" "$mmdb_url" && downloaded=1
+        fi
+        # 下载到临时文件并做基本完整性检查（country.mmdb 正常为数 MB），
+        # 通过后原子替换，避免中断产生的残缺文件被下次运行当成有效数据
+        if [ "$downloaded" = "1" ] && [ "$(stat -c %s "$tmp_mmdb" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+            mv -f "$tmp_mmdb" "$mmdb_path"
+            echo "GeoIP 数据: 已从 ${mmdb_url} 下载到 ${mmdb_path}"
+            return 0
+        fi
+        rm -f "$tmp_mmdb"
     fi
 
     echo "警告: 未检测到 GeoIP 数据文件: ${mmdb_path}" >&2

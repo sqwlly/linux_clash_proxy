@@ -9,8 +9,14 @@ mihomo.pid
 config.yaml
 runtime.yaml
 mihomo.gz
+Country.mmdb
+GeoSite.dat
 .venv/
 .tmp/
+
+# 个人订阅/候选配置含凭据，一律不入库（config.example.yaml 除外）
+/*.yaml
+!config.example.yaml
 
 .DS_Store
 __pycache__/
