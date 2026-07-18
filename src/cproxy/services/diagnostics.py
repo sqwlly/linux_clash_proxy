@@ -6,6 +6,7 @@ from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from .. import __version__
 from ..backend.api import APIBackend
 from ..backend.models import AIProbeReport, AIProbeResult, ConnectivityCheckResult, ConnectivityReport, DelayCheckResult, GroupCheckReport
 from ..backend.process import ProcessBackend
@@ -79,7 +80,7 @@ def _probe_failure_detail(exc: Exception) -> str:
 
 def _probe_target(opener, url: str, timeout: int) -> tuple[bool, str]:
     for attempt in range(DEFAULT_AI_PROBE_RETRIES + 1):
-        request = Request(url, headers={"User-Agent": "cproxy/0.1.0"})
+        request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
         try:
             with opener.open(request, timeout=timeout) as response:
                 status = getattr(response, "status", response.getcode())

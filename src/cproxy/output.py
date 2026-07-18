@@ -46,6 +46,17 @@ def build_root_parser() -> ArgumentParser:
     migrate_parser.add_argument("legacy_root")
 
     subparsers.add_parser("render", help="Render runtime config")
+    snapshots_parser = subparsers.add_parser("snapshots", help="List runtime/config snapshots")
+    snapshots_parser.add_argument("--raw", action="store_true")
+
+    rollback_parser = subparsers.add_parser("rollback", help="Restore a previous runtime/config snapshot")
+    rollback_parser.add_argument("name", nargs="?", help="Snapshot filename (default: latest runtime snapshot)")
+
+    refresh_parser = subparsers.add_parser("refresh", help="Update subscription, render, restart and probe groups")
+    refresh_parser.add_argument("--subscription-url", help="Subscription URL (overrides config subscription-url)")
+    refresh_parser.add_argument("--group", action="append", default=[], help="Group to probe and auto-switch (repeatable)")
+    refresh_parser.add_argument("--raw", action="store_true")
+
     status_parser = subparsers.add_parser("status", help="Show current status")
     status_parser.add_argument("--raw", action="store_true")
     subparsers.add_parser("start", help="Start proxy process")

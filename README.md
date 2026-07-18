@@ -1,5 +1,7 @@
 # cproxy
 
+> 项目当前阶段、里程碑与下一步见 [STATUS.md](STATUS.md)。
+
 `cproxy` 是一个面向用户级安装的 Mihomo CLI，目标是替代当前仓库里默认绑定 `/root/clash_proxy` 的 `proxy.sh` 工作流。
 
 当前已经具备这些能力：
@@ -10,6 +12,8 @@
 - AI 路由状态查看与手动切换
 - 代理组、节点、延迟检查
 - 命令级代理环境注入
+- 运行配置自动快照与一键回滚
+- 一键刷新：订阅更新、重启、分组探测与失效自动切换
 - 从旧仓库目录迁移 `config.yaml`
 
 当前内部结构也已经完成第一版 backend 重构：
@@ -41,7 +45,7 @@ pipx install /path/to/clash_proxy
 - 优先使用 `pipx install --force --editable`
 - 回退到 `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
-- 安装仓库自带的 `Country.mmdb` 到默认 GeoIP 数据路径；如果仓库没有该文件，则打印缺失警告
+- 安装 GeoIP 数据到默认路径：优先复用已有用户级文件和仓库根目录遗留的 `Country.mmdb`（该文件已不入库），缺失时尝试从 meta-rules-dat 下载，仍失败则打印手动放置警告
 - 刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；不会默认覆盖 `cproxy` alias
 
 ## GeoIP 数据
@@ -59,8 +63,8 @@ pipx install /path/to/clash_proxy
 需要注意：
 
 - 在无代理或受限网络环境下，Mihomo 不一定能自动获取 `country.mmdb`
-- `./scripts/install.sh` 会优先复用仓库根目录的 `Country.mmdb`
-- 如果仓库没有该文件，先手动放到上面的默认路径，再执行 `cproxy test`
+- `./scripts/install.sh` 会优先复用仓库根目录的 `Country.mmdb`（本机遗留副本，已不入库），缺失时尝试从 meta-rules-dat 下载
+- 如果以上都不可用，先手动放到上面的默认路径，再执行 `cproxy test`
 
 常用可选配置项：
 

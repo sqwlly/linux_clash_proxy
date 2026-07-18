@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cproxy"
-version = "0.1.0"
+version = "1.0.0"
 description = "User-level CLI for managing Mihomo proxy workflows"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6", "requests>=2", "tqdm>=4", "urllib3>=2.7.0", "idna>=3.15"]

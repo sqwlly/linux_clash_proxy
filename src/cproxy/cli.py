@@ -18,9 +18,11 @@ from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .process import ProcessOwnershipError, get_status, restart_process, start_process, stop_process
 from .runtime import render_runtime
 from .security import validate_controller_security
+from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 from .support import build_support_bundle
 from .output import build_root_parser, normalize_name
 from .services.query import QueryService
+from .services.refresh import RefreshReport, RefreshService
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -373,7 +375,7 @@ def _render_status(raw: bool) -> int:
         pass
 
     if raw:
-        print("版本: 0.1.0")
+        print(f"版本: {__version__}")
         print(f"原始配置: {snapshot.source_config}")
         print(f"运行配置: {snapshot.runtime_config}")
         print(f"控制接口: {snapshot.controller}")
@@ -521,6 +523,87 @@ def _render_security_check(strict: bool) -> int:
     return 0
 
 
+def _render_snapshots(paths, raw: bool) -> int:
+    entries = list_snapshots(paths)
+    if raw:
+        for entry in entries:
+            print(entry.name)
+        return 0
+
+    _print_section("摘要")
+    print(f"快照数: {len(entries)}")
+    print(f"快照目录: {snapshots_dir(paths)}")
+    if entries:
+        print()
+        _print_section("列表")
+        for entry in entries:
+            size = entry.stat().st_size
+            print(f"{snapshot_kind(entry):<8} {entry.name}  {size}B")
+    return 0
+
+
+def _run_rollback(paths, name: str | None) -> int:
+    if name:
+        candidate = snapshots_dir(paths) / Path(name).name
+        if not candidate.is_file():
+            raise RuntimeError(f"错误: 快照不存在: {name}")
+        snapshot = candidate
+    else:
+        runtime_snapshots = list_snapshots(paths, "runtime")
+        if not runtime_snapshots:
+            raise RuntimeError("错误: 没有可用的运行配置快照")
+        snapshot = runtime_snapshots[0]
+
+    target = restore_snapshot(paths, snapshot)
+    kind = snapshot_kind(snapshot)
+    print(_section_title("结果"))
+    print(f"已恢复快照: {snapshot.name}")
+    print(f"目标文件: {target}")
+    if kind == "runtime":
+        if get_status(paths).running:
+            restart_process(paths)
+            print("代理已重启以应用回滚")
+        else:
+            print("提示: 代理未运行，配置将在下次启动时生效")
+    else:
+        print("提示: 原始配置已恢复，执行 cproxy render 使其生效")
+    return 0
+
+
+def _render_refresh(report: RefreshReport, raw: bool) -> int:
+    if raw:
+        print(f"subscription={report.subscription} detail={report.subscription_detail}")
+        print(f"runtime={report.runtime_path}")
+        print(f"restarted={report.restarted}")
+        for item in report.groups:
+            print(f"{item.group}: {item.action} current={item.current or '-'} target={item.target or '-'} {item.detail}")
+        return 0
+
+    _print_section("摘要")
+    subscription_label = report.subscription
+    if report.subscription_detail:
+        subscription_label = f"{subscription_label}  {report.subscription_detail}"
+    print(f"订阅更新: {subscription_label}")
+    print(f"运行配置: {report.runtime_path}")
+    if report.restarted:
+        print("代理: 已重启应用新配置")
+    elif report.was_running:
+        print("代理: 运行中")
+    else:
+        print("代理: 未运行（跳过重启与探测）")
+    if report.groups:
+        print()
+        _print_section("分组探测")
+        for item in report.groups:
+            line = f"{item.group}: {item.action}"
+            if item.target:
+                line += f" -> {normalize_name(item.target)}"
+            if item.detail:
+                line += f"  {item.detail}"
+            print(line)
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = build_root_parser()
     args: Namespace = parser.parse_args(argv)
@@ -542,6 +625,16 @@ def run(argv: list[str] | None = None) -> int:
             runtime_path = render_runtime(default_paths())
             print(f"已生成运行配置: {runtime_path}")
             return 0
+        if args.command == "snapshots":
+            return _render_snapshots(default_paths(), args.raw)
+        if args.command == "rollback":
+            return _run_rollback(default_paths(), args.name)
+        if args.command == "refresh":
+            report = RefreshService(default_paths()).refresh(
+                subscription_url=args.subscription_url,
+                groups=args.group,
+            )
+            return _render_refresh(report, args.raw)
         if args.command == "start":
             pid = start_process(default_paths())
             print(f"代理已启动 (PID: {pid})")

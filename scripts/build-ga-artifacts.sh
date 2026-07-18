@@ -4,7 +4,18 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-${ROOT_DIR}/dist/ga}"
-VERSION="${CPROXY_VERSION:-0.1.0}"
+
+# 版本解析顺序：CPROXY_VERSION 环境变量 > 精确命中的 git tag > pyproject.toml
+VERSION="${CPROXY_VERSION:-}"
+VERSION="${VERSION#v}"
+if [ -z "$VERSION" ]; then
+    VERSION="$(git -C "$ROOT_DIR" describe --tags --exact-match 2>/dev/null || true)"
+    VERSION="${VERSION#v}"
+fi
+if [ -z "$VERSION" ]; then
+    VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${ROOT_DIR}/pyproject.toml" | head -1)"
+fi
+VERSION="${VERSION:-0.1.0}"
 ARCHIVE="cproxy-${VERSION}-source.tar.gz"
 
 mkdir -p "$OUT_DIR"

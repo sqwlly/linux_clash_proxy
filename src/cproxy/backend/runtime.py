@@ -6,6 +6,7 @@ import re
 import yaml
 
 from ..config import AppPaths, config_file, runtime_file
+from ..snapshots import snapshot_file
 from .api import APIBackend
 from .models import ProxyGroup
 
@@ -191,7 +192,12 @@ class RuntimeBackend:
         data["proxy-groups"] = filtered_groups
         data["rules"] = clean_rules
 
+        rendered = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        with target_path.open("w", encoding="utf-8") as fh:
-            yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        # 内容未变化时不重写也不留快照，避免定时任务把快照历史掏空
+        if target_path.exists() and target_path.read_text(encoding="utf-8") == rendered:
+            return target_path
+        # 覆盖运行配置前自动留快照，供 cproxy rollback 回滚
+        snapshot_file(self.paths, target_path, "runtime")
+        target_path.write_text(rendered, encoding="utf-8")
         return target_path

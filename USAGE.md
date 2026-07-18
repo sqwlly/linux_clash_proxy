@@ -19,11 +19,57 @@ pipx install /path/to/clash_proxy
 `cproxy` alias。只想安装用户级 Python `cproxy` 时，可设置
 `CPROXY_INSTALL_SYSTEM_COMMANDS=0`。
 
-安装脚本会把仓库根目录的 `Country.mmdb` 安装到默认 GeoIP 数据文件路径；如果仓库没有该文件，则提示手动放置：
+默认以 editable 方式安装（开发便利，改动立即生效）。生产环境应使用非
+editable 安装，避免未提交的工作区改动直接影响生产命令：
+
+```bash
+CPROXY_EDITABLE=0 ./scripts/install.sh
+```
+
+安装脚本会按顺序准备默认 GeoIP 数据文件：复用已有的用户级文件 → 复用仓库根目录的 `Country.mmdb`（本机遗留副本，已不入库）→ 从 [meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) 下载（可用 `CPROXY_GEODATA_DOWNLOAD=0` 关闭）→ 提示手动放置：
 
 - `~/.local/share/cproxy/country.mmdb`
 
 如果缺失，会打印警告，但不会阻塞安装。
+
+## mihomo 二进制
+
+mihomo 的安装/升级统一走 `scripts/install-mihomo.sh`，版本与 sha256 固定在脚本内：
+
+```bash
+bash scripts/install-mihomo.sh --check        # 检查已安装版本是否符合固定版本
+sudo bash scripts/install-mihomo.sh           # 安装/升级到固定版本（sha256 强制校验）
+bash scripts/install-mihomo.sh --fetch-hash vX.Y.Z   # 升级前获取新版本应写入的哈希常量
+```
+
+升级到新的 mihomo 版本时，先用 `--fetch-hash` 获取哈希并更新脚本里的
+`MIHOMO_VERSION_PIN` / `MIHOMO_SHA256_PIN` 常量，再执行安装。
+若 mihomo 正在运行，安装后需重启服务才生效。
+
+## 快照、回滚与一键刷新
+
+`cproxy render` 和订阅更新会在覆盖配置前自动留快照（各保留最近 10 份，位于
+`~/.local/state/cproxy/snapshots/`）：
+
+```bash
+cproxy snapshots            # 列出快照
+cproxy rollback             # 回滚到上一份运行配置（运行中会自动重启）
+cproxy rollback <快照名>     # 恢复指定快照（含 config 类快照）
+```
+
+`cproxy refresh` 把日常维护串成一条命令：更新订阅（配置了
+`subscription-url` 或 `--subscription-url` 时）→ render → 重启应用 →
+对 `--group`（或配置里的 `refresh-groups`）指定的 select 组做延迟探测，
+当前节点失效时自动切到延迟最低的节点：
+
+```bash
+cproxy refresh --group SSRDOG
+```
+
+订阅更新只覆盖节点/规则等内容：安全相关键（`program-path`、`secret` 系列、
+controller、`allow-lan` 等）即使订阅携带也一律剔除，防止恶意订阅注入；
+本地优先键（端口、模式等）保留本地已配置的值；订阅拉取失败不会阻断后续
+render 与探测。输出中的订阅地址会脱敏。
 
 ## root 生产系统命令
 
