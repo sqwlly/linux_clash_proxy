@@ -3,10 +3,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
 
 def test_logs_command_reads_recent_lines(tmp_path: Path):
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     state_dir = tmp_path / ".local" / "state" / "cproxy"
@@ -20,7 +23,7 @@ def test_logs_command_reads_recent_lines(tmp_path: Path):
         [sys.executable, "-m", "cproxy.cli", "logs", "--lines", "2"],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 

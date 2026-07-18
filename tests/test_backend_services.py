@@ -7,7 +7,10 @@ from threading import Thread
 
 import yaml
 
-sys.path.insert(0, "/root/clash_proxy/src")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+sys.path.insert(0, str(SRC_DIR))
 
 
 class _Handler(BaseHTTPRequestHandler):

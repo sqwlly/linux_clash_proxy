@@ -1,7 +1,10 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/root/clash_proxy/src")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+sys.path.insert(0, str(SRC_DIR))
 
 from cproxy.config import AppPaths
 from cproxy.geodata import check_country_mmdb, country_mmdb_path

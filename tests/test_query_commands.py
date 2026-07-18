@@ -8,6 +8,9 @@ from threading import Thread
 
 import yaml
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
 
 class _Handler(BaseHTTPRequestHandler):
     payload = {
@@ -107,7 +110,7 @@ def _run(env, *args):
         [sys.executable, "-m", "cproxy.cli", *args],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
@@ -132,7 +135,7 @@ def test_query_commands_use_api_output(tmp_path: Path):
         )
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = "/root/clash_proxy/src"
+        env["PYTHONPATH"] = str(SRC_DIR)
         env["HOME"] = str(tmp_path)
 
         current_result = _run(env, "current", "AI-MANUAL")
@@ -214,7 +217,7 @@ def test_query_commands_fall_back_to_runtime_when_api_unavailable(tmp_path: Path
     (data_dir / "runtime.yaml").write_text(yaml.safe_dump(runtime, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     groups_result = _run(env, "list-groups")
@@ -243,7 +246,7 @@ def test_ai_commands_report_friendly_error_when_api_unavailable(tmp_path: Path):
     )
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     ai_status_result = _run(env, "ai-status")

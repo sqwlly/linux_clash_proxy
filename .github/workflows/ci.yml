@@ -15,13 +15,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Legacy test path
-        run: |
-          if [ ! -e "/root/clash_proxy" ]; then
-            sudo ln -s "$GITHUB_WORKSPACE" "/root/clash_proxy"
-          fi
-          sudo chmod o+x "/root"
-
       - name: Install package with TUI extra
         run: python -m pip install -e ".[tui]" pytest
 

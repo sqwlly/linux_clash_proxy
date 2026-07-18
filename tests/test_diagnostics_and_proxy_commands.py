@@ -8,7 +8,10 @@ from threading import Thread
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
-sys.path.insert(0, "/root/clash_proxy/src")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+sys.path.insert(0, str(SRC_DIR))
 
 from cproxy.config import default_paths
 from cproxy.services import diagnostics as diagnostics_module
@@ -101,7 +104,7 @@ def _run(env, *args):
         [sys.executable, "-m", "cproxy.cli", *args],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 
@@ -163,7 +166,7 @@ ip-check-urls:
         )
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = "/root/clash_proxy/src"
+        env["PYTHONPATH"] = str(SRC_DIR)
         env["HOME"] = str(tmp_path)
         env["SHELL"] = "/bin/sh"
 
@@ -260,7 +263,7 @@ ip-check-urls:
         )
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = "/root/clash_proxy/src"
+        env["PYTHONPATH"] = str(SRC_DIR)
         env["HOME"] = str(tmp_path)
 
         test_result = _run(env, "test")

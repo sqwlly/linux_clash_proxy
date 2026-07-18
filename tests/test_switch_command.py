@@ -7,6 +7,9 @@ from pathlib import Path
 from threading import Thread
 from urllib.parse import unquote
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
 
 def test_switch_updates_remote_selection(tmp_path: Path):
     state = {
@@ -87,7 +90,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         )
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = "/root/clash_proxy/src"
+        env["PYTHONPATH"] = str(SRC_DIR)
         env["HOME"] = str(tmp_path)
         env.pop("NO_COLOR", None)
 
@@ -95,7 +98,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "switch", "AI-MANUAL", "AI-SG"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
 
@@ -112,7 +115,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "switch", "AI-MANUAL", "AI-US"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=color_env,
         )
         assert color_switch_result.returncode == 0
@@ -124,7 +127,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "switch", "AI-MANUAL", "AI-SG"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=no_color_env,
         )
         assert no_color_switch_result.returncode == 0
@@ -134,7 +137,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "current", "AI-MANUAL"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
 
@@ -149,7 +152,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "status"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=status_env,
         )
         assert status_result.returncode == 0
@@ -165,7 +168,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "status"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=no_icons_env,
         )
         assert no_icons_status_result.returncode == 0
@@ -176,7 +179,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             [sys.executable, "-m", "cproxy.cli", "status", "--raw"],
             capture_output=True,
             text=True,
-            cwd="/root/clash_proxy",
+            cwd=ROOT_DIR,
             env=env,
         )
         assert raw_status_result.returncode == 0

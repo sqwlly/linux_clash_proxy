@@ -3,6 +3,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
 
 def test_migrate_from_legacy_copies_config_only(tmp_path: Path):
     legacy_dir = tmp_path / "legacy"
@@ -12,14 +15,14 @@ def test_migrate_from_legacy_copies_config_only(tmp_path: Path):
     (legacy_dir / "mihomo.pid").write_text("1234\n", encoding="utf-8")
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/root/clash_proxy/src"
+    env["PYTHONPATH"] = str(SRC_DIR)
     env["HOME"] = str(tmp_path)
 
     result = subprocess.run(
         [sys.executable, "-m", "cproxy.cli", "migrate-from-legacy", str(legacy_dir)],
         capture_output=True,
         text=True,
-        cwd="/root/clash_proxy",
+        cwd=ROOT_DIR,
         env=env,
     )
 

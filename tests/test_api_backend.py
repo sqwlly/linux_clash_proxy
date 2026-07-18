@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import sys
 import ssl
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import URLError
 
-sys.path.insert(0, "/root/clash_proxy/src")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+sys.path.insert(0, str(SRC_DIR))
 
 from cproxy.backend.api import APIBackend, APIUnavailableError
 from cproxy.config import default_paths
