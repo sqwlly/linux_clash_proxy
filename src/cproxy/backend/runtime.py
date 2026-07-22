@@ -17,6 +17,12 @@ AI_SG_GROUP = "AI-SG"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
+CHINAMAX_RULE = "RULE-SET,ChinaMax,DIRECT"
+CHINAMAX_PROVIDER = {
+    "type": "file",
+    "behavior": "classical",
+    "path": "./ruleset/ChinaMax.yml",
+}
 SECRET_PROVIDER_KEYS = {
     "secret-file",
     "secret-systemd-credential",
@@ -110,6 +116,13 @@ class RuntimeBackend:
 
         _sanitize_dns_fallback_filter(data)
 
+        rule_providers = data.get("rule-providers")
+        if not isinstance(rule_providers, dict):
+            rule_providers = {}
+        if "ChinaMax" not in rule_providers:
+            rule_providers["ChinaMax"] = dict(CHINAMAX_PROVIDER)
+        data["rule-providers"] = rule_providers
+
         secret = APIBackend(self.paths).api_secret()
         if secret:
             data["secret"] = secret
@@ -168,26 +181,28 @@ class RuntimeBackend:
         mainland_direct = ["GEOIP,CN,DIRECT,no-resolve"]
         rules = data.get("rules") or []
 
-        clean_rules = [rule for rule in rules if rule not in ai_rules and rule not in mainland_direct]
-        insert_index = None
-        for idx, rule in enumerate(clean_rules):
-            if rule == "RULE-SET,ChinaMax,DIRECT" or (isinstance(rule, str) and rule.startswith("MATCH,")):
-                insert_index = idx
-                break
-        if insert_index is None:
-            clean_rules.extend(ai_rules)
-        else:
-            clean_rules = clean_rules[:insert_index] + ai_rules + clean_rules[insert_index:]
+        clean_rules = [
+            rule
+            for rule in rules
+            if rule not in ai_rules and rule not in mainland_direct and rule != CHINAMAX_RULE
+        ]
 
         match_index = None
         for idx, rule in enumerate(clean_rules):
             if isinstance(rule, str) and rule.startswith("MATCH,"):
                 match_index = idx
                 break
+
         if match_index is None:
-            clean_rules.extend(mainland_direct)
+            clean_rules.extend(ai_rules + [CHINAMAX_RULE] + mainland_direct)
         else:
-            clean_rules = clean_rules[:match_index] + mainland_direct + clean_rules[match_index:]
+            clean_rules = (
+                clean_rules[:match_index]
+                + ai_rules
+                + [CHINAMAX_RULE]
+                + mainland_direct
+                + clean_rules[match_index:]
+            )
 
         data["proxy-groups"] = filtered_groups
         data["rules"] = clean_rules

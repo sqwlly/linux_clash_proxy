@@ -647,3 +647,74 @@ rules:
     assert runtime_file.is_file()
     assert "geosite:" not in runtime_text
     assert "fallback-filter:" in runtime_text
+
+
+def test_render_injects_chinamax_when_missing_from_source(tmp_path: Path):
+    """订阅覆盖后源配置丢失 rule-providers/ChinaMax 和 RULE-SET 规则时，render 应自动补回。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC_DIR)
+    env["HOME"] = str(tmp_path)
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        """
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxy-groups:
+  - name: SSRDOG
+    type: select
+    proxies:
+      - Auto
+      - DIRECT
+  - name: Auto
+    type: fallback
+    proxies:
+      - ProxyA
+  - name: 🇺🇸 United States
+    type: select
+    proxies:
+      - 🇺🇸 United States丨01
+  - name: 🇸🇬 Singapore
+    type: select
+    proxies:
+      - 🇸🇬 Singapore丨01
+rules:
+  - DOMAIN-SUFFIX,example.com,SSRDOG
+  - MATCH,SSRDOG
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    render_result = subprocess.run(
+        [sys.executable, "-m", "cproxy.cli", "render"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT_DIR,
+        env=env,
+    )
+
+    runtime_file = tmp_path / ".local" / "share" / "cproxy" / "runtime.yaml"
+    runtime_text = runtime_file.read_text(encoding="utf-8") if runtime_file.exists() else ""
+
+    assert render_result.returncode == 0, render_result.stderr
+    assert runtime_file.is_file()
+
+    import yaml as _yaml
+
+    runtime_data = _yaml.safe_load(runtime_text)
+
+    providers = runtime_data.get("rule-providers", {})
+    assert "ChinaMax" in providers
+    assert providers["ChinaMax"]["path"] == "./ruleset/ChinaMax.yml"
+
+    rules = runtime_data.get("rules", [])
+    assert "RULE-SET,ChinaMax,DIRECT" in rules
+
+    idx_chinamax = rules.index("RULE-SET,ChinaMax,DIRECT")
+    idx_geoip = rules.index("GEOIP,CN,DIRECT,no-resolve")
+    idx_match = next(i for i, r in enumerate(rules) if r.startswith("MATCH,"))
+    idx_ai = next(i for i, r in enumerate(rules) if "AI-MANUAL" in r)
+
+    assert idx_ai < idx_chinamax < idx_geoip < idx_match

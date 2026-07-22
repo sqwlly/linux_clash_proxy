@@ -682,6 +682,12 @@ AI_RULES = [
 MAINLAND_DIRECT_RULES = [
     "GEOIP,CN,DIRECT,no-resolve",
 ]
+CHINAMAX_RULE = "RULE-SET,ChinaMax,DIRECT"
+CHINAMAX_PROVIDER = {
+    "type": "file",
+    "behavior": "classical",
+    "path": "./ruleset/ChinaMax.yml",
+}
 
 AI_CONFLICT_RULES = {
     "DOMAIN-KEYWORD,chatgpt,SSRDOG",
@@ -745,6 +751,13 @@ if not isinstance(data, dict):
     raise SystemExit("错误: 原始配置格式非法，顶层必须是 YAML 对象")
 
 _sanitize_dns_fallback_filter(data)
+
+rule_providers = data.get("rule-providers")
+if not isinstance(rule_providers, dict):
+    rule_providers = {}
+if "ChinaMax" not in rule_providers:
+    rule_providers["ChinaMax"] = dict(CHINAMAX_PROVIDER)
+data["rule-providers"] = rule_providers
 
 if not data.get("external-controller"):
     data["external-controller"] = "127.0.0.1:9090"
@@ -841,24 +854,11 @@ if not isinstance(rules, list):
 clean_rules = [
     rule
     for rule in rules
-    if rule not in AI_RULES and rule not in AI_CONFLICT_RULES and rule not in MAINLAND_DIRECT_RULES
+    if rule not in AI_RULES
+    and rule not in AI_CONFLICT_RULES
+    and rule not in MAINLAND_DIRECT_RULES
+    and rule != CHINAMAX_RULE
 ]
-
-insert_index = None
-for idx, rule in enumerate(clean_rules):
-    if not isinstance(rule, str):
-        continue
-    if rule == "RULE-SET,ChinaMax,DIRECT":
-        insert_index = idx
-        break
-    if rule.startswith("MATCH,"):
-        insert_index = idx
-        break
-
-if insert_index is None:
-    clean_rules.extend(AI_RULES)
-else:
-    clean_rules = clean_rules[:insert_index] + AI_RULES + clean_rules[insert_index:]
 
 match_index = None
 for idx, rule in enumerate(clean_rules):
@@ -867,9 +867,15 @@ for idx, rule in enumerate(clean_rules):
         break
 
 if match_index is None:
-    clean_rules.extend(MAINLAND_DIRECT_RULES)
+    clean_rules.extend(AI_RULES + [CHINAMAX_RULE] + MAINLAND_DIRECT_RULES)
 else:
-    clean_rules = clean_rules[:match_index] + MAINLAND_DIRECT_RULES + clean_rules[match_index:]
+    clean_rules = (
+        clean_rules[:match_index]
+        + AI_RULES
+        + [CHINAMAX_RULE]
+        + MAINLAND_DIRECT_RULES
+        + clean_rules[match_index:]
+    )
 
 data["proxy-groups"] = filtered_groups
 data["rules"] = clean_rules
