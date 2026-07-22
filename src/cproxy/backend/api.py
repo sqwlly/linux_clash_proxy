@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from ..config import AppPaths, read_config
 from .models import ProxyGroup
@@ -91,7 +91,7 @@ class APIBackend:
         except (TypeError, ValueError):
             return self.DEFAULT_TIMEOUT
 
-    def request(self, method: str, path: str, payload: dict | None = None) -> Any:
+    def request(self, method: str, path: str, payload: dict | None = None, *, request_timeout: int | None = None) -> Any:
         url = f"{self.controller_url()}{path}"
         body = None
         headers: dict[str, str] = {}
@@ -107,10 +107,12 @@ class APIBackend:
         request = Request(url, data=body, method=method, headers=headers)
         try:
             context = self._tls_context(url)
-            if context is None:
-                handle = urlopen(request, timeout=self.request_timeout())
-            else:
-                handle = urlopen(request, timeout=self.request_timeout(), context=context)
+            # Controller traffic must not recurse through the proxy being managed.
+            handlers = [ProxyHandler({})]
+            if context is not None:
+                handlers.append(HTTPSHandler(context=context))
+            effective_timeout = request_timeout if request_timeout is not None else self.request_timeout()
+            handle = build_opener(*handlers).open(request, timeout=effective_timeout)
             with handle as response:
                 response_body = response.read().decode("utf-8")
                 if not response_body.strip():
@@ -162,9 +164,9 @@ class APIBackend:
     def switch_group(self, group_name: str, target_name: str) -> None:
         self.request("PUT", f"/proxies/{quote(group_name, safe='')}", {"name": target_name})
 
-    def delay_test(self, target_name: str, url: str, timeout: int) -> dict[str, Any]:
+    def delay_test(self, target_name: str, url: str, timeout: int, *, request_timeout: int | None = None) -> dict[str, Any]:
         query = urlencode({"url": url, "timeout": timeout})
-        return self.request("GET", f"/proxies/{quote(target_name, safe='')}/delay?{query}")
+        return self.request("GET", f"/proxies/{quote(target_name, safe='')}/delay?{query}", request_timeout=request_timeout)
 
     def get_connections(self) -> dict[str, Any]:
         return self.request("GET", "/connections")

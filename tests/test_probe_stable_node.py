@@ -2,7 +2,9 @@ import copy
 import importlib.util
 import json
 import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from urllib.parse import unquote, urlsplit
 
 
@@ -52,6 +54,47 @@ def _run_probe(monkeypatch, capsys, payload, delays, args):
     rc = module.main()
     captured = capsys.readouterr()
     return rc, captured.out, captured.err, puts
+
+
+def test_request_json_bypasses_environment_proxy(monkeypatch):
+    class ControllerHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/proxies":
+                self.send_error(502, "request must not use environment proxy")
+                return
+            body = json.dumps({"proxies": {"AI-MANUAL": {}}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            pass
+
+    controller = ThreadingHTTPServer(("127.0.0.1", 0), ControllerHandler)
+    thread = Thread(target=controller.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        proxy_url = f"http://127.0.0.1:{controller.server_port}"
+        monkeypatch.setenv("HTTP_PROXY", proxy_url)
+        monkeypatch.setenv("http_proxy", proxy_url)
+        for key in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(key, raising=False)
+
+        module = _load_probe_module()
+        payload = module.request_json(
+            f"http://127.0.0.1:{controller.server_port}",
+            "",
+            "/proxies",
+        )
+    finally:
+        controller.shutdown()
+        controller.server_close()
+        thread.join(timeout=1)
+
+    assert payload == {"proxies": {"AI-MANUAL": {}}}
 
 
 def test_probe_stable_node_defaults_to_all_ai_leaf_nodes_and_switches_path(monkeypatch, capsys):

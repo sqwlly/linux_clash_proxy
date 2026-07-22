@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import sys
+import json
 import ssl
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from urllib.error import URLError
+from urllib.request import HTTPSHandler, ProxyHandler
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
@@ -25,11 +29,11 @@ def test_api_backend_uses_short_default_timeout(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def fake_urlopen(request, timeout):
+    def fake_open(request, timeout):
         captured["timeout"] = timeout
         raise URLError("boom")
 
-    monkeypatch.setattr("cproxy.backend.api.urlopen", fake_urlopen)
+    monkeypatch.setattr("cproxy.backend.api.build_opener", lambda *_handlers: SimpleNamespace(open=fake_open))
 
     backend = APIBackend(default_paths(tmp_path))
 
@@ -61,12 +65,12 @@ def test_api_backend_allows_empty_success_response(tmp_path, monkeypatch):
         def read(self):
             return b""
 
-    def fake_urlopen(request, timeout):
+    def fake_open(request, timeout):
         captured["method"] = request.get_method()
         captured["url"] = request.full_url
         return FakeResponse()
 
-    monkeypatch.setattr("cproxy.backend.api.urlopen", fake_urlopen)
+    monkeypatch.setattr("cproxy.backend.api.build_opener", lambda *_handlers: SimpleNamespace(open=fake_open))
 
     backend = APIBackend(default_paths(tmp_path))
     backend.close_connection("conn/1")
@@ -108,19 +112,67 @@ def test_api_backend_allows_self_signed_loopback_tls_controller(tmp_path, monkey
         def read(self):
             return b'{"version":"test"}'
 
-    def fake_urlopen(request, timeout, context=None):
+    def fake_open(request, timeout):
         captured["url"] = request.full_url
-        captured["context"] = context
         return FakeResponse()
 
-    monkeypatch.setattr("cproxy.backend.api.urlopen", fake_urlopen)
+    def fake_build_opener(*handlers):
+        captured["handlers"] = handlers
+        return SimpleNamespace(open=fake_open)
+
+    monkeypatch.setattr("cproxy.backend.api.build_opener", fake_build_opener)
 
     backend = APIBackend(default_paths(tmp_path))
 
     assert backend.version() == {"version": "test"}
     assert captured["url"] == "https://127.0.0.1:9443/version"
-    assert isinstance(captured["context"], ssl.SSLContext)
-    assert captured["context"].verify_mode == ssl.CERT_NONE
+    handlers = captured["handlers"]
+    assert isinstance(handlers, tuple)
+    assert any(isinstance(handler, ProxyHandler) and handler.proxies == {} for handler in handlers)
+    https_handler = next(handler for handler in handlers if isinstance(handler, HTTPSHandler))
+    assert isinstance(https_handler._context, ssl.SSLContext)
+    assert https_handler._context.verify_mode == ssl.CERT_NONE
+
+
+def test_api_backend_bypasses_environment_proxy(tmp_path, monkeypatch):
+    class ControllerHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/version":
+                self.send_error(502, "request must not use environment proxy")
+                return
+            body = json.dumps({"version": "test"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            pass
+
+    controller = ThreadingHTTPServer(("127.0.0.1", 0), ControllerHandler)
+    thread = Thread(target=controller.serve_forever, daemon=True)
+    thread.start()
+    try:
+        controller_url = f"http://127.0.0.1:{controller.server_port}"
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            monkeypatch.setenv(key, controller_url)
+        for key in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(key, raising=False)
+
+        config_dir = tmp_path / ".config" / "cproxy"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(
+            f"external-controller: {controller_url}\n",
+            encoding="utf-8",
+        )
+
+        backend = APIBackend(default_paths(tmp_path))
+        assert backend.version() == {"version": "test"}
+    finally:
+        controller.shutdown()
+        controller.server_close()
+        thread.join(timeout=1)
 
 
 def test_api_backend_rejects_unix_controller(tmp_path):

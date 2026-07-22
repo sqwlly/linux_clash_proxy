@@ -57,6 +57,9 @@ cat > "$store"
 def test_install_script_prefers_pipx_and_initializes_user_layout(tmp_path: Path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    python_log = tmp_path / "python.log"
+    fake_python = fake_bin / "python3"
+    _write_fake_python(fake_python, python_log)
     pipx_log = tmp_path / "pipx.log"
     fake_pipx = fake_bin / "pipx"
     fake_pipx.write_text(
@@ -94,8 +97,13 @@ exit 0
     assert result.returncode == 0
     assert config_file.is_file()
     assert pipx_log.is_file()
+    assert python_log.is_file()
     log_text = pipx_log.read_text(encoding="utf-8")
+    python_log_text = python_log.read_text(encoding="utf-8")
     assert f"install --force --editable {ROOT_DIR}" in log_text
+    assert "-m cproxy.cli init" in python_log_text
+    assert "-m cproxy.cli bootstrap" in python_log_text
+    assert not (tmp_path / ".local" / "state" / "cproxy" / "cproxy.pid").exists()
     assert "安装完成" in result.stdout
     country_mmdb = tmp_path / ".local" / "share" / "cproxy" / "country.mmdb"
     assert country_mmdb.is_file()
@@ -144,6 +152,9 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     assert python_log.is_file()
     log_text = python_log.read_text(encoding="utf-8")
     assert f"-m pip install --user --editable {ROOT_DIR}" in log_text
+    assert "-m cproxy.cli init" in log_text
+    assert "-m cproxy.cli bootstrap" in log_text
+    assert not (tmp_path / ".local" / "state" / "cproxy" / "cproxy.pid").exists()
     assert "安装完成" in result.stdout
     country_mmdb = tmp_path / ".local" / "share" / "cproxy" / "country.mmdb"
     assert country_mmdb.is_file()

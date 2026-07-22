@@ -235,6 +235,37 @@ ai-openai-api-url: https://api.openai.com/v1/models
 ai-probe-timeout: 8
 ```
 
+## 稳定性探测
+
+多轮延迟探测，找出组内最稳定的叶子节点；可选自动切换：
+
+```bash
+cproxy probe-stable-node                          # 默认 AI-MANUAL, codex profile
+cproxy probe-stable-node AI-MANUAL --profile chatgpt --strategy aggressive --rounds 3
+cproxy probe-stable-node --url https://github.com --timeout 5000
+cproxy probe-stable-node --switch                 # 合格时自动切换
+cproxy probe-stable-node --raw                    # TSV 格式，适合脚本消费
+```
+
+选项：
+
+- `group`（位置参数，默认 `AI-MANUAL`）：目标代理组
+- `--profile`：`codex`（默认）/ `chatgpt` / `github` / `claude`，预设探测 URL 和策略
+- `--strategy`：`conservative` / `balanced` / `aggressive`，覆盖 profile 默认策略
+- `--url`：自定义探测 URL
+- `--rounds`：探测轮数（默认由策略决定，conservative 为 5 轮）
+- `--timeout`：单次延迟测试超时（毫秒，默认 8000）
+- `--switch`：探测完成后，若推荐节点合格则自动切换
+- `--raw`：TSV 输出（GROUP / PROFILE / STRATEGY / ROUNDS / URL / CURRENT / CURRENT_STABLE / STABLE / BEST / SWITCH 或 SKIP_SWITCH / NODE 前缀）
+
+算法要点：
+
+- 递归展开嵌套组到叶子节点，跟踪当前叶子，带 cycle 保护
+- 每轮淘汰排名下半的节点（保留当前节点）
+- 稳定门槛：全成功 + 最大/平均延迟不超过策略阈值
+- 当前节点也稳定时，按绝对值和比例防抖，避免频繁切换
+- `--switch` 时按嵌套路径反序切换（从最内层组到最外层组）
+
 ## 命令级代理
 
 输出环境变量：

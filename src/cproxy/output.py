@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser, REMAINDER
+from collections.abc import Callable
+
+from .services.probe import ProbeReport, format_delay, stable_score
 
 
 def normalize_name(value: object) -> str:
@@ -15,6 +18,87 @@ def normalize_name(value: object) -> str:
     text = text.replace("丨", " ")
     text = text.replace("|", " ")
     return " ".join(text.split())
+
+
+def build_probe_output(
+    report: ProbeReport,
+    raw: bool,
+    section_title: Callable[[str], str] = str,
+) -> tuple[list[str], int]:
+    if raw:
+        lines = [
+            f"GROUP\t{report.group}",
+            f"PROFILE\t{report.profile}",
+            f"STRATEGY\t{report.strategy_name}",
+            f"ROUNDS\t{report.rounds}",
+            f"URL\t{report.url}",
+            f"CURRENT\t{report.current or '-'}",
+            f"CURRENT_STABLE\t{'true' if report.current_verdict.stable else 'false'}\t{report.current_verdict.reason}",
+            f"STABLE\t{'true' if report.verdict.stable else 'false'}\t{report.verdict.reason}",
+        ]
+        if report.best:
+            score = stable_score(report.best, report.rounds, report.strategy)
+            lines.append(
+                f"BEST\t{report.best.name}\tsuccess={report.best.success_count}/{report.rounds}"
+                f"\tfailures={report.best.failures}\tavg={format_delay(report.best.avg_delay)}"
+                f"\tmax={format_delay(report.best.max_delay)}\tscore={score}"
+            )
+        if report.switched:
+            lines.append(f"SWITCH\t{report.group}\t{report.best.name if report.best else '-'}")
+        if report.switch_requested and not report.switched:
+            lines.append(f"SKIP_SWITCH\t{report.group}\t{report.skip_reason}")
+        for summary in sorted(report.summaries, key=lambda item: item.rank_key()):
+            score = stable_score(summary, report.rounds, report.strategy)
+            lines.append(
+                f"NODE\t{summary.name}\tsuccess={summary.success_count}/{report.rounds}"
+                f"\tfailures={summary.failures}\tavg={format_delay(summary.avg_delay)}"
+                f"\tmax={format_delay(summary.max_delay)}\tmin={format_delay(summary.min_delay)}\tscore={score}"
+            )
+    else:
+        current_label = normalize_name(report.current) if report.current else "-"
+        current_stable = "稳定" if report.current_verdict.stable else "不稳定"
+        best_label = normalize_name(report.best.name) if report.best else "-"
+        best_stable = "稳定" if report.verdict.stable else "不稳定"
+        lines = [
+            section_title("摘要"),
+            f"目标组: {report.group}",
+            f"配置: {report.profile} / {report.strategy_name}",
+            f"探测: {report.rounds} 轮, {report.url}",
+            f"当前: {current_label} ({current_stable})",
+            f"推荐: {best_label} ({best_stable})",
+        ]
+        if report.best and report.switched:
+            lines.append(f"切换: 已切换 {report.group} -> {best_label}")
+        elif report.switch_requested:
+            lines.append(f"切换: 未切换 ({report.skip_reason})")
+        elif report.preview_reason:
+            lines.append(f"切换预览: 不会切换 ({report.preview_reason})")
+        elif report.best:
+            lines.append(f"切换预览: 会切换到 {best_label}")
+        lines.extend(["", section_title("结果"), *_probe_table_lines(report)])
+
+    if report.switch_requested:
+        request_satisfied = (
+            report.switched
+            or report.skip_reason == "当前已是推荐稳定节点"
+            or (report.current_verdict.stable and report.skip_reason.startswith("当前节点也稳定"))
+        )
+        if not request_satisfied:
+            return lines, 1
+    return lines, 0 if report.best else 1
+
+
+def _probe_table_lines(report: ProbeReport) -> list[str]:
+    header = f"{'节点':<16} {'成功':>4}  {'失败':>4}  {'平均':>6}  {'最大':>6}  {'最小':>6}  {'score':>5}"
+    lines = [header]
+    for summary in sorted(report.summaries, key=lambda item: item.rank_key()):
+        score = stable_score(summary, report.rounds, report.strategy)
+        lines.append(
+            f"{normalize_name(summary.name):<16} {summary.success_count}/{report.rounds:>3}  "
+            f"{summary.failures:>4}  {format_delay(summary.avg_delay):>6}  "
+            f"{format_delay(summary.max_delay):>6}  {format_delay(summary.min_delay):>6}  {score:>5}"
+        )
+    return lines
 
 
 def build_root_parser() -> ArgumentParser:
@@ -85,6 +169,16 @@ def build_root_parser() -> ArgumentParser:
 
     proxy_shell_parser = subparsers.add_parser("proxy-shell", help="Open a temporary proxy shell")
     proxy_shell_parser.add_argument("shell_args", nargs=REMAINDER)
+
+    probe_parser = subparsers.add_parser("probe-stable-node", help="Multi-round delay probe to find the most stable node")
+    probe_parser.add_argument("group", nargs="?", default="AI-MANUAL")
+    probe_parser.add_argument("--profile", choices=["codex", "chatgpt", "github", "claude"], default="codex")
+    probe_parser.add_argument("--strategy", choices=["conservative", "balanced", "aggressive"])
+    probe_parser.add_argument("--url")
+    probe_parser.add_argument("--rounds", type=int)
+    probe_parser.add_argument("--timeout", type=int, default=8000)
+    probe_parser.add_argument("--switch", action="store_true")
+    probe_parser.add_argument("--raw", action="store_true")
 
     subparsers.add_parser("tui", help="Launch terminal UI dashboard")
     return parser

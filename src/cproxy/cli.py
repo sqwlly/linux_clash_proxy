@@ -20,9 +20,10 @@ from .runtime import render_runtime
 from .security import validate_controller_security
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 from .support import build_support_bundle
-from .output import build_root_parser, normalize_name
+from .output import build_probe_output, build_root_parser, normalize_name
 from .services.query import QueryService
 from .services.refresh import RefreshReport, RefreshService
+from .services.probe import ProbeService
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -690,6 +691,19 @@ def run(argv: list[str] | None = None) -> int:
             print(f"代理组: {args.group}")
             print(f"当前选择: {normalize_name(group.current)}")
             return 0
+        if args.command == "probe-stable-node":
+            report = ProbeService(default_paths()).probe(
+                group=args.group,
+                profile=args.profile,
+                strategy_name=args.strategy,
+                url=args.url,
+                rounds=args.rounds,
+                timeout=args.timeout,
+                switch=args.switch,
+            )
+            output_lines, exit_code = build_probe_output(report, args.raw, _section_title)
+            print("\n".join(output_lines))
+            return exit_code
         if args.command == "tui":
             from .tui.app import run_tui
             run_tui(default_paths())

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from math import ceil
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from probe_history import load_history_penalties
 from progress import ProgressBar, style_text
@@ -21,6 +21,8 @@ DEFAULT_GROUP = "AI-MANUAL"
 DEFAULT_URL = "https://chatgpt.com/backend-api/codex/responses/compact"
 DEFAULT_TIMEOUT_MS = 8000
 REQUEST_TIMEOUT_SECONDS = 10
+# Control-plane requests must not recurse through the proxy being managed.
+CONTROLLER_OPENER = build_opener(ProxyHandler({}))
 
 
 @dataclass(frozen=True)
@@ -165,7 +167,7 @@ def request_json(controller: str, secret: str, path: str, method: str = "GET", p
         headers["Content-Type"] = "application/json"
     request = Request(url, data=body, method=method, headers=headers)
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        with CONTROLLER_OPENER.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             content = response.read().decode("utf-8").strip()
             return json.loads(content) if content else {}
     except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
