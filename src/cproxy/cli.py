@@ -24,6 +24,8 @@ from .output import build_probe_output, build_root_parser, normalize_name
 from .services.query import QueryService
 from .services.refresh import RefreshReport, RefreshService
 from .services.probe import ProbeService
+from .services.probe_history import load_history_rows, probe_history_file
+from .services.ops import AIConnection, build_incident, get_ai_connections, guard
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -605,6 +607,63 @@ def _render_refresh(report: RefreshReport, raw: bool) -> int:
     return 0
 
 
+def _render_shadow_history(paths, limit: int, raw: bool) -> int:
+    rows = load_history_rows(probe_history_file(paths), limit)
+    if raw:
+        for item in rows:
+            print(
+                "PROBE_HISTORY\t"
+                f"ts={item.get('ts', '-')}\tprofile={item.get('profile', '-')}"
+                f"\tstrategy={item.get('strategy', '-')}\tcurrent={item.get('current', '-')}"
+                f"\tbest={item.get('best', '-')}\tstable={item.get('stable', '-')}"
+                f"\tswitched={item.get('switched', '-')}\treason={item.get('skip_reason') or item.get('reason', '-')}"
+            )
+        return 0
+
+    _print_section("稳定探测历史")
+    if not rows:
+        print("-")
+        return 0
+    for item in rows:
+        print(
+            f"{item.get('ts', '-')}  "
+            f"{item.get('profile', '-')}  "
+            f"{item.get('strategy', '-')}  "
+            f"current={item.get('current', '-')}  "
+            f"best={item.get('best', '-')}  "
+            f"stable={item.get('stable', '-')}  "
+            f"switched={item.get('switched', '-')}  "
+            f"reason={item.get('skip_reason') or item.get('reason', '-')}"
+        )
+    return 0
+
+
+def _render_ai_connections(paths, raw: bool) -> int:
+    connections = get_ai_connections(paths)
+    if raw:
+        for conn in connections:
+            print(f"AI_CONNECTION\t{conn.host}\tcount={conn.count}\troute={conn.route}")
+        return 0
+
+    _print_section("AI 连接")
+    if not connections:
+        print("未发现 ChatGPT/OpenAI/Claude/GitHub 相关活动连接")
+        return 0
+    for conn in connections:
+        print(f"{conn.host}  {conn.count} active  {conn.route}")
+    return 0
+
+
+def _render_incident(paths, profile: str) -> int:
+    sections = build_incident(paths, profile)
+    for section in sections:
+        _print_section(section.title)
+        for line in section.lines:
+            print(line)
+        print()
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = build_root_parser()
     args: Namespace = parser.parse_args(argv)
@@ -700,6 +759,44 @@ def run(argv: list[str] | None = None) -> int:
                 rounds=args.rounds,
                 timeout=args.timeout,
                 switch=args.switch,
+                record_history=args.record_history,
+                show_progress=not args.raw,
+            )
+            output_lines, exit_code = build_probe_output(report, args.raw, _section_title)
+            print("\n".join(output_lines))
+            return exit_code
+        if args.command == "shadow-probe":
+            report = ProbeService(default_paths()).probe(
+                group=args.group,
+                profile=args.profile,
+                strategy_name=args.strategy,
+                url=args.url,
+                rounds=args.rounds,
+                timeout=args.timeout,
+                switch=False,
+                record_history=True,
+                show_progress=not args.raw,
+            )
+            output_lines, exit_code = build_probe_output(report, args.raw, _section_title)
+            print("\n".join(output_lines))
+            return exit_code
+        if args.command == "shadow-history":
+            return _render_shadow_history(default_paths(), args.limit, args.raw)
+        if args.command == "guard":
+            command = args.command_args
+            if command and command[0] == "--":
+                command = command[1:]
+            return guard(default_paths(), profile=args.profile, command=command or None)
+        if args.command == "ai-connections":
+            return _render_ai_connections(default_paths(), args.raw)
+        if args.command == "incident":
+            return _render_incident(default_paths(), args.profile)
+        if args.command == "ai-use":
+            report = ProbeService(default_paths()).probe(
+                group=args.group,
+                profile=args.profile,
+                switch=True,
+                show_progress=not args.raw,
             )
             output_lines, exit_code = build_probe_output(report, args.raw, _section_title)
             print("\n".join(output_lines))

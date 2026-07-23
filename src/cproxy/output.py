@@ -178,7 +178,36 @@ def build_root_parser() -> ArgumentParser:
     probe_parser.add_argument("--rounds", type=int)
     probe_parser.add_argument("--timeout", type=int, default=8000)
     probe_parser.add_argument("--switch", action="store_true")
+    probe_parser.add_argument("--record-history", action="store_true")
     probe_parser.add_argument("--raw", action="store_true")
+
+    shadow_probe_parser = subparsers.add_parser("shadow-probe", help="Probe and record history without switching")
+    shadow_probe_parser.add_argument("profile", nargs="?", default="codex", choices=["codex", "chatgpt", "github", "claude"])
+    shadow_probe_parser.add_argument("--group", default="AI-MANUAL")
+    shadow_probe_parser.add_argument("--strategy", choices=["conservative", "balanced", "aggressive"])
+    shadow_probe_parser.add_argument("--url")
+    shadow_probe_parser.add_argument("--rounds", type=int)
+    shadow_probe_parser.add_argument("--timeout", type=int, default=8000)
+    shadow_probe_parser.add_argument("--raw", action="store_true")
+
+    shadow_history_parser = subparsers.add_parser("shadow-history", help="Show recent probe history")
+    shadow_history_parser.add_argument("--limit", type=int, default=5)
+    shadow_history_parser.add_argument("--raw", action="store_true")
+
+    guard_parser = subparsers.add_parser("guard", help="Probe stable AI exit, then optionally run a command with proxy")
+    guard_parser.add_argument("profile", nargs="?", default="codex", choices=["codex", "chatgpt", "github", "claude"])
+    guard_parser.add_argument("command_args", nargs=REMAINDER)
+
+    ai_conn_parser = subparsers.add_parser("ai-connections", help="Show AI/GitHub related active connections")
+    ai_conn_parser.add_argument("--raw", action="store_true")
+
+    incident_parser = subparsers.add_parser("incident", help="Output AI exit fault diagnosis report")
+    incident_parser.add_argument("profile", nargs="?", default="codex", choices=["codex", "chatgpt", "github", "claude"])
+
+    ai_use_parser = subparsers.add_parser("ai-use", help="Probe and switch to stable AI exit (shortcut for probe --switch)")
+    ai_use_parser.add_argument("profile", nargs="?", default="codex", choices=["codex", "chatgpt", "github", "claude"])
+    ai_use_parser.add_argument("--group", default="AI-MANUAL")
+    ai_use_parser.add_argument("--raw", action="store_true")
 
     subparsers.add_parser("tui", help="Launch terminal UI dashboard")
     return parser

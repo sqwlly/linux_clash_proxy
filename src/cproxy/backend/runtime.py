@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import re
@@ -14,6 +15,7 @@ AI_MANUAL_GROUP = "AI-MANUAL"
 AI_AUTO_GROUP = "AI-AUTO"
 AI_US_GROUP = "AI-US"
 AI_SG_GROUP = "AI-SG"
+AI_REGION_JP = "🇯🇵 Japan"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
@@ -30,8 +32,19 @@ SECRET_PROVIDER_KEYS = {
     "secret-keyring-username",
 }
 
+# 部分订阅自带 SSRDOG 路由规则，会与 AI-MANUAL 注入的规则冲突。
+AI_CONFLICT_RULES = {
+    "DOMAIN-KEYWORD,chatgpt,SSRDOG",
+    "DOMAIN-KEYWORD,openai,SSRDOG",
+    "DOMAIN-SUFFIX,chatgpt.com,SSRDOG",
+    "DOMAIN-SUFFIX,openai.com,SSRDOG",
+    "DOMAIN-SUFFIX,anthropic.com,SSRDOG",
+    "DOMAIN-SUFFIX,claude.ai,SSRDOG",
+}
+
 # 当原始订阅没有提供标准区域组时，根据节点名称自动归纳生成。
 REGION_PATTERNS = {
+    AI_REGION_JP: (r"🇯🇵", r"Japan", r"日本", r"\bJP\b"),
     AI_REGION_US: (r"🇺🇸", r"United States", r"美国", r"\bUS\b", r"\bUSA\b"),
     AI_REGION_SG: (r"🇸🇬", r"Singapore", r"新加坡", r"\bSG\b"),
 }
@@ -134,7 +147,7 @@ class RuntimeBackend:
             raise ValueError("proxy-groups 必须是列表")
 
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
-        _ensure_region_groups(groups, group_map, data.get("proxies"), (AI_REGION_US, AI_REGION_SG))
+        _ensure_region_groups(groups, group_map, data.get("proxies"), (AI_REGION_JP, AI_REGION_US, AI_REGION_SG))
 
         for required in (AI_REGION_US, AI_REGION_SG):
             if required not in group_map:
@@ -145,11 +158,16 @@ class RuntimeBackend:
         if not us_proxies or not sg_proxies:
             raise ValueError("美国或新加坡区域组未包含任何节点")
 
+        manual_candidates = [AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP]
+        if AI_REGION_JP in group_map:
+            manual_candidates.append(AI_REGION_JP)
+        manual_candidates.extend([AI_REGION_US, AI_REGION_SG])
+
         ai_groups = [
             {"name": AI_US_GROUP, "type": "fallback", "proxies": us_proxies, "url": TEST_URL, "interval": 300},
             {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_proxies, "url": TEST_URL, "interval": 300},
             {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 300},
-            {"name": AI_MANUAL_GROUP, "type": "select", "proxies": [AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP, AI_REGION_US, AI_REGION_SG]},
+            {"name": AI_MANUAL_GROUP, "type": "select", "proxies": manual_candidates},
         ]
 
         managed_names = {AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP}
@@ -184,7 +202,10 @@ class RuntimeBackend:
         clean_rules = [
             rule
             for rule in rules
-            if rule not in ai_rules and rule not in mainland_direct and rule != CHINAMAX_RULE
+            if rule not in ai_rules
+            and rule not in AI_CONFLICT_RULES
+            and rule not in mainland_direct
+            and rule != CHINAMAX_RULE
         ]
 
         match_index = None
@@ -214,5 +235,7 @@ class RuntimeBackend:
             return target_path
         # 覆盖运行配置前自动留快照，供 cproxy rollback 回滚
         snapshot_file(self.paths, target_path, "runtime")
-        target_path.write_text(rendered, encoding="utf-8")
+        tmp_path = target_path.with_suffix(".tmp")
+        tmp_path.write_text(rendered, encoding="utf-8")
+        os.replace(tmp_path, target_path)
         return target_path

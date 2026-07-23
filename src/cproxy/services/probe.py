@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 
 from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ProxyGroup
 from ..config import AppPaths
+from .probe_history import load_history_penalties, probe_history_file, record_probe_history
 
 DEFAULT_GROUP = "AI-MANUAL"
 DEFAULT_TIMEOUT_MS = 8000
@@ -40,6 +43,7 @@ class ProbeSummary:
     name: str
     delays: tuple[int, ...]
     failures: int
+    history_penalty_ms: int = 0
 
     @property
     def success_count(self) -> int:
@@ -57,11 +61,12 @@ class ProbeSummary:
     def min_delay(self) -> int | None:
         return min(self.delays) if self.delays else None
 
-    def rank_key(self) -> tuple[int, int, int, int, str]:
+    def rank_key(self) -> tuple[int, int, int, int, int, str]:
         _penalty = 1_000_000
         max_d = self.max_delay if self.max_delay is not None else _penalty
         avg_d = self.avg_delay if self.avg_delay is not None else _penalty
-        return (-self.success_count, self.failures, max_d, avg_d, self.name)
+        penalty = max(0, self.history_penalty_ms)
+        return (-self.success_count, self.failures, max_d + penalty, avg_d + penalty, penalty, self.name)
 
 
 @dataclass(frozen=True)
@@ -141,9 +146,19 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
         return current
 
 
-def active_candidates_after_round(results: dict[str, dict], current: str | None) -> set[str]:
+def active_candidates_after_round(
+    results: dict[str, dict],
+    current: str | None,
+    history_penalties: dict[str, int] | None = None,
+) -> set[str]:
+    penalties = history_penalties or {}
     summaries = [
-        ProbeSummary(name=n, delays=tuple(d["delays"]), failures=d["failures"])
+        ProbeSummary(
+            name=n,
+            delays=tuple(d["delays"]),
+            failures=d["failures"],
+            history_penalty_ms=penalties.get(n, 0),
+        )
         for n, d in results.items()
     ]
     keep = max(1, ceil(len(summaries) / 2))
@@ -182,6 +197,7 @@ def stable_score(summary: ProbeSummary, rounds: int, strategy: ProbeStrategy) ->
         score -= min(20, (summary.max_delay / strategy.max_delay_ms) * 15)
     if summary.max_delay is not None and summary.min_delay is not None:
         score -= min(15, ((summary.max_delay - summary.min_delay) / strategy.max_delay_ms) * 30)
+    score -= min(10, max(0, summary.history_penalty_ms) / 30)
     return max(0, min(100, round(score)))
 
 
@@ -220,6 +236,20 @@ def _preview_reason(
     return switch_skip_reason(best, current, current_verdict, current_summary, strategy)
 
 
+def _summary_payload(summary: ProbeSummary, rounds: int, strategy: ProbeStrategy) -> dict:
+    return {
+        "name": summary.name,
+        "success": summary.success_count,
+        "total": summary.success_count + summary.failures,
+        "failures": summary.failures,
+        "avg_ms": summary.avg_delay,
+        "max_ms": summary.max_delay,
+        "min_ms": summary.min_delay,
+        "history_penalty_ms": summary.history_penalty_ms,
+        "score": stable_score(summary, rounds, strategy),
+    }
+
+
 class ProbeService:
     def __init__(self, paths: AppPaths):
         self.paths = paths
@@ -234,6 +264,8 @@ class ProbeService:
         rounds: int | None = None,
         timeout: int = DEFAULT_TIMEOUT_MS,
         switch: bool = False,
+        record_history: bool = False,
+        show_progress: bool = False,
     ) -> ProbeReport:
         prof = PROFILES[profile]
         strat_name = strategy_name or str(prof["strategy"])
@@ -246,6 +278,9 @@ class ProbeService:
             raise ValueError(f"错误: timeout 必须大于 0，当前值 {timeout}")
         req_timeout = max(10, timeout // 1000 + 2)
 
+        history_path = probe_history_file(self.paths)
+        penalties = load_history_penalties(history_path, group, profile, probe_url, strategy.default_rounds)
+
         groups = self.api.get_groups()
         if group not in groups:
             raise RuntimeError(f"错误: 未找到代理组或节点: {group}")
@@ -256,8 +291,14 @@ class ProbeService:
         results: dict[str, dict] = {n: {"delays": [], "failures": 0} for n in candidates}
         active = set(candidates)
 
+        if show_progress:
+            print(f"探测 | {group} | {len(candidates)} 节点 | {probe_rounds} 轮", file=sys.stderr)
+
         for rnd in range(probe_rounds):
-            for name in [c for c in candidates if c in active]:
+            round_candidates = [c for c in candidates if c in active]
+            if show_progress:
+                print(f"轮 {rnd + 1}/{probe_rounds} | {len(round_candidates)} 节点...", file=sys.stderr)
+            for name in round_candidates:
                 try:
                     payload = self.api.delay_test(name, probe_url, timeout, request_timeout=req_timeout)
                     delay = int(payload["delay"])
@@ -269,10 +310,21 @@ class ProbeService:
                     results[name]["delays"].append(delay)
 
             if rnd < probe_rounds - 1 and len(active) > 1:
-                active = active_candidates_after_round({n: results[n] for n in active}, current)
+                before = len(active)
+                active = active_candidates_after_round({n: results[n] for n in active}, current, penalties)
+                if show_progress:
+                    print(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}", file=sys.stderr)
+
+        if show_progress:
+            print("完成", file=sys.stderr)
 
         summaries = tuple(
-            ProbeSummary(name=n, delays=tuple(d["delays"]), failures=d["failures"])
+            ProbeSummary(
+                name=n,
+                delays=tuple(d["delays"]),
+                failures=d["failures"],
+                history_penalty_ms=penalties.get(n, 0),
+            )
             for n, d in results.items()
         )
         successful = [s for s in summaries if s.success_count > 0]
@@ -295,6 +347,30 @@ class ProbeService:
                 for grp, target in reversed(path):
                     self.api.switch_group(grp, target)
                 switched = True
+
+        if record_history or switch:
+            try:
+                record_probe_history(
+                    history_path,
+                    profile=profile,
+                    strategy_name=strat_name,
+                    group=group,
+                    url=probe_url,
+                    rounds=probe_rounds,
+                    timeout_ms=timeout,
+                    current=current,
+                    current_stable=current_verdict.stable,
+                    current_reason=current_verdict.reason,
+                    best=best.name if best else None,
+                    stable=verdict.stable,
+                    reason=verdict.reason,
+                    switch_requested=switch,
+                    switched=switched,
+                    skip_reason=skip_reason,
+                    nodes=[_summary_payload(s, probe_rounds, strategy) for s in summaries],
+                )
+            except OSError:
+                pass
 
         return ProbeReport(
             group=group, profile=profile, strategy_name=strat_name, strategy=strategy,

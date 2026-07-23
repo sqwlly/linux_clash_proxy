@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -10,6 +11,9 @@ from pathlib import Path
 
 from ..config import AppPaths, config_file, log_file, pid_file, process_meta_file, read_config, runtime_file
 from .models import ProcessOwner, StatusSnapshot
+
+SYSTEMD_SERVICE_NAME = "clash-proxy.service"
+LOCK_STALE_SECONDS = 30
 
 
 class ProcessOwnershipError(RuntimeError):
@@ -27,6 +31,40 @@ class ProcessBackend:
     def _program_path(self) -> str:
         config = read_config(self.paths)
         return str(config.get("program-path", "mihomo"))
+
+    def _lock_path(self) -> Path:
+        return self.paths.state_dir / ".lock"
+
+    def _acquire_lock(self) -> bool:
+        lock = self._lock_path()
+        if lock.exists():
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                age = LOCK_STALE_SECONDS + 1
+            if age < LOCK_STALE_SECONDS:
+                return False
+            lock.unlink(missing_ok=True)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.touch()
+        return True
+
+    def _release_lock(self) -> None:
+        self._lock_path().unlink(missing_ok=True)
+
+    @staticmethod
+    def _systemd_managed() -> bool:
+        systemctl = shutil.which("systemctl")
+        if not systemctl:
+            return False
+        try:
+            result = subprocess.run(
+                [systemctl, "is-enabled", SYSTEMD_SERVICE_NAME],
+                capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
     def _read_pid(self) -> int | None:
         path = pid_file(self.paths)
@@ -87,6 +125,12 @@ class ProcessBackend:
         running = self._is_owned_process(pid)
         if not running and pid_file(self.paths).exists() and not self._is_pid_running(pid):
             self._cleanup_process_state()
+        if running:
+            config = read_config(self.paths)
+            port_value = config.get("mixed-port", 7890)
+            address = self._parse_listen_address(port_value)
+            if address and not self._port_accepts_connection(address):
+                return False
         return running
 
     @staticmethod
@@ -148,24 +192,30 @@ class ProcessBackend:
         if not runtime.exists():
             raise FileNotFoundError(f"runtime config not found: {runtime}")
 
-        self._ensure_no_foreign_instance()
+        if not self._acquire_lock():
+            raise RuntimeError("错误: 另一个启动进程正在进行中，请稍候...")
 
-        with log_file(self.paths).open("a", encoding="utf-8") as log_handle:
-            program = self._program_path()
-            process = subprocess.Popen(
-                [program, "-f", str(runtime), "-d", str(self.paths.data_dir)],
-                stdout=log_handle,
-                stderr=log_handle,
-                start_new_session=True,
-            )
+        try:
+            self._ensure_no_foreign_instance()
 
-        pid_file(self.paths).write_text(f"{process.pid}\n", encoding="utf-8")
-        self._write_process_owner(ProcessOwner(pid=process.pid, program=program, runtime=str(runtime)))
-        time.sleep(0.1)
-        if not self._is_pid_running(process.pid):
-            self._cleanup_process_state()
-            raise RuntimeError("process exited immediately")
-        return process.pid
+            with log_file(self.paths).open("a", encoding="utf-8") as log_handle:
+                program = self._program_path()
+                process = subprocess.Popen(
+                    [program, "-f", str(runtime), "-d", str(self.paths.data_dir)],
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    start_new_session=True,
+                )
+
+            pid_file(self.paths).write_text(f"{process.pid}\n", encoding="utf-8")
+            self._write_process_owner(ProcessOwner(pid=process.pid, program=program, runtime=str(runtime)))
+            time.sleep(0.1)
+            if not self._is_pid_running(process.pid):
+                self._cleanup_process_state()
+                raise RuntimeError("process exited immediately")
+            return process.pid
+        finally:
+            self._release_lock()
 
     def stop(self) -> bool:
         pid = self._read_pid()
@@ -188,6 +238,11 @@ class ProcessBackend:
         return True
 
     def restart(self) -> int:
+        if self._systemd_managed():
+            subprocess.run(["systemctl", "restart", SYSTEMD_SERVICE_NAME], check=True, timeout=30)
+            time.sleep(1)
+            pid = self._read_pid()
+            return pid if pid else 0
         self.stop()
         return self.start()
 
