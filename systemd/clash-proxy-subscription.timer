@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Clash Proxy subscription update
+Documentation=file:/root/clash_proxy/README.md
+
+[Timer]
+Unit=clash-proxy-subscription.service
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

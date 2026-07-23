@@ -443,6 +443,16 @@ root 级 systemd 安装还提供 `clash-proxy-refresh.path` 和
 `clash-proxy-refresh.timer`。`.path` 监听 `/root/clash_proxy/config.yaml` 变化后
 触发 refresh，timer 作为周期性兜底。
 
+每日订阅更新由 `clash-proxy-subscription.timer` 触发（默认每天 04:00 +
+最多 30 分钟随机延迟，`Persistent=true` 关机错过会补跑），执行
+`systemd/clash-proxy-subscription.sh`：调用 `scripts/update_subscription_prod.py`
+复用 `cproxy` 的安全合并逻辑（剔除 `program-path`/`secret` 等安全键、保留本地
+优先键、写入前留快照）拉订阅合并进 `config.yaml`，再走 `proxy.sh render` →
+`mihomo -t` 校验 → 仅在配置变化时 `systemctl restart clash-proxy.service` →
+API 探活，任一步失败回滚 `config.yaml` 与 `runtime.yaml`。生产 `config.yaml`
+未配置 `subscription-url` 时直接跳过。手动触发：
+`systemctl start clash-proxy-subscription.service`。
+
 `update_config.sh` 不再注入 AI groups/rules；AI 路由由 `proxy.sh render` 统一生成。
 默认模式是 `--dry-run`，只校验候选 YAML，不写源配置、不触发 refresh。
 
