@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=forking
-ExecStartPre=%h/.local/bin/cproxy render
-ExecStart=%h/.local/bin/cproxy start
-ExecStop=%h/.local/bin/cproxy stop
-ExecReload=%h/.local/bin/cproxy restart
-PIDFile=%h/.local/state/cproxy/cproxy.pid
+ExecStartPre=/usr/local/bin/cproxy render
+ExecStart=/usr/local/bin/cproxy start
+ExecStop=/usr/local/bin/cproxy stop
+ExecReload=/usr/local/bin/cproxy restart
+PIDFile=%h/.local/share/cproxy/mihomo.pid
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
