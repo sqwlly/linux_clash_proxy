@@ -34,7 +34,10 @@ class ProvidersScreen(Widget):
                 with Horizontal(classes="toolbar"):
                     yield Button("Update", id="btn-update-provider", classes="action-button primary-button")
                     yield Button("Refresh", id="btn-refresh-providers", classes="action-button muted-button")
-                yield Label("up/down: move  u: update selected  r: refresh", id="providers-action-status", classes="action-status")
+                yield Label(
+                    "up/down: move  u: update selected  r: refresh",
+                    id="providers-action-status", classes="action-status",
+                )
 
     def on_mount(self) -> None:
         table = self.query_one("#providers-table", DataTable)

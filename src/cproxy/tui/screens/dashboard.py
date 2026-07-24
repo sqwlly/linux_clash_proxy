@@ -6,9 +6,9 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Label
 
+from ...api import APIUnavailableError
 from ...config import AppPaths
 from ...process import get_status
-from ...api import APIUnavailableError
 from ...services.query import QueryService
 
 
@@ -116,7 +116,11 @@ class DashboardScreen(Widget):
                 standby = groups.get(standby_name)
                 if standby:
                     delay_str = f"{standby.delay}ms" if standby.delay else "─"
-                    alive_str = "[#a3e635]●[/]" if standby.alive else "[#fb7185]○[/]" if standby.alive is False else "[#8b98aa]?[/]"
+                    alive_str = (
+                        "[#a3e635]●[/]" if standby.alive
+                        else "[#fb7185]○[/]" if standby.alive is False
+                        else "[#8b98aa]?[/]"
+                    )
                     self.query_one("#dash-ai-standby", Label).update(
                         f"{standby_name} → {standby.current} ({delay_str}) {alive_str}"
                     )

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.request import Request, urlopen
-
-import time
 
 import yaml
 
@@ -90,7 +89,12 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
 
     data = yaml.safe_load(raw.decode("utf-8"))
     if not isinstance(data, dict) or not (data.get("proxies") or data.get("proxy-groups")):
-        raise RuntimeError("错误: 订阅内容不是有效的 Clash/Mihomo 配置")
+        hint = ""
+        if "flag=meta" not in url:
+            hint = "；如果订阅提供商支持 Clash 格式，尝试在 URL 末尾追加 &flag=meta"
+        if isinstance(data, dict) and not data.get("proxies"):
+            raise RuntimeError(f"错误: 订阅返回了有效 YAML 但 proxies 为空{hint}")
+        raise RuntimeError(f"错误: 订阅内容不是有效的 Clash/Mihomo 配置{hint}")
 
     path = config_file(paths)
     existing = read_config(paths)
@@ -178,7 +182,10 @@ class RefreshService:
             return GroupSwitchResult(group=group_name, current=None, action="失败", detail=str(exc))
         group_type = str(group.type or "").lower()
         if group_type not in {"select", "selector"}:
-            return GroupSwitchResult(group=group_name, current=group.current, action="保持不变", detail=f"{group.type} 类型自动选路")
+            return GroupSwitchResult(
+                group=group_name, current=group.current,
+                action="保持不变", detail=f"{group.type} 类型自动选路",
+            )
 
         check: GroupCheckReport = self.diagnostics.test_group(group_name)
         ok_items = [item for item in check.results if item.ok and item.delay is not None]
@@ -187,8 +194,14 @@ class RefreshService:
 
         current_check = next((item for item in check.results if item.name == group.current), None)
         if current_check is not None and current_check.ok:
-            return GroupSwitchResult(group=group_name, current=group.current, action="保持不变", detail=f"{current_check.delay}ms")
+            return GroupSwitchResult(
+                group=group_name, current=group.current,
+                action="保持不变", detail=f"{current_check.delay}ms",
+            )
 
-        best = min(ok_items, key=lambda item: item.delay)
+        best = min(ok_items, key=lambda item: item.delay or 0)
         self.query.switch_group(group_name, best.name)
-        return GroupSwitchResult(group=group_name, current=group.current, action="已切换", target=best.name, detail=f"{best.delay}ms")
+        return GroupSwitchResult(
+            group=group_name, current=group.current,
+            action="已切换", target=best.name, detail=f"{best.delay}ms",
+        )

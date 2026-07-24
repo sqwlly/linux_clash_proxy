@@ -100,7 +100,7 @@ def test_rejects_node_uri_list_without_full_yaml(monkeypatch, tmp_path, capsys):
     assert module.main() == 1
     stderr = capsys.readouterr().err
     assert "订阅导入校验失败" in stderr
-    assert "subscription is not full YAML or Base64 node list" in stderr
+    assert "neither valid Clash YAML nor a Base64 node list" in stderr
 
 
 def test_base64_vless_subscription_converts_to_minimal_yaml(monkeypatch, tmp_path, capsys):

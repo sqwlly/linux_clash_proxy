@@ -6,9 +6,8 @@ import ssl
 from importlib import import_module
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
-from urllib.parse import urlparse
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import BaseHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 
 from ..config import AppPaths, read_config
 from .models import ProxyGroup
@@ -28,7 +27,8 @@ class APIBackend:
         config = read_config(self.paths)
         if config.get("external-controller-unix"):
             raise APIUnavailableError(
-                "错误: 当前不支持 external-controller-unix；Unix socket 控制面不会校验 secret，请改用 loopback HTTP/TLS controller"
+                "错误: 当前不支持 external-controller-unix；"
+                "Unix socket 控制面不会校验 secret，请改用 loopback HTTP/TLS controller"
             )
 
         tls_addr = config.get("external-controller-tls")
@@ -108,7 +108,7 @@ class APIBackend:
         try:
             context = self._tls_context(url)
             # Controller traffic must not recurse through the proxy being managed.
-            handlers = [ProxyHandler({})]
+            handlers: list[BaseHandler] = [ProxyHandler({})]
             if context is not None:
                 handlers.append(HTTPSHandler(context=context))
             effective_timeout = request_timeout if request_timeout is not None else self.request_timeout()
@@ -137,7 +137,7 @@ class APIBackend:
             current=str(payload.get("now", "-")),
             candidates=[str(item) for item in payload.get("all", [])],
             alive=payload.get("alive"),
-            delay=int(delay) if delay not in (None, "-") else None,
+            delay=int(delay) if delay is not None and delay != "-" else None,
             source="api",
         )
 

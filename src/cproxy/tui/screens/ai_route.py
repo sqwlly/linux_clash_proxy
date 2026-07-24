@@ -73,7 +73,7 @@ class AIRouteScreen(Widget):
             manual = groups.get("AI-MANUAL")
             auto = groups.get("AI-AUTO")
 
-            if not all([manual, auto]):
+            if manual is None or auto is None:
                 self.query_one("#ai-route-mode", Label).update("[#8b98aa]Not configured[/]")
                 self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
                 self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
@@ -92,21 +92,29 @@ class AIRouteScreen(Widget):
 
             if active_group:
                 delay_str = f"{active_group.delay}ms" if active_group.delay else "─"
-                alive_str = "[#a3e635]●[/]" if active_group.alive else "[#fb7185]○[/]" if active_group.alive is False else "[#8b98aa]?[/]"
+                alive_str = (
+                    "[#a3e635]●[/]" if active_group.alive
+                    else "[#fb7185]○[/]" if active_group.alive is False
+                    else "[#8b98aa]?[/]"
+                )
                 self.query_one("#ai-route-active", Label).update(
                     f"{active_group_name} → {active_group.current} ({delay_str}) {alive_str}"
                 )
 
             if standby_group:
                 delay_str = f"{standby_group.delay}ms" if standby_group.delay else "─"
-                alive_str = "[#a3e635]●[/]" if standby_group.alive else "[#fb7185]○[/]" if standby_group.alive is False else "[#8b98aa]?[/]"
+                alive_str = (
+                    "[#a3e635]●[/]" if standby_group.alive
+                    else "[#fb7185]○[/]" if standby_group.alive is False
+                    else "[#8b98aa]?[/]"
+                )
                 self.query_one("#ai-route-standby", Label).update(
                     f"{standby_name} → {standby_group.current} ({delay_str}) {alive_str}"
                 )
 
             chain_lines = ["[#7dd3fc]AI-MANUAL[/]"]
             if auto_mode:
-                chain_lines.append(f"└─ [#f6c177]AI-AUTO[/]")
+                chain_lines.append("└─ [#f6c177]AI-AUTO[/]")
                 chain_lines.append(f"   └─ [#5eead4]{active_group_name}[/]")
                 if active_group:
                     chain_lines.append(f"      └─ [#a3e635]{active_group.current}[/]")
@@ -194,7 +202,7 @@ class AIRouteScreen(Widget):
             manual = groups.get("AI-MANUAL")
             auto = groups.get("AI-AUTO")
 
-            if not all([manual, auto]):
+            if manual is None or auto is None:
                 return
 
             auto_mode = manual.current == "AI-AUTO"

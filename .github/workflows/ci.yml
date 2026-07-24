@@ -16,7 +16,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install package with TUI extra
-        run: python -m pip install -e ".[tui]" pytest
+        run: python -m pip install -e ".[tui]" pytest ruff mypy types-PyYAML
+
+      - name: Lint
+        run: ruff check src/
+
+      - name: Type check
+        run: mypy src/
 
       - name: Python tests
         run: PYTHONPATH="src:." python -m pytest -q

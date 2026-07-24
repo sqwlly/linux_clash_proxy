@@ -14,7 +14,9 @@ from textual.widget import Widget
 from textual.widgets import Button, Label
 
 from ...config import AppPaths, config_file, read_config, runtime_file
-from ..widgets import NavigationDataTable as DataTable, NavigationInput as Input, NavigationTextArea as TextArea
+from ..widgets import NavigationDataTable as DataTable
+from ..widgets import NavigationInput as Input
+from ..widgets import NavigationTextArea as TextArea
 
 
 def build_import_subscription_command(

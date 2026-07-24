@@ -7,3 +7,4 @@ def isolate_xdg_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     for name in ("NO_PROXY", "no_proxy"):
         monkeypatch.setenv(name, "127.0.0.1,localhost")
+    monkeypatch.setenv("CPROXY_NO_SYSTEMD", "1")

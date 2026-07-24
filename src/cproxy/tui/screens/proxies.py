@@ -52,7 +52,10 @@ class ProxiesScreen(Widget):
                         yield Button("Test", id="btn-test-delay", classes="action-button primary-button")
                         yield Button("Refresh", id="btn-refresh-proxies", classes="action-button muted-button")
                         yield Button("Restart", id="btn-restart-proxy", classes="action-button muted-button")
-                    yield Label("up/down: move  left/esc: groups  right: nodes  enter/s: switch", id="proxy-action-status", classes="action-status")
+                    yield Label(
+                        "up/down: move  left/esc: groups  right: nodes  enter/s: switch",
+                        id="proxy-action-status", classes="action-status",
+                    )
 
     def on_mount(self) -> None:
         self._init_tables()

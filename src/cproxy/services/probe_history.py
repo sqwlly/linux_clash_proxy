@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 from ..config import AppPaths
 
@@ -18,7 +18,7 @@ def probe_history_file(paths: AppPaths) -> Path:
     return paths.state_dir / "probe_history.jsonl"
 
 
-def _int_value(value: object, default: int = 0) -> int:
+def _int_value(value: Any, default: int = 0) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):

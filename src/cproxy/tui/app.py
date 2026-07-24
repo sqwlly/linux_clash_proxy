@@ -19,14 +19,14 @@ from textual.widgets import (
 )
 
 from ..config import AppPaths, default_paths
-from .screens.dashboard import DashboardScreen
-from .screens.proxies import ProxiesScreen
-from .screens.providers import ProvidersScreen
-from .screens.connections import ConnectionsScreen
 from .screens.ai_route import AIRouteScreen
-from .screens.subscriptions import SubscriptionsScreen
 from .screens.config_editor import ConfigEditorScreen
+from .screens.connections import ConnectionsScreen
+from .screens.dashboard import DashboardScreen
 from .screens.logs import LogsScreen
+from .screens.providers import ProvidersScreen
+from .screens.proxies import ProxiesScreen
+from .screens.subscriptions import SubscriptionsScreen
 from .screens.system_proxy import SystemProxyScreen
 
 

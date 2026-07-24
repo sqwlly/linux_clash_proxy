@@ -8,7 +8,14 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from .. import __version__
 from ..backend.api import APIBackend
-from ..backend.models import AIProbeReport, AIProbeResult, ConnectivityCheckResult, ConnectivityReport, DelayCheckResult, GroupCheckReport
+from ..backend.models import (
+    AIProbeReport,
+    AIProbeResult,
+    ConnectivityCheckResult,
+    ConnectivityReport,
+    DelayCheckResult,
+    GroupCheckReport,
+)
 from ..backend.process import ProcessBackend
 from ..config import AppPaths, read_config
 from ..geodata import check_country_mmdb
@@ -119,7 +126,7 @@ class DiagnosticsService:
             try:
                 payload = self.api.delay_test(str(member), url, timeout)
                 delay = payload.get("delay")
-                results.append(DelayCheckResult(name=str(member), ok=True, delay=int(delay)))
+                results.append(DelayCheckResult(name=str(member), ok=True, delay=int(delay) if delay is not None else None))
             except Exception:
                 results.append(DelayCheckResult(name=str(member), ok=False, delay=None))
         return GroupCheckReport(group_name=group_name, results=results)

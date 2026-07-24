@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .backend.models import AIProbeReport, ConnectivityCheckResult, ConnectivityReport, DelayCheckResult, GroupCheckReport
+from .backend.models import AIProbeReport, ConnectivityReport, GroupCheckReport
 from .config import AppPaths
 from .services.diagnostics import DiagnosticsService
 

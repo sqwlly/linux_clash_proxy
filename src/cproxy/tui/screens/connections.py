@@ -43,7 +43,10 @@ class ConnectionsScreen(Widget):
                     yield Button("Close", id="btn-close-connection", classes="action-button danger-button")
                     yield Button("Close All", id="btn-close-all-connections", classes="action-button danger-button")
                     yield Button("Refresh", id="btn-refresh-connections", classes="action-button primary-button")
-                yield Label("up/down: move  x: close selected  a: close all  r: refresh", id="connections-action-status", classes="action-status")
+                yield Label(
+                    "up/down: move  x: close selected  a: close all  r: refresh",
+                    id="connections-action-status", classes="action-status",
+                )
 
     def on_mount(self) -> None:
         table = self.query_one("#connections-table", DataTable)

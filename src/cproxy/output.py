@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from argparse import ArgumentParser, REMAINDER
+from argparse import REMAINDER, ArgumentParser
 from collections.abc import Callable
 
 from .services.probe import ProbeReport, format_delay, stable_score

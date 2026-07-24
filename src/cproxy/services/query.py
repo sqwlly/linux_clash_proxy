@@ -83,7 +83,10 @@ class QueryService:
         try:
             self.api.close_connection(connection_id)
         except Exception as exc:
-            write_audit_event(self.paths, action="close_connection", target=connection_id, result="error", detail={"error": str(exc)})
+            write_audit_event(
+                self.paths, action="close_connection", target=connection_id,
+                result="error", detail={"error": str(exc)},
+            )
             raise
         write_audit_event(self.paths, action="close_connection", target=connection_id, result="ok")
 
@@ -91,7 +94,10 @@ class QueryService:
         try:
             self.api.close_all_connections()
         except Exception as exc:
-            write_audit_event(self.paths, action="close_all_connections", target="all", result="error", detail={"error": str(exc)})
+            write_audit_event(
+                self.paths, action="close_all_connections", target="all",
+                result="error", detail={"error": str(exc)},
+            )
             raise
         write_audit_event(self.paths, action="close_all_connections", target="all", result="ok")
 
@@ -115,8 +121,10 @@ class QueryService:
         write_audit_event(self.paths, action="update_proxy_provider", target=name, result="ok")
 
     def _to_connection(self, item: dict[str, Any]) -> ConnectionEntry:
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-        chains = item.get("chains") if isinstance(item.get("chains"), list) else []
+        raw_metadata = item.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        raw_chains = item.get("chains")
+        chains = raw_chains if isinstance(raw_chains, list) else []
         return ConnectionEntry(
             id=str(item.get("id", "")),
             host=str(metadata.get("host") or metadata.get("destinationIP") or metadata.get("remoteDestination") or "-"),
@@ -137,7 +145,7 @@ class QueryService:
             updated_at=str(item.get("updatedAt") or item.get("updated") or item.get("updateAt") or "-"),
         )
 
-    def _to_int(self, value: object) -> int:
+    def _to_int(self, value: Any) -> int:
         try:
             return int(value)
         except (TypeError, ValueError):

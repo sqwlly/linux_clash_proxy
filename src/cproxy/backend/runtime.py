@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
-import re
 import yaml
 
 from ..config import AppPaths, config_file, runtime_file

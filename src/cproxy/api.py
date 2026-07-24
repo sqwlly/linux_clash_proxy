@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .backend.api import APIBackend, APIUnavailableError
+from .backend.api import APIBackend
+from .backend.api import APIUnavailableError as APIUnavailableError
 from .config import AppPaths
 
 

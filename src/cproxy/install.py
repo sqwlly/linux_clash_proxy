@@ -6,7 +6,6 @@ from pathlib import Path
 
 from .config import AppPaths, read_config
 
-
 DEFAULT_CONFIG = """mixed-port: 7890
 external-controller: 127.0.0.1:9090
 mode: rule

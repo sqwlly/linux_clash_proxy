@@ -54,6 +54,8 @@ class ProcessBackend:
 
     @staticmethod
     def _systemd_managed() -> bool:
+        if os.environ.get("CPROXY_NO_SYSTEMD"):
+            return False
         systemctl = shutil.which("systemctl")
         if not systemctl:
             return False

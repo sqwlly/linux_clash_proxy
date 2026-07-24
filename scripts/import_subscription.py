@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 
 import yaml
 
-
 DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_USER_AGENT = "clash-proxy-subscription-import/0.1"
@@ -389,13 +388,21 @@ def attach_subscription_group(current: dict, group_config: dict, group_name: str
     return merged
 
 
-def candidate_config_from_subscription(text: str, group_name: str = "") -> CandidateConfig:
+def candidate_config_from_subscription(text: str, group_name: str = "", url: str = "") -> CandidateConfig:
     try:
         data = validate_full_yaml_config(text)
         return CandidateConfig(text=text, data=data, source="yaml")
     except RuntimeError as yaml_error:
-        decoded = decode_base64_subscription(text)
-        proxies = parse_node_uri_list(decoded)
+        try:
+            decoded = decode_base64_subscription(text)
+            proxies = parse_node_uri_list(decoded)
+        except RuntimeError:
+            hint = ""
+            if url and "flag=meta" not in url:
+                hint = " (try appending &flag=meta to the subscription URL)"
+            raise RuntimeError(
+                f"subscription is neither valid Clash YAML nor a Base64 node list{hint}"
+            ) from yaml_error
         data = converted_config_from_proxies(proxies, group_name)
         candidate_text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
         try:
@@ -438,7 +445,7 @@ def main() -> int:
             errors.append(download.error)
             continue
         try:
-            candidate = candidate_config_from_subscription(download.content.text, args.group)
+            candidate = candidate_config_from_subscription(download.content.text, args.group, url=args.url)
             content = download.content
             break
         except RuntimeError as exc:

@@ -34,15 +34,15 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 
 | legacy 能力 | 位置 | cproxy 等价 | 结论 |
 |---|---|---|---|
-| 启动/停止/重启/状态 | `proxy.sh` | `cproxy start/stop/restart/status` | 待核对 |
-| 无 GUI 节点切换 | `proxy.sh` | `cproxy switch` / TUI | 待核对 |
-| 命令级代理注入 | `proxy.sh` | `cproxy` 代理环境注入 | 待核对 |
-| 订阅更新 | `update_config.sh`、`clash-proxy-update` | `scripts/import_subscription.py`、TUI 订阅页 | 待核对 |
-| 稳定节点探测 | `probe_stable_node.py`（`/usr/local/lib`） | 待确认 | 待核对 |
-| AI 路由助手 | `ai-use`、`guard`、`ai-connections`、`incident` | 待确认 | 待核对 |
-| 系统级 systemd 服务 | `systemd/clash-proxy.service` | `systemd-user/cproxy.service` | 待核对 |
-| 定时刷新 | `systemd/clash-proxy-refresh.timer` | `systemd-user/cproxy-refresh.timer` | 待核对 |
-| 日志轮转 | `logrotate.conf.template`（legacy 段） | install.sh 的 cproxy 段 | 待核对 |
+| 启动/停止/重启/状态 | `proxy.sh` | `cproxy start/stop/restart/status`（`backend/process.py`） | 已有等价 |
+| 无 GUI 节点切换 | `proxy.sh` | `cproxy switch` / TUI Proxies 页（`services/query.py`） | 已有等价 |
+| 命令级代理注入 | `proxy.sh` | `cproxy proxy-env/with-proxy/proxy-shell`（`proxyenv.py`） | 已有等价 |
+| 订阅更新 | `update_config.sh`、`clash-proxy-update` | `cproxy import-subscription/refresh`、TUI 订阅页（`services/refresh.py`） | 已有等价 |
+| 稳定节点探测 | `probe_stable_node.py`（`/usr/local/lib`） | `cproxy probe-stable-node/shadow-probe/ai-use`（`services/probe.py`） | 已有等价 |
+| AI 路由助手 | `ai-use`、`guard`、`ai-connections`、`incident` | `cproxy ai-use/guard/ai-connections/incident`（`services/ops.py`、`services/probe.py`） | 已有等价 |
+| 系统级 systemd 服务 | `systemd/clash-proxy.service` | `systemd-user/cproxy.service`（用户级，`systemd-analyze verify` 通过） | 已有等价 |
+| 定时刷新 | `systemd/clash-proxy-refresh.timer` | `systemd-user/cproxy-refresh.timer`（用户级 timer） | 已有等价 |
+| 日志轮转 | `logrotate.conf.template`（legacy 段） | `scripts/install.sh` 的 cproxy 段（logrotate 配置） | 已有等价 |
 
 核对方式：逐项在新链路上演练，把结论列改为"已有等价 / 不再需要 / 需移植（附 issue 或提交）"。
 

@@ -8,8 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from ..backend.api import APIBackend
-from ..backend.process import ProcessBackend
-from ..config import AppPaths, read_config
+from ..config import AppPaths
 from ..proxyenv import proxy_http_url
 from .probe import ProbeService
 from .probe_history import load_history_rows, probe_history_file
@@ -93,9 +92,6 @@ def guard(
 
 def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSection]:
     sections: list[IncidentSection] = []
-    config = read_config(paths)
-    process = ProcessBackend(paths)
-    status = process.status()
 
     header_lines = [
         f"time={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",

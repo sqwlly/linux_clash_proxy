@@ -3,7 +3,6 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from math import ceil
-from pathlib import Path
 
 from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ProxyGroup

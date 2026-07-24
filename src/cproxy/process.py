@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from .backend.models import StatusSnapshot
-from .backend.process import ProcessBackend, ProcessOwnershipError
+from .backend.process import ProcessBackend
+from .backend.process import ProcessOwnershipError as ProcessOwnershipError
 from .config import AppPaths
 
 
