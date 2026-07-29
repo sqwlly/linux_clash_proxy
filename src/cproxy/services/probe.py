@@ -231,6 +231,8 @@ def _preview_reason(
     strategy: ProbeStrategy,
 ) -> str:
     if not verdict.stable:
+        if not current_verdict.stable:
+            return switch_skip_reason(best, current, current_verdict, current_summary, strategy)
         return verdict.reason
     return switch_skip_reason(best, current, current_verdict, current_summary, strategy)
 

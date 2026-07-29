@@ -14,9 +14,10 @@ from cproxy.backend.api import APIUnavailableError
 from cproxy.backend.models import ProxyGroup
 from cproxy.config import default_paths
 from cproxy.services.probe import (
+    STRATEGIES,
     ProbeService,
     ProbeSummary,
-    STRATEGIES,
+    _preview_reason,
     active_candidates_after_round,
     collect_leaf_candidates,
     resolve_current_leaf,
@@ -100,6 +101,36 @@ def test_switch_skip_reasons():
                                         SimpleNamespace(stable=True), ProbeSummary("c", (100, 100, 100), 0), S)
     assert switch_skip_reason(ProbeSummary("n", (50, 50, 50), 0), "c",
                               SimpleNamespace(stable=True), ProbeSummary("c", (500, 500, 500), 0), S) == ""
+
+
+def test_preview_reason_both_unstable_allows_switch():
+    """When current is 0/5 and best candidate is 4/5, switch should not be blocked."""
+    S = STRATEGIES["conservative"]
+    best = ProbeSummary("US-01", (484, 500, 510, 551), 1)  # 4/5
+    verdict = stability_verdict(best, 5, S)
+    assert not verdict.stable  # 4/5 != 5/5
+
+    current_summary = ProbeSummary("SG-01", (), 5)  # 0/5
+    current_verdict = stability_verdict(current_summary, 5, S)
+    assert not current_verdict.stable
+
+    # Both unstable → should allow switch (empty string = no skip)
+    assert _preview_reason(best, verdict, "SG-01", current_verdict, current_summary, S) == ""
+
+
+def test_preview_reason_candidate_unstable_current_stable_blocks():
+    """When current is stable but candidate is not, switch should be blocked."""
+    S = STRATEGIES["conservative"]
+    best = ProbeSummary("US-01", (484, 500, 510, 551), 1)  # 4/5
+    verdict = stability_verdict(best, 5, S)
+    assert not verdict.stable
+
+    current_summary = ProbeSummary("SG-01", (100, 110, 105, 108, 102), 0)  # 5/5
+    current_verdict = stability_verdict(current_summary, 5, S)
+    assert current_verdict.stable
+
+    reason = _preview_reason(best, verdict, "SG-01", current_verdict, current_summary, S)
+    assert reason != "" and "全成功" in reason
 
 
 # --- ProbeService integration ---
@@ -209,10 +240,14 @@ def test_cli_rc_switch(tmp_path, monkeypatch, capsys):
     # debounce
     run3 = _cli(tmp_path, monkeypatch, {"G": _g("G", "Selector", "cur", ["cur", "new"])}, {"cur": 100, "new": 90})
     assert run3(["probe-stable-node", "G"] + ARGS3 + ["--switch"]) == 0
-    # threshold not met (conservative min_rounds=5, rounds=1)
+    # current is already best (n1=100 < n2=200) → "当前已是推荐稳定节点" → rc 0
     run4 = _cli(tmp_path, monkeypatch, {"G": _g("G", "Selector", "n1", ["n1", "n2"])}, {"n1": 100, "n2": 200})
     assert run4(["probe-stable-node", "G", "--strategy", "conservative", "--rounds", "1",
-                 "--timeout", "1000", "--switch"]) == 1
+                 "--timeout", "1000", "--switch"]) == 0
+    # both unstable (insufficient rounds), current is NOT best → switch allowed → rc 0
+    run4b = _cli(tmp_path, monkeypatch, {"G": _g("G", "Selector", "n1", ["n1", "n2"])}, {"n1": 200, "n2": 100})
+    assert run4b(["probe-stable-node", "G", "--strategy", "conservative", "--rounds", "1",
+                  "--timeout", "1000", "--switch"]) == 0
     # all fail
     run5 = _cli(tmp_path, monkeypatch, {"G": _g("G", "Selector", "n", ["n"])}, {}, fail_all=True)
     assert run5(["probe-stable-node", "G"] + ARGS3 + ["--switch"]) == 1
