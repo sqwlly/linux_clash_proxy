@@ -33,8 +33,8 @@ assert_file_contains "$OVERRIDE_EXAMPLE" "EnvironmentFile=%h/.config/cproxy/cpro
 assert_file_contains "$OVERRIDE_EXAMPLE" "After=cproxy.service" "用户级 override 示例应依赖 cproxy.service"
 assert_file_contains "$OVERRIDE_EXAMPLE" "Requires=cproxy.service" "用户级 override 示例应要求 cproxy.service"
 
-assert_file_contains "$SERVICE_FILE" "ExecStart=%h/.local/bin/cproxy start" "用户级 service 应通过 cproxy 启动"
-assert_file_contains "$SERVICE_FILE" "ExecStop=%h/.local/bin/cproxy stop" "用户级 service 应通过 cproxy 停止"
+assert_file_contains "$SERVICE_FILE" "ExecStart=/usr/local/bin/cproxy start" "用户级 service 应通过 cproxy 启动"
+assert_file_contains "$SERVICE_FILE" "ExecStop=/usr/local/bin/cproxy stop" "用户级 service 应通过 cproxy 停止"
 assert_file_contains "$SERVICE_FILE" "NoNewPrivileges=yes" "用户级 service 应启用 NoNewPrivileges"
 assert_file_contains "$SERVICE_FILE" "PrivateTmp=yes" "用户级 service 应隔离临时目录"
 if grep -Fq "/root/clash_proxy" "$SERVICE_FILE"; then
