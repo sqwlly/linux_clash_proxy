@@ -1,29 +1,30 @@
 # 项目状态
 
-更新日期：2026-07-18
+更新日期：2026-07-29
 
 ## 当前阶段
 
-企业 TUI GA readiness 已完成（测试与验收脚本齐备），项目处于 **GA 收尾 + legacy 双轨维护** 阶段：
+legacy proxy.sh → cproxy 功能迁移已基本完成，项目处于 **GA 收尾 + legacy 双轨维护** 阶段：
 
 - `proxy.sh` 旧链路冻结新功能，只接受安全修复
 - 新功能只进 `cproxy`
+- 生产入口仍为 `clash-proxy.service`（proxy.sh 编排），cproxy 作为用户级 CLI 工具使用
 - 退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)
 
 ## 最近里程碑
 
+- 2026-07-29 probe 修复（双方都不稳定时允许切换）、端口冲突防护（cproxy start 检测生产服务、订阅脚本预检用户级 cproxy.service）
+- 2026-07-25 cproxy 功能同步完成：Japan 组、probe history、guard/incident/ai-connections、进程管理；ruff/mypy 接入、cli.py 拆分、测试隔离、功能对账表填写
+- 2026-07-24 生产入口每日订阅更新 systemd timer（04:00 + 30min 随机延迟）
 - 2026-07-18 仓库卫生与发布化：`Country.mmdb` 移出 git（安装时改为下载回退）、根目录个人配置清理、proxy.sh 退役计划、`cproxy start` 外来实例预检、`scripts/install-mihomo.sh`（版本固定 + sha256 校验）、`CPROXY_EDITABLE=0` 生产安装约定、版本升到 1.0.0 并新增 `CHANGELOG.md`、测试解除 `/root/clash_proxy` 硬编码且 CI 去掉 sudo 步骤、新增 `cproxy snapshots`/`rollback`（自动快照回滚）与 `cproxy refresh`（订阅更新→render→重启→探测切换一条龙）
 - 2026-07-14 render 自动创建区域组、清理 dns fallback-filter geosite
 - 2026-06-29 render 自动注入 external-controller / secret 默认值
-- 2026-06-01 TUI 布局与响应性改进
-- 2026-05-14 生产入口与 reload 评估
-- 2026-04-09/10 backend 重构、分发、geodata、状态套件等第一批计划落地
 
 ## 下一步（按优先级）
 
-1. 填写退役计划中的功能对账表
-2. 复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令
-3. 进入退役计划阶段 2：生产入口切到 cproxy，开始 4 周观察期
+1. 复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令
+2. 进入退役计划阶段 2：生产入口切到 cproxy，开始 4 周观察期
+3. 观察期内验证 cproxy refresh 替代 clash-proxy-subscription.sh 的可行性
 
 ## 发布
 
