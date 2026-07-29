@@ -68,6 +68,22 @@ class ProcessBackend:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    @staticmethod
+    def _production_service_active() -> bool:
+        if os.environ.get("CPROXY_NO_SYSTEMD"):
+            return False
+        systemctl = shutil.which("systemctl")
+        if not systemctl:
+            return False
+        try:
+            result = subprocess.run(
+                [systemctl, "is-active", SYSTEMD_SERVICE_NAME],
+                capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+
     def _read_pid(self) -> int | None:
         path = pid_file(self.paths)
         if not path.exists():
@@ -189,6 +205,13 @@ class ProcessBackend:
             pid = self._read_pid()
             if pid is not None:
                 return pid
+
+        if self._production_service_active():
+            raise ForeignInstanceError(
+                f"错误: 系统服务 {SYSTEMD_SERVICE_NAME} 正在运行，再启动 cproxy 会抢占相同端口\n"
+                f"提示: 使用 systemctl restart {SYSTEMD_SERVICE_NAME} 管理生产代理，"
+                "或先 systemctl stop clash-proxy 再启动 cproxy"
+            )
 
         runtime = runtime_file(self.paths)
         if not runtime.exists():

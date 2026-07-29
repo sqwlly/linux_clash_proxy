@@ -169,6 +169,17 @@ wait_for_api() {
     return 1
 }
 
+check_no_competing_instance() {
+    # 用户级 cproxy.service 会与生产服务抢占相同端口，导致 API 探活误判
+    if systemctl --user is-active --quiet cproxy.service 2>/dev/null; then
+        echo "错误: 用户级 cproxy.service 正在运行，会与 $SERVICE_NAME 抢占端口" >&2
+        echo "提示: 先执行 systemctl --user stop cproxy.service 再重试" >&2
+        exit 1
+    fi
+}
+
+check_no_competing_instance
+
 backup_files
 before_source="$(file_hash "$SOURCE_CONFIG")"
 before_runtime="$(file_hash "$RUNTIME_CONFIG")"
