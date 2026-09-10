@@ -17,10 +17,12 @@ from .output import normalize_name
 from .process import get_status, restart_process, start_process
 from .runtime import render_runtime
 from .security import validate_controller_security
+from .services.ipcheck import IpCheckService
 from .services.ops import build_incident, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
 from .services.refresh import RefreshReport
+from .services.traffic import TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 
 ANSI_RESET = "\033[0m"
@@ -661,4 +663,132 @@ def _render_incident(paths, profile: str) -> int:
         for line in section.lines:
             print(line)
         print()
+    return 0
+
+
+_DIMENSION_TITLES = {
+    "node": "按出口链路",
+    "rule": "按命中规则",
+    "host": "按目标主机",
+}
+
+
+def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
+    service = TrafficService(paths)
+    if action == "collect":
+        result = service.collect()
+        if raw:
+            print(
+                f"TRAFFIC_COLLECT\tconnections={result.connections}"
+                f"\tdown={result.download_delta}\tup={result.upload_delta}"
+            )
+            return 0
+        _print_section("流量采集完成")
+        print(f"连接数: {result.connections}")
+        print(f"本周期增量: ↓{format_bytes(result.download_delta)} ↑{format_bytes(result.upload_delta)}")
+        return 0
+
+    report = service.report(days=days, dimension=by, top=top)
+    if raw:
+        print(
+            f"TRAFFIC_REPORT\tsince={report['since']}\tuntil={report['until']}"
+            f"\tdown={report['total_download']}\tup={report['total_upload']}"
+        )
+        for dimension, rows in report["dimensions"].items():
+            for row in rows:
+                print(f"TRAFFIC_{dimension.upper()}\t{row.label}\tdown={row.download}\tup={row.upload}")
+        for row in report["daily"]:
+            print(f"TRAFFIC_DAY\t{row.label}\tdown={row.download}\tup={row.upload}")
+        return 0
+
+    window = (
+        f"{report['since']}"
+        if report["since"] == report["until"]
+        else f"{report['since']} ~ {report['until']}"
+    )
+    _print_section(f"流量统计 ({window})")
+    if report["total_download"] == 0 and report["total_upload"] == 0:
+        print("暂无流量记录 (collector 尚未采集或数据库为空)")
+        return 0
+    print(f"总计: ↓{format_bytes(report['total_download'])} ↑{format_bytes(report['total_upload'])}")
+
+    daily_rows = report["daily"]
+    if len(daily_rows) > 1:
+        print()
+        print("按日期:")
+        for row in daily_rows:
+            print(f"  {row.label}  ↓{format_bytes(row.download)} ↑{format_bytes(row.upload)}")
+
+    for dimension, rows in report["dimensions"].items():
+        print()
+        print(_DIMENSION_TITLES.get(dimension, dimension) + ":")
+        if not rows:
+            print("  -")
+            continue
+        for row in rows:
+            print(f"  ↓{format_bytes(row.download)} ↑{format_bytes(row.upload)}  {row.label}")
+    return 0
+
+
+def _render_ipcheck(paths, *, ip: str | None, group: str | None, node: str | None, timeout: int, raw: bool) -> int:
+    service = IpCheckService(paths)
+    report = service.check(ip=ip, group=group, node=node, timeout=timeout)
+
+    if raw:
+        print(
+            f"IP_CHECK\tip={report.ip}\tcountry={report.country}\tcity={report.city}"
+            f"\tisp={report.isp}\tasn={report.asn}\tip_type={report.ip_type}"
+            f"\tnative={report.native_type}\trisk={report.risk if report.risk is not None else '-'}"
+            f"\tverdict={report.verdict}\tsignals={','.join(report.signals) or '-'}"
+            f"\tblocklist={','.join(report.blocklist_listed) or 'clean'}"
+            f"\tdatacenter={report.datacenter or '-'}"
+        )
+        for item in report.services:
+            print(f"IP_SERVICE\t{item.key}\t{item.status}")
+        for item in report.sources:
+            print(f"IP_SOURCE\t{item.source}\trisk={item.risk}\tweight={item.weight}")
+        return 0
+
+    target = f"指定 IP {report.ip}" if ip else "当前代理出口"
+    _print_section(f"IP 纯净度检测 ({target})")
+    print(f"出口 IP: {report.ip}  ({report.country} {report.city})")
+    print(f"ISP/ASN: {report.isp}  {report.asn}")
+    if report.datacenter:
+        print(f"数据中心: {report.datacenter}")
+    print(f"IP 类型: {report.ip_type} / {report.usage_type}  原生性: {report.native_type}")
+    print(
+        f"风险评分: {report.risk if report.risk is not None else '-'} / 100  "
+        f"判定: {report.verdict}"
+    )
+    if report.signals:
+        print(f"风险信号: {', '.join(report.signals)}")
+    if report.blocklist_checked:
+        listed = ", ".join(report.blocklist_listed) if report.blocklist_listed else "无"
+        print(f"黑名单: {listed} ({len(report.blocklist_listed)}/{report.blocklist_checked} 命中)")
+    if report.shared_users:
+        print(f"共享用户: {report.shared_users} (质量: {report.shared_quality})")
+
+    if report.ai_services:
+        print()
+        print("AI 服务快照:")
+        for item in report.ai_services:
+            print(f"  {item.key:<10} {item.label}")
+    if report.services and not report.ai_services:
+        print()
+        print("服务快照:")
+        for item in report.services:
+            print(f"  {item.key:<10} {item.label}")
+
+    if report.sources:
+        print()
+        print("多源评分:")
+        for item in report.sources:
+            print(f"  {item.source:<14} risk={item.risk:<3} weight={item.weight}")
+
+    if report.switched:
+        print()
+        print(
+            f"检测期间临时切换 {report.switch_group} -> {normalize_name(node or '')}"
+            f"，已恢复为 {normalize_name(report.previous_selection)}"
+        )
     return 0

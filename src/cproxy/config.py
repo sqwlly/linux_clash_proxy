@@ -51,6 +51,10 @@ def log_file(paths: AppPaths) -> Path:
     return paths.state_dir / "cproxy.log"
 
 
+def traffic_db_file(paths: AppPaths) -> Path:
+    return paths.state_dir / "traffic.db"
+
+
 def read_config(paths: AppPaths) -> dict:
     path = config_file(paths)
     if not path.exists():

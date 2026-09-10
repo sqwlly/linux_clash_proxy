@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic Clash Proxy traffic statistics collection
+Documentation=file:/root/clash_proxy/README.md
+
+[Timer]
+Unit=clash-proxy-traffic-collector.service
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

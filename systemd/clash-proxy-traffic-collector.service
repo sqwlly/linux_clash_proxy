@@ -1,0 +1,9 @@
+[Unit]
+Description=Collect Clash Proxy traffic statistics (poll Mihomo connections API)
+Documentation=file:/root/clash_proxy/README.md
+After=network-online.target clash-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cproxy traffic collect --raw

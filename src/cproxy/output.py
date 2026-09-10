@@ -209,5 +209,19 @@ def build_root_parser() -> ArgumentParser:
     ai_use_parser.add_argument("--group", default="AI-MANUAL")
     ai_use_parser.add_argument("--raw", action="store_true")
 
+    traffic_parser = subparsers.add_parser("traffic", help="Show proxy traffic statistics or collect one sample")
+    traffic_parser.add_argument("action", nargs="?", choices=["show", "collect"], default="show")
+    traffic_parser.add_argument("--days", type=int, default=1, help="Report window in days (default: today)")
+    traffic_parser.add_argument("--by", choices=["node", "rule", "host"], help="Restrict breakdown to one dimension")
+    traffic_parser.add_argument("--top", type=int, default=15, help="Rows per breakdown table")
+    traffic_parser.add_argument("--raw", action="store_true")
+
+    ipcheck_parser = subparsers.add_parser("ip-check", help="Check exit IP purity via ipok.io")
+    ipcheck_parser.add_argument("--ip", help="Check a specific IP instead of the current proxy exit")
+    ipcheck_parser.add_argument("--group", help="Group to switch temporarily (default: CyberGuard when --node given)")
+    ipcheck_parser.add_argument("--node", help="Node to exit from during the check (switches group temporarily, then restores)")
+    ipcheck_parser.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds")
+    ipcheck_parser.add_argument("--raw", action="store_true")
+
     subparsers.add_parser("tui", help="Launch terminal UI dashboard")
     return parser

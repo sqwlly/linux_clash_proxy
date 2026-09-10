@@ -13,6 +13,7 @@ from .cli_render import (
     _render_current,
     _render_group_check,
     _render_incident,
+    _render_ipcheck,
     _render_list_groups,
     _render_list_nodes,
     _render_logs,
@@ -21,6 +22,7 @@ from .cli_render import (
     _render_shadow_history,
     _render_snapshots,
     _render_status,
+    _render_traffic,
     _run_bootstrap,
     _run_rollback,
     _section_title,
@@ -176,6 +178,24 @@ def run(argv: list[str] | None = None) -> int:
             output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_title)
             print("\n".join(output_lines))
             return exit_code
+        if args.command == "traffic":
+            return _render_traffic(
+                default_paths(),
+                action=args.action,
+                days=args.days,
+                by=args.by,
+                top=args.top,
+                raw=args.raw,
+            )
+        if args.command == "ip-check":
+            return _render_ipcheck(
+                default_paths(),
+                ip=args.ip,
+                group=args.group,
+                node=args.node,
+                timeout=args.timeout,
+                raw=args.raw,
+            )
         if args.command == "tui":
             from .tui.app import run_tui
             run_tui(default_paths())

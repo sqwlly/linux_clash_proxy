@@ -12,6 +12,8 @@ install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-refresh.timer" "${SYSTEMD_DIR
 install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-refresh.path" "${SYSTEMD_DIR}/clash-proxy-refresh.path"
 install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-subscription.service" "${SYSTEMD_DIR}/clash-proxy-subscription.service"
 install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-subscription.timer" "${SYSTEMD_DIR}/clash-proxy-subscription.timer"
+install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-traffic-collector.service" "${SYSTEMD_DIR}/clash-proxy-traffic-collector.service"
+install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-traffic-collector.timer" "${SYSTEMD_DIR}/clash-proxy-traffic-collector.timer"
 install -m 755 "${PROJECT_DIR}/systemd/clash-proxy-subscription.sh" "${PROJECT_DIR}/systemd/clash-proxy-subscription.sh"
 install -m 644 "${PROJECT_DIR}/systemd/clash-proxy-command.env.example" "${DEFAULT_ENV_DIR}/clash-proxy-command.example"
 
@@ -24,6 +26,7 @@ systemctl enable --now clash-proxy.service
 systemctl enable --now clash-proxy-refresh.timer
 systemctl enable --now clash-proxy-refresh.path
 systemctl enable --now clash-proxy-subscription.timer
+systemctl enable --now clash-proxy-traffic-collector.timer
 
 cat <<'EOF'
 systemd 安装完成:
@@ -33,6 +36,8 @@ systemd 安装完成:
 - /etc/systemd/system/clash-proxy-refresh.path
 - /etc/systemd/system/clash-proxy-subscription.service
 - /etc/systemd/system/clash-proxy-subscription.timer
+- /etc/systemd/system/clash-proxy-traffic-collector.service
+- /etc/systemd/system/clash-proxy-traffic-collector.timer
 - /etc/default/clash-proxy-command.example
 - /etc/default/clash-proxy-command
 
