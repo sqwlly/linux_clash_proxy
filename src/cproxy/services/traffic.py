@@ -13,7 +13,7 @@ DEFAULT_TOP = 15
 SEEN_RETENTION = timedelta(hours=24)
 SAMPLE_RETENTION_DAYS = 90
 
-DIMENSIONS = ("node", "rule", "host")
+DIMENSIONS = ("node", "rule", "host", "process")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS traffic_samples (
@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS traffic_samples (
     upload INTEGER NOT NULL,
     PRIMARY KEY (day, hour, chain, rule, host)
 );
+CREATE TABLE IF NOT EXISTS traffic_process_samples (
+    day TEXT NOT NULL,
+    hour TEXT NOT NULL,
+    process TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    download INTEGER NOT NULL,
+    upload INTEGER NOT NULL,
+    PRIMARY KEY (day, hour, process, chain)
+);
 CREATE TABLE IF NOT EXISTS connections_seen (
     id TEXT PRIMARY KEY,
     host TEXT NOT NULL,
@@ -34,9 +43,18 @@ CREATE TABLE IF NOT EXISTS connections_seen (
     download INTEGER NOT NULL,
     upload INTEGER NOT NULL,
     first_seen TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    process TEXT NOT NULL DEFAULT ''
 );
 """
+
+
+def _conn_process(conn: dict[str, Any]) -> str:
+    metadata = conn.get("metadata") or {}
+    process = str(metadata.get("processPath") or "").strip()
+    if not process:
+        process = str(metadata.get("process") or "").strip()
+    return process or "-"
 
 
 @dataclass(frozen=True)
@@ -95,6 +113,10 @@ class TrafficService:
         conn = sqlite3.connect(db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        # 旧库迁移：connections_seen 补 process 列
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(connections_seen)")}
+        if "process" not in columns:
+            conn.execute("ALTER TABLE connections_seen ADD COLUMN process TEXT NOT NULL DEFAULT ''")
         return conn
 
     def collect(self) -> CollectResult:
@@ -142,20 +164,32 @@ class TrafficService:
                     """,
                     (day, hour, chain, rule, host, delta_download, delta_upload),
                 )
+                process = _conn_process(conn)
+                db.execute(
+                    """
+                    INSERT INTO traffic_process_samples (day, hour, process, chain, download, upload)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (day, hour, process, chain) DO UPDATE SET
+                        download = download + excluded.download,
+                        upload = upload + excluded.upload
+                    """,
+                    (day, hour, process, chain, delta_download, delta_upload),
+                )
                 db.execute(
                     """
                     INSERT INTO connections_seen
-                        (id, host, rule, chain, download, upload, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, host, rule, chain, download, upload, first_seen, last_seen, process)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (id) DO UPDATE SET
                         host = excluded.host,
                         rule = excluded.rule,
                         chain = excluded.chain,
                         download = excluded.download,
                         upload = excluded.upload,
-                        last_seen = excluded.last_seen
+                        last_seen = excluded.last_seen,
+                        process = excluded.process
                     """,
-                    (conn_id, host, rule, chain, download, upload, now_text, now_text),
+                    (conn_id, host, rule, chain, download, upload, now_text, now_text, process),
                 )
 
             closed_ids = set(seen) - active_ids
@@ -169,6 +203,10 @@ class TrafficService:
             db.execute("DELETE FROM connections_seen WHERE last_seen < ?", (cutoff,))
             db.execute(
                 "DELETE FROM traffic_samples WHERE day < ?",
+                ((now - timedelta(days=SAMPLE_RETENTION_DAYS)).strftime("%Y-%m-%d"),),
+            )
+            db.execute(
+                "DELETE FROM traffic_process_samples WHERE day < ?",
                 ((now - timedelta(days=SAMPLE_RETENTION_DAYS)).strftime("%Y-%m-%d"),),
             )
 
@@ -248,6 +286,15 @@ class TrafficService:
                 """,
                 (since, until, top),
             ).fetchall()
+            process_rows = db.execute(
+                """
+                SELECT process AS label, SUM(download) AS download, SUM(upload) AS upload
+                FROM traffic_process_samples
+                WHERE day >= ? AND day <= ? AND chain NOT LIKE '%DIRECT%'
+                GROUP BY process ORDER BY (SUM(download) + SUM(upload)) DESC LIMIT ?
+                """,
+                (since, until, top),
+            ).fetchall()
             totals = db.execute(
                 """
                 SELECT
@@ -272,6 +319,10 @@ class TrafficService:
                 TrafficRow(str(row["label"]), int(row["download"]), int(row["upload"]))
                 for row in rows
             ],
+            "process_rows": [
+                TrafficRow(str(row["label"]), int(row["download"]), int(row["upload"]))
+                for row in process_rows
+            ],
         }
 
     def _dimension_rows(
@@ -282,6 +333,22 @@ class TrafficService:
         until: str,
         top: int,
     ) -> list[TrafficRow]:
+        if dimension == "process":
+            rows = db.execute(
+                """
+                SELECT process AS label, SUM(download) AS download, SUM(upload) AS upload
+                FROM traffic_process_samples
+                WHERE day >= ? AND day <= ?
+                GROUP BY process
+                ORDER BY (SUM(download) + SUM(upload)) DESC
+                LIMIT ?
+                """,
+                (since, until, top),
+            )
+            return [
+                TrafficRow(str(row["label"]), int(row["download"]), int(row["upload"]))
+                for row in rows
+            ]
         column = {
             "node": "chain",
             "rule": "rule",

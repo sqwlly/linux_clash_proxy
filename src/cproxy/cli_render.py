@@ -362,6 +362,24 @@ def _probe_summary_status(report: AIProbeReport) -> str:
     return "部分异常"
 
 
+def _today_traffic_summary() -> dict | None:
+    """今日流量汇总（代理/直连），数据库缺失或异常时返回 None，绝不阻塞 status。"""
+    try:
+        audit = TrafficService(default_paths()).audit(days=1, top=1)
+    except Exception:
+        return None
+    if not any(
+        (
+            audit["proxy_download"],
+            audit["proxy_upload"],
+            audit["direct_download"],
+            audit["direct_upload"],
+        )
+    ):
+        return None
+    return audit
+
+
 def _render_status(raw: bool) -> int:
     snapshot = get_status(default_paths())
     config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
@@ -390,6 +408,13 @@ def _render_status(raw: bool) -> int:
         print(f"状态: {status_text}")
         if snapshot.pid:
             print(f"PID: {snapshot.pid}")
+        traffic = _today_traffic_summary()
+        if traffic is not None:
+            total_down = traffic["proxy_download"] + traffic["direct_download"]
+            total_up = traffic["proxy_upload"] + traffic["direct_upload"]
+            print(f"今日流量: down={total_down} up={total_up}")
+            print(f"今日代理: down={traffic['proxy_download']} up={traffic['proxy_upload']}")
+            print(f"今日直连: down={traffic['direct_download']} up={traffic['direct_upload']}")
         return 0
 
     _print_section("摘要")
@@ -402,6 +427,32 @@ def _render_status(raw: bool) -> int:
     _print_section("资源")
     print(f"代理端口: {snapshot.port}")
     print(f"控制接口: {snapshot.controller}")
+    traffic = _today_traffic_summary()
+    if traffic is not None:
+        total_down = traffic["proxy_download"] + traffic["direct_download"]
+        total_up = traffic["proxy_upload"] + traffic["direct_upload"]
+        proxy_all = traffic["proxy_download"] + traffic["proxy_upload"]
+        direct_all = traffic["direct_download"] + traffic["direct_upload"]
+        all_traffic = proxy_all + direct_all
+        rows = [
+            ("今日总量", total_down, total_up, None),
+            ("代理", traffic["proxy_download"], traffic["proxy_upload"], proxy_all),
+            ("直连", traffic["direct_download"], traffic["direct_upload"], direct_all),
+        ]
+        down_w = max(_display_width("↓" + format_bytes(row[1])) for row in rows)
+        up_w = max(_display_width("↑" + format_bytes(row[2])) for row in rows)
+        print()
+        _print_section("流量")
+        for label, down, up, part in rows:
+            line = (
+                f"{_pad_right(label, 10)}"
+                f"  {_style(_pad_left('↓' + format_bytes(down), down_w), ANSI_GREEN)}"
+                f"  {_style(_pad_left('↑' + format_bytes(up), up_w), ANSI_CYAN)}"
+            )
+            if part is not None:
+                ratio = part / all_traffic * 100 if all_traffic else 0.0
+                line += f"   {_pad_left(f'{ratio:.1f}%', 6)}"
+            print(line)
     print()
     _print_section("路径")
     print(f"原始配置: {snapshot.source_config}")
@@ -671,12 +722,14 @@ _DIMENSION_TITLES = {
     "node": "按出口链路",
     "rule": "按命中规则",
     "host": "按目标主机",
+    "process": "按进程",
 }
 
 _DIMENSION_LABEL_TITLES = {
     "node": "链路",
     "rule": "规则",
     "host": "主机",
+    "process": "进程",
 }
 
 _TRAFFIC_BAR_WIDTH = 20
@@ -719,6 +772,11 @@ def _traffic_column_widths(rows: list, extra_headers: list[str]) -> tuple[int, i
     )
 
 
+def _process_display_label(label: str) -> str:
+    """人读进程标签：保留完整路径便于定位，仅剥离 /proc 的 " (deleted)" 标记。"""
+    return label.removesuffix(" (deleted)")
+
+
 def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
     service = TrafficService(paths)
     if action == "collect":
@@ -744,6 +802,8 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             )
             for row in audit["rows"]:
                 print(f"TRAFFIC_AUDIT_HOST\t{row.label}\tdown={row.download}\tup={row.upload}")
+            for row in audit.get("process_rows") or []:
+                print(f"TRAFFIC_AUDIT_PROCESS\t{row.label}\tdown={row.download}\tup={row.upload}")
             return 0
         window = (
             f"{audit['since']}"
@@ -764,32 +824,58 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             f"    直连: ↓{format_bytes(audit['direct_download'])} ↑{format_bytes(audit['direct_upload'])}"
         )
         rows = audit["rows"]
-        if not rows:
+        process_rows = audit.get("process_rows") or []
+        if not rows and not process_rows:
             print("窗口内没有走代理的流量")
             return 0
         print()
-        print("仅代理流量, 按目标主机:")
-        down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
-        print(
-            _style(
-                f"  {_pad_left('占比', 6)}"
-                f"  {_pad_left('↓下载', down_w)}"
-                f"  {_pad_left('↑上传', up_w)}"
-                f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
-                "  主机",
-                ANSI_BOLD,
-            )
-        )
-        dim_max = max(row.download + row.upload for row in rows)
-        for row in rows:
-            pct = (row.download + row.upload) / proxy_all * 100 if proxy_all else 0.0
+        if rows:
+            print("仅代理流量, 按目标主机:")
+            down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
             print(
-                f"  {_pad_left(f'{pct:.1f}%', 6)}"
-                f"  {_pad_left(format_bytes(row.download), down_w)}"
-                f"  {_pad_left(format_bytes(row.upload), up_w)}"
-                f"  {_traffic_bar(row.download + row.upload, dim_max)}"
-                f"  {row.label}"
+                _style(
+                    f"  {_pad_left('占比', 6)}"
+                    f"  {_pad_left('↓下载', down_w)}"
+                    f"  {_pad_left('↑上传', up_w)}"
+                    f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
+                    "  主机",
+                    ANSI_BOLD,
+                )
             )
+            dim_max = max(row.download + row.upload for row in rows)
+            for row in rows:
+                pct = (row.download + row.upload) / proxy_all * 100 if proxy_all else 0.0
+                print(
+                    f"  {_pad_left(f'{pct:.1f}%', 6)}"
+                    f"  {_pad_left(format_bytes(row.download), down_w)}"
+                    f"  {_pad_left(format_bytes(row.upload), up_w)}"
+                    f"  {_traffic_bar(row.download + row.upload, dim_max)}"
+                    f"  {row.label}"
+                )
+        if process_rows:
+            print()
+            print("仅代理流量, 按进程:")
+            down_w, up_w = _traffic_column_widths(process_rows, ["↓下载", "↑上传"])
+            print(
+                _style(
+                    f"  {_pad_left('占比', 6)}"
+                    f"  {_pad_left('↓下载', down_w)}"
+                    f"  {_pad_left('↑上传', up_w)}"
+                    f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
+                    "  进程",
+                    ANSI_BOLD,
+                )
+            )
+            dim_max = max(row.download + row.upload for row in process_rows)
+            for row in process_rows:
+                pct = (row.download + row.upload) / proxy_all * 100 if proxy_all else 0.0
+                print(
+                    f"  {_pad_left(f'{pct:.1f}%', 6)}"
+                    f"  {_pad_left(format_bytes(row.download), down_w)}"
+                    f"  {_pad_left(format_bytes(row.upload), up_w)}"
+                    f"  {_traffic_bar(row.download + row.upload, dim_max)}"
+                    f"  {_process_display_label(row.label)}"
+                )
         return 0
 
     report = service.report(days=days, dimension=by, top=top)
@@ -866,12 +952,13 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         dim_max = max(row.download + row.upload for row in rows)
         for row in rows:
             pct = (row.download + row.upload) / total_all * 100 if total_all else 0.0
+            label = _process_display_label(row.label) if dimension == "process" else row.label
             print(
                 f"  {_pad_left(f'{pct:.1f}%', 6)}"
                 f"  {_pad_left(format_bytes(row.download), down_w)}"
                 f"  {_pad_left(format_bytes(row.upload), up_w)}"
                 f"  {_traffic_bar(row.download + row.upload, dim_max)}"
-                f"  {row.label}"
+                f"  {label}"
             )
     return 0
 

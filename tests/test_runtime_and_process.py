@@ -1,9 +1,11 @@
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
@@ -138,6 +140,50 @@ rules:
     assert render_result.returncode == 0
     assert "secret: runtime-controller-secret" in runtime_text
     assert "secret-file:" not in runtime_text
+
+
+def test_status_includes_today_traffic_summary(tmp_path: Path):
+    from cproxy.config import default_paths, traffic_db_file
+    from cproxy.services.traffic import _SCHEMA
+
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    (paths.config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\nexternal-controller: 127.0.0.1:19090\n",
+        encoding="utf-8",
+    )
+
+    db_path = traffic_db_file(paths)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(_SCHEMA)
+        conn.execute(
+            "INSERT INTO traffic_samples VALUES (?,?,?,?,?,?,?)",
+            (today, "10", "DIRECT", "DomainSuffix(cn)", "a.cn", 2000, 500),
+        )
+        conn.execute(
+            "INSERT INTO traffic_samples VALUES (?,?,?,?,?,?,?)",
+            (today, "10", "AI-MANUAL", "DomainSuffix(chatgpt.com)", "chatgpt.com", 1000, 300),
+        )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC_DIR)
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "cproxy.cli", "status"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT_DIR,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "流量" in result.stdout
+    assert "今日总量" in result.stdout
+    assert "↓2.93 KB" in result.stdout  # 3000 B 总下载
+    assert "直连" in result.stdout and "代理" in result.stdout
+    assert "34.2%" in result.stdout  # 代理 (1000+300) / 总 (3000+800)
 
 
 def test_status_prefers_tls_controller_when_configured(tmp_path: Path):

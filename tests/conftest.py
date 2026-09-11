@@ -1,3 +1,11 @@
+import sys
+from pathlib import Path
+
+# 优先使用仓库内 src/ 的 cproxy，避免命中 site-packages 中的过期安装快照
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 import pytest
 
 

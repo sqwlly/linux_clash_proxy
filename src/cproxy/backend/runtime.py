@@ -151,6 +151,10 @@ class RuntimeBackend:
 
         _sanitize_dns_fallback_filter(data)
 
+        # 每个连接都查找发起进程，供 /connections API 与流量统计按进程归因
+        if not data.get("find-process-mode"):
+            data["find-process-mode"] = "always"
+
         rule_providers = data.get("rule-providers")
         if not isinstance(rule_providers, dict):
             rule_providers = {}

@@ -30,10 +30,10 @@ def make_service(tmp_path, snapshots: list[dict]) -> TrafficService:
     return service
 
 
-def connection(conn_id: str, host: str, rule: str, chain: list[str], download: int, upload: int) -> dict:
+def connection(conn_id: str, host: str, rule: str, chain: list[str], download: int, upload: int, process: str = "") -> dict:
     return {
         "id": conn_id,
-        "metadata": {"host": host, "destinationIP": "1.2.3.4"},
+        "metadata": {"host": host, "destinationIP": "1.2.3.4", "process": process, "processPath": f"/usr/bin/{process}" if process else ""},
         "rule": rule,
         "rulePayload": "",
         "chains": list(chain),
@@ -46,14 +46,14 @@ def test_collect_credits_deltas_per_connection(tmp_path):
     service = make_service(
         tmp_path,
         [
-            {"connections": [connection("a", "example.com", "Match", ["Node1", "AI"], 1000, 100)]},
+            {"connections": [connection("a", "example.com", "Match", ["Node1", "AI"], 1000, 100, process="python3")]},
             {
                 "connections": [
-                    connection("a", "example.com", "Match", ["Node1", "AI"], 3000, 150),
-                    connection("b", "other.com", "DomainSuffix", ["DIRECT"], 500, 50),
+                    connection("a", "example.com", "Match", ["Node1", "AI"], 3000, 150, process="python3"),
+                    connection("b", "other.com", "DomainSuffix", ["DIRECT"], 500, 50, process="curl"),
                 ]
             },
-            {"connections": [connection("b", "other.com", "DomainSuffix", ["DIRECT"], 800, 80)]},
+            {"connections": [connection("b", "other.com", "DomainSuffix", ["DIRECT"], 800, 80, process="curl")]},
         ],
     )
 
@@ -73,6 +73,17 @@ def test_collect_credits_deltas_per_connection(tmp_path):
     node_rows = {row.label: row for row in report["dimensions"]["node"]}
     assert node_rows["AI -> Node1"].download == 3000
     assert node_rows["DIRECT"].download == 800
+
+    # 进程维度: 全量历史聚合（连接 a 与 b 的累计差值）
+    process_rows = {row.label: row for row in report["dimensions"]["process"]}
+    assert process_rows["/usr/bin/python3"].download == 3000
+    assert process_rows["/usr/bin/curl"].download == 800
+
+    # 审计的进程口径: 仅统计走代理的进程
+    audit = service.audit(days=1)
+    audit_processes = {row.label: row for row in audit["process_rows"]}
+    assert "/usr/bin/python3" in audit_processes
+    assert "/usr/bin/curl" not in audit_processes
 
 
 def test_report_grouping_by_rule_host_and_day(tmp_path):
@@ -120,6 +131,14 @@ def test_format_bytes_units():
     assert format_bytes(512) == "512 B"
     assert format_bytes(1024) == "1.00 KB"
     assert format_bytes(1024 * 1024 * 3.5) == "3.50 MB"
+
+
+def test_process_display_label_strips_deleted_marker():
+    from cproxy.cli_render import _process_display_label
+
+    assert _process_display_label("/root/x/bin/codex (deleted)") == "/root/x/bin/codex"
+    assert _process_display_label("/usr/bin/curl") == "/usr/bin/curl"
+    assert _process_display_label("-") == "-"
 
 
 def test_report_clamps_non_positive_top_and_days(tmp_path):
