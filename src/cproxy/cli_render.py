@@ -4,8 +4,10 @@ import os
 import re
 import sys
 import unicodedata
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .api import APIUnavailableError
@@ -450,7 +452,7 @@ def _render_traffic_totals(traffic: dict) -> None:
 
 
 def _render_process_traffic(report: ProcessTrafficReport | None) -> None:
-    """按进程流量子表：占比 / 代理占比 / ↓ / ↑ / 流量条 / 进程。"""
+    """按进程流量子表：占比 / 代理↓ 代理↑ 直连↓ 直连↑ / 流量条 / 进程。"""
     if report is None or not report.rows:
         return
     print()
@@ -459,9 +461,8 @@ def _render_process_traffic(report: ProcessTrafficReport | None) -> None:
         report.rows,
         lambda row: _process_display_label(row.label, width=_STATUS_PROCESS_LABEL_WIDTH),
         header="进程",
+        columns=_chain_split_columns(),
         total=report.total,
-        extra_header="代理",
-        extra_of=lambda row: _proxy_ratio_label(row.proxy_ratio),
     )
 
 
@@ -962,15 +963,6 @@ def _format_uptime(seconds: int) -> str:
     return f"{hours}h {minutes:02d}m {secs:02d}s"
 
 
-def _proxy_ratio_label(ratio: float) -> str:
-    """进程代理占比：0% / 100% 不留小数，中间值保留一位。"""
-    if ratio <= 0:
-        return "0%"
-    if ratio >= 99.95:
-        return "100%"
-    return f"{ratio:.1f}%"
-
-
 # “标签  值”两列布局的间距（区块内标签列宽 = 最长标签 + 该间距）。
 _KV_GUTTER = 4
 
@@ -985,50 +977,59 @@ def _render_kv(rows: list[tuple[str, str]]) -> None:
         print(f"{_pad_right(label, width)}{value}")
 
 
+def _total_size_columns() -> list[tuple[str, Callable[[Any], str]]]:
+    """「↓下载 / ↑上传」两列：按上下行合计口径。"""
+    return [
+        ("↓下载", lambda row: format_bytes(row.download)),
+        ("↑上传", lambda row: format_bytes(row.upload)),
+    ]
+
+
+def _chain_split_columns() -> list[tuple[str, Callable[[Any], str]]]:
+    """「代理↓ / 代理↑ / 直连↓ / 直连↑」四列：按链路拆分。
+
+    比单个代理占比更直白——低代理占比的进程（如 0.1%）在百分比下几乎看不出量，
+    拆成字节后 0 B / 324 MB 的对比一目了然。
+    """
+    return [
+        ("代理↓", lambda row: format_bytes(row.proxy_download)),
+        ("代理↑", lambda row: format_bytes(row.proxy_upload)),
+        ("直连↓", lambda row: format_bytes(row.download - row.proxy_download)),
+        ("直连↑", lambda row: format_bytes(row.upload - row.proxy_upload)),
+    ]
+
+
 def _render_traffic_table(
     rows: list,
     label_of,
     *,
     header: str,
+    columns: list[tuple[str, Callable[[Any], str]]],
     total: int,
-    extra_header: str | None = None,
-    extra_of=None,
 ) -> None:
-    """渲染「占比 | [代理] | ↓下载 | ↑上传 | 流量条 | 标签」对齐表格。
+    """渲染「占比 | <数值列…> | 流量条 | 标签」对齐表格。
 
-    ``total`` 是占比列的分母；``extra_header`` / ``extra_of`` 为可选附加列
-    （status 的“代理”占比列用它），不传则保持既有报表布局。
+    ``columns`` 是按顺序渲染的数值列 ``(表头, 取值函数)``，取值函数返回**已格式化**
+    的字符串——因此同一套排版既能渲染「↓下载 / ↑上传」，也能渲染
+    「代理↓ / 代理↑ / 直连↓ / 直连↑」这类按链路拆分的列。``total`` 是占比列分母。
     """
-    down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
-    # 表头与取值函数必须同时提供才启用附加列
-    extra_w = 0
-    if extra_header and extra_of:
-        extra_w = max(_display_width(extra_header), *(_display_width(extra_of(row)) for row in rows))
-    head = f"  {_pad_left('占比', 6)}"
-    if extra_w and extra_header:
-        head += f"  {_pad_left(extra_header, extra_w)}"
-    head += (
-        f"  {_pad_left('↓下载', down_w)}"
-        f"  {_pad_left('↑上传', up_w)}"
-        f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
-        f"  {header}"
+    widths = [
+        max(_display_width(title), *(_display_width(value_of(row)) for row in rows))
+        for title, value_of in columns
+    ]
+    head = f"  {_pad_left('占比', 6)}" + "".join(
+        f"  {_pad_left(title, width)}" for (title, _), width in zip(columns, widths)
     )
-    print(_style(head, ANSI_BOLD))
+    print(_style(f"{head}  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}  {header}", ANSI_BOLD))
 
     dim_max = max((row.download + row.upload for row in rows), default=0)
     for row in rows:
         size = row.download + row.upload
         pct = size / total * 100 if total else 0.0
-        line = f"  {_pad_left(f'{pct:.1f}%', 6)}"
-        if extra_w and extra_of:
-            line += f"  {_pad_left(extra_of(row), extra_w)}"
-        line += (
-            f"  {_pad_left(format_bytes(row.download), down_w)}"
-            f"  {_pad_left(format_bytes(row.upload), up_w)}"
-            f"  {_traffic_bar(size, dim_max)}"
-            f"  {label_of(row)}"
+        line = f"  {_pad_left(f'{pct:.1f}%', 6)}" + "".join(
+            f"  {_pad_left(value_of(row), width)}" for (_, value_of), width in zip(columns, widths)
         )
-        print(line)
+        print(f"{line}  {_traffic_bar(size, dim_max)}  {label_of(row)}")
 
 
 def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
@@ -1086,17 +1087,22 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         if rows:
             print()
             print("仅代理流量, 按目标主机:")
-            _render_traffic_table(rows, lambda row: row.label, header="主机", total=proxy_all)
+            _render_traffic_table(
+                rows,
+                lambda row: row.label,
+                header="主机",
+                columns=_total_size_columns(),
+                total=proxy_all,
+            )
         if processes.rows:
             print()
-            print("按进程 (全量, 含代理占比):")
+            print("按进程 (全量, 代理/直连拆分):")
             _render_traffic_table(
                 processes.rows,
                 lambda row: _process_display_label(row.label),
                 header="进程",
+                columns=_chain_split_columns(),
                 total=processes.total,
-                extra_header="代理",
-                extra_of=lambda row: _proxy_ratio_label(row.proxy_ratio),
             )
         if not rows and not processes.rows:
             print("窗口内没有走代理的流量")
@@ -1165,6 +1171,7 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             rows,
             (lambda row: _process_display_label(row.label)) if dimension == "process" else (lambda row: row.label),
             header=_DIMENSION_LABEL_TITLES.get(dimension, dimension),
+            columns=_total_size_columns(),
             total=total_all,
         )
     return 0

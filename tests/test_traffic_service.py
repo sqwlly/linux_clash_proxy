@@ -79,16 +79,18 @@ def test_collect_credits_deltas_per_connection(tmp_path):
     assert process_rows["/usr/bin/python3"].download == 3000
     assert process_rows["/usr/bin/curl"].download == 800
 
-    # 进程口径为全量 + 代理拆分：直连进程同样在列，只是代理占比为 0，
+    # 进程口径为全量 + 代理拆分：直连进程同样在列，只是代理部分为 0，
     # 否则占绝大多数的直连流量会整体不可见。
     breakdown = service.process_breakdown(days=1)
     processes = {row.label: row for row in breakdown.rows}
     assert processes["/usr/bin/python3"].download == 3000
-    assert processes["/usr/bin/python3"].proxy_download == 3000
-    assert processes["/usr/bin/python3"].proxy_ratio == 100.0
+    assert processes["/usr/bin/python3"].upload == 150
+    assert processes["/usr/bin/python3"].proxy_download == 3000  # 全代理
+    assert processes["/usr/bin/python3"].proxy_upload == 150
     assert processes["/usr/bin/curl"].download == 800
-    assert processes["/usr/bin/curl"].proxy_download == 0
-    assert processes["/usr/bin/curl"].proxy_ratio == 0.0
+    assert processes["/usr/bin/curl"].upload == 80
+    assert processes["/usr/bin/curl"].proxy_download == 0  # 全直连
+    assert processes["/usr/bin/curl"].proxy_upload == 0
     # 占比分母是进程表自身的全量合计（3000+150 + 800+80）
     assert breakdown.total == 4030
 

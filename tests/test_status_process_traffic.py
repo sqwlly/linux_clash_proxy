@@ -111,15 +111,28 @@ def test_process_display_label_is_full_path_without_width():
 # ------------------------------------------------------------------ 单元：格式化
 
 
-def test_format_uptime_and_proxy_ratio_labels():
-    from cproxy.cli_render import _format_uptime, _proxy_ratio_label
+def test_format_uptime():
+    from cproxy.cli_render import _format_uptime
 
     assert _format_uptime(0) == "0h 00m 00s"
     assert _format_uptime(7034) == "1h 57m 14s"
     assert _format_uptime(-5) == "0h 00m 00s"
-    assert _proxy_ratio_label(0.0) == "0%"
-    assert _proxy_ratio_label(0.96) == "1.0%"
-    assert _proxy_ratio_label(100.0) == "100%"
+
+
+def test_chain_split_columns_render_proxy_and_direct_separately():
+    from cproxy.cli_render import _chain_split_columns
+    from cproxy.services.traffic import ProcessTrafficRow
+
+    row = ProcessTrafficRow(
+        label="/usr/bin/x", download=1000, upload=200, proxy_download=300, proxy_upload=40
+    )
+    rendered = {title: value_of(row) for title, value_of in _chain_split_columns()}
+    assert rendered == {
+        "代理↓": "300 B",
+        "代理↑": "40 B",
+        "直连↓": "700 B",
+        "直连↑": "160 B",
+    }
 
 
 def test_render_kv_aligns_cjk_labels(capsys):
@@ -163,7 +176,7 @@ def test_runtime_metrics_self_process_is_readable(tmp_path):
 # ------------------------------------------------------------ 端到端：status 面板
 
 
-def test_status_shows_per_process_traffic_with_proxy_ratio(tmp_path: Path):
+def test_status_splits_process_traffic_by_chain(tmp_path: Path):
     _write_config(tmp_path)
     _seed_today(
         tmp_path,
@@ -179,13 +192,19 @@ def test_status_shows_per_process_traffic_with_proxy_ratio(tmp_path: Path):
 
     out = result.stdout
     assert "进程 Top 3" in out
-    assert "代理" in out
+    # 四列拆分：代理/直连 各自给出上下行字节数
+    for column in ("代理↓", "代理↑", "直连↓", "直连↑"):
+        assert column in out
     # 全量口径：直连进程同样在列
     assert "/usr/bin/curl" in out
     assert "/usr/bin/python3" in out
-    # 代理占比：curl 全直连，python3 全代理
-    assert "0%" in out
-    assert "100%" in out
+    # curl 全直连：字节落在直连两列，代理为 0
+    assert "800 B" in out
+    assert "80 B" in out
+    # python3 全代理：字节落在代理两列（3000 B / 150 B），直连为 0
+    assert "2.93 KB" in out
+    assert "150 B" in out
+    assert "0 B" in out
     # 超长路径被压缩后展示
     assert LONG_CODEX_PATH not in out
     assert "…/@openai/codex-linux-x64/codex" in out

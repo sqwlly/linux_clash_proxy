@@ -78,12 +78,6 @@ class ProcessTrafficRow:
     def total(self) -> int:
         return self.download + self.upload
 
-    @property
-    def proxy_ratio(self) -> float:
-        if not self.total:
-            return 0.0
-        return (self.proxy_download + self.proxy_upload) / self.total * 100
-
 
 @dataclass(frozen=True)
 class ProcessTrafficReport:
