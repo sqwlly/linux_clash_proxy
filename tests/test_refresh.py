@@ -184,6 +184,8 @@ rules:
 
     service = RefreshService(paths)
     service.process = StubProcess()
+    # 隔离：bootstrap 分支的 API 就绪等待不应触碰生产 mihomo
+    service._wait_for_api = lambda: None
     report = service.refresh()
 
     assert started == [True]

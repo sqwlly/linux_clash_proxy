@@ -6,8 +6,18 @@
 
 ### 新增
 
+- 渲染规则加固：AI-MANUAL 域名覆盖扩展（claudeusercontent / sora / grok / openai.azure.com / githubcopilot / cdn.auth0.com / challenges.cloudflare.com）；注入规则前移到订阅规则之前防遮蔽；AI 冲突清理泛化到任意订阅商组名；清理有害规则（裸 `GEOIP,CN`、`safebrowsing.googleapis.com` 直连、`cursor.sh` 直连）；大流量下载源（pytorch / pypi / pythonhosted / npmjs / npmmirror）直连
+- 进程维度流量归因：渲染注入 `find-process-mode: always`，新增 `traffic_process_samples` 表（天×小时×进程×链路，90 天），`cproxy traffic show --by process`、audit 的"按进程"小节，人读展示保留完整路径并剥离内核 ` (deleted)` 标记
+- `cproxy traffic audit`：代理/直连占比 + 仅代理流量的目标主机与进程明细，快速发现"不该走代理的流量"
+- `cproxy traffic show` 报表升级：列对齐（东亚宽度感知）、ASCII 流量条、占比列、表头加粗、ANSI 颜色（NO_COLOR 自动降级）
+- `cproxy status` 增加今日流量摘要（总量/代理/直连占比），数据库缺失时静默跳过
+- 流量采集 timer 间隔 1 分钟 → 30 秒，缩小短连接采样漏记窗口
+- refresh 自愈与免中断：代理未运行时先用现有 runtime 拉起再拉订阅（bootstrap 死锁修复）；订阅下载显式走本机代理并回退直连（timer 环境无需代理变量）；新配置经 mihomo `PUT /configs` 热重载应用，长会话/长任务不中断，API 不可达才回退进程重启；热重载后照常执行分组探测
+- `systemd-user/cproxy-subscription.{service,timer}`：每日 04:00（随机延迟）自动订阅更新；修正 `cproxy-refresh.service` ExecStart 路径（此前 203/EXEC 静默失败）与 `cproxy.service` PIDFile 与实现一致
+- proxy.sh 退役计划阶段 2 落地：生产入口切至 cproxy 用户级服务（linger），旧 `clash-proxy.service` 停用保留回滚，观察期至 2026-10-09
+
 - `cproxy ip-check`：基于 ipok.io 免费 API 的出口 IP 纯净度检测——多源风险评分（ip-api/Scamalytics/proxycheck/AbuseIPDB/ipapi.is/StopForumSpam 交叉）、DNSBL 黑名单、IP 类型/原生性、共享用户质量、AI 服务可用性快照；支持 `--node`（临时切换节点检测后自动恢复）与 `--ip`（检测任意 IP）
-- `cproxy traffic`：代理流量统计报表，按出口链路 / 命中规则 / 目标主机与按日汇总（`--days`、`--by`、`--top`、`--raw`）
+- `cproxy traffic`：代理流量统计报表，按出口链路 / 命中规则 / 按目标主机与按日汇总（`--days`、`--by`、`--top`、`--raw`）
 - `cproxy traffic collect`：单次流量采集（对 Mihomo `/connections` 做连接级增量记账），数据落 `~/.local/state/cproxy/traffic.db`，跨重启累计，保留 90 天
 - `systemd/clash-proxy-traffic-collector.{service,timer}`：每分钟自动采集的定时单元，由 `systemd/install-systemd.sh` 一并安装启用
 
