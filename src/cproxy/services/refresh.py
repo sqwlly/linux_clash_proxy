@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 import yaml
@@ -170,17 +172,26 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
 
 def _download_subscription(paths: AppPaths, url: str, timeout: int) -> bytes:
     """下载订阅内容：优先显式走本机代理（订阅域名常被墙且 timer 环境无代理
-    环境变量），代理不可达时回退直连（适用于未被墙的订阅）。"""
+    环境变量），代理不可达时回退直连（适用于未被墙的订阅）。
+    代理已通但订阅站返回 HTTP 错误（4xx/5xx）时直接抛出，不做直连重试。"""
     request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
+    host = (urlparse(url).hostname or "").strip("[]").lower()
+    loopback = host in ("127.0.0.1", "localhost", "::1")
     try:
         port = int((read_config(paths).get("mixed-port") or 7890))
     except Exception:
         port = 7890
     proxy_url = f"http://127.0.0.1:{port}"
     try:
+        if loopback:
+            # 本机地址（本地测试/镜像）无需经代理，直接请求
+            with urlopen(request, timeout=timeout) as response:
+                return response.read(SUBSCRIPTION_MAX_BYTES + 1)
         opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
         with opener.open(request, timeout=timeout) as response:
             return response.read(SUBSCRIPTION_MAX_BYTES + 1)
+    except HTTPError:
+        raise
     except OSError:
         # 本机代理未运行/不可达：回退默认行为（按环境变量或直连）
         with urlopen(request, timeout=timeout) as response:
@@ -271,6 +282,12 @@ class RefreshService:
         if url and not self.process.is_running() and runtime_file(self.paths).exists():
             try:
                 self.process.start()
+                # 等待 mihomo 就绪（监听 mixed-port/controller）再拉订阅，
+                # 避免启动竞态导致订阅下载 Connection refused
+                try:
+                    self._wait_for_api()
+                except Exception:
+                    pass  # 等不到 API 时维持原行为（订阅走直连回退）
             except Exception:
                 pass  # 旧 runtime 也起不来时维持原行为（订阅走直连回退）
         if url:
@@ -296,10 +313,11 @@ class RefreshService:
                 self.process.restart()
                 report.restarted = True
 
-        if target_groups and report.restarted:
+        config_applied = report.restarted or report.hot_reloaded
+        if target_groups and config_applied:
             self._wait_for_api()
         for name in target_groups:
-            if report.restarted:
+            if config_applied:
                 report.groups.append(self._probe_and_switch(name))
             else:
                 report.groups.append(GroupSwitchResult(group=name, current=None, action="跳过", detail="代理未运行"))

@@ -59,6 +59,16 @@ def fake_urlopen(payload: dict):
     return _open
 
 
+def fake_download(payload: dict):
+    """桩掉订阅下载层（_download_subscription），聚焦合并逻辑测试。"""
+    raw = yaml.safe_dump(payload).encode("utf-8")
+
+    def _download(paths, url, timeout=10):
+        return raw
+
+    return _download
+
+
 def test_preserve_local_extra_proxies_appends_nodes_and_group_members():
     merged = subscription_payload()
     existing = {
@@ -171,12 +181,12 @@ def test_update_source_keeps_local_extra_proxy(tmp_path):
 
     import cproxy.services.refresh as refresh_mod
 
-    original = refresh_mod.urlopen
-    refresh_mod.urlopen = fake_urlopen(subscription_payload())
+    original = refresh_mod._download_subscription
+    refresh_mod._download_subscription = fake_download(subscription_payload())
     try:
         out = update_source_from_subscription(paths, "https://example.com/sub")
     finally:
-        refresh_mod.urlopen = original
+        refresh_mod._download_subscription = original
 
     merged = yaml.safe_load(out.read_text(encoding="utf-8"))
     names = [p["name"] for p in merged["proxies"]]

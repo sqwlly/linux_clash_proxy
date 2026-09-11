@@ -7,7 +7,7 @@
 **阶段 2：生产入口已切换到 cproxy 用户级链路，4 周观察期进行中（起算 2026-09-11）**
 
 - `clash-proxy.service`（系统级，proxy.sh 编排）已 `disable --now`，仅停用未删除，回滚 = 重新 enable
-- cproxy 用户级 `cproxy.service` 接管代理（linger 已开启），`cproxy-refresh.timer` 接管订阅定时刷新；流量采集 timer（系统级）继续调用 `cproxy traffic collect`
+- cproxy 用户级 `cproxy.service` 接管代理（linger 已开启）；`cproxy-subscription.timer` 接管每日订阅更新（热重载应用新配置，不中断连接），`cproxy-refresh.timer` 定期重渲染；流量采集 timer（系统级）继续调用 `cproxy traffic collect`
 - legacy 文件（`proxy.sh`、`update_config.sh`、`/usr/local/bin/clash-proxy*`）保留原地，阶段 3 才移除
 - 退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)
 

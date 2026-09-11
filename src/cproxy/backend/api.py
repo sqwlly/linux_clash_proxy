@@ -159,7 +159,7 @@ class APIBackend:
         return self.request("PATCH", "/configs", patch)
 
     def reload_config(self, path: str) -> dict[str, Any]:
-        return self.request("PUT", "/configs", {"path": path})
+        return self.request("PUT", "/configs?force=true", {"path": path})
 
     def switch_group(self, group_name: str, target_name: str) -> None:
         self.request("PUT", f"/proxies/{quote(group_name, safe='')}", {"name": target_name})
