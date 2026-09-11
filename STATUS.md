@@ -1,17 +1,20 @@
 # 项目状态
 
-更新日期：2026-07-29
+更新日期：2026-09-11
 
 ## 当前阶段
 
-legacy proxy.sh → cproxy 功能迁移已基本完成，项目处于 **GA 收尾 + legacy 双轨维护** 阶段：
+**阶段 2：生产入口已切换到 cproxy 用户级链路，4 周观察期进行中（起算 2026-09-11）**
 
-- `proxy.sh` 旧链路冻结新功能，只接受安全修复
-- 新功能只进 `cproxy`
-- 生产入口仍为 `clash-proxy.service`（proxy.sh 编排），cproxy 作为用户级 CLI 工具使用
+- `clash-proxy.service`（系统级，proxy.sh 编排）已 `disable --now`，仅停用未删除，回滚 = 重新 enable
+- cproxy 用户级 `cproxy.service` 接管代理（linger 已开启），`cproxy-refresh.timer` 接管订阅定时刷新；流量采集 timer（系统级）继续调用 `cproxy traffic collect`
+- legacy 文件（`proxy.sh`、`update_config.sh`、`/usr/local/bin/clash-proxy*`）保留原地，阶段 3 才移除
 - 退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)
 
 ## 最近里程碑
+
+- 2026-09-11 渲染规则加固：AI-MANUAL 覆盖扩展、注入规则前移防订阅遮蔽、有害订阅规则清理（裸 GEOIP/safebrowsing/cursor.sh）、大流量下载源直连；流量统计升级（对齐条形图报表、`traffic audit`、进程维度归因 with `find-process-mode: always`、status 今日流量摘要、30s 采集间隔）
+- 2026-09-11 阶段 2 切换：cproxy 用户级服务接管生产，修正 `systemd-user/cproxy.service` PIDFile 与实现一致
 
 - 2026-07-29 probe 修复（双方都不稳定时允许切换）、端口冲突防护（cproxy start 检测生产服务、订阅脚本预检用户级 cproxy.service）
 - 2026-07-25 cproxy 功能同步完成：Japan 组、probe history、guard/incident/ai-connections、进程管理；ruff/mypy 接入、cli.py 拆分、测试隔离、功能对账表填写
@@ -22,9 +25,9 @@ legacy proxy.sh → cproxy 功能迁移已基本完成，项目处于 **GA 收�
 
 ## 下一步（按优先级）
 
-1. 复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令
-2. 进入退役计划阶段 2：生产入口切到 cproxy，开始 4 周观察期
-3. 观察期内验证 cproxy refresh 替代 clash-proxy-subscription.sh 的可行性
+1. 观察期（至 2026-10-09）内确认 cproxy 链路无 P0/P1 事故
+2. 复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令
+3. 观察期满后执行阶段 3：legacy 入口打 deprecation 警告 → 停装 `/usr/local/bin/clash-proxy*` → 删除 legacy 文件
 
 ## 发布
 
