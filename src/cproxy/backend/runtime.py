@@ -32,15 +32,39 @@ SECRET_PROVIDER_KEYS = {
     "secret-keyring-username",
 }
 
-# 部分订阅自带 SSRDOG 路由规则，会与 AI-MANUAL 注入的规则冲突。
-AI_CONFLICT_RULES = {
-    "DOMAIN-KEYWORD,chatgpt,SSRDOG",
-    "DOMAIN-KEYWORD,openai,SSRDOG",
-    "DOMAIN-SUFFIX,chatgpt.com,SSRDOG",
-    "DOMAIN-SUFFIX,openai.com,SSRDOG",
-    "DOMAIN-SUFFIX,anthropic.com,SSRDOG",
-    "DOMAIN-SUFFIX,claude.ai,SSRDOG",
-}
+# AI 域名全集（后缀与精确），用于识别任意订阅商的 AI 冲突规则
+AI_DOMAINS = frozenset((
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "sora.com", "anthropic.com", "claude.ai", "claudeusercontent.com",
+    "x.ai", "grok.com", "openai.azure.com", "githubcopilot.com",
+    "challenges.cloudflare.com",
+    "gemini.google.com", "aistudio.google.com", "ai.google.dev",
+    "generativelanguage.googleapis.com", "cdn.auth0.com",
+))
+AI_CONFLICT_KEYWORDS = frozenset((
+    "openai", "chatgpt", "oaistatic", "oaiusercontent", "anthropic",
+    "claude", "claudeusercontent", "gemini", "copilot", "grok",
+))
+
+
+def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
+    """订阅规则若把 AI 域名/关键字指向非 AI-MANUAL 组，则视为冲突需移除。
+    不限定订阅商组名（SSRDOG/PROXY/其它均可识别），避免换订阅后失效。"""
+    if not isinstance(rule, str):
+        return False
+    parts = [item.strip() for item in rule.split(",")]
+    if len(parts) < 3:
+        return False
+    rtype = parts[0].upper()
+    domain = parts[1].lower()
+    if rtype in ("DOMAIN", "DOMAIN-SUFFIX"):
+        hit = domain in AI_DOMAINS
+    elif rtype == "DOMAIN-KEYWORD":
+        hit = domain in AI_CONFLICT_KEYWORDS
+    else:
+        return False
+    # 末段为目标组（no-resolve 等修饰符位于中间）
+    return hit and parts[-1] != ai_group
 
 # 当原始订阅没有提供标准区域组时，根据节点名称自动归纳生成。
 REGION_PATTERNS = {
@@ -70,9 +94,7 @@ def _ensure_region_groups(
         members = [
             str(proxy["name"])
             for proxy in proxies
-            if isinstance(proxy, dict)
-            and proxy.get("name")
-            and _proxy_matches_region(str(proxy["name"]), patterns)
+            if isinstance(proxy, dict) and proxy.get("name") and _proxy_matches_region(str(proxy["name"]), patterns)
         ]
         if members:
             group = {"name": name, "type": "select", "proxies": members}
@@ -185,28 +207,66 @@ class RuntimeBackend:
             filtered_groups = filtered_groups[: insert_after + 1] + ai_groups + filtered_groups[insert_after + 1 :]
 
         ai_rules = [
+            # OpenAI
             f"DOMAIN-SUFFIX,openai.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,chatgpt.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,oaistatic.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,oaiusercontent.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,sora.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN,cdn.auth0.com,{AI_MANUAL_GROUP}",
+            # Anthropic
             f"DOMAIN-SUFFIX,anthropic.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,claude.ai,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,claudeusercontent.com,{AI_MANUAL_GROUP}",
+            # Google AI
             f"DOMAIN,gemini.google.com,{AI_MANUAL_GROUP}",
             f"DOMAIN,aistudio.google.com,{AI_MANUAL_GROUP}",
             f"DOMAIN,ai.google.dev,{AI_MANUAL_GROUP}",
             f"DOMAIN,generativelanguage.googleapis.com,{AI_MANUAL_GROUP}",
+            # xAI / Azure OpenAI / GitHub Copilot
+            f"DOMAIN-SUFFIX,x.ai,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,grok.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,openai.azure.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,githubcopilot.com,{AI_MANUAL_GROUP}",
+            # 人机验证与 AI 出口保持一致，避免出口 IP 混用触发风控
+            f"DOMAIN-SUFFIX,challenges.cloudflare.com,{AI_MANUAL_GROUP}",
+        ]
+        # 大流量开发下载源直连，避免耗尽代理套餐流量
+        bulk_download_direct = [
+            "DOMAIN-SUFFIX,pytorch.org,DIRECT",
+            "DOMAIN-SUFFIX,pypi.org,DIRECT",
+            "DOMAIN-SUFFIX,pythonhosted.org,DIRECT",
+            "DOMAIN-SUFFIX,npmjs.org,DIRECT",
+            "DOMAIN-SUFFIX,npmmirror.com,DIRECT",
         ]
         mainland_direct = ["GEOIP,CN,DIRECT,no-resolve"]
         rules = data.get("rules") or []
+
+        # 订阅自带或历史遗留的有害/失效规则，重渲染时移除
+        stale_rules = {
+            # Cursor 后端国内无法直连，删除后回落 MATCH 走代理
+            "DOMAIN-SUFFIX,cursor.sh,DIRECT",
+            # 被墙域名直连导致浏览器安全浏览反复超时，删除后回落 MATCH 走代理
+            "DOMAIN,safebrowsing.googleapis.com,DIRECT",
+            # 裸 GEOIP 位于注入规则之前会强制域名真实解析（首连延迟 + DNS 泄漏），
+            # 末尾 no-resolve 版本已兜底
+            "GEOIP,CN,DIRECT",
+        }
 
         clean_rules = [
             rule
             for rule in rules
             if rule not in ai_rules
-            and rule not in AI_CONFLICT_RULES
+            and rule not in bulk_download_direct
+            and not _is_ai_conflict_rule(rule)
+            and rule not in stale_rules
             and rule not in mainland_direct
             and rule != CHINAMAX_RULE
         ]
+
+        # AI 与下载直连规则前移到订阅规则之前：无论订阅商如何调整规则，
+        # AI 域名始终命中注入规则，不会被订阅的通用规则（如 DOMAIN-SUFFIX,google.com）遮蔽
+        front_rules = ai_rules + bulk_download_direct
 
         match_index = None
         for idx, rule in enumerate(clean_rules):
@@ -214,16 +274,11 @@ class RuntimeBackend:
                 match_index = idx
                 break
 
+        tail_rules = [CHINAMAX_RULE] + mainland_direct
         if match_index is None:
-            clean_rules.extend(ai_rules + [CHINAMAX_RULE] + mainland_direct)
+            clean_rules = front_rules + clean_rules + tail_rules
         else:
-            clean_rules = (
-                clean_rules[:match_index]
-                + ai_rules
-                + [CHINAMAX_RULE]
-                + mainland_direct
-                + clean_rules[match_index:]
-            )
+            clean_rules = front_rules + clean_rules[:match_index] + tail_rules + clean_rules[match_index:]
 
         data["proxy-groups"] = filtered_groups
         data["rules"] = clean_rules

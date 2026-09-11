@@ -681,6 +681,11 @@ proxy-groups:
       - 🇸🇬 Singapore丨01
 rules:
   - DOMAIN-SUFFIX,example.com,SSRDOG
+  - DOMAIN-SUFFIX,anthropic.com,PROXY
+  - DOMAIN-KEYWORD,claude,PROXY
+  - DOMAIN-SUFFIX,cursor.sh,DIRECT
+  - DOMAIN,safebrowsing.googleapis.com,DIRECT
+  - GEOIP,CN,DIRECT
   - MATCH,SSRDOG
         """.strip()
         + "\n",
@@ -718,3 +723,25 @@ rules:
     idx_ai = next(i for i, r in enumerate(rules) if "AI-MANUAL" in r)
 
     assert idx_ai < idx_chinamax < idx_geoip < idx_match
+
+    # 裸 GEOIP（无 no-resolve）与有害直连规则应被清理
+    assert "GEOIP,CN,DIRECT" not in rules
+    assert "DOMAIN-SUFFIX,cursor.sh,DIRECT" not in rules
+    assert "DOMAIN,safebrowsing.googleapis.com,DIRECT" not in rules
+
+    # 任意订阅商的 AI 冲突规则（不限 SSRDOG 组名）都应被清理
+    assert "DOMAIN-SUFFIX,anthropic.com,PROXY" not in rules
+    assert "DOMAIN-KEYWORD,claude,PROXY" not in rules
+
+    # AI 域名覆盖与下载直连规则应注入，且前移到订阅规则之前
+    assert "DOMAIN-SUFFIX,claudeusercontent.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,sora.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,grok.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,openai.azure.com,AI-MANUAL" in rules
+    assert "DOMAIN,cdn.auth0.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,challenges.cloudflare.com,AI-MANUAL" in rules
+    idx_pytorch = rules.index("DOMAIN-SUFFIX,pytorch.org,DIRECT")
+    assert "DOMAIN-SUFFIX,npmjs.org,DIRECT" in rules
+    assert idx_ai < idx_pytorch < idx_match
+    idx_subscription = rules.index("DOMAIN-SUFFIX,example.com,SSRDOG")
+    assert idx_ai < idx_pytorch < idx_subscription
