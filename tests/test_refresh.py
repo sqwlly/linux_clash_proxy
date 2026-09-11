@@ -138,6 +138,59 @@ def test_update_source_from_subscription_rejects_invalid_content(tmp_path: Path)
     assert read_config(paths)["program-path"] == "/usr/local/bin/mihomo"
 
 
+def test_refresh_bootstraps_proxy_from_existing_runtime(tmp_path: Path):
+    """代理未运行但 runtime 存在时，refresh 应先拉起代理再拉订阅（自愈死锁）。"""
+    from cproxy.config import default_paths, runtime_file
+    from cproxy.services.refresh import RefreshService
+
+    paths = default_paths(tmp_path)
+    _write_config(
+        paths,
+        """
+mixed-port: 7890
+subscription-url: http://127.0.0.1:1/unreachable
+proxy-groups:
+  - name: SSRDOG
+    type: select
+    proxies:
+      - ProxyA
+  - name: 🇺🇸 United States
+    type: select
+    proxies:
+      - 🇺🇸 United States丨01
+  - name: 🇸🇬 Singapore
+    type: select
+    proxies:
+      - 🇸🇬 Singapore丨01
+rules:
+  - MATCH,SSRDOG
+""",
+    )
+    runtime_file(paths).parent.mkdir(parents=True, exist_ok=True)
+    runtime_file(paths).write_text("rules:\n- MATCH,DIRECT\n", encoding="utf-8")
+
+    started = []
+
+    class StubProcess:
+        def is_running(self):
+            return False
+
+        def start(self):
+            started.append(True)
+            return 123
+
+        def restart(self):
+            raise AssertionError("未运行时不应调用 restart")
+
+    service = RefreshService(paths)
+    service.process = StubProcess()
+    report = service.refresh()
+
+    assert started == [True]
+    assert report.subscription == "失败"  # 订阅站不可达，但 bootstrap 已发生
+    assert report.runtime_path == runtime_file(paths)
+
+
 def test_refresh_without_subscription_and_process(tmp_path: Path):
     from cproxy.config import default_paths, runtime_file
     from cproxy.services.refresh import RefreshService

@@ -11,6 +11,8 @@ mkdir -p "${USER_SYSTEMD_DIR}" "${USER_CONFIG_DIR}"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy.service" "${HOME}/.config/systemd/user/cproxy.service"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-refresh.service" "${HOME}/.config/systemd/user/cproxy-refresh.service"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-refresh.timer" "${HOME}/.config/systemd/user/cproxy-refresh.timer"
+install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-subscription.service" "${HOME}/.config/systemd/user/cproxy-subscription.service"
+install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-subscription.timer" "${HOME}/.config/systemd/user/cproxy-subscription.timer"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-command.env.example" "${HOME}/.config/cproxy/cproxy-command.env.example"
 
 if [ ! -f "${HOME}/.config/cproxy/cproxy-command.env" ]; then
@@ -19,13 +21,15 @@ fi
 
 systemctl --user daemon-reload
 systemctl --user enable --now cproxy.service
-systemctl --user enable --now cproxy-refresh.timer
+systemctl --user enable --now cproxy-refresh.timer cproxy-subscription.timer
 
 cat <<EOF
 用户级 systemd 安装完成:
 - ${HOME}/.config/systemd/user/cproxy.service
 - ${HOME}/.config/systemd/user/cproxy-refresh.service
 - ${HOME}/.config/systemd/user/cproxy-refresh.timer
+- ${HOME}/.config/systemd/user/cproxy-subscription.service
+- ${HOME}/.config/systemd/user/cproxy-subscription.timer
 - ${HOME}/.config/cproxy/cproxy-command.env.example
 - ${HOME}/.config/cproxy/cproxy-command.env
 

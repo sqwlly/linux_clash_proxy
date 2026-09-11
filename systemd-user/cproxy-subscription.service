@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily cproxy subscription update (refresh with bootstrap)
+Documentation=file:/root/clash_proxy/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cproxy refresh
+# refresh 自带 bootstrap：代理未运行时先用现有 runtime 拉起再拉订阅，
+# 无需代理环境变量

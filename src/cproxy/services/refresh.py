@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 import yaml
 
@@ -12,7 +12,7 @@ from ..backend.api import APIUnavailableError
 from ..backend.models import GroupCheckReport
 from ..backend.process import ProcessBackend
 from ..backend.runtime import RuntimeBackend
-from ..config import AppPaths, config_file, read_config
+from ..config import AppPaths, config_file, read_config, runtime_file
 from ..redaction import redact_text
 from ..snapshots import snapshot_file
 from .diagnostics import DiagnosticsService
@@ -167,11 +167,28 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         group["proxies"] = group_members
 
 
+def _download_subscription(paths: AppPaths, url: str, timeout: int) -> bytes:
+    """下载订阅内容：优先显式走本机代理（订阅域名常被墙且 timer 环境无代理
+    环境变量），代理不可达时回退直连（适用于未被墙的订阅）。"""
+    request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
+    try:
+        port = int((read_config(paths).get("mixed-port") or 7890))
+    except Exception:
+        port = 7890
+    proxy_url = f"http://127.0.0.1:{port}"
+    try:
+        opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        with opener.open(request, timeout=timeout) as response:
+            return response.read(SUBSCRIPTION_MAX_BYTES + 1)
+    except OSError:
+        # 本机代理未运行/不可达：回退默认行为（按环境变量或直连）
+        with urlopen(request, timeout=timeout) as response:
+            return response.read(SUBSCRIPTION_MAX_BYTES + 1)
+
+
 def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SUBSCRIPTION_TIMEOUT) -> Path:
     """下载订阅并合并进原始配置；订阅内容覆盖节点/规则，本地环境键保留。"""
-    request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
-    with urlopen(request, timeout=timeout) as response:
-        raw = response.read(SUBSCRIPTION_MAX_BYTES + 1)
+    raw = _download_subscription(paths, url, timeout)
     if len(raw) > SUBSCRIPTION_MAX_BYTES:
         raise RuntimeError("错误: 订阅内容超过大小限制")
 
@@ -246,6 +263,13 @@ class RefreshService:
             target_groups = _config_groups(config.get("refresh-groups"))
 
         report = RefreshReport(subscription="跳过", subscription_detail="未配置订阅地址")
+        # 订阅域名通常需经代理访问：代理未运行且存在旧 runtime 时先拉起，
+        # 避免"代理挂了 → 拉不到订阅 → 无法自愈"的 bootstrap 死锁
+        if url and not self.process.is_running() and runtime_file(self.paths).exists():
+            try:
+                self.process.start()
+            except Exception:
+                pass  # 旧 runtime 也起不来时维持原行为（订阅走直连回退）
         if url:
             try:
                 update_source_from_subscription(self.paths, url)
