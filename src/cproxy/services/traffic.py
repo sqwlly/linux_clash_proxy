@@ -226,6 +226,54 @@ class TrafficService:
             "daily": daily,
         }
 
+    def audit(
+        self,
+        days: int = 1,
+        top: int = DEFAULT_TOP,
+    ) -> dict[str, Any]:
+        """代理流量审计：区分走代理与直连的流量，并列出走代理的目标主机明细。"""
+        days = max(1, days)
+        top = max(1, top)
+        now = datetime.now().astimezone()
+        since = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        until = now.strftime("%Y-%m-%d")
+
+        with closing(self._connect()) as db, db:
+            rows = db.execute(
+                """
+                SELECT host AS label, SUM(download) AS download, SUM(upload) AS upload
+                FROM traffic_samples
+                WHERE day >= ? AND day <= ? AND chain NOT LIKE '%DIRECT%'
+                GROUP BY host ORDER BY (SUM(download) + SUM(upload)) DESC LIMIT ?
+                """,
+                (since, until, top),
+            ).fetchall()
+            totals = db.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN download ELSE 0 END), 0) AS p_down,
+                    COALESCE(SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN upload ELSE 0 END), 0) AS p_up,
+                    COALESCE(SUM(CASE WHEN chain LIKE '%DIRECT%' THEN download ELSE 0 END), 0) AS d_down,
+                    COALESCE(SUM(CASE WHEN chain LIKE '%DIRECT%' THEN upload ELSE 0 END), 0) AS d_up
+                FROM traffic_samples
+                WHERE day >= ? AND day <= ?
+                """,
+                (since, until),
+            ).fetchone()
+
+        return {
+            "since": since,
+            "until": until,
+            "proxy_download": int(totals["p_down"]),
+            "proxy_upload": int(totals["p_up"]),
+            "direct_download": int(totals["d_down"]),
+            "direct_upload": int(totals["d_up"]),
+            "rows": [
+                TrafficRow(str(row["label"]), int(row["download"]), int(row["upload"]))
+                for row in rows
+            ],
+        }
+
     def _dimension_rows(
         self,
         db: sqlite3.Connection,

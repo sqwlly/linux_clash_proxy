@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
@@ -672,6 +673,51 @@ _DIMENSION_TITLES = {
     "host": "按目标主机",
 }
 
+_DIMENSION_LABEL_TITLES = {
+    "node": "链路",
+    "rule": "规则",
+    "host": "主机",
+}
+
+_TRAFFIC_BAR_WIDTH = 20
+_TRAFFIC_BAR_PARTIALS = "▏▎▍▌▋▊▉"
+
+
+def _display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _pad_left(text: str, width: int) -> str:
+    return " " * max(0, width - _display_width(text)) + text
+
+
+def _pad_right(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+
+
+def _traffic_bar(value: int, max_value: int) -> str:
+    """纯文本 ASCII 流量条（先 pad 后上色，保证宽度计算不受 ANSI 转义干扰）。"""
+    if max_value <= 0 or value <= 0:
+        return ""
+    ratio = min(1.0, value / max_value)
+    scaled = _TRAFFIC_BAR_WIDTH * ratio
+    full = int(scaled)
+    partial = ""
+    if full < _TRAFFIC_BAR_WIDTH:
+        frac_idx = min(len(_TRAFFIC_BAR_PARTIALS) - 1, int((scaled - full) * len(_TRAFFIC_BAR_PARTIALS)))
+        partial = _TRAFFIC_BAR_PARTIALS[frac_idx]
+    bar = _pad_right("█" * full + partial, _TRAFFIC_BAR_WIDTH)
+    return _style(bar, ANSI_GREEN)
+
+
+def _traffic_column_widths(rows: list, extra_headers: list[str]) -> tuple[int, int]:
+    down_texts = [format_bytes(row.download) for row in rows] + [extra_headers[0]]
+    up_texts = [format_bytes(row.upload) for row in rows] + [extra_headers[1]]
+    return (
+        max(_display_width(text) for text in down_texts),
+        max(_display_width(text) for text in up_texts),
+    )
+
 
 def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
     service = TrafficService(paths)
@@ -686,6 +732,64 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         _print_section("流量采集完成")
         print(f"连接数: {result.connections}")
         print(f"本周期增量: ↓{format_bytes(result.download_delta)} ↑{format_bytes(result.upload_delta)}")
+        return 0
+
+    if action == "audit":
+        audit = service.audit(days=days, top=top)
+        if raw:
+            print(
+                f"TRAFFIC_AUDIT\tsince={audit['since']}\tuntil={audit['until']}"
+                f"\tproxy_down={audit['proxy_download']}\tproxy_up={audit['proxy_upload']}"
+                f"\tdirect_down={audit['direct_download']}\tdirect_up={audit['direct_upload']}"
+            )
+            for row in audit["rows"]:
+                print(f"TRAFFIC_AUDIT_HOST\t{row.label}\tdown={row.download}\tup={row.upload}")
+            return 0
+        window = (
+            f"{audit['since']}"
+            if audit["since"] == audit["until"]
+            else f"{audit['since']} ~ {audit['until']}"
+        )
+        _print_section(f"代理流量审计 ({window})")
+        proxy_all = audit["proxy_download"] + audit["proxy_upload"]
+        direct_all = audit["direct_download"] + audit["direct_upload"]
+        if proxy_all == 0 and direct_all == 0:
+            print("暂无流量记录 (collector 尚未采集或数据库为空)")
+            return 0
+        proxy_ratio = proxy_all / (proxy_all + direct_all) * 100 if (proxy_all + direct_all) else 0.0
+        print(
+            f"代理: {_style('↓' + format_bytes(audit['proxy_download']), ANSI_GREEN)}"
+            f" {_style('↑' + format_bytes(audit['proxy_upload']), ANSI_CYAN)}"
+            f"  ({proxy_ratio:.1f}%)"
+            f"    直连: ↓{format_bytes(audit['direct_download'])} ↑{format_bytes(audit['direct_upload'])}"
+        )
+        rows = audit["rows"]
+        if not rows:
+            print("窗口内没有走代理的流量")
+            return 0
+        print()
+        print("仅代理流量, 按目标主机:")
+        down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
+        print(
+            _style(
+                f"  {_pad_left('占比', 6)}"
+                f"  {_pad_left('↓下载', down_w)}"
+                f"  {_pad_left('↑上传', up_w)}"
+                f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
+                "  主机",
+                ANSI_BOLD,
+            )
+        )
+        dim_max = max(row.download + row.upload for row in rows)
+        for row in rows:
+            pct = (row.download + row.upload) / proxy_all * 100 if proxy_all else 0.0
+            print(
+                f"  {_pad_left(f'{pct:.1f}%', 6)}"
+                f"  {_pad_left(format_bytes(row.download), down_w)}"
+                f"  {_pad_left(format_bytes(row.upload), up_w)}"
+                f"  {_traffic_bar(row.download + row.upload, dim_max)}"
+                f"  {row.label}"
+            )
         return 0
 
     report = service.report(days=days, dimension=by, top=top)
@@ -710,14 +814,36 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
     if report["total_download"] == 0 and report["total_upload"] == 0:
         print("暂无流量记录 (collector 尚未采集或数据库为空)")
         return 0
-    print(f"总计: ↓{format_bytes(report['total_download'])} ↑{format_bytes(report['total_upload'])}")
+    total_download = report["total_download"]
+    total_upload = report["total_upload"]
+    total_all = total_download + total_upload
+    print(
+        f"总计: {_style('↓' + format_bytes(total_download), ANSI_GREEN)}"
+        f"  {_style('↑' + format_bytes(total_upload), ANSI_CYAN)}"
+    )
 
     daily_rows = report["daily"]
     if len(daily_rows) > 1:
         print()
         print("按日期:")
+        down_w, up_w = _traffic_column_widths(daily_rows, ["↓下载", "↑上传"])
+        print(
+            _style(
+                f"  {_pad_right('日期', 12)}"
+                f"  {_pad_left('↓下载', down_w)}"
+                f"  {_pad_left('↑上传', up_w)}"
+                "  流量",
+                ANSI_BOLD,
+            )
+        )
+        day_max = max(row.download + row.upload for row in daily_rows)
         for row in daily_rows:
-            print(f"  {row.label}  ↓{format_bytes(row.download)} ↑{format_bytes(row.upload)}")
+            print(
+                f"  {_pad_right(row.label, 12)}"
+                f"  {_pad_left(format_bytes(row.download), down_w)}"
+                f"  {_pad_left(format_bytes(row.upload), up_w)}"
+                f"  {_traffic_bar(row.download + row.upload, day_max)}"
+            )
 
     for dimension, rows in report["dimensions"].items():
         print()
@@ -725,8 +851,28 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         if not rows:
             print("  -")
             continue
+        down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
+        label_title = _DIMENSION_LABEL_TITLES.get(dimension, dimension)
+        print(
+            _style(
+                f"  {_pad_left('占比', 6)}"
+                f"  {_pad_left('↓下载', down_w)}"
+                f"  {_pad_left('↑上传', up_w)}"
+                f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
+                f"  {label_title}",
+                ANSI_BOLD,
+            )
+        )
+        dim_max = max(row.download + row.upload for row in rows)
         for row in rows:
-            print(f"  ↓{format_bytes(row.download)} ↑{format_bytes(row.upload)}  {row.label}")
+            pct = (row.download + row.upload) / total_all * 100 if total_all else 0.0
+            print(
+                f"  {_pad_left(f'{pct:.1f}%', 6)}"
+                f"  {_pad_left(format_bytes(row.download), down_w)}"
+                f"  {_pad_left(format_bytes(row.upload), up_w)}"
+                f"  {_traffic_bar(row.download + row.upload, dim_max)}"
+                f"  {row.label}"
+            )
     return 0
 
 

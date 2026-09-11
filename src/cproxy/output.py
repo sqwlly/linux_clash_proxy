@@ -210,7 +210,7 @@ def build_root_parser() -> ArgumentParser:
     ai_use_parser.add_argument("--raw", action="store_true")
 
     traffic_parser = subparsers.add_parser("traffic", help="Show proxy traffic statistics or collect one sample")
-    traffic_parser.add_argument("action", nargs="?", choices=["show", "collect"], default="show")
+    traffic_parser.add_argument("action", nargs="?", choices=["show", "collect", "audit"], default="show")
     traffic_parser.add_argument("--days", type=int, default=1, help="Report window in days (default: today)")
     traffic_parser.add_argument("--by", choices=["node", "rule", "host"], help="Restrict breakdown to one dimension")
     traffic_parser.add_argument("--top", type=int, default=15, help="Rows per breakdown table")
