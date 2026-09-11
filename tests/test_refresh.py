@@ -1,10 +1,8 @@
-import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
 
 import pytest
-import yaml
 
 from cproxy.backend.models import DelayCheckResult, GroupCheckReport, ProxyGroup
 
@@ -145,7 +143,9 @@ def test_refresh_without_subscription_and_process(tmp_path: Path):
     from cproxy.services.refresh import RefreshService
 
     paths = default_paths(tmp_path)
-    _write_config(paths, """
+    _write_config(
+        paths,
+        """
 mixed-port: 7890
 proxy-groups:
   - name: SSRDOG
@@ -164,7 +164,8 @@ rules:
   - MATCH,SSRDOG
 refresh-groups:
   - SSRDOG
-""")
+""",
+    )
 
     report = RefreshService(paths).refresh()
 
@@ -182,7 +183,9 @@ def test_refresh_subscription_failure_does_not_block_render(tmp_path: Path):
     from cproxy.services.refresh import RefreshService
 
     paths = default_paths(tmp_path)
-    _write_config(paths, """
+    _write_config(
+        paths,
+        """
 mixed-port: 7890
 subscription-url: http://127.0.0.1:1/unreachable
 proxy-groups:
@@ -200,7 +203,8 @@ proxy-groups:
       - 🇸🇬 Singapore丨01
 rules:
   - MATCH,SSRDOG
-""")
+""",
+    )
 
     report = RefreshService(paths).refresh()
 
@@ -375,6 +379,112 @@ rules:
     # 本地缺失的本地优先键则接受订阅值
     assert merged["mixed-port"] == 9999
     assert [p["name"] for p in merged["proxies"]] == ["NEW-US"]
+
+
+NODELIST_LOCAL_CONFIG = """
+mixed-port: 7890
+unified-delay: true
+tcp-concurrent: true
+dns:
+  enable: true
+  nameserver:
+    - 223.5.5.5
+proxies:
+  - name: OLD-1
+    type: ss
+    server: old1.example.com
+  - name: OLD-2
+    type: ss
+    server: old2.example.com
+proxy-groups:
+  - name: MAIN
+    type: select
+    proxies:
+      - Auto
+      - OLD-1
+      - OLD-2
+      - DIRECT
+  - name: Auto
+    type: url-test
+    proxies:
+      - OLD-2
+      - OLD-1
+  - name: GroupOnly
+    type: select
+    proxies:
+      - Auto
+      - DIRECT
+rules:
+  - MATCH,MAIN
+"""
+
+NODELIST_SUBSCRIPTION = """
+proxies:
+  - name: NEW-US
+    type: ss
+    server: us.example.com
+  - name: NEW-SG
+    type: ss
+    server: sg.example.com
+"""
+
+
+def test_update_source_from_subscription_rebuilds_groups_for_nodelist(tmp_path: Path):
+    from cproxy.config import default_paths, read_config
+    from cproxy.services.refresh import update_source_from_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, NODELIST_LOCAL_CONFIG)
+
+    class NodeListHandler(_SubscriptionHandler):
+        payload = NODELIST_SUBSCRIPTION
+
+    server, thread = _serve(NodeListHandler)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/sub"
+        update_source_from_subscription(paths, url)
+    finally:
+        server.shutdown()
+        thread.join()
+
+    merged = read_config(paths)
+    assert [p["name"] for p in merged["proxies"]] == ["NEW-US", "NEW-SG"]
+    groups = {g["name"]: g["proxies"] for g in merged["proxy-groups"]}
+    # 旧节点成员整体替换为新节点名序列，组引用与 DIRECT 原位保留
+    assert groups["MAIN"] == ["Auto", "NEW-US", "NEW-SG", "DIRECT"]
+    assert groups["Auto"] == ["NEW-US", "NEW-SG"]
+    # 组内没有旧节点时保持原样
+    assert groups["GroupOnly"] == ["Auto", "DIRECT"]
+    # 本地规则与其余本地键（dns 等）保留
+    assert merged["rules"] == ["MATCH,MAIN"]
+    assert merged["unified-delay"] is True
+    assert merged["tcp-concurrent"] is True
+    assert merged["dns"] == {"enable": True, "nameserver": ["223.5.5.5"]}
+
+
+def test_update_source_rejects_empty_nodelist(tmp_path: Path):
+    """nodelist 订阅 0 节点时应报错而非产出空代理组的非法配置。"""
+    from cproxy.config import default_paths, read_config
+    from cproxy.services.refresh import update_source_from_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, NODELIST_LOCAL_CONFIG)
+
+    class EmptyListHandler(_SubscriptionHandler):
+        payload = "proxies: []\n"
+
+    server, thread = _serve(EmptyListHandler)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/sub"
+        with pytest.raises(RuntimeError, match="proxies 为空"):
+            update_source_from_subscription(paths, url)
+    finally:
+        server.shutdown()
+        thread.join()
+
+    # 失败时本地配置保持原样
+    merged = read_config(paths)
+    assert [p["name"] for p in merged["proxies"]] == ["OLD-1", "OLD-2"]
 
 
 def test_refresh_redacts_subscription_url_token(tmp_path: Path):

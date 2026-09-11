@@ -57,6 +57,7 @@ LOCAL_PREFERRED_KEYS = {
     "ai-chatgpt-url",
     "ai-openai-api-url",
     "refresh-groups",
+    "profile",
 }
 
 
@@ -79,6 +80,93 @@ class RefreshReport:
     groups: list[GroupSwitchResult] = field(default_factory=list)
 
 
+def _rebuild_groups_with_new_nodes(local_groups: list, old_node_names: list[str], new_node_names: list[str]) -> list:
+    """nodelist 型订阅只提供 proxies：沿用本地分组结构，把组内旧节点成员
+    整体替换为新节点名序列（在首个旧节点出现的位置展开），组引用与
+    DIRECT/REJECT 等内置策略成员原位保留。组内没有旧节点时保持原样。"""
+    old_set = set(old_node_names)
+    rebuilt: list = []
+    for group in local_groups:
+        if not isinstance(group, dict) or not isinstance(group.get("proxies"), list):
+            rebuilt.append(group)
+            continue
+        members: list = []
+        inserted = False
+        for member in group["proxies"]:
+            if str(member) in old_set:
+                if not inserted:
+                    members.extend(new_node_names)
+                    inserted = True
+                continue
+            members.append(member)
+        rebuilt.append({**group, "proxies": members})
+    return rebuilt
+
+
+PANEL_INFO_NODE_MARKERS: tuple[str, ...] = (
+    "剩余流量",
+    "套餐到期",
+    "过期时间",
+    "到期时间",
+    "流量重置",
+    "有效期",
+    "官网",
+    "expire",
+    "traffic",
+)
+
+
+def _is_panel_info_node(name: str) -> bool:
+    """识别机场面板注入的信息节点（剩余流量/套餐到期等）。
+
+    这类节点名携带动态数值（如“剩余流量：160.9 GB”），每次订阅都会改名，
+    不能按“本地有而订阅没有”识别为用户自建节点，否则旧名字会以附加节点
+    形式无限累积成死节点。"""
+    lowered = name.lower()
+    return any(marker in lowered for marker in PANEL_INFO_NODE_MARKERS)
+
+
+def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
+    """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加节点：
+    节点追加进 merged["proxies"]，并在同名组中按本地原有位置插回这些成员，
+    防止每日订阅更新冲掉自建节点或改变其在 fallback 组中的优先级。
+    面板信息节点（名字随流量/到期日变化）不视为自建节点，任其随订阅更替。"""
+    local_proxies = [proxy for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
+    merged_names = {
+        str(proxy.get("name")) for proxy in merged.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+    }
+    extra_names: set[str] = set()
+    extra_proxies: list = []
+    for proxy in local_proxies:
+        name = str(proxy["name"])
+        if name not in merged_names and not _is_panel_info_node(name):
+            extra_proxies.append(proxy)
+            extra_names.add(name)
+    if not extra_proxies:
+        return
+
+    proxies: list = merged.get("proxies") or []
+    proxies.extend(extra_proxies)
+    merged["proxies"] = proxies
+
+    local_group_members: dict[str, list] = {}
+    for group in existing.get("proxy-groups") or []:
+        if isinstance(group, dict) and isinstance(group.get("name"), str):
+            local_group_members[group["name"]] = group.get("proxies") or []
+    for group in merged.get("proxy-groups") or []:
+        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
+            continue
+        members = local_group_members.get(group["name"])
+        if not isinstance(members, list):
+            continue
+        group_members: list = group.get("proxies") or []
+        for index, member in enumerate(members):
+            name = str(member)
+            if name in extra_names and name not in group_members:
+                group_members.insert(min(index, len(group_members)), name)
+        group["proxies"] = group_members
+
+
 def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SUBSCRIPTION_TIMEOUT) -> Path:
     """下载订阅并合并进原始配置；订阅内容覆盖节点/规则，本地环境键保留。"""
     request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
@@ -98,12 +186,33 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
 
     path = config_file(paths)
     existing = read_config(paths)
-    # 订阅数据先剔除安全相关键；本地已存在的值（含安全键与本地优先键）一律保留。
-    # 区别仅在于本地缺失时：安全键保持缺失，本地优先键接受订阅值。
-    merged = {key: value for key, value in data.items() if key not in SUBSCRIPTION_STRIP_KEYS}
-    for key in SUBSCRIPTION_STRIP_KEYS | LOCAL_PREFERRED_KEYS:
-        if key in existing:
-            merged[key] = existing[key]
+    if isinstance(data.get("proxy-groups"), list):
+        # 完整配置订阅：订阅数据先剔除安全相关键；本地已存在的值（含安全键与
+        # 本地优先键）一律保留。区别仅在于本地缺失时：安全键保持缺失，本地优先键接受订阅值。
+        merged = {key: value for key, value in data.items() if key not in SUBSCRIPTION_STRIP_KEYS}
+        for key in SUBSCRIPTION_STRIP_KEYS | LOCAL_PREFERRED_KEYS:
+            if key in existing:
+                merged[key] = existing[key]
+        _preserve_local_extra_proxies(merged, existing)
+    else:
+        # nodelist 型订阅只提供 proxies：以本地配置为基础，仅替换节点并沿用
+        # 本地分组模板重建成员，dns/mode/rules 等其余本地键全部保留，
+        # 避免 config.yaml 丢失 proxy-groups/rules/dns 导致 render/校验失败。
+        old_node_names = [
+            str(proxy["name"]) for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+        ]
+        new_node_names = [
+            str(proxy["name"]) for proxy in data.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+        ]
+        if not new_node_names:
+            # 订阅未返回任何节点：直接落盘会把 url-test/fallback 组重建成
+            # 空成员（非法配置），宁可失败交给上层回滚，也不产出坏 config。
+            raise ValueError("nodelist 订阅未返回任何节点，已跳过合并")
+        merged = dict(existing)
+        merged["proxies"] = data.get("proxies") or []
+        merged["proxy-groups"] = _rebuild_groups_with_new_nodes(
+            existing.get("proxy-groups") or [], old_node_names, new_node_names
+        )
     merged["subscription-url"] = url
 
     snapshot_file(paths, path, "config")
@@ -183,8 +292,10 @@ class RefreshService:
         group_type = str(group.type or "").lower()
         if group_type not in {"select", "selector"}:
             return GroupSwitchResult(
-                group=group_name, current=group.current,
-                action="保持不变", detail=f"{group.type} 类型自动选路",
+                group=group_name,
+                current=group.current,
+                action="保持不变",
+                detail=f"{group.type} 类型自动选路",
             )
 
         check: GroupCheckReport = self.diagnostics.test_group(group_name)
@@ -195,13 +306,18 @@ class RefreshService:
         current_check = next((item for item in check.results if item.name == group.current), None)
         if current_check is not None and current_check.ok:
             return GroupSwitchResult(
-                group=group_name, current=group.current,
-                action="保持不变", detail=f"{current_check.delay}ms",
+                group=group_name,
+                current=group.current,
+                action="保持不变",
+                detail=f"{current_check.delay}ms",
             )
 
         best = min(ok_items, key=lambda item: item.delay or 0)
         self.query.switch_group(group_name, best.name)
         return GroupSwitchResult(
-            group=group_name, current=group.current,
-            action="已切换", target=best.name, detail=f"{best.delay}ms",
+            group=group_name,
+            current=group.current,
+            action="已切换",
+            target=best.name,
+            detail=f"{best.delay}ms",
         )

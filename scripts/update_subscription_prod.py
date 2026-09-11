@@ -18,6 +18,9 @@ import sys
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# 生产订阅更新必须使用仓库内代码（systemd 从本仓库运行本脚本），
+# 避免命中 site-packages 里可能过期的安装快照。
+sys.path.insert(0, str(PROJECT_DIR / "src"))
 
 from cproxy.config import AppPaths, config_file, read_config  # noqa: E402
 from cproxy.redaction import redact_text  # noqa: E402

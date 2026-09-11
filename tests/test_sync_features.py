@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,14 +12,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from cproxy.config import default_paths
-from cproxy.services.probe_history import (
+from cproxy.config import default_paths  # noqa: E402
+from cproxy.services.probe_history import (  # noqa: E402
     load_history_penalties,
     load_history_rows,
     probe_history_file,
     record_probe_history,
 )
-
 
 # ---------------------------------------------------------------------------
 # probe_history: record + load
@@ -226,7 +223,9 @@ def test_render_ssrdog_rules_removed(tmp_path: Path):
     ssrdog = [r for r in data["rules"] if "SSRDOG" in str(r)]
     assert ssrdog == []
     ai_rules = [r for r in data["rules"] if "AI-MANUAL" in str(r)]
-    assert len(ai_rules) == 10
+    assert len(ai_rules) == 18
+    # 注入规则需前移到订阅规则之前（首条规则即 AI 规则）
+    assert "AI-MANUAL" in str(data["rules"][0])
 
 
 def test_render_atomic_write(tmp_path: Path):
@@ -294,9 +293,8 @@ def test_cli_shadow_history_empty(tmp_path: Path, monkeypatch, capsys):
 
 
 def test_cli_ai_use_parses(tmp_path: Path, monkeypatch):
-    from cproxy.cli import run
     from cproxy.backend.models import ProxyGroup
-    from cproxy.backend.api import APIUnavailableError
+    from cproxy.cli import run
 
     d = tmp_path / ".config" / "cproxy"
     d.mkdir(parents=True, exist_ok=True)
