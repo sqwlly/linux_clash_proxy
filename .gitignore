@@ -25,3 +25,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 运行时数据与本地工具目录
+.data/
+.spec-workflow/
+/5.5.5
