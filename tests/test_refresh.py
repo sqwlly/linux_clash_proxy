@@ -191,6 +191,66 @@ rules:
     assert report.runtime_path == runtime_file(paths)
 
 
+def test_refresh_prefers_hot_reload_over_restart(tmp_path: Path):
+    """代理运行中时 refresh 应优先热重载（不中断连接），API 失败才回退重启。"""
+    from cproxy.config import default_paths, runtime_file
+    from cproxy.services.refresh import RefreshService
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, RENDERABLE_CONFIG)
+
+    reload_calls = []
+
+    class StubProcess:
+        def is_running(self):
+            return True
+
+        def restart(self):
+            raise AssertionError("热重载可用时不应重启进程")
+
+    class StubAPI:
+        def reload_config(self, path):
+            reload_calls.append(path)
+            return {"message": "ok"}
+
+    service = RefreshService(paths)
+    service.process = StubProcess()
+    service._api_factory = lambda _paths: StubAPI()
+    service.refresh()
+
+    assert reload_calls == [str(runtime_file(paths))]
+
+
+def test_refresh_falls_back_to_restart_when_reload_fails(tmp_path: Path):
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import RefreshService
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, RENDERABLE_CONFIG)
+
+    restarted = []
+
+    class StubProcess:
+        def is_running(self):
+            return True
+
+        def restart(self):
+            restarted.append(True)
+
+    class StubAPI:
+        def reload_config(self, path):
+            raise RuntimeError("api down")
+
+    service = RefreshService(paths)
+    service.process = StubProcess()
+    service._api_factory = lambda _paths: StubAPI()
+    report = service.refresh()
+
+    assert restarted == [True]
+    assert report.restarted is True
+    assert report.hot_reloaded is False
+
+
 def test_refresh_without_subscription_and_process(tmp_path: Path):
     from cproxy.config import default_paths, runtime_file
     from cproxy.services.refresh import RefreshService

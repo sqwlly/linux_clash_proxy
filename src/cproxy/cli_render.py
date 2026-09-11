@@ -631,7 +631,7 @@ def _render_refresh(report: RefreshReport, raw: bool) -> int:
     if raw:
         print(f"subscription={report.subscription} detail={report.subscription_detail}")
         print(f"runtime={report.runtime_path}")
-        print(f"restarted={report.restarted}")
+        print(f"restarted={report.restarted} hot_reloaded={report.hot_reloaded}")
         for item in report.groups:
             print(f"{item.group}: {item.action} current={item.current or '-'} target={item.target or '-'} {item.detail}")
         return 0
@@ -643,7 +643,9 @@ def _render_refresh(report: RefreshReport, raw: bool) -> int:
     print(f"订阅更新: {subscription_label}")
     print(f"运行配置: {report.runtime_path}")
     if report.restarted:
-        print("代理: 已重启应用新配置")
+        print("代理: 已重启应用新配置（连接已中断）")
+    elif report.hot_reloaded:
+        print("代理: 已热重载应用新配置（连接不中断）")
     elif report.was_running:
         print("代理: 运行中")
     else:

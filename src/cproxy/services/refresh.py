@@ -8,7 +8,7 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 import yaml
 
 from .. import __version__
-from ..backend.api import APIUnavailableError
+from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import GroupCheckReport
 from ..backend.process import ProcessBackend
 from ..backend.runtime import RuntimeBackend
@@ -77,6 +77,7 @@ class RefreshReport:
     runtime_path: Path | None = None
     was_running: bool = False
     restarted: bool = False
+    hot_reloaded: bool = False
     groups: list[GroupSwitchResult] = field(default_factory=list)
 
 
@@ -253,6 +254,8 @@ class RefreshService:
         self.process = ProcessBackend(paths)
         self.query = QueryService(paths)
         self.diagnostics = DiagnosticsService(paths)
+        # 测试可注入假的 API 工厂以隔离热重载行为
+        self._api_factory = APIBackend
 
     def refresh(self, subscription_url: str | None = None, groups: list[str] | None = None) -> RefreshReport:
         config = read_config(self.paths)
@@ -284,8 +287,14 @@ class RefreshService:
 
         report.was_running = self.process.is_running()
         if report.was_running:
-            self.process.restart()
-            report.restarted = True
+            # 优先热重载：mihomo PUT /configs 重新加载配置但不中断既有连接，
+            # 避免打断长会话/长任务；API 不可用时回退为进程重启
+            try:
+                self._api_factory(self.paths).reload_config(str(report.runtime_path))
+                report.hot_reloaded = True
+            except Exception:
+                self.process.restart()
+                report.restarted = True
 
         if target_groups and report.restarted:
             self._wait_for_api()
