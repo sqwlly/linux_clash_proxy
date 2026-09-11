@@ -103,6 +103,35 @@ def test_collect_credits_deltas_per_connection(tmp_path):
     assert audit["direct_download"] == 800
 
 
+def test_direct_classification_uses_chain_tail_not_substring(tmp_path):
+    """直连判据是「链路末端动作 = DIRECT」，不是全串子串匹配。
+
+    覆盖两种子串匹配会出错的情形：
+    - 分组当前选中节点就是 DIRECT（链路 "AI-MANUAL -> DIRECT"）—— 实际走直连；
+    - 代理节点名里含 direct（"AI-MANUAL -> DIRECT-US"）—— 实际走代理。
+    """
+    service = make_service(
+        tmp_path,
+        [
+            {
+                "connections": [
+                    # 末端动作是 DIRECT 的两条：链路以 -> DIRECT 结尾
+                    connection("g", "via-group.com", "Match", ["DIRECT", "AI-MANUAL"], 1000, 0),
+                    connection("b", "bare.com", "Match", ["DIRECT"], 500, 0),
+                    # 代理节点名含 direct：不得被判为直连
+                    connection("n", "proxy.com", "Match", ["DIRECT-US", "AI-MANUAL"], 700, 0),
+                ]
+            }
+        ],
+    )
+    service.collect()
+    audit = service.audit(days=1)
+
+    assert audit["direct_download"] == 1500  # 1000 + 500
+    assert audit["proxy_download"] == 700  # 名字含 direct 的代理节点仍算代理
+    assert [row.label for row in audit["rows"]] == ["proxy.com"]
+
+
 def test_report_grouping_by_rule_host_and_day(tmp_path):
     service = make_service(
         tmp_path,

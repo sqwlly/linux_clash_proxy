@@ -9,8 +9,9 @@
 - `cproxy status` 面板升级：`◆ cproxy` 主标题与 `▸` 区块标签（与 proxy.sh 面板视觉统一，随 `CPROXY_ICONS` 门控）、键值列按东亚宽度对齐、长路径压缩为 `$HOME` → `~` 与 `…/` 形式（保留辨识尾段，跳过 `node_modules`/`bin`/版本号等噪声段）；`--raw` 输出逐字不变
 - `cproxy status` 新增「按进程」流量明细（`--top N`，默认 5；`--no-process` 关闭）：每进程给出占总流量比例，以及按链路拆分的 `代理↓ / 代理↑ / 直连↓ / 直连↑` 四个字节列，直接暴露"谁在消耗流量、谁在绕开代理"（`直连 = 总量 − 代理`；用字节而非单个代理占比，是因为 0.1% 这类低占比进程在百分比下看不出量，`0 B` vs `324 MB` 才说明问题）
 - 流量表渲染器泛化为「占比 + 任意数值列 + 流量条 + 标签」，`代理↓/代理↑/直连↓/直连↑` 与 `↓下载/↑上传` 共用同一套排版
-- `cproxy traffic audit` 的「按进程」小节改用同一口径（全量 + 链路拆分），此前 `chain NOT LIKE '%DIRECT%'` 过滤会漏掉占 ~92% 的直连流量；`--raw` 的 `TRAFFIC_AUDIT_PROCESS` 行保留 `down`/`up` 并新增 `proxy_down`/`proxy_up`（口径由仅代理改为全量）
-- `cproxy status` 补齐 proxy.sh 面板的运行时指标（退役 parity）：`连接数` / `运行时间` / `内存` / `日志` / `实际配置`（后者仅在运行实例未跟随最近一次 render 时显示）。其中运行时间/内存/日志由新增的 `backend/runtime_metrics.py` 以纯 `/proc` 只读采集，不依赖 `ps`/`ss`/`du`，取不到时该行自动省略
+- `cproxy traffic audit` 的「按进程」小节改用同一口径（全量 + 链路拆分），此前 `chain NOT LIKE '%DIRECT%'` 过滤会漏掉占 ~92% 的直连流量
+- 直连判据由子串匹配改为「**链路末端动作是 DIRECT**」：mihomo 若某分组当前选中节点就是 DIRECT（链路形如 `Group -> ... -> DIRECT`），该流量同样不经代理；而原 `chain LIKE '%DIRECT%'` 既受 SQLite LIKE 大小写不敏感影响，又会把名字含 direct 的代理节点（如 `DIRECT-US`）误判为直连。生产数据上两种判据结果一致（已核对）
+- `cproxy status` 补齐 proxy.sh 面板的运行时指标（退役 parity）：`连接数` / `运行时间` / `内存` / `日志` / `配置时效`。其中运行时间/内存/日志由新增的 `backend/runtime_metrics.py` 以纯 `/proc` 只读采集，不依赖 `ps`/`ss`/`du`，取不到时该行自动省略；`配置时效` 通过启动时记录的 runtime 内容指纹（sha256）与磁盘当前指纹比对，不一致才显示「运行实例未跟随最近一次 render」
 - 区块标题样式收敛到单一入口 `_section_heading()`：`rollback`/`switch`/`probe-stable-node` 等此前直接调用 `_section_title()` 而绕开图标门控的路径一并统一
 - 渲染规则加固：AI-MANUAL 域名覆盖扩展（claudeusercontent / sora / grok / openai.azure.com / githubcopilot / cdn.auth0.com / challenges.cloudflare.com）；注入规则前移到订阅规则之前防遮蔽；AI 冲突清理泛化到任意订阅商组名；清理有害规则（裸 `GEOIP,CN`、`safebrowsing.googleapis.com` 直连、`cursor.sh` 直连）；大流量下载源（pytorch / pypi / pythonhosted / npmjs / npmmirror）直连
 - 进程维度流量归因：渲染注入 `find-process-mode: always`，新增 `traffic_process_samples` 表（天×小时×进程×链路，90 天），`cproxy traffic show --by process`、audit 的"按进程"小节，人读展示保留完整路径并剥离内核 ` (deleted)` 标记
@@ -26,6 +27,14 @@
 - `cproxy traffic`：代理流量统计报表，按出口链路 / 命中规则 / 按目标主机与按日汇总（`--days`、`--by`、`--top`、`--raw`）
 - `cproxy traffic collect`：单次流量采集（对 Mihomo `/connections` 做连接级增量记账），数据落 `~/.local/state/cproxy/traffic.db`，跨重启累计，保留 90 天
 - `systemd/clash-proxy-traffic-collector.{service,timer}`：每分钟自动采集的定时单元，由 `systemd/install-systemd.sh` 一并安装启用
+
+### 修复
+
+- **`--raw` 破坏性变更（需脚本注意）**：`TRAFFIC_AUDIT_PROCESS` 行的 `down`/`up` 改为 `total_down`/`total_up`。该行口径已从「仅代理」改为「全量」，复用旧字段名会让外部脚本静默拿到含 ~92% 直连的数字；改名使破坏在解析期即可见，而非悄悄算错。`proxy_down`/`proxy_up` 为新增字段。`cproxy status --raw` 字段不变
+- `实际配置` 行原本恒不渲染：`process.start()` 与 `status()` 都取 `runtime_file(paths)`，路径比对恒等。改为 `配置时效` + 内容指纹判据
+- `runtime_metrics` 的 `/proc` 读取加 `errors="replace"`：`UnicodeDecodeError` 是 `ValueError` 子类，不被 `except OSError` 捕获，会穿透「绝不阻塞 status」的契约
+- `_traffic_bar` 对 0 字节行返回定宽空白占位（`pad=True` 时），否则该行标签左移一整个条形宽度、整表错位
+- `_shorten_path` 增加最终 clamp：末段自身超宽时（如极长可执行名）循环压不进 `width`，原先会返回超宽串突破列宽契约
 
 ## [1.0.0] - 2026-07-18
 

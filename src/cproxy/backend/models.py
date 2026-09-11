@@ -46,6 +46,9 @@ class ProcessOwner:
     pid: int
     program: str
     runtime: str
+    # 启动时 runtime 文件的内容指纹：运行实例加载的配置是否已落后于磁盘当前版本
+    # 只能靠内容比对判断（runtime 路径恒定，且 render 会重写同一文件）
+    runtime_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -57,9 +60,11 @@ class StatusSnapshot:
     runtime_ready: bool
     running: bool
     pid: int | None
-    # 进程实际加载的运行配置（来自 ProcessOwner）。与 runtime_config 不同时
-    # 说明运行中的实例没有跟随最近一次 render，status 会多显示一行“实际配置”。
-    running_config: str | None = None
+    # 运行实例加载的 runtime 是否已落后于磁盘当前版本。runtime 路径恒定
+    # （process.start 与 status 都取 runtime_file(paths)），因此**不能**用路径比对
+    # 判断——那会恒等、永远不触发。改比内容指纹：为 True 时 status 多显示一行
+    # “配置时效”，提示运行实例未跟随最近一次 render。
+    runtime_stale: bool = False
 
 
 @dataclass(frozen=True)

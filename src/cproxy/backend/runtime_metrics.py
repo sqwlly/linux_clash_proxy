@@ -38,8 +38,11 @@ def _clk_tck() -> int:
 def _read_uptime_seconds(pid: int) -> int | None:
     """进程已运行秒数 = 系统 uptime - 进程启动时刻。"""
     try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        uptime_text = Path("/proc/uptime").read_text(encoding="utf-8")
+        # errors="replace"：/proc 文本理论上可能含非 UTF-8 字节（comm 字段），
+        # 严格解码会抛 UnicodeDecodeError —— 它是 ValueError 子类，不被下面的
+        # OSError 捕获，会穿透本模块“绝不阻塞 status”的契约。
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        uptime_text = Path("/proc/uptime").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -61,7 +64,7 @@ def _read_uptime_seconds(pid: int) -> int | None:
 
 def _read_memory_bytes(pid: int) -> int | None:
     try:
-        status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 

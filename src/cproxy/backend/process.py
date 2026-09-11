@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -108,15 +109,48 @@ class ProcessBackend:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return ProcessOwner(pid=int(data["pid"]), program=str(data["program"]), runtime=str(data["runtime"]))
+            return ProcessOwner(
+                pid=int(data["pid"]),
+                program=str(data["program"]),
+                runtime=str(data["runtime"]),
+                runtime_hash=str(data.get("runtime_hash") or ""),
+            )
         except (ValueError, KeyError, json.JSONDecodeError):
             return None
 
     def _write_process_owner(self, owner: ProcessOwner) -> None:
         process_meta_file(self.paths).write_text(
-            json.dumps({"pid": owner.pid, "program": owner.program, "runtime": owner.runtime}, ensure_ascii=True) + "\n",
+            json.dumps(
+                {
+                    "pid": owner.pid,
+                    "program": owner.program,
+                    "runtime": owner.runtime,
+                    "runtime_hash": owner.runtime_hash,
+                },
+                ensure_ascii=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> str:
+        """runtime 文件的内容指纹；读不到时返回空串（调用方按“不可判定”处理）。"""
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _runtime_is_stale(owner: ProcessOwner | None, current_hash: str) -> bool:
+        """运行实例加载的 runtime 是否落后于磁盘当前版本。
+
+        任一侧指纹缺失（旧版 process_meta_file 未记 runtime_hash、或文件读不到）时
+        一律判为 False —— 宁可不提示，也不能凭不可判定的信息误报"未跟随"。
+        """
+        if not owner or not owner.runtime_hash or not current_hash:
+            return False
+        return owner.runtime_hash != current_hash
 
     def _cleanup_process_state(self) -> None:
         pid_file(self.paths).unlink(missing_ok=True)
@@ -233,7 +267,15 @@ class ProcessBackend:
                 )
 
             pid_file(self.paths).write_text(f"{process.pid}\n", encoding="utf-8")
-            self._write_process_owner(ProcessOwner(pid=process.pid, program=program, runtime=str(runtime)))
+            # 记下启动时加载的 runtime 内容指纹，供 status 判断运行实例是否已落后
+            self._write_process_owner(
+                ProcessOwner(
+                    pid=process.pid,
+                    program=program,
+                    runtime=str(runtime),
+                    runtime_hash=self._file_fingerprint(runtime),
+                )
+            )
             time.sleep(0.1)
             if not self._is_pid_running(process.pid):
                 self._cleanup_process_state()
@@ -281,13 +323,16 @@ class ProcessBackend:
         if not running:
             pid = None
         owner = self._read_process_owner() if running else None
+        runtime_path = runtime_file(self.paths)
+        # 路径恒同，只有内容指纹能说明运行实例是否落后于最近一次 render
+        stale = self._runtime_is_stale(owner, self._file_fingerprint(runtime_path))
         return StatusSnapshot(
             source_config=str(config_file(self.paths)),
-            runtime_config=str(runtime_file(self.paths)),
+            runtime_config=str(runtime_path),
             controller=str(config.get("external-controller-tls") or config.get("external-controller", "127.0.0.1:9090")),
             port=str(config.get("mixed-port", 7890)),
-            runtime_ready=runtime_file(self.paths).exists(),
+            runtime_ready=runtime_path.exists(),
             running=running,
             pid=pid,
-            running_config=owner.runtime if owner else None,
+            runtime_stale=stale,
         )

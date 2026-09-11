@@ -114,15 +114,22 @@ def format_bytes(size: int | float) -> str:
     return f"{value:.2f} TB"
 
 
-# 按进程聚合全量流量并拆出代理部分。不做 DIRECT 过滤：直连常占绝大多数，
+# 链路是否走直连。mihomo 以字面量 DIRECT 表示直连出站；若某分组当前选中的节点就是
+# DIRECT，链路形如 "Group -> ... -> DIRECT"，该流量同样不经代理，所以判据是
+# **链路末端动作**为 DIRECT。原实现用 `chain LIKE '%DIRECT%'` 子串匹配，有两个问题：
+# SQLite 的 LIKE 对 ASCII 大小写不敏感（"direct" 也算直连），且名字里含 direct 的
+# 代理节点（如 "DIRECT-US"）会被误判为直连。
+_DIRECT_CHAIN = "(chain = 'DIRECT' OR chain LIKE '% -> DIRECT')"
+
+# 按进程聚合全量流量并拆出代理部分。不做直连过滤：直连常占绝大多数，
 # 只统计代理会漏掉主要消耗方（“仅代理”视角改由 proxy_* 两列体现）。
 # grand_total 用窗口函数在同一次查询里取全量合计，作为占比分母（SQLite ≥ 3.25）。
-_PROCESS_BREAKDOWN_SQL = """
+_PROCESS_BREAKDOWN_SQL = f"""
 SELECT process AS label,
        SUM(download) AS download,
        SUM(upload) AS upload,
-       SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN download ELSE 0 END) AS proxy_download,
-       SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN upload ELSE 0 END) AS proxy_upload,
+       SUM(CASE WHEN NOT {_DIRECT_CHAIN} THEN download ELSE 0 END) AS proxy_download,
+       SUM(CASE WHEN NOT {_DIRECT_CHAIN} THEN upload ELSE 0 END) AS proxy_upload,
        SUM(SUM(download) + SUM(upload)) OVER () AS grand_total
 FROM traffic_process_samples
 WHERE day >= ? AND day <= ?
@@ -350,21 +357,21 @@ class TrafficService:
 
         with closing(self._connect()) as db, db:
             rows = db.execute(
-                """
+                f"""
                 SELECT host AS label, SUM(download) AS download, SUM(upload) AS upload
                 FROM traffic_samples
-                WHERE day >= ? AND day <= ? AND chain NOT LIKE '%DIRECT%'
+                WHERE day >= ? AND day <= ? AND NOT {_DIRECT_CHAIN}
                 GROUP BY host ORDER BY (SUM(download) + SUM(upload)) DESC LIMIT ?
                 """,
                 (since, until, top),
             ).fetchall()
             totals = db.execute(
-                """
+                f"""
                 SELECT
-                    COALESCE(SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN download ELSE 0 END), 0) AS p_down,
-                    COALESCE(SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN upload ELSE 0 END), 0) AS p_up,
-                    COALESCE(SUM(CASE WHEN chain LIKE '%DIRECT%' THEN download ELSE 0 END), 0) AS d_down,
-                    COALESCE(SUM(CASE WHEN chain LIKE '%DIRECT%' THEN upload ELSE 0 END), 0) AS d_up
+                    COALESCE(SUM(CASE WHEN NOT {_DIRECT_CHAIN} THEN download ELSE 0 END), 0) AS p_down,
+                    COALESCE(SUM(CASE WHEN NOT {_DIRECT_CHAIN} THEN upload ELSE 0 END), 0) AS p_up,
+                    COALESCE(SUM(CASE WHEN {_DIRECT_CHAIN} THEN download ELSE 0 END), 0) AS d_down,
+                    COALESCE(SUM(CASE WHEN {_DIRECT_CHAIN} THEN upload ELSE 0 END), 0) AS d_up
                 FROM traffic_samples
                 WHERE day >= ? AND day <= ?
                 """,

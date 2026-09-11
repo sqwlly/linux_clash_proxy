@@ -100,6 +100,24 @@ def test_shorten_path_passes_through_non_paths():
     assert _shorten_path("", 46) == ""
 
 
+def test_shorten_path_clamps_when_last_segment_alone_overflows():
+    """末段自身超宽时也必须满足 width 契约（循环只能丢中间段，压不进去）。"""
+    from cproxy.cli_render import _display_width, _shorten_path
+
+    out = _shorten_path("/usr/bin/" + "x" * 80, 46)
+    assert _display_width(out) <= 46
+    assert out.endswith("…")  # 保头部截断
+
+
+def test_traffic_bar_reserves_width_for_zero_value_rows():
+    """0 字节行在表格内需占位，否则该行标签左移、整表错位。"""
+    from cproxy.cli_render import _TRAFFIC_BAR_WIDTH, _traffic_bar
+
+    assert _traffic_bar(0, 100) == " " * _TRAFFIC_BAR_WIDTH
+    # 行尾场景（pad=False）仍返回空串，不留行尾空白
+    assert _traffic_bar(0, 100, pad=False) == ""
+
+
 def test_process_display_label_is_full_path_without_width():
     from cproxy.cli_render import _process_display_label
 
@@ -152,6 +170,22 @@ def test_render_kv_aligns_cjk_labels(capsys):
     # 值列起点一致：最长标签（8 显示列）+ 间距 4 = 12
     assert out[0] == "状态        运行中"
     assert out[1] == "运行配置    已就绪"
+
+
+def test_runtime_staleness_requires_both_fingerprints():
+    """runtime 路径恒定，只能靠内容指纹判断；任一侧缺失都不得误报“未跟随”。"""
+    from cproxy.backend.models import ProcessOwner
+    from cproxy.backend.process import ProcessBackend
+
+    owner = ProcessOwner(pid=1, program="mihomo", runtime="/x/runtime.yaml", runtime_hash="aaa")
+    assert ProcessBackend._runtime_is_stale(owner, "bbb") is True  # 内容已变
+    assert ProcessBackend._runtime_is_stale(owner, "aaa") is False  # 已跟随最近一次 render
+    assert ProcessBackend._runtime_is_stale(owner, "") is False  # 当前指纹不可得
+    assert ProcessBackend._runtime_is_stale(None, "bbb") is False  # 未运行
+
+    # 旧版 process_meta_file 没有 runtime_hash：不可判定，不提示
+    legacy = ProcessOwner(pid=1, program="mihomo", runtime="/x/runtime.yaml")
+    assert ProcessBackend._runtime_is_stale(legacy, "bbb") is False
 
 
 def test_render_kv_skips_empty_values(capsys):

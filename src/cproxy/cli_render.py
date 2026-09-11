@@ -381,10 +381,10 @@ _STATUS_PROCESS_LABEL_WIDTH = 46
 _STATUS_PATH_WIDTH = 48
 
 
-def _today_traffic_summary() -> dict | None:
+def _today_traffic_summary(paths) -> dict | None:
     """今日流量汇总（代理/直连），数据库缺失或异常时返回 None，绝不阻塞 status。"""
     try:
-        audit = TrafficService(default_paths()).audit(days=1, top=1)
+        audit = TrafficService(paths).audit(days=1, top=1)
     except Exception:
         return None
     if not any(
@@ -399,20 +399,20 @@ def _today_traffic_summary() -> dict | None:
     return audit
 
 
-def _today_process_traffic(top: int) -> ProcessTrafficReport | None:
+def _today_process_traffic(paths, top: int) -> ProcessTrafficReport | None:
     """今日按进程流量（全量 + 代理/直连拆分）；top<=0 或采集失败时返回 None。"""
     if top <= 0:
         return None
     try:
-        return TrafficService(default_paths()).process_breakdown(days=1, top=top)
+        return TrafficService(paths).process_breakdown(days=1, top=top)
     except Exception:
         return None
 
 
-def _connection_count() -> int | None:
+def _connection_count(paths) -> int | None:
     """Mihomo 当前连接数；API 不可达时返回 None。"""
     try:
-        connections = APIBackend(default_paths()).get_connections().get("connections")
+        connections = APIBackend(paths).get_connections().get("connections")
     except Exception:
         return None
     return len(connections) if isinstance(connections, list) else None
@@ -494,7 +494,7 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
         print(f"状态: {status_text}")
         if snapshot.pid:
             print(f"PID: {snapshot.pid}")
-        traffic = _today_traffic_summary()
+        traffic = _today_traffic_summary(paths)
         if traffic is not None:
             total_down = traffic["proxy_download"] + traffic["direct_download"]
             total_up = traffic["proxy_upload"] + traffic["direct_upload"]
@@ -521,7 +521,7 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
     _print_section("资源")
     metrics = collect_runtime_metrics(paths, snapshot.pid)
     # API 已知不可达时不再试一次——否则白白多等一个 api-timeout（默认 2s）
-    connections = _connection_count() if api_text == "可访问" else None
+    connections = _connection_count(paths) if api_text == "可访问" else None
     _render_kv(
         [
             ("代理端口", snapshot.port),
@@ -534,12 +534,12 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
         ]
     )
 
-    traffic = _today_traffic_summary()
+    traffic = _today_traffic_summary(paths)
     if traffic is not None:
         print()
         _print_section("流量 (今日)")
         _render_traffic_totals(traffic)
-        _render_process_traffic(_today_process_traffic(process_top))
+        _render_process_traffic(_today_process_traffic(paths, process_top))
 
     print()
     _print_section("路径")
@@ -547,9 +547,10 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
         ("原始配置", _shorten_path(snapshot.source_config, _STATUS_PATH_WIDTH)),
         ("运行配置", _shorten_path(snapshot.runtime_config, _STATUS_PATH_WIDTH)),
     ]
-    # 仅当运行中的实例没有跟随最近一次 render 时才展示，避免重复一行同样内容
-    if snapshot.running_config and snapshot.running_config != snapshot.runtime_config:
-        path_rows.append(("实际配置", _shorten_path(snapshot.running_config, _STATUS_PATH_WIDTH)))
+    # 仅当运行实例加载的 runtime 内容已落后于磁盘当前版本时才展示：
+    # runtime 路径恒定，所以信号是**内容时效**而非路径差异
+    if snapshot.runtime_stale:
+        path_rows.append(("配置时效", _status_label("待刷新") + "  运行实例未跟随最近一次 render"))
     _render_kv(path_rows)
 
     if not snapshot.running and api_text == "可访问":
@@ -850,7 +851,8 @@ def _traffic_bar(value: int, max_value: int, *, pad: bool = True) -> str:
     表格内需要靠它对齐后续列，保持默认的定宽填充。
     """
     if max_value <= 0 or value <= 0:
-        return ""
+        # 表格内需占位：返回空串会让该行标签左移一整个条形宽度、整表错位
+        return _pad_right("", _TRAFFIC_BAR_WIDTH) if pad else ""
     ratio = min(1.0, value / max_value)
     scaled = _TRAFFIC_BAR_WIDTH * ratio
     full = int(scaled)
@@ -955,7 +957,19 @@ def _shorten_path(text: str, width: int) -> str:
         if _display_width(candidate) > width:
             break
         tail.insert(0, segment)
-    return "…/" + "/".join(tail)
+    result = "…/" + "/".join(tail)
+    if _display_width(result) <= width:
+        return result
+
+    # 末段自身就超宽（如极长可执行名）：上述循环只能丢中间段，压不进 width。
+    # 保头部截断（路径头部比尾部更易辨识）并补省略号，确保真的满足列宽契约。
+    budget = max(0, width - _display_width("…"))
+    head = ""
+    for ch in result:
+        if _display_width(head + ch) > budget:
+            break
+        head += ch
+    return head + "…"
 
 
 def _format_uptime(seconds: int) -> str:
@@ -1050,8 +1064,9 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
 
     if action == "audit":
         audit = service.audit(days=days, top=top)
-        processes = service.process_breakdown(days=days, top=top)
         if raw:
+            # 进程查询只在确实要输出时才做：下文的“暂无流量记录”早退不应白跑一次查询
+            processes = service.process_breakdown(days=days, top=top)
             print(
                 f"TRAFFIC_AUDIT\tsince={audit['since']}\tuntil={audit['until']}"
                 f"\tproxy_down={audit['proxy_download']}\tproxy_up={audit['proxy_upload']}"
@@ -1060,9 +1075,12 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             for row in audit["rows"]:
                 print(f"TRAFFIC_AUDIT_HOST\t{row.label}\tdown={row.download}\tup={row.upload}")
             # 注意 down/up 为全量口径；proxy_down/proxy_up 是其中走代理的部分
+            # 字段名用 total_* 而非沿用 down/up：该行口径已从“仅代理”改为“全量”，
+            # 复用旧字段名会让外部脚本静默拿到含 ~92% 直连的数字。改名后旧解析会在
+            # 取值时立刻暴露，而不是悄悄算错。
             for row in processes.rows:
                 print(
-                    f"TRAFFIC_AUDIT_PROCESS\t{row.label}\tdown={row.download}\tup={row.upload}"
+                    f"TRAFFIC_AUDIT_PROCESS\t{row.label}\ttotal_down={row.download}\ttotal_up={row.upload}"
                     f"\tproxy_down={row.proxy_download}\tproxy_up={row.proxy_upload}"
                 )
             return 0
@@ -1077,6 +1095,7 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         if proxy_all == 0 and direct_all == 0:
             print("暂无流量记录 (collector 尚未采集或数据库为空)")
             return 0
+        processes = service.process_breakdown(days=days, top=top)
         proxy_ratio = proxy_all / (proxy_all + direct_all) * 100 if (proxy_all + direct_all) else 0.0
         print(
             f"代理: {_style('↓' + format_bytes(audit['proxy_download']), ANSI_GREEN)}"

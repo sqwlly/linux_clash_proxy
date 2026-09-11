@@ -204,9 +204,10 @@ TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前
 - 默认输出优先给结论，再给明细
 - 区块标题统一使用 `摘要 / 资源 / 流量 / 路径 / 连通性 / 链路 / 备用 / 分组 / 列表 / 结果`，
   开启图标时（`CPROXY_ICONS=1` 或配置 `output-icons: true`）每个标题带 `▸` 前缀，
-  `status` 顶部另有一行 `◆ cproxy` 主标题
+  `status` 顶部另有一行 `◆ cproxy` 主标题。`status` 的流量区块带统计窗口限定词，
+  实际渲染为 `流量 (今日)`
 - `status` 的值列按显示宽度对齐，超长路径压缩为 `~` 与 `…/` 形式（不传 `--raw` 时）
-- `status` 的 `流量` 区块内置「按进程」明细（`--top N`，`--no-process` 关闭）：
+- `status` 的 `流量 (今日)` 区块内置「按进程」明细（`--top N`，`--no-process` 关闭）：
   每个进程给出占总流量比例，以及按链路拆分的 `代理↓ / 代理↑ / 直连↓ / 直连↑`
   四个字节列，便于直接定位"谁在消耗流量、谁在绕开代理"。用四列而非单个代理占比，
   是因为低占比进程（如 0.1%）在百分比下几乎看不出量，拆成字节后
@@ -338,7 +339,7 @@ sudo ./scripts/install-system-commands.sh --with-cproxy-alias
 ```
 
 默认不覆盖 `cproxy`，因为仓库里还保留了用户级 Python CLI。若
-`cproxy status` 显示 `运行配置状态: 待刷新`，先确认它看的是否是
+`cproxy status` 显示 `运行配置    待刷新`，先确认它看的是否是
 `~/.local/share/cproxy/runtime.yaml`；生产入口状态应优先使用：
 
 ```bash

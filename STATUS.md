@@ -13,7 +13,8 @@
 
 ## 最近里程碑
 
-- 2026-09-11 `cproxy status` 面板产品化与退役 parity 补齐：`◆`/`▸` 区块（与 proxy.sh 视觉统一）、键值列东亚宽度对齐、长路径压缩；新增「按进程」流量归因（`--top`/`--no-process`），按链路拆分为 `代理↓/代理↑/直连↓/直连↑` 四列；补齐 `连接数/运行时间/内存/日志/实际配置` 五项 proxy.sh 面板指标（新增 `backend/runtime_metrics.py`，纯 `/proc` 只读）；`traffic audit` 进程口径同步改全量+链路拆分；`--raw` 输出逐字不变。功能对账表「启动/停止/重启/状态」行的"已有等价"结论此前与实际不符，已补齐并附核对依据。安装沿用系统级非 editable 路径（`pip install --force-reinstall --no-deps .`），**未**走 `install.sh` 的 `--user` 分支以免产生 ~/.local 跨副本遮蔽
+- 2026-09-11 `cproxy status` 面板产品化与退役 parity 补齐：`◆`/`▸` 区块（与 proxy.sh 视觉统一）、键值列东亚宽度对齐、长路径压缩；新增「按进程」流量归因（`--top`/`--no-process`），按链路拆分为 `代理↓/代理↑/直连↓/直连↑` 四列；补齐 `连接数/运行时间/内存/日志/配置时效` 五项 proxy.sh 面板指标（新增 `backend/runtime_metrics.py`，纯 `/proc` 只读）。功能对账表「启动/停止/重启/状态」行的"已有等价"结论此前与实际不符，已补齐并附核对依据。安装沿用系统级非 editable 路径（`pip install --force-reinstall --no-deps .`），**未**走 `install.sh` 的 `--user` 分支以免产生 ~/.local 跨副本遮蔽
+- 2026-09-11 code review 修复（cproxy）：`--raw` 的 `TRAFFIC_AUDIT_PROCESS` 字段 `down`/`up` 改名 `total_down`/`total_up`（口径已改全量，复用旧名会让脚本静默算错）；直连判据改为「链路末端动作是 DIRECT」（原子串匹配受 LIKE 大小写不敏感影响，且会误判名字含 direct 的代理节点）；`实际配置` 行原为恒不触发的死代码，改为 `配置时效` + 内容指纹；`/proc` 读取加 `errors="replace"` 防 `UnicodeDecodeError` 穿透；`_traffic_bar` 零值行补定宽占位；`_shorten_path` 末段超宽补最终 clamp
 - 2026-09-11 渲染规则加固：AI-MANUAL 覆盖扩展、注入规则前移防订阅遮蔽、有害订阅规则清理（裸 GEOIP/safebrowsing/cursor.sh）、大流量下载源直连；流量统计升级（对齐条形图报表、`traffic audit`、进程维度归因 with `find-process-mode: always`、status 今日流量摘要、30s 采集间隔）
 - 2026-09-11 阶段 2 切换：cproxy 用户级服务接管生产，修正 `systemd-user/cproxy.service` PIDFile 与实现一致
 

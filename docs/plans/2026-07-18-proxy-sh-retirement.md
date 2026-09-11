@@ -57,13 +57,18 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 | `运行时间` | `ps -o etimes= -p $pid` | `/proc/{pid}/stat` starttime + `/proc/uptime` |
 | `内存` | `ps -o rss= -p $pid` | `/proc/{pid}/status` 的 `VmRSS` |
 | `日志` | `du -h $LOG_FILE` | `log_file(paths).stat().st_size` |
-| `实际配置` | 对比运行中配置与 runtime | `ProcessOwner.runtime`（`process_meta_file`，仅在两者不一致时显示） |
+| `实际配置` | 对比运行中配置文件的**路径**与 runtime | 不等价，已改为 `配置时效`：cproxy 的 runtime 路径恒定（`process.start` 与 `status` 都取 `runtime_file(paths)`），路径比对**恒等、永不触发**；改用**内容指纹**——`start()` 把启动时 runtime 的 sha256 记入 `process_meta_file`，`status()` 与磁盘当前指纹比对，不一致才显示该行 |
+
+> 注：`实际配置` 最初按路径比对实现，属恒不触发的死代码（2026-09-11 code review 发现），
+> 已改为等价的「内容时效」判据。回归测试见
+> `tests/test_status_process_traffic.py::test_runtime_staleness_requires_both_fingerprints`。
 
 实现落在 `src/cproxy/backend/runtime_metrics.py`（纯 `/proc` 只读，不引入
 `ps`/`ss`/`du` 外部依赖）与 `src/cproxy/cli_render.py` 的 `_render_status()`；
 覆盖测试见 `tests/test_status_process_traffic.py`、`tests/test_runtime_and_process.py`。
 
-另：`cproxy status` 额外提供 `proxy.sh` 没有的「按进程」流量归因（全量 + 代理占比）。
+另：`cproxy status` 额外提供 `proxy.sh` 没有的「按进程」流量归因（按链路拆分为
+`代理↓ / 代理↑ / 直连↓ / 直连↑` 四列，直连量由 `总量 − 代理` 派生）。
 
 ## 分阶段步骤
 
