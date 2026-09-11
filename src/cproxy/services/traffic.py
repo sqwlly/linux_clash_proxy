@@ -389,9 +389,10 @@ class TrafficService:
         days: int = 1,
         top: int = DEFAULT_TOP,
     ) -> ProcessTrafficReport:
-        """按进程聚合全量流量，并标注其中走代理的比例。
+        """按进程聚合全量流量，并拆出其中走代理的部分。
 
-        不过滤 DIRECT 链路：直连常占绝大多数（实测 ~92%），只看代理会漏掉主要消耗方。
+        不过滤 DIRECT 链路：直连常占绝大多数（实测 ~92%），只看代理会漏掉主要消耗方；
+        直连量由 ``download - proxy_download`` 等派生（直连是总量的子集，恒非负）。
         """
         days = max(1, days)
         top = max(1, top)

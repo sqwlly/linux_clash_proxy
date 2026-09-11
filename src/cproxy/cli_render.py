@@ -19,7 +19,7 @@ from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
 from .geodata import check_country_mmdb
 from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config
 from .logs import follow_lines, read_recent_lines
-from .output import normalize_name
+from .output import STATUS_PROCESS_TOP_DEFAULT, normalize_name
 from .process import get_status, restart_process, start_process
 from .runtime import render_runtime
 from .security import validate_controller_security
@@ -376,8 +376,7 @@ def _probe_summary_status(report: AIProbeReport) -> str:
     return "部分异常"
 
 
-# status 面板显示参数
-_STATUS_PROCESS_TOP = 5
+# status 面板显示参数（进程行数的默认值属于 CLI 契约，见 output.STATUS_PROCESS_TOP_DEFAULT）
 _STATUS_PROCESS_LABEL_WIDTH = 46
 _STATUS_PATH_WIDTH = 48
 
@@ -401,7 +400,7 @@ def _today_traffic_summary() -> dict | None:
 
 
 def _today_process_traffic(top: int) -> ProcessTrafficReport | None:
-    """今日按进程流量（全量 + 代理占比）；top<=0 或采集失败时返回 None。"""
+    """今日按进程流量（全量 + 代理/直连拆分）；top<=0 或采集失败时返回 None。"""
     if top <= 0:
         return None
     try:
@@ -466,7 +465,7 @@ def _render_process_traffic(report: ProcessTrafficReport | None) -> None:
     )
 
 
-def _render_status(raw: bool, process_top: int = _STATUS_PROCESS_TOP) -> int:
+def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> int:
     paths = default_paths()
     snapshot = get_status(paths)
     config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
@@ -948,6 +947,7 @@ def _shorten_path(text: str, width: int) -> str:
         return display
 
     tail = [parts[-1]]
+    # parts[0] 是根标记（绝对路径的空串，或 `~`），与末段一起不进候选循环
     for segment in reversed(parts[1:-1]):
         if _is_noise_segment(segment):
             continue

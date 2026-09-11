@@ -5,6 +5,10 @@ from collections.abc import Callable
 
 from .services.probe import ProbeReport, format_delay, stable_score
 
+# `cproxy status` 按进程明细的默认行数。定义在此处是因为它属于 CLI 契约，
+# argparse 默认值与渲染层共用同一来源（渲染层不能反向 import 本模块之外的定义）。
+STATUS_PROCESS_TOP_DEFAULT = 5
+
 
 def normalize_name(value: object) -> str:
     if value in ("-", None):
@@ -146,7 +150,7 @@ def build_root_parser() -> ArgumentParser:
     status_parser.add_argument(
         "--top",
         type=int,
-        default=5,
+        default=STATUS_PROCESS_TOP_DEFAULT,
         help="按进程流量明细的行数（0 表示不显示，默认 5）",
     )
     status_parser.add_argument(

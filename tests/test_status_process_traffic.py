@@ -247,6 +247,28 @@ def test_status_top_limits_process_rows(tmp_path: Path):
     assert "/usr/bin/awk" not in out
 
 
+def test_status_default_process_top_matches_cli_contract(tmp_path: Path):
+    """不带参数时应显示 STATUS_PROCESS_TOP_DEFAULT 行。
+
+    锁的是端到端的有效默认值：argparse 的 default 与渲染层默认参数必须一致，
+    否则两处会各自漂移（此前默认值 5 就硬编码在两个文件里）。
+    """
+    from cproxy.output import STATUS_PROCESS_TOP_DEFAULT
+
+    _write_config(tmp_path)
+    _seed_today(
+        tmp_path,
+        [
+            (f"/usr/bin/proc{index}", "DIRECT", 1000 - index, 100)
+            for index in range(STATUS_PROCESS_TOP_DEFAULT + 2)
+        ],
+    )
+
+    out = _run_status(tmp_path).stdout
+    assert f"进程 Top {STATUS_PROCESS_TOP_DEFAULT}" in out
+    assert f"进程 Top {STATUS_PROCESS_TOP_DEFAULT + 1}" not in out
+
+
 def test_status_paths_are_home_relative(tmp_path: Path):
     _write_config(tmp_path)
     result = _run_status(tmp_path)
