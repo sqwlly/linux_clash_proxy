@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unicodedata
 from functools import lru_cache
@@ -8,7 +9,9 @@ from pathlib import Path
 
 from . import __version__
 from .api import APIUnavailableError
+from .backend.api import APIBackend
 from .backend.models import AIProbeReport, ProxyGroup
+from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
 from .geodata import check_country_mmdb
@@ -23,7 +26,7 @@ from .services.ops import build_incident, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
 from .services.refresh import RefreshReport
-from .services.traffic import TrafficService, format_bytes
+from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 
 ANSI_RESET = "\033[0m"
@@ -186,8 +189,17 @@ def _status_label(text: str) -> str:
     return f"{icon} {label}"
 
 
+def _section_heading(title: str, *, icon: str = "▸") -> str:
+    """区块标题文本；图标随 `_icons_enabled()` 开关（与 proxy.sh 的 section_label 对齐）。
+
+    与 :func:`_section_title` 的分工：`_section_title` 只是“加粗蓝字”原语，也被
+    通知类文本复用；本函数专用于**区块标题**，因此承载图标门控。
+    """
+    return _section_title(f"{icon} {title}" if _icons_enabled() else title)
+
+
 def _print_section(title: str) -> None:
-    print(_section_title(title))
+    print(_section_heading(title))
 
 
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
@@ -362,6 +374,12 @@ def _probe_summary_status(report: AIProbeReport) -> str:
     return "部分异常"
 
 
+# status 面板显示参数
+_STATUS_PROCESS_TOP = 5
+_STATUS_PROCESS_LABEL_WIDTH = 46
+_STATUS_PATH_WIDTH = 48
+
+
 def _today_traffic_summary() -> dict | None:
     """今日流量汇总（代理/直连），数据库缺失或异常时返回 None，绝不阻塞 status。"""
     try:
@@ -380,8 +398,76 @@ def _today_traffic_summary() -> dict | None:
     return audit
 
 
-def _render_status(raw: bool) -> int:
-    snapshot = get_status(default_paths())
+def _today_process_traffic(top: int) -> ProcessTrafficReport | None:
+    """今日按进程流量（全量 + 代理占比）；top<=0 或采集失败时返回 None。"""
+    if top <= 0:
+        return None
+    try:
+        return TrafficService(default_paths()).process_breakdown(days=1, top=top)
+    except Exception:
+        return None
+
+
+def _connection_count() -> int | None:
+    """Mihomo 当前连接数；API 不可达时返回 None。"""
+    try:
+        connections = APIBackend(default_paths()).get_connections().get("connections")
+    except Exception:
+        return None
+    return len(connections) if isinstance(connections, list) else None
+
+
+def _render_traffic_totals(traffic: dict) -> None:
+    """今日总量 / 代理 / 直连三行；代理与直连带占比与流量条。"""
+    total_down = traffic["proxy_download"] + traffic["direct_download"]
+    total_up = traffic["proxy_upload"] + traffic["direct_upload"]
+    proxy_all = traffic["proxy_download"] + traffic["proxy_upload"]
+    direct_all = traffic["direct_download"] + traffic["direct_upload"]
+    all_traffic = proxy_all + direct_all
+    rows = [
+        ("今日总量", total_down, total_up, None),
+        ("代理", traffic["proxy_download"], traffic["proxy_upload"], proxy_all),
+        ("直连", traffic["direct_download"], traffic["direct_upload"], direct_all),
+    ]
+    label_width = max(_display_width(row[0]) for row in rows) + _KV_GUTTER
+    down_w = max(_display_width("↓" + format_bytes(row[1])) for row in rows)
+    up_w = max(_display_width("↑" + format_bytes(row[2])) for row in rows)
+    ratio_w = max(
+        (_display_width(f"{row[3] / all_traffic * 100 if all_traffic else 0.0:.1f}%") for row in rows if row[3] is not None),
+        default=0,
+    )
+    for label, down, up, part in rows:
+        line = (
+            f"{_pad_right(label, label_width)}"
+            f"{_style(_pad_left('↓' + format_bytes(down), down_w), ANSI_GREEN)}"
+            f"  {_style(_pad_left('↑' + format_bytes(up), up_w), ANSI_CYAN)}"
+        )
+        if part is not None:
+            ratio = part / all_traffic * 100 if all_traffic else 0.0
+            # 流量条位于行尾，不做定宽填充，避免行尾空白
+            line += f"   {_pad_left(f'{ratio:.1f}%', ratio_w)}  {_traffic_bar(part, all_traffic, pad=False)}"
+        print(line)
+
+
+def _render_process_traffic(report: ProcessTrafficReport | None) -> None:
+    """按进程流量子表：占比 / 代理占比 / ↓ / ↑ / 流量条 / 进程。"""
+    if report is None or not report.rows:
+        return
+    print()
+    print(f"  进程 Top {len(report.rows)}")
+    _render_traffic_table(
+        report.rows,
+        lambda row: _process_display_label(row.label, width=_STATUS_PROCESS_LABEL_WIDTH),
+        header="进程",
+        total=report.total,
+        extra_header="代理",
+        extra_of=lambda row: _proxy_ratio_label(row.proxy_ratio),
+    )
+
+
+def _render_status(raw: bool, process_top: int = _STATUS_PROCESS_TOP) -> int:
+    paths = default_paths()
+    snapshot = get_status(paths)
     config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
     status_text = "运行中" if snapshot.running else "未运行"
     api_text = "不可访问"
@@ -389,7 +475,7 @@ def _render_status(raw: bool) -> int:
     ai_summary = "-"
 
     try:
-        route = _resolve_ai_route(QueryService(default_paths()).get_ai_status_groups())
+        route = _resolve_ai_route(QueryService(paths).get_ai_status_groups())
         api_text = "可访问"
         ai_mode = str(route["mode_label"])
         ai_summary = f"{route['active_group']} -> {normalize_name(route['active_node'])}"
@@ -417,48 +503,54 @@ def _render_status(raw: bool) -> int:
             print(f"今日直连: down={traffic['direct_download']} up={traffic['direct_upload']}")
         return 0
 
+    title = "◆ cproxy" if _icons_enabled() else "cproxy"
+    print(_style(title, ANSI_BOLD, ANSI_BLUE))
+
     _print_section("摘要")
-    print(f"状态: {_status_label(status_text)}")
-    print(f"API: {_status_label(api_text)}")
-    print(f"AI 路由模式: {ai_mode}")
-    print(f"AI 当前出口: {_accent(ai_summary)}")
-    print(f"运行配置状态: {_status_label(config_state)}")
+    _render_kv(
+        [
+            ("状态", _status_label(status_text)),
+            ("API", _status_label(api_text)),
+            ("运行配置", _status_label(config_state)),
+            ("AI 路由", ai_mode),
+            ("当前出口", _accent(ai_summary)),
+        ]
+    )
+
     print()
     _print_section("资源")
-    print(f"代理端口: {snapshot.port}")
-    print(f"控制接口: {snapshot.controller}")
+    metrics = collect_runtime_metrics(paths, snapshot.pid)
+    connections = _connection_count()
+    _render_kv(
+        [
+            ("代理端口", snapshot.port),
+            ("控制接口", snapshot.controller),
+            ("PID", str(snapshot.pid) if snapshot.pid else ""),
+            ("连接数", "" if connections is None else str(connections)),
+            ("运行时间", "" if metrics.uptime_seconds is None else _format_uptime(metrics.uptime_seconds)),
+            ("内存", "" if metrics.memory_bytes is None else format_bytes(metrics.memory_bytes)),
+            ("日志", "" if metrics.log_bytes is None else format_bytes(metrics.log_bytes)),
+        ]
+    )
+
     traffic = _today_traffic_summary()
     if traffic is not None:
-        total_down = traffic["proxy_download"] + traffic["direct_download"]
-        total_up = traffic["proxy_upload"] + traffic["direct_upload"]
-        proxy_all = traffic["proxy_download"] + traffic["proxy_upload"]
-        direct_all = traffic["direct_download"] + traffic["direct_upload"]
-        all_traffic = proxy_all + direct_all
-        rows = [
-            ("今日总量", total_down, total_up, None),
-            ("代理", traffic["proxy_download"], traffic["proxy_upload"], proxy_all),
-            ("直连", traffic["direct_download"], traffic["direct_upload"], direct_all),
-        ]
-        down_w = max(_display_width("↓" + format_bytes(row[1])) for row in rows)
-        up_w = max(_display_width("↑" + format_bytes(row[2])) for row in rows)
         print()
-        _print_section("流量")
-        for label, down, up, part in rows:
-            line = (
-                f"{_pad_right(label, 10)}"
-                f"  {_style(_pad_left('↓' + format_bytes(down), down_w), ANSI_GREEN)}"
-                f"  {_style(_pad_left('↑' + format_bytes(up), up_w), ANSI_CYAN)}"
-            )
-            if part is not None:
-                ratio = part / all_traffic * 100 if all_traffic else 0.0
-                line += f"   {_pad_left(f'{ratio:.1f}%', 6)}"
-            print(line)
+        _print_section("流量 (今日)")
+        _render_traffic_totals(traffic)
+        _render_process_traffic(_today_process_traffic(process_top))
+
     print()
     _print_section("路径")
-    print(f"原始配置: {snapshot.source_config}")
-    print(f"运行配置: {snapshot.runtime_config}")
-    if snapshot.pid:
-        print(f"PID: {snapshot.pid}")
+    path_rows = [
+        ("原始配置", _shorten_path(snapshot.source_config, _STATUS_PATH_WIDTH)),
+        ("运行配置", _shorten_path(snapshot.runtime_config, _STATUS_PATH_WIDTH)),
+    ]
+    # 仅当运行中的实例没有跟随最近一次 render 时才展示，避免重复一行同样内容
+    if snapshot.running_config and snapshot.running_config != snapshot.runtime_config:
+        path_rows.append(("实际配置", _shorten_path(snapshot.running_config, _STATUS_PATH_WIDTH)))
+    _render_kv(path_rows)
+
     if not snapshot.running and api_text == "可访问":
         print()
         _print_section("提示")
@@ -613,7 +705,7 @@ def _run_rollback(paths, name: str | None) -> int:
 
     target = restore_snapshot(paths, snapshot)
     kind = snapshot_kind(snapshot)
-    print(_section_title("结果"))
+    print(_section_heading("结果"))
     print(f"已恢复快照: {snapshot.name}")
     print(f"目标文件: {target}")
     if kind == "runtime":
@@ -750,8 +842,12 @@ def _pad_right(text: str, width: int) -> str:
     return text + " " * max(0, width - _display_width(text))
 
 
-def _traffic_bar(value: int, max_value: int) -> str:
-    """纯文本 ASCII 流量条（先 pad 后上色，保证宽度计算不受 ANSI 转义干扰）。"""
+def _traffic_bar(value: int, max_value: int, *, pad: bool = True) -> str:
+    """纯文本 ASCII 流量条（先 pad 后上色，保证宽度计算不受 ANSI 转义干扰）。
+
+    ``pad=False`` 用于流量条位于行尾的场景，避免留下行尾空白；
+    表格内需要靠它对齐后续列，保持默认的定宽填充。
+    """
     if max_value <= 0 or value <= 0:
         return ""
     ratio = min(1.0, value / max_value)
@@ -761,7 +857,9 @@ def _traffic_bar(value: int, max_value: int) -> str:
     if full < _TRAFFIC_BAR_WIDTH:
         frac_idx = min(len(_TRAFFIC_BAR_PARTIALS) - 1, int((scaled - full) * len(_TRAFFIC_BAR_PARTIALS)))
         partial = _TRAFFIC_BAR_PARTIALS[frac_idx]
-    bar = _pad_right("█" * full + partial, _TRAFFIC_BAR_WIDTH)
+    bar = "█" * full + partial
+    if pad:
+        bar = _pad_right(bar, _TRAFFIC_BAR_WIDTH)
     return _style(bar, ANSI_GREEN)
 
 
@@ -774,9 +872,163 @@ def _traffic_column_widths(rows: list, extra_headers: list[str]) -> tuple[int, i
     )
 
 
-def _process_display_label(label: str) -> str:
-    """人读进程标签：保留完整路径便于定位，仅剥离 /proc 的 " (deleted)" 标记。"""
-    return label.removesuffix(" (deleted)")
+def _process_display_label(label: str, *, width: int | None = None) -> str:
+    """人读进程标签：保留完整路径便于定位，仅剥离 /proc 的 " (deleted)" 标记。
+
+    传入 ``width`` 时改为紧凑显示（见 :func:`_shorten_path`），供 status 面板使用；
+    不传时维持“完整路径”语义，供 traffic 报表使用。
+    """
+    display = label.removesuffix(" (deleted)")
+    if width is None:
+        return display
+    return _shorten_path(display, width)
+
+
+# 压缩路径时跳过的“噪声”目录段：这些段对辨识进程几乎没有贡献，却极占宽度。
+_PATH_NOISE_SEGMENTS = frozenset(
+    {
+        "bin",
+        "build",
+        "dist",
+        "etc",
+        "lib",
+        "lib64",
+        "libexec",
+        "local",
+        # nvm / pipx 风格的 "versions/node/vX.Y.Z" 安装层级，对辨识进程无贡献
+        "node",
+        "node_modules",
+        "opt",
+        "sbin",
+        "share",
+        "site-packages",
+        "usr",
+        "vendor",
+        "versions",
+    }
+)
+# 版本号段与目标平台三元组段，例如 v22.23.1 / x86_64-unknown-linux-musl。
+_PATH_NOISE_RE = re.compile(r"^(?:v\d+(?:\.\d+)*|(?:x86_64|aarch64|arm64|i686|amd64)[\w.-]*)$")
+
+
+def _home_relative(text: str) -> str:
+    home = str(Path.home())
+    if not home or home == "/":
+        return text
+    if text == home:
+        return "~"
+    if text.startswith(home + "/"):
+        return "~" + text[len(home):]
+    return text
+
+
+def _is_noise_segment(segment: str) -> bool:
+    if not segment:
+        return True
+    return segment in _PATH_NOISE_SEGMENTS or bool(_PATH_NOISE_RE.match(segment))
+
+
+def _shorten_path(text: str, width: int) -> str:
+    """把超长路径压进 ``width`` 显示宽度，尽量保留有辨识度的尾段。
+
+    先做 ``$HOME`` → ``~``；仍超宽时从尾部回升段落，跳过噪声段
+    （``node_modules`` / ``bin`` / 版本号 / 平台三元组等），前缀 ``…/``。
+    """
+    if not text or text == "-":
+        return text
+
+    display = _home_relative(text)
+    if _display_width(display) <= width:
+        return display
+
+    parts = display.split("/")
+    if len(parts) <= 1:
+        return display
+
+    tail = [parts[-1]]
+    for segment in reversed(parts[1:-1]):
+        if _is_noise_segment(segment):
+            continue
+        candidate = "…/" + "/".join([segment, *tail])
+        if _display_width(candidate) > width:
+            break
+        tail.insert(0, segment)
+    return "…/" + "/".join(tail)
+
+
+def _format_uptime(seconds: int) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h {minutes:02d}m {secs:02d}s"
+
+
+def _proxy_ratio_label(ratio: float) -> str:
+    """进程代理占比：0% / 100% 不留小数，中间值保留一位。"""
+    if ratio <= 0:
+        return "0%"
+    if ratio >= 99.95:
+        return "100%"
+    return f"{ratio:.1f}%"
+
+
+# “标签  值”两列布局的间距（区块内标签列宽 = 最长标签 + 该间距）。
+_KV_GUTTER = 4
+
+
+def _render_kv(rows: list[tuple[str, str]]) -> None:
+    """按东亚宽度对齐输出「标签  值」两列；空值行自动跳过。"""
+    visible = [(label, value) for label, value in rows if value]
+    if not visible:
+        return
+    width = max(_display_width(label) for label, _ in visible) + _KV_GUTTER
+    for label, value in visible:
+        print(f"{_pad_right(label, width)}{value}")
+
+
+def _render_traffic_table(
+    rows: list,
+    label_of,
+    *,
+    header: str,
+    total: int,
+    extra_header: str | None = None,
+    extra_of=None,
+) -> None:
+    """渲染「占比 | [代理] | ↓下载 | ↑上传 | 流量条 | 标签」对齐表格。
+
+    ``total`` 是占比列的分母；``extra_header`` / ``extra_of`` 为可选附加列
+    （status 的“代理”占比列用它），不传则保持既有报表布局。
+    """
+    down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
+    # 表头与取值函数必须同时提供才启用附加列
+    extra_w = 0
+    if extra_header and extra_of:
+        extra_w = max(_display_width(extra_header), *(_display_width(extra_of(row)) for row in rows))
+    head = f"  {_pad_left('占比', 6)}"
+    if extra_w and extra_header:
+        head += f"  {_pad_left(extra_header, extra_w)}"
+    head += (
+        f"  {_pad_left('↓下载', down_w)}"
+        f"  {_pad_left('↑上传', up_w)}"
+        f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
+        f"  {header}"
+    )
+    print(_style(head, ANSI_BOLD))
+
+    dim_max = max((row.download + row.upload for row in rows), default=0)
+    for row in rows:
+        size = row.download + row.upload
+        pct = size / total * 100 if total else 0.0
+        line = f"  {_pad_left(f'{pct:.1f}%', 6)}"
+        if extra_w and extra_of:
+            line += f"  {_pad_left(extra_of(row), extra_w)}"
+        line += (
+            f"  {_pad_left(format_bytes(row.download), down_w)}"
+            f"  {_pad_left(format_bytes(row.upload), up_w)}"
+            f"  {_traffic_bar(size, dim_max)}"
+            f"  {label_of(row)}"
+        )
+        print(line)
 
 
 def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
@@ -796,6 +1048,7 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
 
     if action == "audit":
         audit = service.audit(days=days, top=top)
+        processes = service.process_breakdown(days=days, top=top)
         if raw:
             print(
                 f"TRAFFIC_AUDIT\tsince={audit['since']}\tuntil={audit['until']}"
@@ -804,8 +1057,12 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             )
             for row in audit["rows"]:
                 print(f"TRAFFIC_AUDIT_HOST\t{row.label}\tdown={row.download}\tup={row.upload}")
-            for row in audit.get("process_rows") or []:
-                print(f"TRAFFIC_AUDIT_PROCESS\t{row.label}\tdown={row.download}\tup={row.upload}")
+            # 注意 down/up 为全量口径；proxy_down/proxy_up 是其中走代理的部分
+            for row in processes.rows:
+                print(
+                    f"TRAFFIC_AUDIT_PROCESS\t{row.label}\tdown={row.download}\tup={row.upload}"
+                    f"\tproxy_down={row.proxy_download}\tproxy_up={row.proxy_upload}"
+                )
             return 0
         window = (
             f"{audit['since']}"
@@ -826,58 +1083,23 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             f"    直连: ↓{format_bytes(audit['direct_download'])} ↑{format_bytes(audit['direct_upload'])}"
         )
         rows = audit["rows"]
-        process_rows = audit.get("process_rows") or []
-        if not rows and not process_rows:
-            print("窗口内没有走代理的流量")
-            return 0
-        print()
         if rows:
-            print("仅代理流量, 按目标主机:")
-            down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
-            print(
-                _style(
-                    f"  {_pad_left('占比', 6)}"
-                    f"  {_pad_left('↓下载', down_w)}"
-                    f"  {_pad_left('↑上传', up_w)}"
-                    f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
-                    "  主机",
-                    ANSI_BOLD,
-                )
-            )
-            dim_max = max(row.download + row.upload for row in rows)
-            for row in rows:
-                pct = (row.download + row.upload) / proxy_all * 100 if proxy_all else 0.0
-                print(
-                    f"  {_pad_left(f'{pct:.1f}%', 6)}"
-                    f"  {_pad_left(format_bytes(row.download), down_w)}"
-                    f"  {_pad_left(format_bytes(row.upload), up_w)}"
-                    f"  {_traffic_bar(row.download + row.upload, dim_max)}"
-                    f"  {row.label}"
-                )
-        if process_rows:
             print()
-            print("仅代理流量, 按进程:")
-            down_w, up_w = _traffic_column_widths(process_rows, ["↓下载", "↑上传"])
-            print(
-                _style(
-                    f"  {_pad_left('占比', 6)}"
-                    f"  {_pad_left('↓下载', down_w)}"
-                    f"  {_pad_left('↑上传', up_w)}"
-                    f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
-                    "  进程",
-                    ANSI_BOLD,
-                )
+            print("仅代理流量, 按目标主机:")
+            _render_traffic_table(rows, lambda row: row.label, header="主机", total=proxy_all)
+        if processes.rows:
+            print()
+            print("按进程 (全量, 含代理占比):")
+            _render_traffic_table(
+                processes.rows,
+                lambda row: _process_display_label(row.label),
+                header="进程",
+                total=processes.total,
+                extra_header="代理",
+                extra_of=lambda row: _proxy_ratio_label(row.proxy_ratio),
             )
-            dim_max = max(row.download + row.upload for row in process_rows)
-            for row in process_rows:
-                pct = (row.download + row.upload) / proxy_all * 100 if proxy_all else 0.0
-                print(
-                    f"  {_pad_left(f'{pct:.1f}%', 6)}"
-                    f"  {_pad_left(format_bytes(row.download), down_w)}"
-                    f"  {_pad_left(format_bytes(row.upload), up_w)}"
-                    f"  {_traffic_bar(row.download + row.upload, dim_max)}"
-                    f"  {_process_display_label(row.label)}"
-                )
+        if not rows and not processes.rows:
+            print("窗口内没有走代理的流量")
         return 0
 
     report = service.report(days=days, dimension=by, top=top)
@@ -939,29 +1161,12 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         if not rows:
             print("  -")
             continue
-        down_w, up_w = _traffic_column_widths(rows, ["↓下载", "↑上传"])
-        label_title = _DIMENSION_LABEL_TITLES.get(dimension, dimension)
-        print(
-            _style(
-                f"  {_pad_left('占比', 6)}"
-                f"  {_pad_left('↓下载', down_w)}"
-                f"  {_pad_left('↑上传', up_w)}"
-                f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}"
-                f"  {label_title}",
-                ANSI_BOLD,
-            )
+        _render_traffic_table(
+            rows,
+            (lambda row: _process_display_label(row.label)) if dimension == "process" else (lambda row: row.label),
+            header=_DIMENSION_LABEL_TITLES.get(dimension, dimension),
+            total=total_all,
         )
-        dim_max = max(row.download + row.upload for row in rows)
-        for row in rows:
-            pct = (row.download + row.upload) / total_all * 100 if total_all else 0.0
-            label = _process_display_label(row.label) if dimension == "process" else row.label
-            print(
-                f"  {_pad_left(f'{pct:.1f}%', 6)}"
-                f"  {_pad_left(format_bytes(row.download), down_w)}"
-                f"  {_pad_left(format_bytes(row.upload), up_w)}"
-                f"  {_traffic_bar(row.download + row.upload, dim_max)}"
-                f"  {label}"
-            )
     return 0
 
 

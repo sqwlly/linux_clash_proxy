@@ -57,6 +57,9 @@ class StatusSnapshot:
     runtime_ready: bool
     running: bool
     pid: int | None
+    # 进程实际加载的运行配置（来自 ProcessOwner）。与 runtime_config 不同时
+    # 说明运行中的实例没有跟随最近一次 render，status 会单独提示。
+    running_config: str | None = None
 
 
 @dataclass(frozen=True)

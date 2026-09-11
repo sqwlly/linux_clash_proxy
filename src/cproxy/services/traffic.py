@@ -65,6 +65,40 @@ class TrafficRow:
 
 
 @dataclass(frozen=True)
+class ProcessTrafficRow:
+    """按进程聚合的全量流量，附代理/直连拆分，用于回答“流量消耗在哪些进程”。"""
+
+    label: str
+    download: int
+    upload: int
+    proxy_download: int
+    proxy_upload: int
+
+    @property
+    def total(self) -> int:
+        return self.download + self.upload
+
+    @property
+    def proxy_ratio(self) -> float:
+        if not self.total:
+            return 0.0
+        return (self.proxy_download + self.proxy_upload) / self.total * 100
+
+
+@dataclass(frozen=True)
+class ProcessTrafficReport:
+    """按进程流量报表。
+
+    ``total`` 是窗口内**所有进程**的合计，作为占比分母——不能用
+    ``traffic_samples`` 的合计代替：进程归因上线时间晚于样本表，
+    两者历史累计并不相等（实测差 ~24%），混用会让占比系统性低估。
+    """
+
+    rows: list[ProcessTrafficRow]
+    total: int
+
+
+@dataclass(frozen=True)
 class CollectResult:
     connections: int
     download_delta: int
@@ -84,6 +118,46 @@ def format_bytes(size: int | float) -> str:
             return f"{value:.2f} {unit}"
         value /= 1024
     return f"{value:.2f} TB"
+
+
+# 按进程聚合全量流量并拆出代理部分。不做 DIRECT 过滤：直连常占绝大多数，
+# 只统计代理会漏掉主要消耗方（“仅代理”视角改由 proxy_* 两列体现）。
+# grand_total 用窗口函数在同一次查询里取全量合计，作为占比分母（SQLite ≥ 3.25）。
+_PROCESS_BREAKDOWN_SQL = """
+SELECT process AS label,
+       SUM(download) AS download,
+       SUM(upload) AS upload,
+       SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN download ELSE 0 END) AS proxy_download,
+       SUM(CASE WHEN chain NOT LIKE '%DIRECT%' THEN upload ELSE 0 END) AS proxy_upload,
+       SUM(SUM(download) + SUM(upload)) OVER () AS grand_total
+FROM traffic_process_samples
+WHERE day >= ? AND day <= ?
+GROUP BY process
+ORDER BY (SUM(download) + SUM(upload)) DESC
+LIMIT ?
+"""
+
+
+def _process_breakdown(
+    db: sqlite3.Connection,
+    since: str,
+    until: str,
+    top: int,
+) -> ProcessTrafficReport:
+    rows = db.execute(_PROCESS_BREAKDOWN_SQL, (since, until, top)).fetchall()
+    return ProcessTrafficReport(
+        rows=[
+            ProcessTrafficRow(
+                label=str(row["label"]),
+                download=int(row["download"]),
+                upload=int(row["upload"]),
+                proxy_download=int(row["proxy_download"]),
+                proxy_upload=int(row["proxy_upload"]),
+            )
+            for row in rows
+        ],
+        total=int(rows[0]["grand_total"]) if rows else 0,
+    )
 
 
 def _conn_label(conn: dict[str, Any]) -> tuple[str, str, str]:
@@ -269,7 +343,11 @@ class TrafficService:
         days: int = 1,
         top: int = DEFAULT_TOP,
     ) -> dict[str, Any]:
-        """代理流量审计：区分走代理与直连的流量，并列出走代理的目标主机明细。"""
+        """代理流量审计：区分走代理与直连的流量，并列出走代理的目标主机明细。
+
+        进程维度不在这里返回——调用方改用 :meth:`process_breakdown`，其口径为
+        “全量 + 代理拆分”，与 status 面板一致。
+        """
         days = max(1, days)
         top = max(1, top)
         now = datetime.now().astimezone()
@@ -283,15 +361,6 @@ class TrafficService:
                 FROM traffic_samples
                 WHERE day >= ? AND day <= ? AND chain NOT LIKE '%DIRECT%'
                 GROUP BY host ORDER BY (SUM(download) + SUM(upload)) DESC LIMIT ?
-                """,
-                (since, until, top),
-            ).fetchall()
-            process_rows = db.execute(
-                """
-                SELECT process AS label, SUM(download) AS download, SUM(upload) AS upload
-                FROM traffic_process_samples
-                WHERE day >= ? AND day <= ? AND chain NOT LIKE '%DIRECT%'
-                GROUP BY process ORDER BY (SUM(download) + SUM(upload)) DESC LIMIT ?
                 """,
                 (since, until, top),
             ).fetchall()
@@ -319,11 +388,25 @@ class TrafficService:
                 TrafficRow(str(row["label"]), int(row["download"]), int(row["upload"]))
                 for row in rows
             ],
-            "process_rows": [
-                TrafficRow(str(row["label"]), int(row["download"]), int(row["upload"]))
-                for row in process_rows
-            ],
         }
+
+    def process_breakdown(
+        self,
+        days: int = 1,
+        top: int = DEFAULT_TOP,
+    ) -> ProcessTrafficReport:
+        """按进程聚合全量流量，并标注其中走代理的比例。
+
+        不过滤 DIRECT 链路：直连常占绝大多数（实测 ~92%），只看代理会漏掉主要消耗方。
+        """
+        days = max(1, days)
+        top = max(1, top)
+        now = datetime.now().astimezone()
+        since = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        until = now.strftime("%Y-%m-%d")
+
+        with closing(self._connect()) as db, db:
+            return _process_breakdown(db, since, until, top)
 
     def _dimension_rows(
         self,

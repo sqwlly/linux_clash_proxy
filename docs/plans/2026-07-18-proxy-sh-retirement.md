@@ -34,7 +34,7 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 
 | legacy 能力 | 位置 | cproxy 等价 | 结论 |
 |---|---|---|---|
-| 启动/停止/重启/状态 | `proxy.sh` | `cproxy start/stop/restart/status`（`backend/process.py`） | 已有等价 |
+| 启动/停止/重启/状态 | `proxy.sh` | `cproxy start/stop/restart/status`（`backend/process.py`） | 已有等价（见下） |
 | 无 GUI 节点切换 | `proxy.sh` | `cproxy switch` / TUI Proxies 页（`services/query.py`） | 已有等价 |
 | 命令级代理注入 | `proxy.sh` | `cproxy proxy-env/with-proxy/proxy-shell`（`proxyenv.py`） | 已有等价 |
 | 订阅更新 | `update_config.sh`、`clash-proxy-update` | `cproxy import-subscription/refresh`、TUI 订阅页（`services/refresh.py`） | 已有等价 |
@@ -45,6 +45,25 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 | 日志轮转 | `logrotate.conf.template`（legacy 段） | `scripts/install.sh` 的 cproxy 段（logrotate 配置） | 已有等价 |
 
 核对方式：逐项在新链路上演练，把结论列改为"已有等价 / 不再需要 / 需移植（附 issue 或提交）"。
+
+### 附录：「启动/停止/重启/状态」行的核对依据
+
+首次填写时该行结论为"已有等价"，但实际核对发现 `cproxy status` 缺失 `proxy.sh status`
+面板的五项展示能力，结论名不副实；已补齐（2026-09-11）。逐项对应关系：
+
+| `proxy.sh status` 字段 | 数据来源 | cproxy 等价 |
+|---|---|---|
+| `连接数` | `ss -tn \| grep ":$port"` | `APIBackend.get_connections()`（Mihomo `/connections`，比按端口数 TCP 更准） |
+| `运行时间` | `ps -o etimes= -p $pid` | `/proc/{pid}/stat` starttime + `/proc/uptime` |
+| `内存` | `ps -o rss= -p $pid` | `/proc/{pid}/status` 的 `VmRSS` |
+| `日志` | `du -h $LOG_FILE` | `log_file(paths).stat().st_size` |
+| `实际配置` | 对比运行中配置与 runtime | `ProcessOwner.runtime`（`process_meta_file`，仅在两者不一致时显示） |
+
+实现落在 `src/cproxy/backend/runtime_metrics.py`（纯 `/proc` 只读，不引入
+`ps`/`ss`/`du` 外部依赖）与 `src/cproxy/cli_render.py` 的 `_render_status()`；
+覆盖测试见 `tests/test_status_process_traffic.py`、`tests/test_runtime_and_process.py`。
+
+另：`cproxy status` 额外提供 `proxy.sh` 没有的「按进程」流量归因（全量 + 代理占比）。
 
 ## 分阶段步骤
 

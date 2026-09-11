@@ -79,11 +79,26 @@ def test_collect_credits_deltas_per_connection(tmp_path):
     assert process_rows["/usr/bin/python3"].download == 3000
     assert process_rows["/usr/bin/curl"].download == 800
 
-    # 审计的进程口径: 仅统计走代理的进程
+    # 进程口径为全量 + 代理拆分：直连进程同样在列，只是代理占比为 0，
+    # 否则占绝大多数的直连流量会整体不可见。
+    breakdown = service.process_breakdown(days=1)
+    processes = {row.label: row for row in breakdown.rows}
+    assert processes["/usr/bin/python3"].download == 3000
+    assert processes["/usr/bin/python3"].proxy_download == 3000
+    assert processes["/usr/bin/python3"].proxy_ratio == 100.0
+    assert processes["/usr/bin/curl"].download == 800
+    assert processes["/usr/bin/curl"].proxy_download == 0
+    assert processes["/usr/bin/curl"].proxy_ratio == 0.0
+    # 占比分母是进程表自身的全量合计（3000+150 + 800+80）
+    assert breakdown.total == 4030
+
+    # audit 不再返回进程维度，其职责收敛为“代理/直连总量 + 仅代理主机”
     audit = service.audit(days=1)
-    audit_processes = {row.label: row for row in audit["process_rows"]}
-    assert "/usr/bin/python3" in audit_processes
-    assert "/usr/bin/curl" not in audit_processes
+    assert "process_rows" not in audit
+    # other.com 走 DIRECT，因此只出现在直连总量里，不进“仅代理主机”明细
+    assert [row.label for row in audit["rows"]] == ["example.com"]
+    assert audit["proxy_download"] == 3000
+    assert audit["direct_download"] == 800
 
 
 def test_report_grouping_by_rule_host_and_day(tmp_path):

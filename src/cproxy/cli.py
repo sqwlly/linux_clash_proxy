@@ -25,6 +25,7 @@ from .cli_render import (
     _render_traffic,
     _run_bootstrap,
     _run_rollback,
+    _section_heading,
     _section_title,
 )
 from .config import default_paths
@@ -90,7 +91,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "logs":
             return _render_logs(args.lines, args.follow)
         if args.command == "status":
-            return _render_status(args.raw)
+            return _render_status(args.raw, 0 if args.no_process else args.top)
         if args.command == "test":
             return _render_connectivity_report(run_connectivity_test(default_paths()))
         if args.command == "security-check":
@@ -123,7 +124,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "switch":
             service = QueryService(default_paths())
             group = service.switch_group(args.group, args.target)
-            print(_section_title("结果"))
+            print(_section_heading("结果"))
             print(f"代理组: {args.group}")
             print(f"当前选择: {normalize_name(group.current)}")
             return 0
@@ -139,7 +140,7 @@ def run(argv: list[str] | None = None) -> int:
                 record_history=args.record_history,
                 show_progress=not args.raw,
             )
-            output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_title)
+            output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_heading)
             print("\n".join(output_lines))
             return exit_code
         if args.command == "shadow-probe":
@@ -154,7 +155,7 @@ def run(argv: list[str] | None = None) -> int:
                 record_history=True,
                 show_progress=not args.raw,
             )
-            output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_title)
+            output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_heading)
             print("\n".join(output_lines))
             return exit_code
         if args.command == "shadow-history":
@@ -175,7 +176,7 @@ def run(argv: list[str] | None = None) -> int:
                 switch=True,
                 show_progress=not args.raw,
             )
-            output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_title)
+            output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_heading)
             print("\n".join(output_lines))
             return exit_code
         if args.command == "traffic":

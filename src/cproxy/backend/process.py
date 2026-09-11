@@ -280,6 +280,7 @@ class ProcessBackend:
             pid = None
         if not running:
             pid = None
+        owner = self._read_process_owner() if running else None
         return StatusSnapshot(
             source_config=str(config_file(self.paths)),
             runtime_config=str(runtime_file(self.paths)),
@@ -288,4 +289,5 @@ class ProcessBackend:
             runtime_ready=runtime_file(self.paths).exists(),
             running=running,
             pid=pid,
+            running_config=owner.runtime if owner else None,
         )

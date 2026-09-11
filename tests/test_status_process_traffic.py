@@ -1,0 +1,226 @@
+"""`cproxy status` 的按进程流量归因、退役 parity 指标与路径压缩。"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+
+# codex 实测路径，用于验证“智能压缩保留辨识尾段”
+LONG_CODEX_PATH = (
+    "/root/versions/node/v22.23.1/lib/node_modules/@openai/.codex-qWKjdDCx"
+    "/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+)
+
+
+def _write_config(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\nexternal-controller: 127.0.0.1:19090\n",
+        encoding="utf-8",
+    )
+
+
+def _seed_today(tmp_path: Path, process_rows: list[tuple[str, str, int, int]]) -> None:
+    """写入今日流量样本。
+
+    ``process_rows`` 每项为 ``(process, chain, download, upload)``，同时按
+    host 维度写入 ``traffic_samples``，让 status 的流量区块有数据。
+    """
+    from cproxy.config import default_paths, traffic_db_file
+    from cproxy.services.traffic import _SCHEMA
+
+    paths = default_paths(tmp_path)
+    db_path = traffic_db_file(paths)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(_SCHEMA)
+        for index, (process, chain, download, upload) in enumerate(process_rows):
+            conn.execute(
+                "INSERT INTO traffic_process_samples VALUES (?,?,?,?,?,?)",
+                (today, "10", process, chain, download, upload),
+            )
+            conn.execute(
+                "INSERT INTO traffic_samples VALUES (?,?,?,?,?,?,?)",
+                (today, "10", chain, "Match", f"host{index}.example", download, upload),
+            )
+
+
+def _run_status(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC_DIR)
+    env["HOME"] = str(tmp_path)
+    env["CPROXY_COLOR"] = "never"
+    return subprocess.run(
+        [sys.executable, "-m", "cproxy.cli", "status", *args],
+        capture_output=True,
+        text=True,
+        cwd=ROOT_DIR,
+        env=env,
+    )
+
+
+# ---------------------------------------------------------------- 单元：路径压缩
+
+
+def test_shorten_path_keeps_home_relative_when_it_fits():
+    from cproxy.cli_render import _shorten_path
+
+    assert _shorten_path("/usr/bin/curl", 46) == "/usr/bin/curl"
+    assert _shorten_path(LONG_CODEX_PATH, 200).startswith("~/")
+
+
+def test_shorten_path_compresses_long_path_keeping_identifying_tail():
+    from cproxy.cli_render import _shorten_path
+
+    shortened = _shorten_path(LONG_CODEX_PATH, 46)
+    # 噪声段（versions/node/vX/lib/node_modules/vendor/平台三元组/bin）被跳过
+    for noise in ("node_modules", "vendor", "x86_64", "versions"):
+        assert noise not in shortened
+    # 保留最能区分进程的尾段
+    assert shortened.startswith("…/")
+    assert shortened.endswith("/codex")
+    assert "@openai" in shortened
+    assert len(shortened) <= 46
+
+
+def test_shorten_path_passes_through_non_paths():
+    from cproxy.cli_render import _shorten_path
+
+    assert _shorten_path("-", 46) == "-"
+    assert _shorten_path("", 46) == ""
+
+
+def test_process_display_label_is_full_path_without_width():
+    from cproxy.cli_render import _process_display_label
+
+    # 不传 width 时维持“完整路径 + 剥离 (deleted)”的既有语义
+    assert _process_display_label(f"{LONG_CODEX_PATH} (deleted)") == LONG_CODEX_PATH
+    assert _process_display_label(f"{LONG_CODEX_PATH} (deleted)", width=46).endswith("/codex")
+
+
+# ------------------------------------------------------------------ 单元：格式化
+
+
+def test_format_uptime_and_proxy_ratio_labels():
+    from cproxy.cli_render import _format_uptime, _proxy_ratio_label
+
+    assert _format_uptime(0) == "0h 00m 00s"
+    assert _format_uptime(7034) == "1h 57m 14s"
+    assert _format_uptime(-5) == "0h 00m 00s"
+    assert _proxy_ratio_label(0.0) == "0%"
+    assert _proxy_ratio_label(0.96) == "1.0%"
+    assert _proxy_ratio_label(100.0) == "100%"
+
+
+def test_render_kv_aligns_cjk_labels(capsys):
+    from cproxy.cli_render import _render_kv
+
+    _render_kv([("状态", "运行中"), ("运行配置", "已就绪")])
+    out = capsys.readouterr().out.splitlines()
+    # 值列起点一致：最长标签（8 显示列）+ 间距 4 = 12
+    assert out[0] == "状态        运行中"
+    assert out[1] == "运行配置    已就绪"
+
+
+def test_render_kv_skips_empty_values(capsys):
+    from cproxy.cli_render import _render_kv
+
+    _render_kv([("连接数", ""), ("日志", "")])
+    assert capsys.readouterr().out == ""
+
+
+# -------------------------------------------------------------- 单元：运行时指标
+
+
+def test_runtime_metrics_missing_pid_yields_none(tmp_path):
+    from cproxy.backend.runtime_metrics import collect_runtime_metrics
+    from cproxy.config import default_paths
+
+    metrics = collect_runtime_metrics(default_paths(tmp_path), None)
+    assert metrics.uptime_seconds is None
+    assert metrics.memory_bytes is None
+
+
+def test_runtime_metrics_self_process_is_readable(tmp_path):
+    from cproxy.backend.runtime_metrics import collect_runtime_metrics
+    from cproxy.config import default_paths
+
+    metrics = collect_runtime_metrics(default_paths(tmp_path), os.getpid())
+    assert metrics.uptime_seconds is not None and metrics.uptime_seconds >= 0
+    assert metrics.memory_bytes is not None and metrics.memory_bytes > 0
+
+
+# ------------------------------------------------------------ 端到端：status 面板
+
+
+def test_status_shows_per_process_traffic_with_proxy_ratio(tmp_path: Path):
+    _write_config(tmp_path)
+    _seed_today(
+        tmp_path,
+        [
+            ("/usr/bin/curl", "DIRECT", 800, 80),
+            ("/usr/bin/python3", "AI-MANUAL -> Node1", 3000, 150),
+            (LONG_CODEX_PATH, "AI-MANUAL -> Node1", 100, 100),
+        ],
+    )
+
+    result = _run_status(tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    out = result.stdout
+    assert "进程 Top 3" in out
+    assert "代理" in out
+    # 全量口径：直连进程同样在列
+    assert "/usr/bin/curl" in out
+    assert "/usr/bin/python3" in out
+    # 代理占比：curl 全直连，python3 全代理
+    assert "0%" in out
+    assert "100%" in out
+    # 超长路径被压缩后展示
+    assert LONG_CODEX_PATH not in out
+    assert "…/@openai/codex-linux-x64/codex" in out
+
+
+def test_status_no_process_hides_process_table(tmp_path: Path):
+    _write_config(tmp_path)
+    _seed_today(tmp_path, [("/usr/bin/curl", "DIRECT", 800, 80)])
+
+    assert "进程 Top" in _run_status(tmp_path).stdout
+    hidden = _run_status(tmp_path, "--no-process").stdout
+    assert "进程 Top" not in hidden
+    # 汇总区块仍在
+    assert "今日总量" in hidden
+
+
+def test_status_top_limits_process_rows(tmp_path: Path):
+    _write_config(tmp_path)
+    _seed_today(
+        tmp_path,
+        [
+            ("/usr/bin/curl", "DIRECT", 9000, 900),
+            ("/usr/bin/python3", "AI-MANUAL", 3000, 150),
+            ("/usr/bin/awk", "DIRECT", 100, 10),
+        ],
+    )
+
+    out = _run_status(tmp_path, "--top", "2").stdout
+    assert "进程 Top 2" in out
+    assert "/usr/bin/curl" in out
+    assert "/usr/bin/awk" not in out
+
+
+def test_status_paths_are_home_relative(tmp_path: Path):
+    _write_config(tmp_path)
+    result = _run_status(tmp_path)
+    assert "~/." in result.stdout
+    assert str(tmp_path) not in result.stdout

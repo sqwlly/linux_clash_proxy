@@ -120,7 +120,7 @@ sudo ./scripts/install-system-commands.sh --with-cproxy-alias
 
 注意：`cproxy status` 属于用户级 XDG 入口，使用 `~/.config/cproxy` 和
 `~/.local/share/cproxy`。如果未初始化用户级 runtime，它会显示
-`运行配置状态: 待刷新`，这不代表 root 生产入口不可用。生产排障优先使用
+`运行配置    待刷新`，这不代表 root 生产入口不可用。生产排障优先使用
 `clash-proxy status` 或在仓库根目录运行 `./proxy.sh status`。
 
 ## 初始化
@@ -346,6 +346,7 @@ cproxy migrate-from-legacy /root/clash_proxy
 
 - `摘要`
 - `资源`
+- `流量`
 - `路径`
 - `连通性`
 - `链路`
@@ -355,6 +356,17 @@ cproxy migrate-from-legacy /root/clash_proxy
 - `结果`
 
 其中不同命令只显示自己需要的区块，`--raw` 保持原始稳定格式。
+开启图标时（`CPROXY_ICONS=1` 或配置 `output-icons: true`）区块标题带 `▸` 前缀。
+
+`status` 的 `流量` 区块除今日总量/代理/直连外，还给出「按进程」明细：
+
+- 默认显示前 5 个进程，`--top N` 调整，`--no-process` 关闭
+- 每行包含全量 ↓/↑、占总流量比例、以及其中走代理的比例
+- 进程路径按需压缩（`$HOME` → `~`，超长时跳过 `node_modules`/`bin`/版本号等
+  噪声段、保留辨识尾段并前缀 `…/`）
+
+`status` 的 `资源` 区块展示 `连接数`/`运行时间`/`内存`/`日志`，
+其中后三项来自本机 `/proc` 只读采集，取不到时该行自动省略（不影响其余输出）。
 
 着色规则：
 

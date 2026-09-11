@@ -143,6 +143,17 @@ def build_root_parser() -> ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show current status")
     status_parser.add_argument("--raw", action="store_true")
+    status_parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="按进程流量明细的行数（0 表示不显示，默认 5）",
+    )
+    status_parser.add_argument(
+        "--no-process",
+        action="store_true",
+        help="不显示按进程流量明细（等价 --top 0）",
+    )
     subparsers.add_parser("start", help="Start proxy process")
     subparsers.add_parser("stop", help="Stop proxy process")
     subparsers.add_parser("restart", help="Restart proxy process")

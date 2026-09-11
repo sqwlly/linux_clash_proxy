@@ -13,6 +13,7 @@
 
 ## 最近里程碑
 
+- 2026-09-11 `cproxy status` 面板产品化与退役 parity 补齐：`◆`/`▸` 区块（与 proxy.sh 视觉统一）、键值列东亚宽度对齐、长路径压缩；新增「按进程」流量归因（全量 + 代理占比，`--top`/`--no-process`）；补齐 `连接数/运行时间/内存/日志/实际配置` 五项 proxy.sh 面板指标（新增 `backend/runtime_metrics.py`，纯 `/proc` 只读）；`traffic audit` 进程口径同步改全量+占比；`--raw` 输出逐字不变。功能对账表「启动/停止/重启/状态」行的"已有等价"结论此前与实际不符，已补齐并附核对依据
 - 2026-09-11 渲染规则加固：AI-MANUAL 覆盖扩展、注入规则前移防订阅遮蔽、有害订阅规则清理（裸 GEOIP/safebrowsing/cursor.sh）、大流量下载源直连；流量统计升级（对齐条形图报表、`traffic audit`、进程维度归因 with `find-process-mode: always`、status 今日流量摘要、30s 采集间隔）
 - 2026-09-11 阶段 2 切换：cproxy 用户级服务接管生产，修正 `systemd-user/cproxy.service` PIDFile 与实现一致
 
