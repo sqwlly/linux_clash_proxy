@@ -135,6 +135,15 @@ def test_chain_split_columns_render_proxy_and_direct_separately():
     }
 
 
+def test_render_traffic_table_tolerates_empty_rows(capsys):
+    """空行集不应崩溃——列宽计算必须能退化为仅表头宽度。"""
+    from cproxy.cli_render import _render_traffic_table, _total_size_columns
+
+    _render_traffic_table([], lambda row: row.label, header="主机", columns=_total_size_columns(), total=0)
+    out = capsys.readouterr().out
+    assert "↓下载" in out and "↑上传" in out and "主机" in out
+
+
 def test_render_kv_aligns_cjk_labels(capsys):
     from cproxy.cli_render import _render_kv
 

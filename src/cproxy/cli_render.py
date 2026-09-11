@@ -521,7 +521,8 @@ def _render_status(raw: bool, process_top: int = _STATUS_PROCESS_TOP) -> int:
     print()
     _print_section("资源")
     metrics = collect_runtime_metrics(paths, snapshot.pid)
-    connections = _connection_count()
+    # API 已知不可达时不再试一次——否则白白多等一个 api-timeout（默认 2s）
+    connections = _connection_count() if api_text == "可访问" else None
     _render_kv(
         [
             ("代理端口", snapshot.port),
@@ -1014,7 +1015,7 @@ def _render_traffic_table(
     「代理↓ / 代理↑ / 直连↓ / 直连↑」这类按链路拆分的列。``total`` 是占比列分母。
     """
     widths = [
-        max(_display_width(title), *(_display_width(value_of(row)) for row in rows))
+        max([_display_width(title), *(_display_width(value_of(row)) for row in rows)])
         for title, value_of in columns
     ]
     head = f"  {_pad_left('占比', 6)}" + "".join(
