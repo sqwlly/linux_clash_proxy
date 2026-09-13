@@ -153,6 +153,37 @@ def test_preserve_drops_stale_panel_info_nodes():
     assert "剩余流量：160.9 GB" not in cyber["proxies"], "组内也不应回插旧信息节点"
 
 
+def test_preserve_local_only_groups_and_references():
+    """本地附加分组（多订阅机场组）应整体保留，且主订阅同名组里挂的
+    分组引用（如 CyberGuard 里的 "Mitce" 入口）按原位置插回。"""
+    merged = subscription_payload()
+    existing = {
+        "proxies": [
+            {"name": "🇭🇰香港 01", "type": "ss", "server": "1.2.3.4", "port": 8388},
+            {"name": "Mitce HK-1", "type": "hysteria2", "server": "hk1.example.com", "port": 20272, "password": "x"},
+        ],
+        "proxy-groups": [
+            {
+                "name": "CyberGuard",
+                "type": "select",
+                "proxies": ["🇭🇰香港 01", "自动选择", "Mitce"],
+            },
+            {"name": "Mitce-HK", "type": "url-test", "proxies": ["Mitce HK-1"],
+             "url": "https://cp.cloudflare.com/generate_204", "interval": 300},
+            {"name": "Mitce", "type": "select", "proxies": ["Mitce-HK"]},
+        ],
+    }
+
+    _preserve_local_extra_proxies(merged, existing)
+
+    group_names = [g["name"] for g in merged["proxy-groups"]]
+    assert "Mitce" in group_names and "Mitce-HK" in group_names, "本地附加分组应整体保留"
+    cyber = merged["proxy-groups"][0]
+    assert cyber["proxies"] == ["🇭🇰香港 01", "自动选择", "Mitce"], "主订阅组里的附加入口应按原位置保留"
+    names = [p["name"] for p in merged["proxies"]]
+    assert "Mitce HK-1" in names, "附加分组引用的节点也应保留"
+
+
 def test_update_source_keeps_local_extra_proxy(tmp_path):
     paths = make_paths(tmp_path)
     write_config(

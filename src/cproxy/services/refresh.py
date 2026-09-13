@@ -13,11 +13,17 @@ from .. import __version__
 from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import GroupCheckReport
 from ..backend.process import ProcessBackend
-from ..backend.runtime import RuntimeBackend
+from ..backend.runtime import TEST_URL, RuntimeBackend
 from ..config import AppPaths, config_file, read_config, runtime_file
 from ..redaction import redact_text
 from ..snapshots import snapshot_file
 from .diagnostics import DiagnosticsService
+from .nodelist import (
+    REGION_LABELS,
+    SUBSCRIPTION_REGION_ORDER,
+    match_region,
+    parse_subscription_payload,
+)
 from .query import QueryService
 
 SUBSCRIPTION_MAX_BYTES = 4 * 1024 * 1024
@@ -59,6 +65,7 @@ LOCAL_PREFERRED_KEYS = {
     "ai-chatgpt-url",
     "ai-openai-api-url",
     "refresh-groups",
+    "subscriptions",
     "profile",
 }
 
@@ -76,6 +83,7 @@ class GroupSwitchResult:
 class RefreshReport:
     subscription: str
     subscription_detail: str = ""
+    extra_subscriptions: list[ExtraSubscriptionResult] = field(default_factory=list)
     runtime_path: Path | None = None
     was_running: bool = False
     restarted: bool = False
@@ -130,9 +138,12 @@ def _is_panel_info_node(name: str) -> bool:
 
 
 def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
-    """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加节点：
-    节点追加进 merged["proxies"]，并在同名组中按本地原有位置插回这些成员，
-    防止每日订阅更新冲掉自建节点或改变其在 fallback 组中的优先级。
+    """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加内容：
+    - 附加节点：追加进 merged["proxies"]，并在同名组中按本地原有位置插回，
+      防止每日订阅更新冲掉自建节点或改变其在 fallback 组中的优先级。
+    - 附加分组：本地存在而订阅未提供的分组（自建分组、多订阅机场分组）
+      整体追加到组列表末尾，其名称同样按本地位置插回同名组，保证主订阅
+      组里挂的附加机场入口（如 "Mitce"）不随订阅更新丢失。
     面板信息节点（名字随流量/到期日变化）不视为自建节点，任其随订阅更替。"""
     local_proxies = [proxy for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
     merged_names = {
@@ -145,13 +156,34 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         if name not in merged_names and not _is_panel_info_node(name):
             extra_proxies.append(proxy)
             extra_names.add(name)
-    if not extra_proxies:
+
+    merged_group_names = {
+        str(group.get("name"))
+        for group in merged.get("proxy-groups") or []
+        if isinstance(group, dict) and isinstance(group.get("name"), str)
+    }
+    extra_group_names: set[str] = set()
+    extra_groups: list = []
+    for group in existing.get("proxy-groups") or []:
+        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
+            continue
+        if group["name"] not in merged_group_names:
+            extra_groups.append(group)
+            extra_group_names.add(group["name"])
+
+    if not extra_proxies and not extra_groups:
         return
 
-    proxies: list = merged.get("proxies") or []
-    proxies.extend(extra_proxies)
-    merged["proxies"] = proxies
+    if extra_proxies:
+        proxies: list = merged.get("proxies") or []
+        proxies.extend(extra_proxies)
+        merged["proxies"] = proxies
+    if extra_groups:
+        groups: list = merged.get("proxy-groups") or []
+        groups.extend(extra_groups)
+        merged["proxy-groups"] = groups
 
+    member_extras = extra_names | extra_group_names
     local_group_members: dict[str, list] = {}
     for group in existing.get("proxy-groups") or []:
         if isinstance(group, dict) and isinstance(group.get("name"), str):
@@ -165,7 +197,7 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         group_members: list = group.get("proxies") or []
         for index, member in enumerate(members):
             name = str(member)
-            if name in extra_names and name not in group_members:
+            if name in member_extras and name not in group_members:
                 group_members.insert(min(index, len(group_members)), name)
         group["proxies"] = group_members
 
@@ -259,6 +291,126 @@ def _config_groups(value: object) -> list[str]:
     return []
 
 
+@dataclass
+class ExtraSubscriptionResult:
+    name: str
+    status: str
+    detail: str = ""
+
+
+def _extra_subscriptions_from_config(config: dict) -> list[tuple[str, str]]:
+    """读取 subscriptions 列表（附加机场订阅），返回 (名称, URL) 列表。"""
+    subs = config.get("subscriptions")
+    if not isinstance(subs, list):
+        return []
+    entries: list[tuple[str, str]] = []
+    for item in subs:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if name and url:
+            entries.append((name, url))
+    return entries
+
+
+def _subscription_region_groups(sub_name: str, proxies: list) -> list:
+    """为一家附加订阅生成分组：每个地区一个 url-test 组，外加一个以订阅名
+    命名的 select 入口组。订阅名保留 `{name}` / `{name}-*` 分组命名空间。"""
+    buckets: dict[str, list[str]] = {}
+    for proxy in proxies:
+        if isinstance(proxy, dict) and proxy.get("name"):
+            buckets.setdefault(match_region(str(proxy["name"])), []).append(str(proxy["name"]))
+    groups: list = []
+    entry_members: list[str] = []
+    for region in SUBSCRIPTION_REGION_ORDER:
+        members = buckets.get(region)
+        if not members:
+            continue
+        label = REGION_LABELS.get(region, region)
+        entry_members.append(f"{sub_name}-{label}")
+        groups.append(
+            {
+                "name": f"{sub_name}-{label}",
+                "type": "url-test",
+                "proxies": members,
+                "url": TEST_URL,
+                "interval": 300,
+            }
+        )
+    if entry_members:
+        groups.append({"name": sub_name, "type": "select", "proxies": entry_members})
+    return groups
+
+
+def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
+    """更新 subscriptions 列表中的附加机场订阅：下载并解析（Clash YAML 或
+    base64 分享链接 nodelist 均可），节点按 `{订阅名} ` 前缀重命名后并入
+    config，并重建该订阅的地区分组。先全部下载成功再落盘，单项下载失败时
+    保留该订阅原有节点与分组，不阻断其它订阅。"""
+    config = read_config(paths)
+    subs = _extra_subscriptions_from_config(config)
+    if not subs:
+        return []
+
+    results: list[ExtraSubscriptionResult] = []
+    downloaded: list[tuple[str, list]] = []
+    for name, url in subs:
+        try:
+            raw = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
+            data = parse_subscription_payload(raw)
+            valid_proxies = [
+                proxy
+                for proxy in data.get("proxies") or []
+                if isinstance(proxy, dict) and proxy.get("name") and not _is_panel_info_node(str(proxy["name"]))
+            ]
+            if not valid_proxies:
+                raise ValueError("错误: 订阅未返回任何节点")
+            downloaded.append((name, valid_proxies))
+            results.append(ExtraSubscriptionResult(name, "已更新", f"{len(valid_proxies)} 个节点"))
+        except Exception as exc:
+            results.append(ExtraSubscriptionResult(name, "失败", redact_text(str(exc))))
+    if not downloaded:
+        return results
+
+    sub_names = {name for name, _ in downloaded}
+    proxies: list = [
+        proxy
+        for proxy in config.get("proxies") or []
+        if not (
+            isinstance(proxy, dict)
+            and isinstance(proxy.get("name"), str)
+            and any(proxy["name"] == n or proxy["name"].startswith(f"{n} ") for n in sub_names)
+        )
+    ]
+    groups: list = [
+        group
+        for group in config.get("proxy-groups") or []
+        if not (
+            isinstance(group, dict)
+            and isinstance(group.get("name"), str)
+            and any(group["name"] == n or group["name"].startswith(f"{n}-") for n in sub_names)
+        )
+    ]
+    for name, sub_proxies in downloaded:
+        prefixed: list = []
+        for proxy in sub_proxies:
+            renamed = dict(proxy)
+            renamed["name"] = f"{name} {str(proxy['name'])}"
+            prefixed.append(renamed)
+        proxies.extend(prefixed)
+        groups.extend(_subscription_region_groups(name, prefixed))
+    config["proxies"] = proxies
+    config["proxy-groups"] = groups
+
+    path = config_file(paths)
+    snapshot_file(paths, path, "config")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=False)
+    return results
+
+
 class RefreshService:
     def __init__(self, paths: AppPaths):
         self.paths = paths
@@ -290,6 +442,11 @@ class RefreshService:
                     pass  # 等不到 API 时维持原行为（订阅走直连回退）
             except Exception:
                 pass  # 旧 runtime 也起不来时维持原行为（订阅走直连回退）
+        # 附加机场订阅（subscriptions 列表）先于主订阅应用：先落地各机场
+        # 分组，主订阅合并时才能把这些分组与其入口引用（如 CyberGuard 组里
+        # 挂的 "Mitce"）作为本地附加内容保留；单项失败保留旧节点不阻断
+        report.extra_subscriptions = apply_extra_subscriptions(self.paths)
+
         if url:
             try:
                 update_source_from_subscription(self.paths, url)

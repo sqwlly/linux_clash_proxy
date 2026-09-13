@@ -67,10 +67,11 @@ def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
     return hit and parts[-1] != ai_group
 
 # 当原始订阅没有提供标准区域组时，根据节点名称自动归纳生成。
+# 数字变体（\bJP\d 等）覆盖 "JP6-HY2" 这类机场命名，与 nodelist.REGION_PATTERNS 对齐。
 REGION_PATTERNS = {
-    AI_REGION_JP: (r"🇯🇵", r"Japan", r"日本", r"\bJP\b"),
-    AI_REGION_US: (r"🇺🇸", r"United States", r"美国", r"\bUS\b", r"\bUSA\b"),
-    AI_REGION_SG: (r"🇸🇬", r"Singapore", r"新加坡", r"\bSG\b"),
+    AI_REGION_JP: (r"🇯🇵", r"Japan", r"日本", r"\bJP\b", r"\bJP\d"),
+    AI_REGION_US: (r"🇺🇸", r"United States", r"美国", r"\bUS\b", r"\bUSA\b", r"\bUS\d"),
+    AI_REGION_SG: (r"🇸🇬", r"Singapore", r"新加坡", r"\bSG\b", r"\bSG\d"),
 }
 
 

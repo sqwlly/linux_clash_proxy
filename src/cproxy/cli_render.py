@@ -724,6 +724,8 @@ def _run_rollback(paths, name: str | None) -> int:
 def _render_refresh(report: RefreshReport, raw: bool) -> int:
     if raw:
         print(f"subscription={report.subscription} detail={report.subscription_detail}")
+        for extra in report.extra_subscriptions:
+            print(f"extra:{extra.name}={extra.status} detail={extra.detail}")
         print(f"runtime={report.runtime_path}")
         print(f"restarted={report.restarted} hot_reloaded={report.hot_reloaded}")
         for item in report.groups:
@@ -735,6 +737,11 @@ def _render_refresh(report: RefreshReport, raw: bool) -> int:
     if report.subscription_detail:
         subscription_label = f"{subscription_label}  {report.subscription_detail}"
     print(f"订阅更新: {subscription_label}")
+    for extra in report.extra_subscriptions:
+        extra_label = extra.status
+        if extra.detail:
+            extra_label = f"{extra_label}  {extra.detail}"
+        print(f"附加订阅 {extra.name}: {extra_label}")
     print(f"运行配置: {report.runtime_path}")
     if report.restarted:
         print("代理: 已重启应用新配置（连接已中断）")
