@@ -118,6 +118,43 @@ def test_traffic_bar_reserves_width_for_zero_value_rows():
     assert _traffic_bar(0, 100, pad=False) == ""
 
 
+def test_chain_traffic_bar_splits_by_proxy_ratio(monkeypatch):
+    """双色流量条：条宽按总量、绿段长度按代理占比，0 字节保持占位契约。"""
+    import re
+
+    from cproxy.cli_render import ANSI_GREEN, ANSI_RESET, ANSI_YELLOW, _TRAFFIC_BAR_WIDTH, _chain_traffic_bar
+
+    monkeypatch.setenv("CPROXY_COLOR", "always")
+    # total=max → 满宽条；proxy:direct=3:1 → 绿 15 格、黄 5 格
+    bar = _chain_traffic_bar(300, 100, 400)
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", bar)
+    assert plain == "█" * _TRAFFIC_BAR_WIDTH
+    assert f"{ANSI_GREEN}{'█' * 15}{ANSI_RESET}" in bar
+    assert f"{ANSI_YELLOW}{'█' * 5}{ANSI_RESET}" in bar
+    # 纯代理/纯直连退化为单色整条
+    assert ANSI_YELLOW not in _chain_traffic_bar(400, 0, 400)
+    assert ANSI_GREEN not in _chain_traffic_bar(0, 400, 400)
+    # 0 字节占位与 pad=False 契约
+    assert _chain_traffic_bar(0, 0, 400) == " " * _TRAFFIC_BAR_WIDTH
+    assert _chain_traffic_bar(0, 0, 400, pad=False) == ""
+
+
+def test_process_table_uses_chain_split_bar(monkeypatch, capsys):
+    """按进程表的「流量」列用双色条：同一条内绿段=代理、黄段=直连。"""
+    from cproxy.cli_render import ANSI_GREEN, ANSI_YELLOW, _chain_split_columns, _process_row_bar, _render_traffic_table
+    from cproxy.services.traffic import ProcessTrafficRow
+
+    monkeypatch.setenv("CPROXY_COLOR", "always")
+    row = ProcessTrafficRow(label="/usr/bin/x", download=1000, upload=0, proxy_download=250, proxy_upload=0)
+    _render_traffic_table(
+        [row], lambda r: r.label, header="进程", columns=_chain_split_columns(), total=1000, bar_of=_process_row_bar
+    )
+    data_line = capsys.readouterr().out.splitlines()[1]
+    assert ANSI_GREEN in data_line and ANSI_YELLOW in data_line
+    # 绿段在前（代理），黄段紧随（直连）：250B 代理 + 750B 直连
+    assert data_line.index(ANSI_GREEN) < data_line.index(ANSI_YELLOW)
+
+
 def test_process_display_label_is_full_path_without_width():
     from cproxy.cli_render import _process_display_label
 
@@ -138,19 +175,84 @@ def test_format_uptime():
 
 
 def test_chain_split_columns_render_proxy_and_direct_separately():
-    from cproxy.cli_render import _chain_split_columns
+    from cproxy.cli_render import ANSI_CYAN, ANSI_GREEN, ANSI_MAGENTA, ANSI_YELLOW, _chain_split_columns
     from cproxy.services.traffic import ProcessTrafficRow
 
     row = ProcessTrafficRow(
         label="/usr/bin/x", download=1000, upload=200, proxy_download=300, proxy_upload=40
     )
-    rendered = {title: value_of(row) for title, value_of in _chain_split_columns()}
+    rendered = {title: value_of(row) for title, value_of, _ in _chain_split_columns()}
     assert rendered == {
         "代理↓": "300 B",
         "代理↑": "40 B",
         "直连↓": "700 B",
         "直连↑": "160 B",
     }
+    # 链路着色契约：代理绿/青、直连黄/洋红，表头即图例
+    colors = {title: color for title, _, color in _chain_split_columns()}
+    assert colors == {
+        "代理↓": ANSI_GREEN,
+        "代理↑": ANSI_CYAN,
+        "直连↓": ANSI_YELLOW,
+        "直连↑": ANSI_MAGENTA,
+    }
+
+
+def test_traffic_renders_chain_colors(monkeypatch, capsys):
+    """代理与直连用不同颜色区分：直连行数字黄/洋红、条形黄，代理行维持绿/青。"""
+    from cproxy.cli_render import (
+        ANSI_CYAN,
+        ANSI_GREEN,
+        ANSI_MAGENTA,
+        ANSI_RESET,
+        ANSI_YELLOW,
+        _render_traffic_totals,
+    )
+
+    monkeypatch.setenv("CPROXY_COLOR", "always")
+    traffic = {
+        "proxy_download": 1000,
+        "proxy_upload": 100,
+        "direct_download": 3000,
+        "direct_upload": 300,
+    }
+    _render_traffic_totals(traffic)
+    lines = capsys.readouterr().out.splitlines()
+    proxy_line = next(line for line in lines if line.startswith("代理"))
+    direct_line = next(line for line in lines if line.startswith("直连"))
+    assert ANSI_GREEN in proxy_line and ANSI_CYAN in proxy_line
+    assert ANSI_YELLOW not in proxy_line and ANSI_MAGENTA not in proxy_line
+    assert ANSI_YELLOW in direct_line and ANSI_MAGENTA in direct_line
+    # 直连流量条也用黄色（与该行链路色一致），而不是默认绿
+    assert ANSI_YELLOW + "█" in direct_line.replace(ANSI_RESET, "")
+    assert ANSI_GREEN + "█" not in direct_line.replace(ANSI_RESET, "")
+
+
+def test_traffic_table_colors_column_headers_as_legend(monkeypatch, capsys):
+    """进程表表头单元格带链路色（加粗），数值同色——列色即图例且对齐不受 ANSI 干扰。"""
+    from cproxy.cli_render import (
+        ANSI_CYAN,
+        ANSI_GREEN,
+        ANSI_MAGENTA,
+        ANSI_YELLOW,
+        _chain_split_columns,
+        _render_traffic_table,
+    )
+    from cproxy.services.traffic import ProcessTrafficRow
+
+    monkeypatch.setenv("CPROXY_COLOR", "always")
+    row = ProcessTrafficRow(
+        label="/usr/bin/x", download=1000, upload=200, proxy_download=300, proxy_upload=40
+    )
+    _render_traffic_table(
+        [row], lambda r: r.label, header="进程", columns=_chain_split_columns(), total=1300
+    )
+    lines = capsys.readouterr().out.splitlines()
+    # 表头与数据行都带全套链路色：代理绿/青、直连黄/洋红
+    for line in (lines[0], lines[1]):
+        assert ANSI_GREEN in line and ANSI_CYAN in line
+        assert ANSI_YELLOW in line and ANSI_MAGENTA in line
+    assert lines[0].index("代理↓") < lines[0].index("直连↓")
 
 
 def test_render_traffic_table_tolerates_empty_rows(capsys):

@@ -38,6 +38,7 @@ ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
 ANSI_RED = "\033[31m"
 ANSI_CYAN = "\033[36m"
+ANSI_MAGENTA = "\033[35m"
 
 POSITIVE_STATUSES = {"正常", "运行中", "可访问", "已就绪"}
 WARNING_STATUSES = {"部分异常", "待刷新", "未知"}
@@ -419,16 +420,23 @@ def _connection_count(paths) -> int | None:
 
 
 def _render_traffic_totals(traffic: dict) -> None:
-    """今日总量 / 代理 / 直连三行；代理与直连带占比与流量条。"""
+    """今日总量 / 代理 / 直连三行；代理与直连带占比与流量条。
+
+    链路着色：代理 ↓绿/↑青，直连 ↓黄/↑洋红（与四列进程表的列色一致），
+    一眼区分谁走代理、谁在直连。
+    """
     total_down = traffic["proxy_download"] + traffic["direct_download"]
     total_up = traffic["proxy_upload"] + traffic["direct_upload"]
     proxy_all = traffic["proxy_download"] + traffic["proxy_upload"]
     direct_all = traffic["direct_download"] + traffic["direct_upload"]
     all_traffic = proxy_all + direct_all
+    # (标签, ↓, ↑, 占比分子|None, ↓色, ↑色, 条形色)
+    # 条形色与行链路一致：代理行绿条（长度=代理占比）、直连行黄条（长度=直连占比），
+    # 与按进程表的双色条（同一条内绿黄分段）语义不同，不可混用 _chain_traffic_bar
     rows = [
-        ("今日总量", total_down, total_up, None),
-        ("代理", traffic["proxy_download"], traffic["proxy_upload"], proxy_all),
-        ("直连", traffic["direct_download"], traffic["direct_upload"], direct_all),
+        ("今日总量", total_down, total_up, None, ANSI_GREEN, ANSI_CYAN, ANSI_GREEN),
+        ("代理", traffic["proxy_download"], traffic["proxy_upload"], proxy_all, ANSI_GREEN, ANSI_CYAN, ANSI_GREEN),
+        ("直连", traffic["direct_download"], traffic["direct_upload"], direct_all, ANSI_YELLOW, ANSI_MAGENTA, ANSI_YELLOW),
     ]
     label_width = max(_display_width(row[0]) for row in rows) + _KV_GUTTER
     down_w = max(_display_width("↓" + format_bytes(row[1])) for row in rows)
@@ -437,16 +445,16 @@ def _render_traffic_totals(traffic: dict) -> None:
         (_display_width(f"{row[3] / all_traffic * 100 if all_traffic else 0.0:.1f}%") for row in rows if row[3] is not None),
         default=0,
     )
-    for label, down, up, part in rows:
+    for label, down, up, part, down_color, up_color, bar_color in rows:
         line = (
             f"{_pad_right(label, label_width)}"
-            f"{_style(_pad_left('↓' + format_bytes(down), down_w), ANSI_GREEN)}"
-            f"  {_style(_pad_left('↑' + format_bytes(up), up_w), ANSI_CYAN)}"
+            f"{_style(_pad_left('↓' + format_bytes(down), down_w), down_color)}"
+            f"  {_style(_pad_left('↑' + format_bytes(up), up_w), up_color)}"
         )
         if part is not None:
             ratio = part / all_traffic * 100 if all_traffic else 0.0
             # 流量条位于行尾，不做定宽填充，避免行尾空白
-            line += f"   {_pad_left(f'{ratio:.1f}%', ratio_w)}  {_traffic_bar(part, all_traffic, pad=False)}"
+            line += f"   {_pad_left(f'{ratio:.1f}%', ratio_w)}  {_traffic_bar(part, all_traffic, pad=False, color=bar_color)}"
         print(line)
 
 
@@ -462,6 +470,7 @@ def _render_process_traffic(report: ProcessTrafficReport | None) -> None:
         header="进程",
         columns=_chain_split_columns(),
         total=report.total,
+        bar_of=_process_row_bar,
     )
 
 
@@ -851,11 +860,12 @@ def _pad_right(text: str, width: int) -> str:
     return text + " " * max(0, width - _display_width(text))
 
 
-def _traffic_bar(value: int, max_value: int, *, pad: bool = True) -> str:
+def _traffic_bar(value: int, max_value: int, *, pad: bool = True, color: str = ANSI_GREEN) -> str:
     """纯文本 ASCII 流量条（先 pad 后上色，保证宽度计算不受 ANSI 转义干扰）。
 
     ``pad=False`` 用于流量条位于行尾的场景，避免留下行尾空白；
     表格内需要靠它对齐后续列，保持默认的定宽填充。
+    ``color`` 供链路着色：代理流量条绿色、直连流量条黄色。
     """
     if max_value <= 0 or value <= 0:
         # 表格内需占位：返回空串会让该行标签左移一整个条形宽度、整表错位
@@ -870,7 +880,38 @@ def _traffic_bar(value: int, max_value: int, *, pad: bool = True) -> str:
     bar = "█" * full + partial
     if pad:
         bar = _pad_right(bar, _TRAFFIC_BAR_WIDTH)
-    return _style(bar, ANSI_GREEN)
+    return _style(bar, color)
+
+
+def _chain_traffic_bar(proxy: int, direct: int, max_value: int, *, pad: bool = True) -> str:
+    """双色流量条：绿段=代理、黄段=直连，条宽仍按总量占比。
+
+    与 `_traffic_bar` 相同的拼条/pad/0 字节占位契约；先拼纯文本条再按
+    代理比例切分上色，宽度计算不受 ANSI 转义干扰。
+    """
+    total = proxy + direct
+    if max_value <= 0 or total <= 0:
+        return _pad_right("", _TRAFFIC_BAR_WIDTH) if pad else ""
+    scaled = _TRAFFIC_BAR_WIDTH * min(1.0, total / max_value)
+    full = int(scaled)
+    partial = ""
+    if full < _TRAFFIC_BAR_WIDTH:
+        frac_idx = min(len(_TRAFFIC_BAR_PARTIALS) - 1, int((scaled - full) * len(_TRAFFIC_BAR_PARTIALS)))
+        partial = _TRAFFIC_BAR_PARTIALS[frac_idx]
+    bar = "█" * full + partial
+    split = int(_display_width(bar) * proxy / total)
+    segments = ((bar[:split], ANSI_GREEN), (bar[split:], ANSI_YELLOW))
+    colored = "".join(_style(seg, color) for seg, color in segments if seg)
+    if not pad:
+        return colored
+    return colored + " " * max(0, _TRAFFIC_BAR_WIDTH - _display_width(bar))
+
+
+def _process_row_bar(row, dim_max: int) -> str:
+    """按进程行流量条：绿段=代理、黄段=直连（条宽按该进程总量）。"""
+    proxy = row.proxy_download + row.proxy_upload
+    total = row.download + row.upload
+    return _chain_traffic_bar(proxy, total - proxy, dim_max)
 
 
 def _traffic_column_widths(rows: list, extra_headers: list[str]) -> tuple[int, int]:
@@ -999,25 +1040,26 @@ def _render_kv(rows: list[tuple[str, str]]) -> None:
         print(f"{_pad_right(label, width)}{value}")
 
 
-def _total_size_columns() -> list[tuple[str, Callable[[Any], str]]]:
-    """「↓下载 / ↑上传」两列：按上下行合计口径。"""
+def _total_size_columns() -> list[tuple[str, Callable[[Any], str], str]]:
+    """「↓下载 / ↑上传」两列：按上下行合计口径（方向色：↓绿/↑青）。"""
     return [
-        ("↓下载", lambda row: format_bytes(row.download)),
-        ("↑上传", lambda row: format_bytes(row.upload)),
+        ("↓下载", lambda row: format_bytes(row.download), ANSI_GREEN),
+        ("↑上传", lambda row: format_bytes(row.upload), ANSI_CYAN),
     ]
 
 
-def _chain_split_columns() -> list[tuple[str, Callable[[Any], str]]]:
-    """「代理↓ / 代理↑ / 直连↓ / 直连↑」四列：按链路拆分。
+def _chain_split_columns() -> list[tuple[str, Callable[[Any], str], str]]:
+    """「代理↓ / 代理↑ / 直连↓ / 直连↑」四列：按链路拆分并着色。
 
     比单个代理占比更直白——低代理占比的进程（如 0.1%）在百分比下几乎看不出量，
-    拆成字节后 0 B / 324 MB 的对比一目了然。
+    拆成字节后 0 B / 324 MB 的对比一目了然。链路用色相区分（代理绿/青，
+    直连黄/洋红），方向靠箭头：表头即图例。
     """
     return [
-        ("代理↓", lambda row: format_bytes(row.proxy_download)),
-        ("代理↑", lambda row: format_bytes(row.proxy_upload)),
-        ("直连↓", lambda row: format_bytes(row.download - row.proxy_download)),
-        ("直连↑", lambda row: format_bytes(row.upload - row.proxy_upload)),
+        ("代理↓", lambda row: format_bytes(row.proxy_download), ANSI_GREEN),
+        ("代理↑", lambda row: format_bytes(row.proxy_upload), ANSI_CYAN),
+        ("直连↓", lambda row: format_bytes(row.download - row.proxy_download), ANSI_YELLOW),
+        ("直连↑", lambda row: format_bytes(row.upload - row.proxy_upload), ANSI_MAGENTA),
     ]
 
 
@@ -1026,32 +1068,41 @@ def _render_traffic_table(
     label_of,
     *,
     header: str,
-    columns: list[tuple[str, Callable[[Any], str]]],
+    columns: list[tuple[str, Callable[[Any], str], str]],
     total: int,
+    bar_of: Callable[[Any, int], str] | None = None,
 ) -> None:
     """渲染「占比 | <数值列…> | 流量条 | 标签」对齐表格。
 
-    ``columns`` 是按顺序渲染的数值列 ``(表头, 取值函数)``，取值函数返回**已格式化**
-    的字符串——因此同一套排版既能渲染「↓下载 / ↑上传」，也能渲染
-    「代理↓ / 代理↑ / 直连↓ / 直连↑」这类按链路拆分的列。``total`` 是占比列分母。
+    ``columns`` 是按顺序渲染的数值列 ``(表头, 取值函数, 颜色)``，取值函数返回
+    **未着色**的格式化字符串——上色在 pad 之后进行，宽度计算不受 ANSI 转义
+    干扰；表头单元格带同色（加粗），兼作列色图例。因此同一套排版既能渲染
+    「↓下载 / ↑上传」，也能渲染「代理↓ / 代理↑ / 直连↓ / 直连↑」这类按链路
+    拆分的列。``total`` 是占比列分母。``bar_of(row, dim_max)`` 自定义流量条
+    （如按进程行的绿/黄双色条），缺省为总量的绿色单色条。
     """
     widths = [
         max([_display_width(title), *(_display_width(value_of(row)) for row in rows)])
-        for title, value_of in columns
+        for title, value_of, _ in columns
     ]
-    head = f"  {_pad_left('占比', 6)}" + "".join(
-        f"  {_pad_left(title, width)}" for (title, _), width in zip(columns, widths)
+    # 逐段独立加粗而非整行嵌套包一层：内层列色的 RESET 会截断外层加粗
+    head = _style(f"  {_pad_left('占比', 6)}", ANSI_BOLD) + "".join(
+        f"  {_style(_pad_left(title, width), ANSI_BOLD, color)}"
+        for (title, _, color), width in zip(columns, widths)
     )
-    print(_style(f"{head}  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}  {header}", ANSI_BOLD))
+    head += _style(f"  {_pad_right('流量', _TRAFFIC_BAR_WIDTH)}  {header}", ANSI_BOLD)
+    print(head)
 
     dim_max = max((row.download + row.upload for row in rows), default=0)
     for row in rows:
         size = row.download + row.upload
         pct = size / total * 100 if total else 0.0
         line = f"  {_pad_left(f'{pct:.1f}%', 6)}" + "".join(
-            f"  {_pad_left(value_of(row), width)}" for (_, value_of), width in zip(columns, widths)
+            f"  {_style(_pad_left(value_of(row), width), color)}"
+            for (_, value_of, color), width in zip(columns, widths)
         )
-        print(f"{line}  {_traffic_bar(size, dim_max)}  {label_of(row)}")
+        bar = bar_of(row, dim_max) if bar_of is not None else _traffic_bar(size, dim_max)
+        print(f"{line}  {bar}  {label_of(row)}")
 
 
 def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
@@ -1108,7 +1159,8 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
             f"代理: {_style('↓' + format_bytes(audit['proxy_download']), ANSI_GREEN)}"
             f" {_style('↑' + format_bytes(audit['proxy_upload']), ANSI_CYAN)}"
             f"  ({proxy_ratio:.1f}%)"
-            f"    直连: ↓{format_bytes(audit['direct_download'])} ↑{format_bytes(audit['direct_upload'])}"
+            f"    直连: {_style('↓' + format_bytes(audit['direct_download']), ANSI_YELLOW)}"
+            f" {_style('↑' + format_bytes(audit['direct_upload']), ANSI_MAGENTA)}"
         )
         rows = audit["rows"]
         if rows:
@@ -1130,6 +1182,7 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
                 header="进程",
                 columns=_chain_split_columns(),
                 total=processes.total,
+                bar_of=_process_row_bar,
             )
         if not rows and not processes.rows:
             print("窗口内没有走代理的流量")
