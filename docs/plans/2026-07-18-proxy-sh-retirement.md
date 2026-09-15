@@ -28,6 +28,20 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 3. `cproxy` 作为唯一操作入口连续运行 4 周，无 P0/P1 事故
 4. README / USAGE 已移除以 `proxy.sh` 为默认入口的描述
 
+### 当前状态（2026-09-15 核验）
+
+| Gate | 状态 |
+|---|---|
+| 1. acceptance 通过 | ⚠️ 已复跑：静态审计 0 failure、TUI 39 passed、后端 22 passed、运维与安装 dry-run 6/6、GA 产物 build+verify、本地 smoke 均通过。唯一未过项 `security-check --strict`（返回 1）属「环境未达 GA 配置」——本机未配 `external-controller-tls`，acceptance.md 已声明此类失败不代表仓库测试失败 |
+| 2. 功能对账表 | ✅ 9 行全部填「已有等价」 |
+| 3. 4 周无 P0/P1 | ⏳ 起算 2026-09-11，至 2026-10-09 |
+| 4. README / USAGE 改写 | ✅ 入口描述已以 cproxy 为准重写；legacy 侧保留为**带状态的对照表**而非使用说明 |
+
+另：`clash-proxy-refresh.path` 于 2026-09-15 停掉——它是阶段 2 的遗漏项（阶段 2 只
+`disable --now` 了 `clash-proxy.service`，未停这个独立 unit），此前持续监听
+`/root/clash_proxy/config.yaml` 并会在该文件变化时拉起 legacy 刷新流程。至此 legacy
+侧全部 unit 为 `inactive` + `disabled`，系统内无任何 legacy 组件在运行。
+
 ## 功能对账表
 
 退役前必须逐项核对并填写结论。legacy 侧待核对项：

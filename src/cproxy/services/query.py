@@ -15,9 +15,9 @@ class QueryService:
         self.api = APIBackend(paths)
         self.runtime = RuntimeBackend(paths)
 
-    def load_context(self, require_api: bool = False) -> QueryContext:
+    def load_context(self, require_api: bool = False, *, request_timeout: float | None = None) -> QueryContext:
         try:
-            groups = self.api.get_groups()
+            groups = self.api.get_groups(request_timeout=request_timeout)
             return QueryContext(groups=groups, api_available=True, runtime_available=False)
         except APIUnavailableError:
             if require_api:
@@ -25,8 +25,8 @@ class QueryService:
             groups = self.runtime.get_groups()
             return QueryContext(groups=groups, api_available=False, runtime_available=True)
 
-    def list_groups(self) -> list[ProxyGroup]:
-        context = self.load_context(require_api=False)
+    def list_groups(self, *, request_timeout: float | None = None) -> list[ProxyGroup]:
+        context = self.load_context(require_api=False, request_timeout=request_timeout)
         return list(context.groups.values())
 
     def get_group(self, name: str, require_api: bool = False) -> ProxyGroup:

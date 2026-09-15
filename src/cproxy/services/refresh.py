@@ -25,6 +25,7 @@ from .nodelist import (
     parse_subscription_payload,
 )
 from .query import QueryService
+from .subscription_info import MAIN_SUBSCRIPTION_KEY, record_subscription_info
 
 SUBSCRIPTION_MAX_BYTES = 4 * 1024 * 1024
 SUBSCRIPTION_TIMEOUT = 20
@@ -202,10 +203,11 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         group["proxies"] = group_members
 
 
-def _download_subscription(paths: AppPaths, url: str, timeout: int) -> bytes:
+def _download_subscription(paths: AppPaths, url: str, timeout: int) -> tuple[bytes, str | None]:
     """下载订阅内容：优先显式走本机代理（订阅域名常被墙且 timer 环境无代理
     环境变量），代理不可达时回退直连（适用于未被墙的订阅）。
-    代理已通但订阅站返回 HTTP 错误（4xx/5xx）时直接抛出，不做直连重试。"""
+    代理已通但订阅站返回 HTTP 错误（4xx/5xx）时直接抛出，不做直连重试。
+    返回 (订阅内容, subscription-userinfo 头)；头缺失时为 None。"""
     request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
     host = (urlparse(url).hostname or "").strip("[]").lower()
     loopback = host in ("127.0.0.1", "localhost", "::1")
@@ -218,21 +220,33 @@ def _download_subscription(paths: AppPaths, url: str, timeout: int) -> bytes:
         if loopback:
             # 本机地址（本地测试/镜像）无需经代理，直接请求
             with urlopen(request, timeout=timeout) as response:
-                return response.read(SUBSCRIPTION_MAX_BYTES + 1)
+                return _read_subscription_response(response)
         opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
         with opener.open(request, timeout=timeout) as response:
-            return response.read(SUBSCRIPTION_MAX_BYTES + 1)
+            return _read_subscription_response(response)
     except HTTPError:
         raise
     except OSError:
         # 本机代理未运行/不可达：回退默认行为（按环境变量或直连）
         with urlopen(request, timeout=timeout) as response:
-            return response.read(SUBSCRIPTION_MAX_BYTES + 1)
+            return _read_subscription_response(response)
+
+
+def _read_subscription_response(response: object) -> tuple[bytes, str | None]:
+    """读出订阅响应体与 ``subscription-userinfo`` 头（机场账户用量，可缺省）。"""
+    body = response.read(SUBSCRIPTION_MAX_BYTES + 1)
+    try:
+        userinfo = response.headers.get("subscription-userinfo")
+    except Exception:
+        userinfo = None
+    return body, userinfo
 
 
 def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SUBSCRIPTION_TIMEOUT) -> Path:
     """下载订阅并合并进原始配置；订阅内容覆盖节点/规则，本地环境键保留。"""
-    raw = _download_subscription(paths, url, timeout)
+    raw, userinfo = _download_subscription(paths, url, timeout)
+    # 用量头独立于订阅体有效性：即使后续大小检查/合并失败，新用量也值得记录
+    record_subscription_info(paths, MAIN_SUBSCRIPTION_KEY, userinfo)
     if len(raw) > SUBSCRIPTION_MAX_BYTES:
         raise RuntimeError("错误: 订阅内容超过大小限制")
 
@@ -357,7 +371,8 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
     downloaded: list[tuple[str, list]] = []
     for name, url in subs:
         try:
-            raw = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
+            raw, userinfo = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
+            record_subscription_info(paths, name, userinfo)
             data = parse_subscription_payload(raw)
             valid_proxies = [
                 proxy

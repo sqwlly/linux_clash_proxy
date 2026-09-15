@@ -2,7 +2,7 @@
 
 > 项目当前阶段、里程碑与下一步见 [STATUS.md](STATUS.md)。
 
-`cproxy` 是一个面向用户级安装的 Mihomo CLI，目标是替代当前仓库里默认绑定 `/root/clash_proxy` 的 `proxy.sh` 工作流。
+`cproxy` 是面向用户级安装的 Mihomo CLI，**已是本机生产入口**。旧的 `proxy.sh` 工作流已于 2026-09-11 停用（生产入口切换至 cproxy 用户级链路），遗留文件与 systemd unit 保留原地仅供回滚与对照——退役条件与进度见 [STATUS.md](STATUS.md) 与 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
 
 当前已经具备这些能力：
 
@@ -46,7 +46,7 @@ pipx install /path/to/clash_proxy
 - 回退到 `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
 - 安装 GeoIP 数据到默认路径：优先复用已有用户级文件和仓库根目录遗留的 `Country.mmdb`（该文件已不入库），缺失时尝试从 meta-rules-dat 下载，仍失败则打印手动放置警告
-- 刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；不会默认覆盖 `cproxy` alias
+- 刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；这两者是 **legacy 入口**（已停用待退役），不需要可设 `CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过。脚本不会默认覆盖 `cproxy` alias
 
 ## GeoIP 数据
 
@@ -173,18 +173,21 @@ cproxy proxy-shell
 cproxy proxy-shell -- -c 'env | rg "PROXY"'
 ```
 
-连通性检查：
+诊断与排障：
 
 ```bash
 cproxy test
 ```
 
-用户级 TUI：
+交互界面：
 
 ```bash
 cproxy tui
 cproxy-tui
+cproxy completion bash --install
 ```
+
+分组名与 `cproxy --help` 保持一致；完整命令清单见 `cproxy` 或 `cproxy --help`，shell 补全见 [USAGE.md](USAGE.md#shell-补全)。
 
 TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy 和 Logs；其中 Providers 可手动更新 `/providers/proxies`，Connections 可查看 `/connections` 并断开选中连接，断开全部连接需要二次确认。
 
@@ -292,13 +295,9 @@ ai-probe-timeout: 8
 
 ## 当前边界
 
-当前 Python CLI 还没有把旧仓库里的所有外围资产一起迁完，尤其是：
-
-- `proxy.sh` 仍保留在仓库内，便于对照和渐进迁移
-
-这不影响 `cproxy` 作为用户级 CLI 使用，但当前生产运行态不能只看
-`cproxy`。截至 2026-05-14，本机只读核验显示当前 active 的生产入口仍是
-root 级 `clash-proxy.service`，并由 `/root/clash_proxy/proxy.sh` 管理。
+`proxy.sh` 工作流已于 2026-09-11 停用；其文件与 systemd unit 保留原地供回滚对照，
+退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
+日常使用与排障只看 `cproxy` 即可。
 
 另外，`cproxy` 只管理自己启动的 mihomo 进程：
 
@@ -308,179 +307,101 @@ root 级 `clash-proxy.service`，并由 `/root/clash_proxy/proxy.sh` 管理。
 
 ## 生产入口识别
 
-当前仓库同时存在两套入口，排查运行态时必须先确认正在使用哪一套：
+生产入口是 **cproxy 用户级链路**：
 
-- root 级生产入口：`/etc/systemd/system/clash-proxy.service`
-- root 级管理脚本：`/root/clash_proxy/proxy.sh`
-- root 级运行配置：`/root/clash_proxy/runtime.yaml`
-- root 级 PID：`/root/clash_proxy/mihomo.pid`
-- root 级系统命令：`clash-proxy`、`clash-proxy-update`
-- 用户级 `cproxy` 入口：`systemd-user/cproxy.service`
-- 用户级 `cproxy` 路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
+- 用户级服务：`systemd-user/cproxy.service`
+- 用户级路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
+- 定时任务：`cproxy-subscription.timer`（每日订阅更新）、`cproxy-refresh.timer`（周期性重渲染）
 
-可用下面的一键脚本安装 root 级系统命令：
+legacy 侧（已停用，保留待退役，**不要**再作为入口使用）：
 
-```bash
-sudo ./scripts/install-system-commands.sh
-```
+| 组件 | 位置 | 当前状态 |
+|---|---|---|
+| `clash-proxy.service` | `/etc/systemd/system/` | `inactive` + `disabled` |
+| `clash-proxy-refresh.path` / `.timer` / `.service` | `/etc/systemd/system/` | `inactive` + `disabled`（`.path` 的监听已于 2026-09-15 停掉） |
+| `clash-proxy-subscription.timer` / `.service` | `/etc/systemd/system/` | `inactive` + `disabled` |
+| `clash-proxy`、`clash-proxy-update` | `/usr/local/bin/` | wrapper 仍在 PATH，但其指向的 unit 已停用 |
+| `proxy.sh`、`update_config.sh` | 仓库根目录 | 保留对照，不再作为入口 |
 
-`./scripts/install.sh` 也会默认调用该脚本刷新 `clash-proxy` / `clash-proxy-update`；
-如果只想安装用户级 Python `cproxy`，可设置 `CPROXY_INSTALL_SYSTEM_COMMANDS=0`。
+> ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际转发到 legacy 的
+> `update_config.sh`——不要把它当成 cproxy 的一部分。
 
-默认安装：
-
-- `clash-proxy`：转发到仓库内 `proxy.sh`
-- `clash-proxy-update`：转发到仓库内 `update_config.sh`
-
-如果确实需要把 `cproxy` 和 `cproxy-update` 也指向 root 生产入口，使用显式别名模式：
+只读确认：
 
 ```bash
-sudo ./scripts/install-system-commands.sh --with-cproxy-alias
+systemctl --user is-active cproxy.service    # 预期 active
+systemctl is-active clash-proxy.service      # 预期 inactive
 ```
 
-默认不覆盖 `cproxy`，因为仓库里还保留了用户级 Python CLI。若
-`cproxy status` 显示 `运行配置    待刷新`，先确认它看的是否是
-`~/.local/share/cproxy/runtime.yaml`；生产入口状态应优先使用：
+### legacy 命令对照
 
-```bash
-clash-proxy status
-clash-proxy status --raw
-clash-proxy import-subscription "https://example.com/sub" --dry-run
-clash-proxy probe-stable-node --switch
-clash-proxy menu
-```
+legacy 入口的子命令与 cproxy **绝大多数同名同义**——`status`、`switch`、`list-groups`、
+`list-nodes`、`current`、`probe-stable-node`、`ai-use`、`shadow-probe`、`shadow-history`、
+`guard`、`ai-connections`、`incident`、`test-group`、`proxy-env`、`with-proxy`、
+`proxy-shell` 等直接换成 `cproxy <同名>` 即可。只有两处映射不同：
 
-`clash-proxy status` 默认显示彩色、带 icon 的产品化状态面板；自动化脚本应使用
-`clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
-`clash-proxy ai-status` 同样默认展示状态 icon 和 `[US]`、`[SG]` 国家徽标，方便直接识别当前 AI
-出口区域。
-`clash-proxy probe-stable-node` 默认会递归展开 `AI-MANUAL` 可达的 AI 路由池，对所有叶子节点至少做一轮只读延迟探测，随后按逐轮淘汰保留更优候选，并按成功率、失败数、
-最大延迟、平均延迟、抖动和最近历史表现计算 `score`，推荐更稳定的节点；人类模式会预览如果请求切换将执行还是跳过。加上 `--switch`
-后只有推荐节点满足稳定门槛且明显优于当前稳定节点才会沿对应分组路径自动切换。
-人类模式会在探测期间通过 `tqdm` 输出逐轮进度条；`--raw` 不输出进度，保持脚本友好。
-内置 `conservative`、`balanced`、`aggressive` 三档策略，以及 `codex`、`chatgpt`、`github`、`claude` 场景预设。
-默认 `codex` 场景使用保守策略：至少 5 轮、全成功、0 失败、最大延迟不超过 3000ms、平均延迟不超过 1500ms；如果当前节点也稳定，
-推荐节点还需要带来至少 100ms 或 20% 的平均延迟改善。可用 `--profile`、`--strategy`、`--url`、`--rounds`、`--timeout` 覆盖；
-降低 `--rounds` 不会降低自动切换的最少轮数要求。
-`clash-proxy ai-use codex` 会按场景探测并切换，`clash-proxy shadow-probe codex` 只记录历史不切换，
-`clash-proxy shadow-history` 会摘要展示最近探测历史。
-`clash-proxy guard codex` 只选择稳定出口，不启动 `codex`；也可以用 `clash-proxy guard codex -- <cmd>` 包裹一条命令。`clash-proxy ai-connections`
-展示 AI/GitHub 相关活动连接，`clash-proxy incident codex` 输出故障排查报告。
-`clash-proxy import-subscription <url>` 会下载完整 Clash/Mihomo YAML 订阅，或把 Base64 VLESS 节点列表转换为最小可用配置后走安全更新校验；默认
-`--dry-run` 不写入配置，只有显式 `--apply` 才会调用现有 `update_config.sh --apply`。当前不转换 `ss://`、`vmess://`、`trojan://` 等其他节点 URI。
-如果要让转换后的订阅配置使用指定分组名，使用
-`clash-proxy import-subscription <url> --dry-run --group CyberGuard`；生成的配置会使用 `CyberGuard` 和
-`CyberGuard-Auto` 两个组。确认后再用 `--apply --group CyberGuard`。
-如果只想导入后自己手动选择，不希望订阅立即接管默认流量，使用
-`clash-proxy import-subscription <url> --dry-run --group CyberGuard --attach-to AI-MANUAL`；
-它会把 `CyberGuard` 加到 `AI-MANUAL` 候选列表，不修改现有 `MATCH` 规则，也不会执行切换。确认后再用
-`--apply --group CyberGuard --attach-to AI-MANUAL`。
-`clash-proxy menu` 会进入交互式控制台，适合重复查看状态、切换 AI 路由、导入订阅或执行
-常用维护动作；菜单里的订阅导入默认也是 dry-run，只有确认立即应用才写入本地配置。
+| legacy | cproxy 等价 |
+|---|---|
+| `clash-proxy import-subscription <url>` | `cproxy refresh`（订阅更新→渲染→热重载→探测） |
+| `clash-proxy menu` | `cproxy tui` |
 
-本机可用这些只读命令确认当前运行入口：
+探测策略（`conservative` / `balanced` / `aggressive`）、场景预设（`codex` / `chatgpt` /
+`github` / `claude`）、评分口径与自动切换门槛等细节，由 `cproxy <命令> --help` 与
+[USAGE.md](USAGE.md) 覆盖——两套实现共用同一份逻辑，故此处不再重复。
 
-```bash
-systemctl cat clash-proxy.service --no-pager
-systemctl is-active clash-proxy.service
-systemctl --user is-active cproxy.service
-ps -p "$(cat /root/clash_proxy/mihomo.pid)" -o "pid=,ppid=,args="
-```
-
-当前核验结果是：root 级 `clash-proxy.service` 为 `active`，用户级
-`cproxy.service` 为 `inactive`，mihomo 进程参数为
-`/usr/local/bin/mihomo -f /root/clash_proxy/runtime.yaml -d /root/clash_proxy`。
-因此生产排障应优先看 root 级 unit、`proxy.sh`、root 级 `runtime.yaml` 和
-`mihomo.pid`；`cproxy status` 只代表用户级 XDG 入口的状态。
+> 若 `cproxy status` 显示 `运行配置    待刷新`，确认它读的是
+> `~/.local/share/cproxy/runtime.yaml`；那是用户级入口的正常路径。
 
 ## 安全更新流程
 
-root 级生产入口当前仍以 restart 作为生效边界。安全更新应保持以下顺序：
+生产入口以 **热重载** 作为生效边界，长会话与长任务不中断：
 
-1. 先确认入口：用上面的只读命令确认当前是否仍由 `clash-proxy.service` 管理。
+1. 先确认入口：`systemctl --user is-active cproxy.service`。
 2. 只修改原始配置或订阅产物，不手工编辑 `runtime.yaml`。
-3. 先 dry-run 候选配置：
+3. 更新订阅并应用：
 
    ```bash
-   /root/clash_proxy/update_config.sh --dry-run /root/clash_proxy/config_1.yaml
+   cproxy refresh
    ```
 
-   如果候选配置来自完整 YAML 订阅，也可以先运行：
+   它会依次完成：订阅更新（保留本地环境键；单个附加机场失败不影响主订阅与其它机场）
+   → render → 经 Mihomo `PUT /configs` 热重载（API 不可达才回退进程重启）→
+   分组探测与自动切换。加 `--raw` 得到机器可读输出；`--group <名>` 可重复指定要
+   探测并自动切换的分组。
+
+4. 需要回滚时：
 
    ```bash
-   clash-proxy import-subscription "https://example.com/sub" --dry-run
+   cproxy snapshots           # 列出快照
+   cproxy rollback [文件名]    # 省略文件名则回滚最近一份运行时快照
    ```
 
-   如果需要让转换后的订阅配置使用指定分组名，先运行：
+   render 与订阅更新在覆盖配置前各留一份快照（各保留 10 份）；运行中回滚会自动重启。
 
-   ```bash
-   clash-proxy import-subscription "https://example.com/sub" --dry-run --group CyberGuard
-   ```
+每日订阅更新由用户级 `cproxy-subscription.timer` 触发（默认 04:00 + 随机延迟），
+`cproxy-refresh.timer` 作为周期性重渲染兜底，定义见
+[systemd-user/](/root/clash_proxy/systemd-user/)。
 
-   如果只导入为可选分组、不切换当前出口，先运行：
+> legacy 侧原先由 `clash-proxy-refresh.path` 监听 `/root/clash_proxy/config.yaml`
+> 变化触发刷新，该监听已于 2026-09-15 停掉，对应 unit 全部 `disabled`。
 
-   ```bash
-   clash-proxy import-subscription "https://example.com/sub" --dry-run --group CyberGuard --attach-to AI-MANUAL
-   ```
+## Mihomo 热 reload
 
-4. 需要应用时再执行：
+2026-05-14 的历史评估结论是「热 reload 不宜作为生产方案」，理由是缺 CLI 级 reload
+参数、也没有失败回滚。**该结论已被取代**：
 
-   ```bash
-   /root/clash_proxy/update_config.sh --apply /root/clash_proxy/config_1.yaml
-   ```
+- `mihomo -h` 确实没有 CLI 级 reload 参数，但 controller API 提供 `PUT /configs`。
+  `cproxy refresh` 正是经这条路应用新配置——长会话与长任务不中断。
+- 失败回滚改由快照承担：render 与订阅更新在覆盖配置前各留一份
+  （`cproxy snapshots` / `cproxy rollback`，各保留 10 份，运行中回滚自动重启）。
+- 仅当 API 不可达时才回退到进程重启。
 
-   或者对指定分组订阅执行：
+原评估记录见
+[docs/plans/2026-05-14-production-entry-and-reload-evaluation.md](/root/clash_proxy/docs/plans/2026-05-14-production-entry-and-reload-evaluation.md)，保留供追溯。
 
-   ```bash
-   clash-proxy import-subscription "https://example.com/sub" --apply --group CyberGuard
-   ```
+## 用户级 systemd（生产入口）
 
-   或者只导入为可选分组、不切换当前出口：
-
-   ```bash
-   clash-proxy import-subscription "https://example.com/sub" --apply --group CyberGuard --attach-to AI-MANUAL
-   ```
-
-5. `--apply` 写入源配置后会进入受控 refresh 流程；也可以等待 systemd path/timer 触发。
-
-`systemd/clash-proxy-refresh.sh` 的现有流程是：备份当前 `runtime.yaml`，render，
-比较 hash，执行 `mihomo -t`，仅在校验通过且配置变化时 restart 服务，并在 API
-探活失败后回滚上一份 runtime 并尝试恢复服务。API 探活会检查 `/version` 和
-`/proxies` 中的 `AI-MANUAL`、`AI-AUTO`、`AI-US`、`AI-SG`。
-
-root 级 systemd 安装还提供 `clash-proxy-refresh.path` 和
-`clash-proxy-refresh.timer`。`.path` 监听 `/root/clash_proxy/config.yaml` 变化后
-触发 refresh，timer 作为周期性兜底。
-
-每日订阅更新由 `clash-proxy-subscription.timer` 触发（默认每天 04:00 +
-最多 30 分钟随机延迟，`Persistent=true` 关机错过会补跑），执行
-`systemd/clash-proxy-subscription.sh`：调用 `scripts/update_subscription_prod.py`
-复用 `cproxy` 的安全合并逻辑（剔除 `program-path`/`secret` 等安全键、保留本地
-优先键、写入前留快照）拉订阅合并进 `config.yaml`，再走 `proxy.sh render` →
-`mihomo -t` 校验 → 仅在配置变化时 `systemctl restart clash-proxy.service` →
-API 探活，任一步失败回滚 `config.yaml` 与 `runtime.yaml`。生产 `config.yaml`
-未配置 `subscription-url` 时直接跳过。手动触发：
-`systemctl start clash-proxy-subscription.service`。
-
-`update_config.sh` 不再注入 AI groups/rules；AI 路由由 `proxy.sh render` 统一生成。
-默认模式是 `--dry-run`，只校验候选 YAML，不写源配置、不触发 refresh。
-
-## Mihomo 热 reload 评估
-
-当前仓库证据不足以把 Mihomo 热 reload 作为替代 restart 的生产方案：
-
-- `mihomo -h` 只展示 `-f`、`-d`、`-t`、`-v`、controller override 等启动和校验参数，没有 CLI 级 reload 参数。
-- `clash-proxy.service` 的 `ExecReload` 当前等价于 `/root/clash_proxy/proxy.sh restart`。
-- `proxy.sh restart` 当前实现是 `stop` 后 `start`。
-- `systemd/clash-proxy-refresh.sh` 的安全边界依赖 restart 后 API 探活和失败回滚，没有热 reload 回滚实现。
-
-结论：热 reload 可以作为后续小范围实验方向，但当前不适合作为生产替代方案。
-在补齐可验证入口、失败回滚、运行态一致性检查和测试前，继续使用现有
-render + `mihomo -t` + restart 流程更可控。
-
-## 用户级 systemd
-
-仓库里新增了一套用户级示例，位于：
+生产运行使用的用户级单元位于：
 
 - [cproxy.service](/root/clash_proxy/systemd-user/cproxy.service)
 - [cproxy-refresh.service](/root/clash_proxy/systemd-user/cproxy-refresh.service)

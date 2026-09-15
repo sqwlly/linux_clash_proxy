@@ -91,7 +91,7 @@ class APIBackend:
         except (TypeError, ValueError):
             return self.DEFAULT_TIMEOUT
 
-    def request(self, method: str, path: str, payload: dict | None = None, *, request_timeout: int | None = None) -> Any:
+    def request(self, method: str, path: str, payload: dict | None = None, *, request_timeout: float | None = None) -> Any:
         url = f"{self.controller_url()}{path}"
         body = None
         headers: dict[str, str] = {}
@@ -141,8 +141,8 @@ class APIBackend:
             source="api",
         )
 
-    def get_groups(self) -> dict[str, ProxyGroup]:
-        payload = self.request("GET", "/proxies").get("proxies", {})
+    def get_groups(self, *, request_timeout: float | None = None) -> dict[str, ProxyGroup]:
+        payload = self.request("GET", "/proxies", request_timeout=request_timeout).get("proxies", {})
         return {
             str(name): self._to_proxy_group(str(name), group)
             for name, group in payload.items()

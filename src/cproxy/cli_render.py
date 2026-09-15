@@ -5,6 +5,7 @@ import re
 import sys
 import unicodedata
 from collections.abc import Callable
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from .services.ipcheck import IpCheckService
 from .services.ops import build_incident, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
+from .services.subscription_info import SubscriptionUsage, display_entries
 from .services.refresh import RefreshReport
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
@@ -125,13 +127,20 @@ def _color_mode() -> str:
     return "auto"
 
 
-def _color_enabled() -> bool:
+def _color_enabled(stream: object | None = None) -> bool:
+    """是否上色。`stream=None` 时按 stdout 判定（历史行为）；传 stderr 则按 stderr 判。
+
+    门控规则（CPROXY_COLOR / NO_COLOR / FORCE_COLOR / config 的 output-color）
+    仍由 `_color_mode()` 单点决定，这里只负责挑 TTY。
+    """
     mode = _color_mode()
     if mode == "always":
         return True
     if mode == "never":
         return False
-    return sys.stdout.isatty()
+    target = sys.stdout if stream is None else stream
+    isatty = getattr(target, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
 
 
 def _icons_enabled() -> bool:
@@ -156,11 +165,21 @@ def _icons_enabled() -> bool:
     return False
 
 
-def _style(text: object, *codes: str) -> str:
+def _style(text: object, *codes: str, stream: object | None = None) -> str:
     content = str(text)
-    if not _color_enabled() or not codes:
+    if not _color_enabled(stream) or not codes:
         return content
     return f"{''.join(codes)}{content}{ANSI_RESET}"
+
+
+def print_error(message: object) -> None:
+    """统一的 stderr 错误出口：整条着红，非 TTY / NO_COLOR 下逐字降级。
+
+    整条包裹而非只染「错误: 」前缀是刻意的——测试断言
+    `"错误: Mihomo API 不可访问" in stderr`，只染前缀会把 ANSI 复位码插进
+    这个子串中间，反而打爆断言。
+    """
+    print(_style(message, ANSI_RED, stream=sys.stderr), file=sys.stderr)
 
 
 def _section_title(title: str) -> str:
@@ -201,8 +220,19 @@ def _section_heading(title: str, *, icon: str = "▸") -> str:
     return _section_title(f"{icon} {title}" if _icons_enabled() else title)
 
 
+# 区块标题下划线宽度：定长横线给面板以“标题带”的分隔感，宽度不随标题
+# 变化（CJK 标题长短不一，随标题定宽会显得零碎）
+_SECTION_RULE_WIDTH = 36
+
+
+def _section_rule() -> str:
+    """标题下的细分隔线；配色与标题一致，NO_COLOR 下为普通横线。"""
+    return _style("─" * _SECTION_RULE_WIDTH, ANSI_BLUE)
+
+
 def _print_section(title: str) -> None:
     print(_section_heading(title))
+    print(_section_rule())
 
 
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
@@ -474,6 +504,83 @@ def _render_process_traffic(report: ProcessTrafficReport | None) -> None:
     )
 
 
+# 订阅用量着色/提示阈值：余量不足 20% 转黄、耗尽转红；到期 7 天内转黄、
+# 已过期转红；记录超 48h（订阅每日 04:00 刷新）标注数据截至时间
+_SUBSCRIPTION_LOW_RATIO = 0.2
+_SUBSCRIPTION_EXPIRE_SOON_DAYS = 7
+_SUBSCRIPTION_EXPIRE_NOTICE_DAYS = 30
+_SUBSCRIPTION_STALE_HOURS = 48
+
+
+def _format_subscription_usage(usage: SubscriptionUsage) -> str:
+    """单条订阅用量一行：剩余/总量（含已用占比）与到期日。
+
+    按余量与到期紧迫度着色（正常绿 / 偏低黄 / 耗尽或过期红）；
+    total 缺失时退化为展示已用上下行。
+    """
+    parts: list[str] = []
+    if usage.total:
+        remaining = usage.remaining or 0
+        pct_used = min(100.0, usage.used / usage.total * 100)
+        text = f"剩余 {format_bytes(remaining)} / {format_bytes(usage.total)}（已用 {pct_used:.1f}%）"
+        if remaining <= 0:
+            color = ANSI_RED
+        elif remaining < usage.total * _SUBSCRIPTION_LOW_RATIO:
+            color = ANSI_YELLOW
+        else:
+            color = ANSI_GREEN
+        parts.append(_style(text, color))
+    else:
+        parts.append(f"已用 ↓{format_bytes(usage.download or 0)} ↑{format_bytes(usage.upload or 0)}")
+    if usage.expire:
+        expire_day = _safe_timestamp_date(usage.expire)
+        if expire_day is not None:
+            days = (expire_day - date.today()).days
+            text = f"到期 {expire_day:%Y-%m-%d}"
+            if days < 0:
+                parts.append(_style(f"{text}（已过期 {-days} 天）", ANSI_RED))
+            elif days <= _SUBSCRIPTION_EXPIRE_SOON_DAYS:
+                parts.append(_style(f"{text}（剩 {days} 天）", ANSI_YELLOW))
+            elif days <= _SUBSCRIPTION_EXPIRE_NOTICE_DAYS:
+                parts.append(f"{text}（剩 {days} 天）")
+            else:
+                parts.append(text)
+    stale = _subscription_stale_suffix(usage)
+    if stale:
+        parts.append(stale)
+    return " · ".join(parts)
+
+
+def _safe_timestamp_date(timestamp: int) -> date | None:
+    """Unix 秒 → 本地日期；越界/畸形值返回 None（跳过到期行，不崩面板）。"""
+    try:
+        return datetime.fromtimestamp(timestamp).date()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _subscription_stale_suffix(usage: SubscriptionUsage) -> str:
+    """记录超 48h 未更新时标注数据截至时间，提示订阅刷新可能已失败。"""
+    try:
+        updated = datetime.fromisoformat(usage.updated_at)
+        age = datetime.now() - updated
+    except (ValueError, TypeError):
+        # 畸形时间串，或带时区的 aware 时间与本地 naive 相减
+        return ""
+    if age < timedelta(hours=_SUBSCRIPTION_STALE_HOURS):
+        return ""
+    return f"数据截至 {updated:%m-%d %H:%M}"
+
+
+def _render_subscription_info(entries: list[tuple[str, SubscriptionUsage]]) -> None:
+    """「订阅」区块：主订阅在前、附加机场按配置顺序，各自一行用量。"""
+    if not entries:
+        return
+    print()
+    _print_section("订阅")
+    _render_kv([(label, _format_subscription_usage(usage)) for label, usage in entries])
+
+
 def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> int:
     paths = default_paths()
     snapshot = get_status(paths)
@@ -510,10 +617,16 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
             print(f"今日流量: down={total_down} up={total_up}")
             print(f"今日代理: down={traffic['proxy_download']} up={traffic['proxy_upload']}")
             print(f"今日直连: down={traffic['direct_download']} up={traffic['direct_upload']}")
+        for label, usage in display_entries(paths):
+            print(
+                f"订阅 {label}: upload={usage.upload} download={usage.download}"
+                f" total={usage.total} expire={usage.expire} updated_at={usage.updated_at}"
+            )
         return 0
 
     title = "◆ cproxy" if _icons_enabled() else "cproxy"
     print(_style(title, ANSI_BOLD, ANSI_BLUE))
+    print(_section_rule())
 
     _print_section("摘要")
     _render_kv(
@@ -549,6 +662,8 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
         _print_section("流量 (今日)")
         _render_traffic_totals(traffic)
         _render_process_traffic(_today_process_traffic(paths, process_top))
+
+    _render_subscription_info(display_entries(paths))
 
     print()
     _print_section("路径")
@@ -716,7 +831,7 @@ def _run_rollback(paths, name: str | None) -> int:
 
     target = restore_snapshot(paths, snapshot)
     kind = snapshot_kind(snapshot)
-    print(_section_heading("结果"))
+    _print_section("结果")
     print(f"已恢复快照: {snapshot.name}")
     print(f"目标文件: {target}")
     if kind == "runtime":

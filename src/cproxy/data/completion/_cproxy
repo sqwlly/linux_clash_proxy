@@ -1,0 +1,17 @@
+#compdef cproxy
+# cproxy 的 zsh 补全。
+#
+# 启用（当前会话）:  source <(cproxy completion zsh)
+# 永久启用:          cproxy completion zsh --install
+#
+# 候选来自 `cproxy __complete`，分组名与节点名由它按需实时拉取；controller
+# 不可达时它会在短超时后静默返回空，不会卡住 <Tab>。
+_cproxy() {
+    local -a candidates
+    # CURRENT 从 1 起算（1 = 命令名本身），__complete 期望 0 起的下标
+    # ${(f)...} 按行切分：节点名可能含空格、emoji 与 `丨`
+    candidates=(${(f)"$(cproxy __complete $((CURRENT - 1)) ${words[@]} 2>/dev/null)"})
+    compadd -- $candidates
+}
+
+_cproxy "$@"

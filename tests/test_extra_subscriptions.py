@@ -41,7 +41,7 @@ def patch_download(monkeypatch, payloads: dict[str, bytes]):
     def _download(paths, url, timeout=20):
         if url not in payloads:
             raise OSError(f"unexpected url: {url}")
-        return payloads[url]
+        return payloads[url], None
 
     monkeypatch.setattr("cproxy.services.refresh._download_subscription", _download)
 
@@ -187,7 +187,7 @@ def test_subscription_url_yaml_also_supported(tmp_path, monkeypatch):
     ).encode("utf-8")
     monkeypatch.setattr(
         "cproxy.services.refresh._download_subscription",
-        lambda paths, url, timeout=20: payload,
+        lambda paths, url, timeout=20: (payload, None),
     )
 
     results = apply_extra_subscriptions(paths)

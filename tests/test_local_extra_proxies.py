@@ -64,7 +64,7 @@ def fake_download(payload: dict):
     raw = yaml.safe_dump(payload).encode("utf-8")
 
     def _download(paths, url, timeout=10):
-        return raw
+        return raw, None
 
     return _download
 

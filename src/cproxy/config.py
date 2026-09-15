@@ -55,6 +55,10 @@ def traffic_db_file(paths: AppPaths) -> Path:
     return paths.state_dir / "traffic.db"
 
 
+def subscription_info_file(paths: AppPaths) -> Path:
+    return paths.state_dir / "subscription-info.json"
+
+
 def read_config(paths: AppPaths) -> dict:
     path = config_file(paths)
     if not path.exists():

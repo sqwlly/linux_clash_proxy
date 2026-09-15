@@ -2694,6 +2694,13 @@ EOF
 main() {
     local command="${1:-}"
 
+    # legacy 入口提示：经 /usr/local/bin/clash-proxy 等 wrapper 调用时，wrapper 已经
+    # 打过更具体的警告（并设 CPROXY_LEGACY_WARNED=1 去重）；这里覆盖直接执行
+    # ./proxy.sh 的场景。走 stderr，不污染 stdout 的 --raw 输出。
+    if [ -z "${CPROXY_LEGACY_WARNED:-}" ]; then
+        echo "警告: proxy.sh 是已停用的 legacy 入口，请改用 cproxy（cproxy --help 查看等价命令）。" >&2
+    fi
+
     case "$command" in
         start)
             start

@@ -15,9 +15,9 @@ pipx install /path/to/clash_proxy
 ```
 
 `./scripts/install.sh` 会自动尝试一键部署（等价于 `cproxy bootstrap`）。
-它也会刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；不会默认覆盖
-`cproxy` alias。只想安装用户级 Python `cproxy` 时，可设置
-`CPROXY_INSTALL_SYSTEM_COMMANDS=0`。
+它也会刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令——这两者是
+**legacy 入口**（已停用待退役，见 [legacy 入口](#legacy-入口已停用)），不需要可设置
+`CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过。脚本不会默认覆盖 `cproxy` alias。
 
 默认以 editable 方式安装（开发便利，改动立即生效）。生产环境应使用非
 editable 安装，避免未提交的工作区改动直接影响生产命令：
@@ -71,57 +71,34 @@ controller、`allow-lan` 等）即使订阅携带也一律剔除，防止恶意�
 本地优先键（端口、模式等）保留本地已配置的值；订阅拉取失败不会阻断后续
 render 与探测。输出中的订阅地址会脱敏。
 
-## root 生产系统命令
+## legacy 入口（已停用）
 
-当前生产入口仍是 root 级 `proxy.sh`。在仓库根目录运行：
+`proxy.sh` 工作流已于 2026-09-11 停用，生产入口是 cproxy 用户级链路
+（见 [README 的生产入口识别](README.md#生产入口识别)）。本节内容保留仅供回滚对照。
+
+如仍需安装 root 级 wrapper（不需要可设 `CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过）：
 
 ```bash
 sudo ./scripts/install-system-commands.sh
 ```
 
-默认安装：
-
 - `clash-proxy`：转发到仓库内 `proxy.sh`
 - `clash-proxy-update`：转发到仓库内 `update_config.sh`
 
-常用命令：
+legacy 子命令与 cproxy **绝大多数同名同义**——`status`、`switch`、`list-nodes`、
+`probe-stable-node`、`ai-use`、`guard`、`ai-connections`、`incident` 等直接换成
+`cproxy <同名>` 即可。只有两处映射不同：
 
-```bash
-clash-proxy status
-clash-proxy status --raw
-clash-proxy menu
-clash-proxy import-subscription "https://example.com/sub" --dry-run
-clash-proxy-update --dry-run config_1.yaml
-clash-proxy-update --apply config_1.yaml
-```
+| legacy | cproxy 等价 |
+|---|---|
+| `clash-proxy import-subscription <url>` | `cproxy refresh`（订阅更新→渲染→热重载→探测） |
+| `clash-proxy menu` | `cproxy tui` |
 
-`clash-proxy status` 默认显示彩色、带 icon 的产品化状态面板；脚本消费继续使用
-`clash-proxy status --raw`。如需关闭 icon，可设置 `CPROXY_ICONS=0`。
-`clash-proxy ai-status` 也会默认展示状态 icon 和 `[US]`、`[SG]` 国家徽标，便于直接识别当前 AI
-出口区域。
-`clash-proxy menu` 会进入交互式控制台，可直接选择查看状态、切换 AI 路由、
-导入订阅、重新渲染并重启等常用操作；菜单里的订阅导入默认只做 dry-run。
-`clash-proxy import-subscription <url>` 支持导入完整 Clash/Mihomo YAML 订阅，也支持把
-Base64 VLESS 节点列表转换为最小可用配置；默认 `--dry-run` 只下载和校验，显式
-`--apply` 才会写入并刷新。
-要让转换后的订阅配置使用指定分组名，先用
-`clash-proxy import-subscription <url> --dry-run --group CyberGuard`；确认后再用
-`--apply --group CyberGuard`。
-如果只想导入为可选分组并自己手动选择，使用
-`clash-proxy import-subscription <url> --dry-run --group CyberGuard --attach-to AI-MANUAL`；
-确认后再用 `--apply --group CyberGuard --attach-to AI-MANUAL`。这会把 `CyberGuard`
-加入 `AI-MANUAL` 候选列表，不修改 `MATCH` 规则，也不会自动切换。
+> ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际转发到 legacy 的
+> `update_config.sh`——不要把它当成 cproxy 的一部分。
 
-如果明确要把 `cproxy` 也指向 root 生产入口，可显式安装别名：
-
-```bash
-sudo ./scripts/install-system-commands.sh --with-cproxy-alias
-```
-
-注意：`cproxy status` 属于用户级 XDG 入口，使用 `~/.config/cproxy` 和
-`~/.local/share/cproxy`。如果未初始化用户级 runtime，它会显示
-`运行配置    待刷新`，这不代表 root 生产入口不可用。生产排障优先使用
-`clash-proxy status` 或在仓库根目录运行 `./proxy.sh status`。
+若 `cproxy status` 显示 `运行配置    待刷新`，说明用户级 runtime 尚未初始化
+（它读 `~/.local/share/cproxy/runtime.yaml`），与 legacy 入口无关。
 
 ## 初始化
 
@@ -186,6 +163,39 @@ cproxy-tui
 ```
 
 TUI 是当前 Python/Textual `cproxy` 的用户级控制台，使用 `~/.config/cproxy`、`~/.local/share/cproxy` 和 `~/.local/state/cproxy`。页签包括 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy 和 Logs。Providers 支持手动更新 `/providers/proxies`；Connections 支持查看 `/connections`、断开选中连接，并对断开全部连接做二次确认。
+
+## Shell 补全
+
+候选由隐藏命令 `cproxy __complete` 实时提供：命令名、选项与固定枚举是静态的，
+分组名与节点名按需从 controller 拉取（不可达时短超时后静默返回空，不会卡住 `<Tab>`）。
+
+```bash
+# bash：装到标准补全目录，新开的 shell 自动生效
+cproxy completion bash --install
+# 或只在当前会话启用
+source <(cproxy completion bash)
+
+# zsh：装到 ~/.zfunc 后还需让 zsh 找到它
+cproxy completion zsh --install
+```
+
+zsh 还需要在 `~/.zshrc` 加入：
+
+```zsh
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
+```
+
+只想看脚本内容、不写文件时，去掉 `--install`（直接打印到 stdout）。
+
+## 交互式选择
+
+`cproxy switch` 不带参数时进入上下键选择（先选分组、再选节点）：
+`↑↓` 或 `j k` 移动、`Enter` 确认、`q` / `Esc` / `Ctrl-C` 取消。
+
+- 带全参数时行为与以往完全一致；只给一个参数仍按原来的「缺少必需参数」报错
+- 只列出可手动切换（selector 类型）的分组
+- 在管道等非交互终端下退化为「打印可选分组 + 退出码 2」，不会挂起等待输入
 
 ## AI 路由
 
@@ -381,7 +391,14 @@ cproxy migrate-from-legacy /root/clash_proxy
 - 可通过 `CPROXY_COLOR=always|never|auto` 明确控制
 - 可通过 `NO_COLOR=1` 禁用颜色
 - `cproxy` 默认启用状态 icon，可通过 `CPROXY_ICONS=0` 或配置 `output-icons: false` 关闭
+- 错误输出（stderr）与标准输出共用同一套开关，整条消息着色
 - 脚本场景优先使用 `--raw`
+
+帮助与报错同样保持中文：
+
+- `cproxy`（不带参数）与 `cproxy --help` 都按功能分组列出命令
+- 命令名或取值范围写错时给出「您是不是想输入 X」的建议
+- 用法错误的退出码仍是 2，业务错误仍是 1（`--raw` 契约与退出码均未变动）
 
 对应配置项：
 
