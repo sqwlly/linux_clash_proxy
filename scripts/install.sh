@@ -29,6 +29,19 @@ install_with_pip() {
     fi
 }
 
+# root 下的安装路径。刻意不带 --user：root 的 --user 会装到 /root/.local，而
+# PATH 里 ~/.local/bin 排在 /usr/local/bin 之前，于是交互命令走用户级副本、
+# systemd 服务走系统级副本（unit 硬编码 /usr/local/bin/cproxy），两者可能跑
+# 不同版本的代码。统一装到 /usr/local 可根除这种分叉。
+install_system_wide() {
+    if [ "${CPROXY_EDITABLE:-1}" = "0" ]; then
+        # --force-reinstall 覆盖旧副本；--no-deps 不动系统依赖
+        python3 -m pip install --force-reinstall --no-deps "$ROOT_DIR"
+    else
+        python3 -m pip install --editable "$ROOT_DIR"
+    fi
+}
+
 ensure_geodata() {
     local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
     local mmdb_path="${data_home}/cproxy/country.mmdb"
@@ -181,7 +194,12 @@ install_system_commands() {
 main() {
     require_cmd python3
 
-    if command -v pipx >/dev/null 2>&1; then
+    # root 下一律走系统级安装，避免交互命令与 systemd 服务分叉到两个副本；
+    # 非 root 保持原有 pipx / --user 逻辑不变
+    if [ "$(id -u)" = "0" ]; then
+        echo "检测到 root：使用系统级安装（/usr/local），与 systemd 服务保持同一副本"
+        install_system_wide
+    elif command -v pipx >/dev/null 2>&1; then
         pipx_bin="$(command -v pipx)"
         python_bin="$(command -v python3)"
 

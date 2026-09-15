@@ -23,6 +23,7 @@
 
 - 版本号权威来源是 `pyproject.toml`；发布流程见 `STATUS.md` 的“发布”一节（bump 版本 → CHANGELOG → git tag → GA 产物）。
 - 生产安装使用 `CPROXY_EDITABLE=0 ./scripts/install.sh`（非 editable）；开发实验不要在生产 checkout 直接改。
+- root 下 `install.sh` 会自动走**系统级**安装（装到 `/usr/local`），不产生 `~/.local` 副本：`cproxy.service` 硬编码 `/usr/local/bin/cproxy`，而 PATH 里 `~/.local/bin` 更靠前，两份副本会让交互命令与服务分叉到不同版本。不要手工执行 `pip install --user`。
 
 ## Legacy Retirement
 

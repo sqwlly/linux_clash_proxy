@@ -62,6 +62,7 @@
 改动直接影响生产 `cproxy` 命令。约定如下：
 
 - 生产安装一律使用干净的工作区 + `CPROXY_EDITABLE=0 ./scripts/install.sh`（非 editable）
+- **root 下安装只落系统级副本**：`install.sh` 检测到 uid 0 即走 `pip install --force-reinstall --no-deps` 装到 `/usr/local`，不再用 pipx / `--user`。原因是 `cproxy.service` 硬编码 `/usr/local/bin/cproxy`，而 PATH 里 `~/.local/bin` 排在它前面——两份副本会让交互命令与 systemd 服务跑不同版本的代码。若日后又出现 `/root/.local/bin/cproxy`，说明有绕开 `install.sh` 的 `pip install --user`，应删除该副本以恢复单副本状态
 - 日常开发实验在另一个 clone 或 `git worktree` 里进行，不在生产目录直接改
 - 生产目录只通过 `git pull`（或 checkout 固定 tag）+ 重新安装来变更
 - 运行中 mihomo 由 cproxy 启动，`-d` 是 `~/.local/share/cproxy`，不再依赖仓库根目录（历史上 legacy mihomo 曾以 `/root/clash_proxy` 为 `-d`，该链路已停用）

@@ -43,6 +43,7 @@
 
 ### 修复
 
+- `scripts/install.sh` 在 root 下改走**系统级**安装（`pip install --force-reinstall --no-deps` 装到 `/usr/local`），不再用 pipx / `--user`：`cproxy.service` 硬编码 `/usr/local/bin/cproxy`，而 PATH 里 `~/.local/bin` 排在它前面，两份副本会让交互命令与 systemd 服务分派到不同版本的代码。本机此前已实际处于该状态（`/root/.local` 与 `/usr/local` 各一份 1.0.0），现统一为单副本；非 root 用户仍走原有 pipx / `--user` 逻辑
 - 阶段 2 的一处遗漏：`clash-proxy-refresh.path` 此前仍是 `active (waiting)`——阶段 2 只 `disable --now` 了 `clash-proxy.service`，没停这个独立 unit，于是它持续监听 `/root/clash_proxy/config.yaml`，一旦该文件变化就会拉起 legacy 刷新流程去操作已由 cproxy 接管的运行时。已停掉（未 disable、未删文件，回滚 = `systemctl start`）；至此 legacy 侧全部 unit 为 `inactive` + `disabled`
 - README / USAGE 里「截至 2026-05-14……当前 active 的生产入口仍是 root 级 `clash-proxy.service`」与 2026-09-11 已切换的事实相反，照此排障会去翻一个已停用的服务。已改写为以 cproxy 用户级链路为唯一生产入口，legacy 侧保留**带状态的对照表**，并提示 `/usr/local/bin/cproxy-update` 名字形似 cproxy 子命令、实际转发到 legacy 的 `update_config.sh`
 - **`--raw` 破坏性变更（需脚本注意）**：`TRAFFIC_AUDIT_PROCESS` 行的 `down`/`up` 改为 `total_down`/`total_up`。该行口径已从「仅代理」改为「全量」，复用旧字段名会让外部脚本静默拿到含 ~92% 直连的数字；改名使破坏在解析期即可见，而非悄悄算错。`proxy_down`/`proxy_up` 为新增字段。`cproxy status --raw` 字段不变

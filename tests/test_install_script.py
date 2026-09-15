@@ -35,6 +35,26 @@ exec "{real_python}" "$@"
     fake_python.chmod(0o755)
 
 
+def _write_fake_id(fake_bin: Path, uid: int) -> None:
+    """伪造 id 命令——install.sh 用 `id -u` 判断是否 root。
+
+    测试必须显式指定 uid：CI 与开发机常常就是 root，不 mock 的话会走到
+    系统级分支，把「pipx / --user 回退」两个用例的断言打翻。
+    """
+    fake_id = fake_bin / "id"
+    fake_id.write_text(
+        f"""#!/bin/bash
+if [ "${{1:-}}" = "-u" ]; then
+  echo {uid}
+  exit 0
+fi
+exec /usr/bin/id "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_id.chmod(0o755)
+
+
 def _write_fake_crontab(fake_crontab: Path, crontab_store: Path) -> None:
     fake_crontab.write_text(
         f"""#!/bin/bash
@@ -70,6 +90,9 @@ exit 0
         encoding="utf-8",
     )
     fake_pipx.chmod(0o755)
+    # 显式模拟非 root：否则在 root 环境（CI/开发机）会走系统级分支，
+    # 与本用例要验证的 pipx / --user 回退路径不符
+    _write_fake_id(fake_bin, 1000)
     crontab_store = tmp_path / "crontab.txt"
     fake_crontab = fake_bin / "crontab"
     _write_fake_crontab(fake_crontab, crontab_store)
@@ -125,6 +148,9 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     python_log = tmp_path / "python.log"
     fake_python = fake_bin / "python3"
     _write_fake_python(fake_python, python_log)
+    # 显式模拟非 root：否则在 root 环境（CI/开发机）会走系统级分支，
+    # 与本用例要验证的 pipx / --user 回退路径不符
+    _write_fake_id(fake_bin, 1000)
     crontab_store = tmp_path / "crontab.txt"
     fake_crontab = fake_bin / "crontab"
     _write_fake_crontab(fake_crontab, crontab_store)
@@ -172,6 +198,81 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     assert "系统命令安装: 已跳过（legacy 入口已停用" in result.stdout
 
 
+def _install_env(tmp_path: Path, fake_bin: Path, logrotate_dir: Path) -> dict:
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["PYTHONPATH"] = str(SRC_DIR)
+    env["CPROXY_LOGROTATE_DIR"] = str(logrotate_dir)
+    env["BINDIR"] = str(tmp_path / "system-bin")
+    env["LIBDIR"] = str(tmp_path / "system-lib")
+    env["CPROXY_EDITABLE"] = "0"
+    return env
+
+
+def test_install_script_uses_system_wide_install_when_root(tmp_path: Path):
+    """root 下必须走系统级安装，不落 --user 副本。
+
+    `cproxy.service` 硬编码 `/usr/local/bin/cproxy`，而 PATH 里 `~/.local/bin`
+    排在 `/usr/local/bin` 之前；root 若也装一份 --user 副本，交互命令与服务就会
+    跑不同版本的代码（STATUS.md 记录过这种跨副本遮蔽）。
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python_log = tmp_path / "python.log"
+    _write_fake_python(fake_bin / "python3", python_log)
+    _write_fake_id(fake_bin, 0)
+    _write_fake_crontab(fake_bin / "crontab", tmp_path / "crontab.txt")
+    logrotate_dir = tmp_path / "logrotate.d"
+    logrotate_dir.mkdir()
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT_DIR / "scripts" / "install.sh")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT_DIR,
+        env=_install_env(tmp_path, fake_bin, logrotate_dir),
+    )
+
+    assert result.returncode == 0
+    assert "系统级安装" in result.stdout
+
+    pip_lines = [line for line in python_log.read_text(encoding="utf-8").splitlines() if "-m pip" in line]
+    assert pip_lines, "root 路径下应至少调用一次 pip"
+    for line in pip_lines:
+        assert "--user" not in line, f"root 下不应使用 --user：{line}"
+    assert any("--force-reinstall" in line and "--no-deps" in line for line in pip_lines), (
+        "非 editable 的系统级安装应带 --force-reinstall --no-deps"
+    )
+
+
+def test_root_branch_takes_precedence_over_pipx(tmp_path: Path):
+    """root 下即便装了 pipx 也不该用它——pipx 同样会产生用户级副本。"""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_python(fake_bin / "python3", tmp_path / "python.log")
+    _write_fake_id(fake_bin, 0)
+    _write_fake_crontab(fake_bin / "crontab", tmp_path / "crontab.txt")
+    pipx_log = tmp_path / "pipx.log"
+    fake_pipx = fake_bin / "pipx"
+    fake_pipx.write_text(f'#!/bin/bash\nprintf \'%s\\n\' "$*" >> "{pipx_log}"\nexit 0\n', encoding="utf-8")
+    fake_pipx.chmod(0o755)
+    logrotate_dir = tmp_path / "logrotate.d"
+    logrotate_dir.mkdir()
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT_DIR / "scripts" / "install.sh")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT_DIR,
+        env=_install_env(tmp_path, fake_bin, logrotate_dir),
+    )
+
+    assert result.returncode == 0
+    assert not pipx_log.exists(), "root 分支应优先于 pipx，不应调用 pipx"
+    assert "系统级安装" in result.stdout
+
+
 def test_pyproject_declares_runtime_dependencies():
     data = tomllib.loads((ROOT_DIR / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = data["project"].get("dependencies", [])
@@ -188,6 +289,9 @@ def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
     fake_python = fake_bin / "python3"
     _write_fake_python(fake_python, python_log)
 
+    # 显式模拟非 root：否则在 root 环境（CI/开发机）会走系统级分支，
+    # 与本用例要验证的 pipx / --user 回退路径不符
+    _write_fake_id(fake_bin, 1000)
     crontab_store = tmp_path / "crontab.txt"
     fake_crontab = fake_bin / "crontab"
     _write_fake_crontab(fake_crontab, crontab_store)
