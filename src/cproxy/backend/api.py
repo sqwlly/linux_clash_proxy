@@ -141,6 +141,30 @@ class APIBackend:
             source="api",
         )
 
+    def get_delays(self, *, request_timeout: float | None = None) -> dict[str, int]:
+        """各代理项的最近一次延迟（毫秒），供选择器/列表在名字旁标注。
+
+        只有被 url-test / fallback 组测过速的项才有 `history`；selector 组自身
+        没有，所以这里取到的基本都是叶子节点。没数据的项直接不出现在结果里，
+        调用方按「无延迟」处理即可。
+        """
+        payload = self.request("GET", "/proxies", request_timeout=request_timeout).get("proxies", {})
+        delays: dict[str, int] = {}
+        for name, item in payload.items():
+            if not isinstance(item, dict):
+                continue
+            history = item.get("history") or []
+            if not history:
+                continue
+            delay = history[-1].get("delay")
+            if delay in (None, "-"):
+                continue
+            try:
+                delays[str(name)] = int(delay)
+            except (TypeError, ValueError):
+                continue
+        return delays
+
     def get_groups(self, *, request_timeout: float | None = None) -> dict[str, ProxyGroup]:
         payload = self.request("GET", "/proxies", request_timeout=request_timeout).get("proxies", {})
         return {

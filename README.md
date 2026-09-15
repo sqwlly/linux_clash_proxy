@@ -42,11 +42,25 @@ pipx install /path/to/clash_proxy
 
 安装脚本会：
 
-- 优先使用 `pipx install --force --editable`
-- 回退到 `python3 -m pip install --user --editable`
+- **root 下一律装到系统级 `/usr/local`**（`pip install --force-reinstall --no-deps`），
+  刻意不用 `--user`：`systemd-user/cproxy.service` 硬编码 `/usr/local/bin/cproxy`，
+  而 PATH 里 `~/.local/bin` 排在它前面——同时存在两份副本时，交互命令与 systemd
+  服务会跑不同版本的代码
+- 非 root 时优先 `pipx install --force --editable`，回退
+  `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
 - 安装 GeoIP 数据到默认路径：优先复用已有用户级文件和仓库根目录遗留的 `Country.mmdb`（该文件已不入库），缺失时尝试从 meta-rules-dat 下载，仍失败则打印手动放置警告
 - 刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；这两者是 **legacy 入口**（已停用待退役），不需要可设 `CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过。脚本不会默认覆盖 `cproxy` alias
+
+安装脚本**不会中断正在运行的代理**：
+
+- 代理进程由 mihomo 独立持有，`cproxy` 只是控制端——换掉 CLI 的代码不影响它
+- 脚本末尾的一键部署会调 `cproxy bootstrap`，其中的 `start` 是**幂等**的：
+  检测到代理已在运行就直接返回现有 PID，不会重启（`backend/process.py` 的
+  `start()` 以 `is_running()` 短路）
+- 配置层面同样支持热重载：`cproxy refresh` 经 Mihomo 的 `PUT /configs` 应用新
+  配置，长会话与长任务不中断，仅在 API 不可达时回退进程重启（见
+  [安全更新流程](#安全更新流程)）
 
 ## GeoIP 数据
 

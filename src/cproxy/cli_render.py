@@ -28,8 +28,8 @@ from .services.ipcheck import IpCheckService
 from .services.ops import build_incident, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
-from .services.subscription_info import SubscriptionUsage, display_entries
 from .services.refresh import RefreshReport
+from .services.subscription_info import SubscriptionUsage, display_entries
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 

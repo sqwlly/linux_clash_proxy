@@ -4,25 +4,12 @@ from argparse import REMAINDER, ArgumentParser
 from collections.abc import Callable
 
 from .cli_args import CliArgumentParser, CliHelpFormatter
+from .names import normalize_name as normalize_name  # 再导出：既有 import 路径保持可用
 from .services.probe import ProbeReport, format_delay, stable_score
 
 # `cproxy status` 按进程明细的默认行数。定义在此处是因为它属于 CLI 契约，
 # argparse 默认值与渲染层共用同一来源（渲染层不能反向 import 本模块之外的定义）。
 STATUS_PROCESS_TOP_DEFAULT = 5
-
-
-def normalize_name(value: object) -> str:
-    if value in ("-", None):
-        return "-"
-
-    text = str(value).strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) == 2 and parts[0] and all(not ch.isalnum() for ch in parts[0]):
-        text = parts[1].strip()
-
-    text = text.replace("丨", " ")
-    text = text.replace("|", " ")
-    return " ".join(text.split())
 
 
 def build_probe_output(

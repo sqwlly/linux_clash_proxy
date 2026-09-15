@@ -24,8 +24,15 @@ class _FakeStdin:
 
 
 class _FakeService:
-    def __init__(self, groups: list[ProxyGroup] | None = None):
+    def __init__(
+        self,
+        groups: list[ProxyGroup] | None = None,
+        delays: dict[str, int] | None = None,
+        match_group: str | None = None,
+    ):
         self._groups = groups or [_group("G1", "Selector", ["node-1", "node-2"])]
+        self._delays = delays or {}
+        self._match_group = match_group
 
     def list_groups(self):
         return list(self._groups)
@@ -35,6 +42,12 @@ class _FakeService:
             if group.name == name:
                 return group
         raise AssertionError(f"未预期的分组: {name}")
+
+    def node_delays(self) -> dict[str, int]:
+        return dict(self._delays)
+
+    def match_rule_group(self) -> str | None:
+        return self._match_group
 
 
 def _group(name: str, group_type: str, candidates: list[str]) -> ProxyGroup:
@@ -172,6 +185,97 @@ def test_no_args_only_offers_selectable_groups():
         _resolve_switch(service, Namespace(group=None, target=None))
 
     assert exc.value.code == 1
+
+
+def test_selector_receives_current_and_delays(monkeypatch):
+    """选节点那一步要拿到当前值（用于高亮）与延迟（用于标注）。"""
+    captured: dict = {}
+
+    def fake_select(title, items, **kwargs):
+        captured[title] = kwargs
+        return items[0]
+
+    monkeypatch.setattr("cproxy.cli.select_one", fake_select)
+    service = _FakeService(delays={"node-1": 123})
+
+    assert _resolve_switch(service, Namespace(group=None, target=None)) == ("G1", "node-1")
+
+    node_call = captured["选择节点"]
+    assert node_call["current"] == "node-1", "应把组当前选择传给选择器做高亮"
+    # 有测速记录的给毫秒数；没有的显式标 `-`（留空会让人分不清是没测过还是取数失败）
+    assert node_call["annotations"] == {"node-1": "123 ms", "node-2": "-"}
+    # 选组那一步没有「当前组」的概念，不应传 current
+    assert "current" not in captured["选择代理组"] or captured["选择代理组"]["current"] is None
+
+
+def test_group_roles_label_only_reliable_ones():
+    """只标判据可靠的角色。
+
+    猜错的分类比不标更误导——把某个「地区池」标成「订阅」会让人改错组，
+    而改错组正是这次要防的问题（用户切了🇺🇸 United States 却发现 AI 流量没变）。
+    """
+    from cproxy.cli import _group_roles
+
+    service = _FakeService(match_group="CyberGuard")
+    roles = _group_roles(service, ["AI-MANUAL", "CyberGuard", "GLOBAL", "Mitce", "🇯🇵 Japan"])
+
+    assert roles["AI-MANUAL"].startswith("AI 流量")
+    assert roles["CyberGuard"].startswith("默认路由")
+    assert roles["GLOBAL"].startswith("全局")
+    # 判据不可靠的一律不标
+    assert "Mitce" not in roles
+    assert "🇯🇵 Japan" not in roles
+
+
+def test_group_roles_skips_match_group_outside_list():
+    """MATCH 指向的组若不在可切换列表里，不该凭空多出一条标注。"""
+    from cproxy.cli import _group_roles
+
+    service = _FakeService(match_group="DIRECT")
+
+    assert _group_roles(service, ["AI-MANUAL"]) == {"AI-MANUAL": "AI 流量 · 决定 AI 出口"}
+
+
+def test_resolve_delay_drills_into_referenced_groups():
+    """候选是组时要沿它当前出口往下钻。
+
+    `AI-MANUAL` 的候选大多是 selector 组，而 selector 自身不测速——只查候选名
+    永远得到空，各组的快慢也就无从比较（这正是「一排 `-` 看不出谁快」的成因）。
+    """
+    from cproxy.cli import _resolve_delay
+
+    inner = _group("🇯🇵 Japan", "Selector", ["node-A"])
+    outer = _group("AI-MANUAL", "Selector", ["🇯🇵 Japan"])
+    groups = {g.name: g for g in (inner, outer)}
+    delays = {"node-A": 123}
+
+    assert _resolve_delay("node-A", groups, delays) == 123  # 节点：直接取
+    assert _resolve_delay("🇯🇵 Japan", groups, delays) == 123  # 组：钻到当前节点
+    assert _resolve_delay("AI-MANUAL", groups, delays) == 123  # 多级组：一路钻到底
+    assert _resolve_delay("不存在的项", groups, delays) is None
+
+
+def test_resolve_delay_survives_reference_cycle():
+    """组之间互相引用成环时不能无限递归。"""
+    from cproxy.cli import _resolve_delay
+
+    a = _group("A", "Selector", ["B"])
+    b = _group("B", "Selector", ["A"])
+
+    assert _resolve_delay("A", {"A": a, "B": b}, {}) is None
+
+
+def test_delay_label_separates_timeout_from_missing():
+    """延迟标注必须三态分明。
+
+    `0` 是 mihomo 的测速失败标记——显示成 `0 ms` 会被读成「极快」，让人挑中
+    实际不可用的节点；`-` 则是「没有测速记录」。两者不能混为一谈。
+    """
+    from cproxy.cli import _delay_label
+
+    assert _delay_label(None) == "-"
+    assert _delay_label(0) == "超时"
+    assert _delay_label(123) == "123 ms"
 
 
 def test_cancel_exits_zero(monkeypatch):

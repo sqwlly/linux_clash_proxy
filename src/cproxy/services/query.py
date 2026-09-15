@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+import yaml
+
 from ..audit import write_audit_event
 from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ConnectionEntry, ProviderEntry, ProxyGroup, QueryContext
 from ..backend.runtime import RuntimeBackend
-from ..config import AppPaths
+from ..config import AppPaths, runtime_file
+from ..names import resolve_candidate
 
 
 class QueryService:
@@ -29,6 +32,37 @@ class QueryService:
         context = self.load_context(require_api=False, request_timeout=request_timeout)
         return list(context.groups.values())
 
+    def match_rule_group(self) -> str | None:
+        """`MATCH` 规则指向的组——它承载所有未命中前面规则的流量。
+
+        选择器用它标注「默认路由」，好让用户分清该改哪个组才影响实际出口。
+        读的是 runtime.yaml（规则就在那里），失败返回 None：标注只是辅助信息。
+        """
+        try:
+            data = yaml.safe_load(runtime_file(self.paths).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        rules = data.get("rules") if isinstance(data, dict) else None
+        if not isinstance(rules, list):
+            return None
+        # MATCH 是最后一条，倒着找最快
+        for rule in reversed(rules):
+            text = str(rule)
+            if text.startswith("MATCH,"):
+                return text.split(",", 1)[1].strip() or None
+        return None
+
+    def node_delays(self) -> dict[str, int]:
+        """各节点最近一次延迟（毫秒）。取不到就返回空。
+
+        延迟只是选择器上的锦上添花，不该因为它查询失败就阻塞选择流程，
+        所以这里吞掉异常而非上抛。
+        """
+        try:
+            return self.api.get_delays()
+        except Exception:
+            return {}
+
     def get_group(self, name: str, require_api: bool = False) -> ProxyGroup:
         context = self.load_context(require_api=require_api)
         group = context.groups.get(name)
@@ -48,8 +82,16 @@ class QueryService:
         group_type = str(group.type).lower()
         if group_type not in {"selector", "select"}:
             raise SystemExit(f"错误: 代理组 [{group_name}] 不是可手动切换的 Selector 类型")
-        if target_name not in group.candidates:
-            raise SystemExit(f"错误: 目标 [{target_name}] 不在代理组 [{group_name}] 的候选列表中")
+        # 面板展示会经 normalize_name 剥掉 emoji 与 `丨`（`🇯🇵 Japan` → `Japan`），
+        # 用户照屏幕上的名字输入是自然行为——按规范化名再解析一次候选，
+        # 避免出现「照着显示敲却切不动」
+        resolved = resolve_candidate(target_name, group.candidates)
+        if resolved is None:
+            raise SystemExit(
+                f"错误: 目标 [{target_name}] 不在代理组 [{group_name}] 的候选列表中\n"
+                f"提示: cproxy list-nodes {group_name} 查看候选"
+            )
+        target_name = resolved
 
         try:
             self.api.switch_group(group_name, target_name)

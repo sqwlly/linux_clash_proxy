@@ -250,20 +250,32 @@ def _resolve_switch(service: QueryService, args: Namespace) -> tuple[str, str]:
         print("用法: cproxy switch <代理组> <目标>", file=sys.stderr)
         raise SystemExit(2)
 
-    groups = [group.name for group in service.list_groups() if str(group.type).lower() in {"selector", "select"}]
+    # 需要**全部**组（不只可切换的那些）来解析候选延迟——候选很可能是组，
+    # 得沿它当前出口往下钻才能拿到真实测速值
+    all_groups = service.list_groups()
+    groups = [g.name for g in all_groups if str(g.type).lower() in {"selector", "select"}]
+    groups_by_name = {g.name: g for g in all_groups}
     if not groups:
         print("错误: 没有可手动切换的代理组", file=sys.stderr)
         raise SystemExit(1)
 
     try:
-        group_name = select_one("选择代理组", groups)
+        group_name = select_one("选择代理组", groups, annotations=_group_roles(service, groups))
         if group_name is None:
             raise SystemExit(0)  # 用户主动取消，不是错误
-        candidates = service.get_group(group_name).candidates
-        if not candidates:
+        group = service.get_group(group_name)
+        if not group.candidates:
             print(f"错误: 代理组 [{group_name}] 没有候选节点", file=sys.stderr)
             raise SystemExit(1)
-        target_name = select_one("选择节点", candidates)
+        delays = service.node_delays()
+        target_name = select_one(
+            "选择节点",
+            group.candidates,
+            current=group.current,  # 高亮当前在用的那个
+            annotations={
+                name: _delay_label(_resolve_delay(name, groups_by_name, delays)) for name in group.candidates
+            },
+        )
     except NotATerminalError:
         _explain_switch_usage(groups)
         raise SystemExit(2) from None
@@ -271,6 +283,54 @@ def _resolve_switch(service: QueryService, args: Namespace) -> tuple[str, str]:
     if target_name is None:
         raise SystemExit(0)
     return group_name, target_name
+
+
+def _group_roles(service: QueryService, groups: list[str]) -> dict[str, str]:
+    """选择器里每个组的角色标注。
+
+    只标 **判据可靠** 的三个：`MATCH` 规则指向的组、`AI-MANUAL`、`GLOBAL`。
+    其余一律不标——猜错的分类比没有分类更误导人（比如把某个「地区池」标成
+    「订阅」会让人改错组，这正是这个标注要防的事）。
+    """
+    roles: dict[str, str] = {}
+    match_group = service.match_rule_group()
+    if match_group in groups:
+        roles[match_group] = "默认路由 · 决定其余流量"
+    if "AI-MANUAL" in groups:
+        roles["AI-MANUAL"] = "AI 流量 · 决定 AI 出口"
+    if "GLOBAL" in groups:
+        roles["GLOBAL"] = "全局 · 绕过规则"
+    return roles
+
+
+def _delay_label(delay: int | None) -> str:
+    """选择器里的延迟标注。
+
+    `0` 是 mihomo 的**测速失败**标记，不是「极快」——直接显示 `0 ms` 会让人
+    挑中实际不可用的节点。取不到记录则标 `-`，与「失败」区分开。
+    """
+    if delay is None:
+        return "-"
+    return "超时" if delay <= 0 else f"{delay} ms"
+
+
+def _resolve_delay(name: str, groups: dict, delays: dict[str, int], depth: int = 0) -> int | None:
+    """取某个候选的延迟。
+
+    候选可能是节点，也可能是**组**——`AI-MANUAL` 这一层的候选大多是后者
+    （`🇯🇵 Japan` 等 selector 组自己不测速，直接查只会得到空）。所以遇到组就
+    沿它当前出口往下钻，直到拿到真实节点的测速值，这样各组的快慢才可比。
+    """
+    if name in delays:
+        return delays[name]
+    group = groups.get(name)
+    # depth 兜底：配置异常时组之间可能互相引用成环
+    if group is None or depth >= 8:
+        return None
+    current = getattr(group, "current", None)
+    if not current or current == name:
+        return None
+    return _resolve_delay(str(current), groups, delays, depth + 1)
 
 
 def _explain_switch_usage(groups: list[str]) -> None:
