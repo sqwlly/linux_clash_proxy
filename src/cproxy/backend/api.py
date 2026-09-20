@@ -10,11 +10,54 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import BaseHandler, HTTPSHandler, OpenerDirector, ProxyHandler, Request, build_opener
 
 from ..config import AppPaths, read_config
+from ..services.nodelist import match_region
 from .models import ProxyGroup
+
+_LEGACY_AI_REGION = {
+    "AI-US": "US",
+    "AI-SG": "SG",
+    "🇯🇵 Japan": "JP",
+    "🇺🇸 United States": "US",
+    "🇸🇬 Singapore": "SG",
+}
 
 
 class APIUnavailableError(RuntimeError):
     pass
+
+
+def _restore_selector_targets(
+    group_name: str,
+    wanted: str,
+    groups: dict[str, ProxyGroup],
+    snapshot: dict[str, str],
+) -> tuple[str | None, str | None]:
+    """把热重载前的选中项映射到当前候选。
+
+    返回 (父组目标, 子组节点)。子组节点仅在旧叶子已被收进国家 selector 时出现。
+    """
+    group = groups.get(group_name)
+    if group is None:
+        return None, None
+    if wanted in group.candidates:
+        return wanted, None
+    inner = snapshot.get(wanted)
+    if inner and inner in group.candidates:
+        return inner, None
+    region = _LEGACY_AI_REGION.get(wanted)
+    if region:
+        for candidate in group.candidates:
+            if match_region(candidate) == region:
+                return candidate, None
+    for candidate in group.candidates:
+        child = groups.get(candidate)
+        if child is None or str(child.type).lower() not in {"select", "selector"}:
+            continue
+        if wanted in child.candidates:
+            return candidate, wanted
+        if inner and inner in child.candidates:
+            return candidate, inner
+    return None, None
 
 
 class APIBackend:
@@ -212,7 +255,11 @@ class APIBackend:
         return snapshot
 
     def restore_selectors(self, snapshot: dict[str, str]) -> dict[str, str]:
-        """把仍存在于候选列表里的选中项写回。节点已从订阅消失的项跳过。"""
+        """把仍存在于候选列表里的选中项写回。节点已从订阅消失的项跳过。
+
+        热重载后 AI-MANUAL 不再挂 AI-US / 🇯🇵 Japan 这类组：旧值映射到对应地区节点。
+        若旧值是主订阅里的叶子节点、现已收进国家 selector，则父组切到该国家、再切节点。
+        """
         restored: dict[str, str] = {}
         if not snapshot:
             return restored
@@ -221,12 +268,22 @@ class APIBackend:
             group = groups.get(name)
             if group is None or str(group.type).lower() not in {"select", "selector"}:
                 continue
-            if wanted not in group.candidates:
+            parent_target, child_target = _restore_selector_targets(name, wanted, groups, snapshot)
+            if parent_target is None:
                 continue
-            if group.current == wanted:
-                continue
-            self.switch_group(name, wanted)
-            restored[name] = wanted
+            if group.current != parent_target:
+                self.switch_group(name, parent_target)
+                restored[name] = parent_target
+            if child_target:
+                child = groups.get(parent_target)
+                if (
+                    child is not None
+                    and str(child.type).lower() in {"select", "selector"}
+                    and child_target in child.candidates
+                    and child.current != child_target
+                ):
+                    self.switch_group(parent_target, child_target)
+                    restored[parent_target] = child_target
         if restored:
             self._drop_connections_using_groups(set(restored))
         return restored

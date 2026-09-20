@@ -181,9 +181,13 @@ def test_render_japan_group_in_manual(tmp_path: Path):
     data = _render_config(tmp_path, BASE_CONFIG)
     groups = {g["name"]: g for g in data["proxy-groups"]}
     manual = groups["AI-MANUAL"]
-    assert "🇯🇵 Japan" in manual["proxies"]
-    assert manual["proxies"][0] == "🇺🇸 United States"
-    assert "🇯🇵 Japan" in manual["proxies"]
+    assert "JP-01" in manual["proxies"]
+    assert "AI-US" not in manual["proxies"]
+    assert "AI-SG" not in manual["proxies"]
+    assert "🇯🇵 Japan" not in manual["proxies"]
+    assert "🇺🇸 United States" not in manual["proxies"]
+    assert manual["proxies"][0] == "US-01"
+    assert "🇯🇵 Japan" not in groups
 
 
 def test_render_prefers_non_iepl_nodes_in_region_groups(tmp_path: Path):
@@ -214,9 +218,11 @@ rules:
 """
     data = _render_config(tmp_path, config)
     groups = {g["name"]: g for g in data["proxy-groups"]}
-    assert groups["🇯🇵 Japan"]["proxies"][0] == "🇯🇵 JP 01 | 1X"
-    assert groups["🇺🇸 United States"]["proxies"][0] == "🇺🇸 US 01 | 1X"
-    assert groups["AI-MANUAL"]["proxies"][0] == "🇺🇸 United States"
+    assert "🇯🇵 Japan" not in groups
+    assert "🇺🇸 United States" not in groups
+    assert groups["AI-MANUAL"]["proxies"][0] == "🇺🇸 US 01 | 1X"
+    assert "🇯🇵 JP 01 | 1X" in groups["AI-MANUAL"]["proxies"]
+    assert groups["AI-US"]["proxies"][0] == "🇺🇸 US 01 | 1X"
 
 
 def test_render_no_japan_when_absent(tmp_path: Path):
@@ -247,9 +253,9 @@ rules:
 """
     data = _render_config(tmp_path, config)
     groups = {g["name"]: g for g in data["proxy-groups"]}
-    jp = groups["🇯🇵 Japan"]
-    assert jp["proxies"] == ["🇯🇵 JP 01", "🇯🇵 JP 02"]
-    assert "🇯🇵 Japan" in groups["AI-MANUAL"]["proxies"]
+    assert "🇯🇵 Japan" not in groups
+    assert "🇯🇵 JP 01" in groups["AI-MANUAL"]["proxies"]
+    assert "🇯🇵 JP 02" in groups["AI-MANUAL"]["proxies"]
 
 
 def test_render_ssrdog_rules_removed(tmp_path: Path):
@@ -342,3 +348,56 @@ def test_cli_ai_use_parses(tmp_path: Path, monkeypatch):
 
     rc = run(["ai-use", "codex", "--group", "G", "--raw"])
     assert rc == 0
+
+
+def test_render_match_country_selectors_and_strips_panel(tmp_path: Path):
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: 🇭🇰香港 01
+  - name: 🇯🇵日本 01
+  - name: 🇺🇸美国 01
+  - name: 🇸🇬新加坡 01
+  - name: 剩余流量：10 GB
+  - name: Mitce HK-1
+proxy-groups:
+  - name: CyberGuard
+    type: select
+    proxies: [自动选择, 🇭🇰香港 01, 🇯🇵日本 01, 🇺🇸美国 01, 🇸🇬新加坡 01, 剩余流量：10 GB, Mitce]
+  - name: 自动选择
+    type: url-test
+    proxies: [🇭🇰香港 01, 🇯🇵日本 01, 剩余流量：10 GB]
+  - name: Mitce
+    type: select
+    proxies: [Mitce HK-1]
+subscriptions:
+  - name: Mitce
+    url: https://example.test/mitce
+rules:
+  - MATCH,CyberGuard
+"""
+    data = _render_config(tmp_path, config)
+    groups = {g["name"]: g for g in data["proxy-groups"]}
+    cyber = groups["CyberGuard"]
+    assert "Mitce" not in cyber["proxies"]
+    assert "剩余流量：10 GB" not in cyber["proxies"]
+    assert "🇯🇵 Japan" not in cyber["proxies"]
+    assert "自动选择" in cyber["proxies"]
+    assert "香港" in cyber["proxies"]
+    assert "日本" in cyber["proxies"]
+    assert "美国" in cyber["proxies"]
+    assert "新加坡" in cyber["proxies"]
+    assert groups["香港"]["proxies"] == ["🇭🇰香港 01"]
+    assert groups["日本"]["proxies"] == ["🇯🇵日本 01"]
+    assert "剩余流量：10 GB" not in groups["自动选择"]["proxies"]
+    manual = groups["AI-MANUAL"]
+    assert "AI-US" not in manual["proxies"]
+    assert "AI-SG" not in manual["proxies"]
+    assert "🇺🇸 United States" not in manual["proxies"]
+    assert "🇺🇸美国 01" in manual["proxies"]
+    assert "AI-AUTO" in manual["proxies"]
+    assert "🇯🇵 Japan" not in groups
+    assert groups["AI-US"]["type"] == "fallback"
+    assert groups["AI-SG"]["type"] == "fallback"
+

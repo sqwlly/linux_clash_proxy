@@ -33,19 +33,19 @@ class ConnectionsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("连接", classes="page-title")
             with Vertical(classes="panel output-panel"):
-                yield Label("活动连接", classes="panel-title")
-                yield Label("─", id="connections-status", classes="status-strip")
+                with Horizontal(classes="panel-header"):
+                    yield Label("活动连接", classes="panel-title")
+                    yield Label("─", id="connections-status", classes="status-strip")
                 yield Input(placeholder="筛选主机 / 代理链路 / 进程…", id="connections-filter", classes="table-filter")
                 yield DataTable(id="connections-table")
                 yield Label("─", id="connection-detail", classes="current-info")
                 with Horizontal(classes="toolbar"):
-                    yield Button("断开选中连接", id="btn-close-connection", classes="action-button danger-button")
-                    yield Button("断开全部连接", id="btn-close-all-connections", classes="action-button danger-button")
-                    yield Button("刷新", id="btn-refresh-connections", classes="action-button primary-button")
+                    yield Button("断开", id="btn-close-connection", classes="action-button danger-button")
+                    yield Button("全部断开", id="btn-close-all-connections", classes="action-button danger-button")
+                    yield Button("刷新", id="btn-refresh-connections", classes="action-button muted-button")
                 yield Label(
-                    "↑↓ 移动  x 断开选中连接  a 断开全部连接  r 刷新",
+                    "↑↓ 移动  x 断开  a 全部断开  r 刷新",
                     id="connections-action-status", classes="action-status",
                 )
 

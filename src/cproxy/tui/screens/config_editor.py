@@ -32,17 +32,16 @@ class ConfigEditorScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("配置编辑器", classes="page-title")
             with Vertical(classes="panel output-panel"):
-                yield Label("源配置", classes="panel-title")
-                with Horizontal(classes="field-row"):
+                with Horizontal(classes="panel-header"):
+                    yield Label("源配置", classes="panel-title")
                     yield Label("─", id="config-file-label", classes="path-label")
                     yield Label("", id="config-modified-label", classes="status-strip")
                 with Horizontal(classes="toolbar"):
                     yield Button("保存", id="btn-config-save", classes="action-button success-button")
-                    yield Button("生成运行配置", id="btn-config-render", classes="action-button primary-button")
-                    yield Button("重启并应用", id="btn-config-restart", classes="action-button danger-button")
-                    yield Button("重新载入", id="btn-config-reload", classes="action-button muted-button")
+                    yield Button("生成", id="btn-config-render", classes="action-button primary-button")
+                    yield Button("重启", id="btn-config-restart", classes="action-button danger-button")
+                    yield Button("载入", id="btn-config-reload", classes="action-button muted-button")
                 yield TextArea(id="config-editor", classes="config-editor")
                 yield Label("─", id="config-log", classes="action-status")
 

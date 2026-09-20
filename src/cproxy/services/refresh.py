@@ -23,6 +23,7 @@ from .diagnostics import DiagnosticsService
 from .nodelist import (
     REGION_LABELS,
     SUBSCRIPTION_REGION_ORDER,
+    is_panel_info_node,
     match_region,
     parse_subscription_payload,
 )
@@ -125,29 +126,6 @@ def _rebuild_groups_with_new_nodes(local_groups: list, old_node_names: list[str]
     return rebuilt
 
 
-PANEL_INFO_NODE_MARKERS: tuple[str, ...] = (
-    "剩余流量",
-    "套餐到期",
-    "过期时间",
-    "到期时间",
-    "流量重置",
-    "有效期",
-    "官网",
-    "expire",
-    "traffic",
-)
-
-
-def _is_panel_info_node(name: str) -> bool:
-    """识别机场面板注入的信息节点（剩余流量/套餐到期等）。
-
-    这类节点名携带动态数值（如“剩余流量：160.9 GB”），每次订阅都会改名，
-    不能按“本地有而订阅没有”识别为用户自建节点，否则旧名字会以附加节点
-    形式无限累积成死节点。"""
-    lowered = name.lower()
-    return any(marker in lowered for marker in PANEL_INFO_NODE_MARKERS)
-
-
 def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加内容：
     - 附加节点：追加进 merged["proxies"]，并在同名组中按本地原有位置插回，
@@ -164,7 +142,7 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     extra_proxies: list = []
     for proxy in local_proxies:
         name = str(proxy["name"])
-        if name not in merged_names and not _is_panel_info_node(name):
+        if name not in merged_names and not is_panel_info_node(name):
             extra_proxies.append(proxy)
             extra_names.add(name)
 
@@ -466,7 +444,7 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
             valid_proxies = [
                 proxy
                 for proxy in data.get("proxies") or []
-                if isinstance(proxy, dict) and proxy.get("name") and not _is_panel_info_node(str(proxy["name"]))
+                if isinstance(proxy, dict) and proxy.get("name") and not is_panel_info_node(str(proxy["name"]))
             ]
             if not valid_proxies:
                 raise ValueError("错误: 订阅未返回任何节点")

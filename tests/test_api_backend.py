@@ -238,3 +238,85 @@ def test_api_backend_reads_keyring_secret(tmp_path, monkeypatch):
     backend = APIBackend(default_paths(tmp_path))
 
     assert backend.api_secret() == "cproxy:controller:secret"
+
+
+def test_restore_selectors_maps_legacy_ai_us(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("external-controller: 127.0.0.1:9\n", encoding="utf-8")
+    backend = APIBackend(default_paths(tmp_path))
+    groups = {
+        "AI-MANUAL": ProxyGroup(
+            name="AI-MANUAL",
+            type="select",
+            current="AI-AUTO",
+            candidates=["US-01", "AI-AUTO", "JP-01", "SG-01"],
+        ),
+    }
+    switches: list[tuple[str, str]] = []
+    monkeypatch.setattr(backend, "get_groups", lambda: groups)
+    monkeypatch.setattr(backend, "switch_group", lambda name, target: switches.append((name, target)))
+    monkeypatch.setattr(backend, "_drop_connections_using_groups", lambda names: 0)
+
+    restored = backend.restore_selectors({"AI-MANUAL": "AI-US"})
+    assert switches == [("AI-MANUAL", "US-01")]
+    assert restored["AI-MANUAL"] == "US-01"
+
+
+def test_restore_selectors_maps_legacy_japan_group_to_node(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("external-controller: 127.0.0.1:9\n", encoding="utf-8")
+    backend = APIBackend(default_paths(tmp_path))
+    groups = {
+        "AI-MANUAL": ProxyGroup(
+            name="AI-MANUAL",
+            type="select",
+            current="US-01",
+            candidates=["US-01", "AI-AUTO", "JP-01", "SG-01"],
+        ),
+    }
+    switches: list[tuple[str, str]] = []
+    monkeypatch.setattr(backend, "get_groups", lambda: groups)
+    monkeypatch.setattr(backend, "switch_group", lambda name, target: switches.append((name, target)))
+    monkeypatch.setattr(backend, "_drop_connections_using_groups", lambda names: 0)
+
+    restored = backend.restore_selectors({"AI-MANUAL": "🇯🇵 Japan", "🇯🇵 Japan": "JP-01"})
+    assert switches == [("AI-MANUAL", "JP-01")]
+    assert restored["AI-MANUAL"] == "JP-01"
+
+
+def test_restore_selectors_maps_leaf_into_country_group(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("external-controller: 127.0.0.1:9\n", encoding="utf-8")
+    backend = APIBackend(default_paths(tmp_path))
+    groups = {
+        "CyberGuard": ProxyGroup(
+            name="CyberGuard",
+            type="select",
+            current="自动选择",
+            candidates=["自动选择", "香港", "日本"],
+        ),
+        "香港": ProxyGroup(
+            name="香港",
+            type="select",
+            current="HK-2",
+            candidates=["HK-1", "HK-2"],
+        ),
+    }
+    switches: list[tuple[str, str]] = []
+    monkeypatch.setattr(backend, "get_groups", lambda: groups)
+    monkeypatch.setattr(backend, "switch_group", lambda name, target: switches.append((name, target)))
+    monkeypatch.setattr(backend, "_drop_connections_using_groups", lambda names: 0)
+
+    restored = backend.restore_selectors({"CyberGuard": "HK-1"})
+    assert switches == [("CyberGuard", "香港"), ("香港", "HK-1")]
+    assert restored["CyberGuard"] == "香港"
+    assert restored["香港"] == "HK-1"

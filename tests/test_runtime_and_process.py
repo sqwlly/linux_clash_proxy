@@ -619,8 +619,9 @@ rules:
 
     assert render_result.returncode == 0, render_result.stderr
     assert runtime_file.is_file()
-    assert "name: 🇺🇸 United States" in runtime_text
-    assert "name: 🇸🇬 Singapore" in runtime_text
+    assert "name: 美国" in runtime_text
+    assert "name: 🇸🇬 Singapore" not in runtime_text
+    assert "name: 🇺🇸 United States" not in runtime_text
     assert "name: AI-MANUAL" in runtime_text
     assert "name: AI-AUTO" in runtime_text
 

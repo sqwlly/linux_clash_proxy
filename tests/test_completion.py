@@ -67,7 +67,7 @@ def test_completes_enum_values(tmp_path):
 def test_completes_group_names(tmp_path, monkeypatch):
     _stub_groups(monkeypatch, [_group("AI-MANUAL", "Selector", ["n1"])])
 
-    assert _candidates(_paths(tmp_path), ["cproxy", "switch", ""], 2) == ["AI-MANUAL"]
+    assert _candidates(_paths(tmp_path), ["cproxy", "switch", ""], 2) == ["AI-MANUAL", "AI 出口"]
 
 
 def test_switch_only_offers_selectable_groups(tmp_path, monkeypatch):

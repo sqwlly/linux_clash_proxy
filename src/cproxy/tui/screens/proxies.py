@@ -9,10 +9,11 @@ from textual.widgets import Button, Label
 
 from ...api import APIUnavailableError
 from ...backend.models import ProxyGroup
-from ...config import AppPaths
+from ...config import AppPaths, read_config
 from ...process import restart_process
 from ...runtime import render_runtime
 from ...services.query import QueryService
+from ...services.switch_tree import SwitchChoice, build_switch_tree, extra_subscription_names
 from ..widgets import NavigationDataTable as DataTable
 
 
@@ -33,28 +34,30 @@ class ProxiesScreen(Widget):
         super().__init__(**kwargs)
         self.paths = paths
         self._groups: list[ProxyGroup] = []
+        self._tree_entries: list[SwitchChoice] = []
         self._current_group: ProxyGroup | None = None
+        self._current_entry: SwitchChoice | None = None
+        self._drilled: SwitchChoice | None = None
         self._api_available = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("节点与分组", classes="page-title")
             with Horizontal(classes="workbench-row"):
                 with Vertical(classes="proxy-group-card split-sidebar proxy-sidebar"):
-                    yield Label("分组", classes="proxy-group-title")
+                    yield Label("用途", classes="proxy-group-title")
                     yield DataTable(id="groups-table")
                 with Vertical(classes="proxy-group-card split-main proxy-main"):
-                    yield Label("节点", classes="proxy-group-title")
-                    yield Label("─", id="current-node", classes="node-current")
-                    yield Label("─", id="api-status", classes="status-strip")
+                    with Horizontal(classes="panel-header"):
+                        yield Label("─", id="current-node", classes="node-current")
+                        yield Label("─", id="api-status", classes="status-strip")
                     yield DataTable(id="nodes-table")
                     with Horizontal(classes="toolbar"):
-                        yield Button("切换", id="btn-switch-node", classes="action-button success-button")
-                        yield Button("测速", id="btn-test-delay", classes="action-button primary-button")
+                        yield Button("切换", id="btn-switch-node", classes="action-button primary-button")
+                        yield Button("测速", id="btn-test-delay", classes="action-button muted-button")
                         yield Button("刷新", id="btn-refresh-proxies", classes="action-button muted-button")
-                        yield Button("重启", id="btn-restart-proxy", classes="action-button muted-button")
+                        yield Button("重启", id="btn-restart-proxy", classes="action-button danger-button")
                     yield Label(
-                        "↑↓ 移动  ←/Esc 返回分组  → 进入节点  Enter/s 切换",
+                        "↑↓ 移动  ←/Esc 返回  → 进入  Enter 下钻或切换",
                         id="proxy-action-status", classes="action-status",
                     )
 
@@ -65,7 +68,7 @@ class ProxiesScreen(Widget):
 
     def _init_tables(self) -> None:
         groups_table = self.query_one("#groups-table", DataTable)
-        groups_table.add_columns("名称", "类型", "当前选择")
+        groups_table.add_columns("用途", "当前")
         groups_table.cursor_type = "row"
         groups_table.show_header = True
         groups_table.navigation_next_handler = self.action_focus_nodes
@@ -86,52 +89,60 @@ class ProxiesScreen(Widget):
         try:
             service = QueryService(self.paths)
             context = service.load_context(require_api=False)
-            self.app.call_from_thread(self._apply_groups, context, None)
+            match_group = service.match_rule_group() if hasattr(service, "match_rule_group") else None
+            try:
+                extra = extra_subscription_names(read_config(self.paths))
+            except Exception:
+                extra = []
+            delays = {
+                name: group.delay for name, group in context.groups.items() if group.delay is not None
+            }
+            tree = build_switch_tree(
+                context.groups,
+                match_group=match_group,
+                extra_names=extra,
+                delays=delays,
+            )
+            self.app.call_from_thread(self._apply_groups, context, tree, None)
         except Exception as exc:
-            self.app.call_from_thread(self._apply_groups, None, str(exc))
+            self.app.call_from_thread(self._apply_groups, None, (), str(exc))
 
-    def _apply_groups(self, context, error: str | None) -> None:
+    def _apply_groups(self, context, tree, error: str | None) -> None:
         groups_table = self.query_one("#groups-table", DataTable)
         if error is not None or context is None:
             self._api_available = False
             self._update_api_status()
             groups_table.clear()
-            groups_table.add_row(f"错误: {error}", "─", "─")
+            groups_table.add_row(f"错误: {error}", "─")
             return
 
         self._api_available = context.api_available
         self._groups = list(context.groups.values())
+        self._tree_entries = list(tree or ())
+        self._drilled = None
         self._update_api_status()
 
         groups_table.clear()
-
-        rendered_group_count = 0
-        rendered_groups: list[ProxyGroup] = []
-        for group in self._groups:
-            group_type = str(group.type).lower()
-            if group_type in {"selector", "select", "fallback", "url-test", "load-balance"}:
-                groups_table.add_row(group.name, group.type, group.current or "─", key=group.name)
-                rendered_group_count += 1
-                rendered_groups.append(group)
-
-        if not rendered_group_count:
-            groups_table.add_row("[#8b98aa]没有可显示的代理组[/]", "─", "─")
+        if not self._tree_entries:
+            groups_table.add_row("[#8b98aa]没有可显示的代理组[/]", "─")
             self._current_group = None
+            self._current_entry = None
             self._update_nodes_table()
             return
 
+        for entry in self._tree_entries:
+            group = context.groups.get(entry.key)
+            current = group.current if group else "─"
+            groups_table.add_row(entry.display, current or "─", key=entry.key)
+
         previous_group_name = self._current_group.name if self._current_group else None
-        chosen = next((group for group in rendered_groups if group.name == previous_group_name), None)
+        chosen = next((entry for entry in self._tree_entries if entry.key == previous_group_name), None)
         if chosen is None:
-            selectable = [group for group in rendered_groups if str(group.type).lower() in {"selector", "select"}]
-            fallback = [
-                group for group in rendered_groups if str(group.type).lower() in {"fallback", "url-test", "load-balance"}
-            ]
-            chosen = selectable[0] if selectable else fallback[0] if fallback else None
-        if chosen:
-            self._current_group = chosen
-            self._update_nodes_table()
-            groups_table.move_cursor(row=rendered_groups.index(chosen), animate=False)
+            chosen = self._tree_entries[0]
+        self._current_entry = chosen
+        self._current_group = context.groups.get(chosen.key)
+        self._update_nodes_table()
+        groups_table.move_cursor(row=self._tree_entries.index(chosen), animate=False)
 
     def _update_api_status(self) -> None:
         label = self.query_one("#api-status", Label)
@@ -139,6 +150,13 @@ class ProxiesScreen(Widget):
             label.update("[#a3e635]● API 已连接[/]")
         else:
             label.update("[#f6c177]○ 仅显示运行配置；切换前请启动或重启代理[/]")
+
+    def _visible_choices(self) -> tuple[SwitchChoice, ...]:
+        if self._drilled is not None:
+            return self._drilled.children
+        if self._current_entry is not None:
+            return self._current_entry.children
+        return ()
 
     def _update_nodes_table(self) -> None:
         nodes_table = self.query_one("#nodes-table", DataTable)
@@ -152,20 +170,35 @@ class ProxiesScreen(Widget):
             nodes_table.add_row("[#8b98aa]选择分组后查看节点[/]", "─")
             return
 
-        current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
+        if self._drilled is not None:
+            current_label.update(f"[#a3e635]● {self._drilled.display}[/]")
+        else:
+            current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
 
-        for node in self._current_group.candidates:
-            is_current = node == self._current_group.current
-            delay = "─"
-            if is_current and self._current_group.delay:
-                delay = f"{self._current_group.delay}ms"
-            prefix = "[#a3e635]●[/] " if is_current else "  "
-            nodes_table.add_row(f"{prefix}{node}", delay, key=node)
+        choices = self._visible_choices()
+        if not choices:
+            for node in self._current_group.candidates:
+                is_current = node == self._current_group.current
+                delay = "─"
+                if is_current and self._current_group.delay:
+                    delay = f"{self._current_group.delay}ms"
+                prefix = "[#a3e635]●[/] " if is_current else "  "
+                nodes_table.add_row(f"{prefix}{node}", delay, key=node)
+            preferred_node = previous_node or self._current_group.current
+            self._move_nodes_cursor(preferred_node)
+            return
 
-        preferred_node = previous_node or self._current_group.current
-        self._move_nodes_cursor(preferred_node)
+        for choice in choices:
+            prefix = "[#a3e635]●[/] " if choice.current else "  "
+            delay = choice.annotation or "─"
+            nodes_table.add_row(f"{prefix}{choice.display}", delay, key=choice.key)
+
+        preferred = previous_node or next((choice.key for choice in choices if choice.current), None)
+        self._move_nodes_cursor(preferred)
 
     def _set_current_group(self, group_name: str, focus_nodes: bool) -> None:
+        self._drilled = None
+        self._current_entry = next((entry for entry in self._tree_entries if entry.key == group_name), None)
         for group in self._groups:
             if group.name == group_name:
                 self._current_group = group
@@ -180,10 +213,12 @@ class ProxiesScreen(Widget):
         return str(table.ordered_rows[table.cursor_row].key.value)
 
     def _move_nodes_cursor(self, node_name: str | None) -> None:
-        if not self._current_group or not node_name:
+        if not node_name:
             return
+        choices = self._visible_choices()
+        keys = [choice.key for choice in choices] if choices else list(self._current_group.candidates if self._current_group else [])
         try:
-            row_index = self._current_group.candidates.index(node_name)
+            row_index = keys.index(node_name)
         except ValueError:
             return
         self.query_one("#nodes-table", DataTable).move_cursor(row=row_index, animate=False)
@@ -235,6 +270,11 @@ class ProxiesScreen(Widget):
 
     def action_back(self) -> None:
         focused = getattr(self.app, "focused", None)
+        if self._drilled is not None and isinstance(focused, DataTable) and focused.id == "nodes-table":
+            self._drilled = None
+            self._update_nodes_table()
+            self.query_one("#proxy-action-status", Label).update("[#8b98aa]已返回上一级[/]")
+            return
         if not (isinstance(focused, DataTable) and focused.id == "groups-table"):
             self.action_focus_groups()
             self.query_one("#proxy-action-status", Label).update("[#8b98aa]已返回分组列表[/]")
@@ -256,27 +296,51 @@ class ProxiesScreen(Widget):
             self.query_one("#proxy-action-status", Label).update("[#f6c177]尚未选择节点[/]")
             return
 
+        row = nodes_table.ordered_rows[nodes_table.cursor_row]
+        node_name = str(row.key.value)
+        choice = next((item for item in self._visible_choices() if item.key == node_name), None)
+        if choice is not None and choice.drillable:
+            self._drilled = choice
+            self._update_nodes_table()
+            self.query_one("#nodes-table", DataTable).focus()
+            self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]已进入 {choice.display}[/]")
+            return
+
         if not self._api_available:
             self.query_one("#proxy-action-status", Label).update(
                 "[#f6c177]API 不可访问；请点击重启或执行 cproxy restart[/]"
             )
             return
 
-        row = nodes_table.ordered_rows[nodes_table.cursor_row]
-        node_name = str(row.key.value)
+        path = list(choice.path) if choice is not None else [(self._current_group.name, node_name)]
+        if not path:
+            self.notify(f"[{self._current_group.name}] 该项不能直接切换", severity="warning")
+            return
 
-        if str(self._current_group.type).lower() not in {"selector", "select"}:
+        if choice is None and str(self._current_group.type).lower() not in {"selector", "select"}:
             self.notify(f"分组 [{self._current_group.name}] 不支持手动切换", severity="warning")
             return
 
-        group_name = self._current_group.name
-        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在切换 {group_name} → {node_name}…[/]")
-        self._switch_node(group_name, node_name)
+        group_name, target_name = path[-1]
+        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在切换 {group_name} → {target_name}…[/]")
+        if len(path) == 1:
+            self._switch_node(path[0][0], path[0][1])
+        else:
+            self._switch_path(path)
 
     @work(thread=True, exclusive=True, group="proxy-action")
     def _switch_node(self, group_name: str, node_name: str) -> None:
         try:
             QueryService(self.paths).switch_group(group_name, node_name)
+            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, exc)
+
+    @work(thread=True, exclusive=True, group="proxy-action")
+    def _switch_path(self, path: list[tuple[str, str]]) -> None:
+        group_name, node_name = path[-1]
+        try:
+            QueryService(self.paths).switch_path(path)
             self.app.call_from_thread(self._finish_switch_node, group_name, node_name, None)
         except Exception as exc:
             self.app.call_from_thread(self._finish_switch_node, group_name, node_name, exc)
@@ -319,8 +383,12 @@ class ProxiesScreen(Widget):
     def action_test_delay(self) -> None:
         if not self._current_group:
             return
-        group_name = self._current_group.name
+        group_name = self._drilled.key if self._drilled is not None else self._current_group.name
         current_name = self._current_group.current
+        if self._drilled is not None:
+            drilled_group = next((group for group in self._groups if group.name == self._drilled.key), None)
+            if drilled_group is not None:
+                current_name = drilled_group.current
         self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在测速: {group_name}…[/]")
         self._test_delay(group_name, current_name)
 

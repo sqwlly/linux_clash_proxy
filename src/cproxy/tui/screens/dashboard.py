@@ -9,6 +9,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Label
 
+from ...backend.runtime import ai_standby_peer
 from ...config import AppPaths
 from ...process import get_status
 from ...services.query import QueryService
@@ -22,7 +23,6 @@ class DashboardScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("概览", classes="page-title")
             yield Label("等待刷新", id="dash-refresh-status", classes="status-strip")
 
             with Horizontal(id="dashboard-grid"):
@@ -160,7 +160,7 @@ class DashboardScreen(Widget):
                         f"{active_group_name} → {active.current} ({delay_str}) {alive_str}"
                     )
 
-                standby_name = "AI-SG" if active_group_name == "AI-US" else "AI-US"
+                standby_name = ai_standby_peer(active_group_name)
                 standby = groups.get(standby_name)
                 if standby:
                     delay_str = f"{standby.delay}ms" if standby.delay else "─"

@@ -97,4 +97,5 @@ def test_command_table_matches_registered_subcommands():
         for name in action.choices
     }
 
-    assert registered == set(_COMMAND_HELP)
+    assert set(_COMMAND_HELP) <= registered
+    assert registered - set(_COMMAND_HELP) == {"group", "groups"}

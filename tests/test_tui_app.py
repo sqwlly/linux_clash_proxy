@@ -339,11 +339,11 @@ def test_tui_app_ai_table_boundary_reaches_toolbar(tmp_path):
             table = app.query_one("#ai-probe-table", DataTable)
             assert app.focused is table
             await pilot.press("down")
-            assert app.focused is app.query_one("#btn-ai-refresh", Button)
-            await pilot.press("right")
             assert app.focused is app.query_one("#btn-ai-probe", Button)
             await pilot.press("right")
             assert app.focused is app.query_one("#btn-ai-switch", Button)
+            await pilot.press("right")
+            assert app.focused is app.query_one("#btn-ai-refresh", Button)
 
     asyncio.run(run_case())
 

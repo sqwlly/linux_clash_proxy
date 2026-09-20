@@ -177,8 +177,9 @@ AI 路由控制：
 
 ```bash
 cproxy list-groups
+cproxy group
 cproxy list-groups --raw
-cproxy list-nodes "AI-MANUAL"
+cproxy list-nodes "AI 出口"
 cproxy list-nodes "AI-MANUAL" --raw
 cproxy current "AI-MANUAL"
 cproxy current "AI-MANUAL" --raw

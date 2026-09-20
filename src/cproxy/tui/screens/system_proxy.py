@@ -27,9 +27,7 @@ class SystemProxyScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("代理环境", classes="page-title")
-
-            with Horizontal(classes="workbench-row compact-row"):
+            with Horizontal(classes="compact-row"):
                 with Vertical(classes="panel form-panel split-main"):
                     yield Label("临时命令范围", classes="panel-title")
                     with Horizontal(classes="field-row"):
@@ -46,19 +44,18 @@ class SystemProxyScreen(Widget):
                         yield Label("─", id="all-proxy-label", classes="metric-value")
 
                 with Vertical(classes="panel summary-panel split-sidebar"):
-                    yield Label("当前 TUI 进程环境", classes="panel-title")
+                    yield Label("当前进程环境", classes="panel-title")
                     yield Label("─", id="env-status", classes="current-info")
 
             with Vertical(classes="panel output-panel"):
                 yield Label("生成命令与持久配置", classes="panel-title")
                 with Horizontal(classes="toolbar"):
-                    yield Button("显示 export", id="btn-set-all", classes="action-button success-button")
-                    yield Button("显示 unset", id="btn-clear-all", classes="action-button muted-button")
-                    yield Button("写入 bashrc", id="btn-write-bashrc", classes="action-button primary-button")
-                    yield Button("写入 zshrc", id="btn-write-zshrc", classes="action-button primary-button")
-                with Horizontal(classes="toolbar"):
-                    yield Button("移除 bashrc 配置", id="btn-remove-bashrc", classes="action-button danger-button")
-                    yield Button("移除 zshrc 配置", id="btn-remove-zshrc", classes="action-button danger-button")
+                    yield Button("export", id="btn-set-all", classes="action-button success-button")
+                    yield Button("unset", id="btn-clear-all", classes="action-button muted-button")
+                    yield Button("写入 bash", id="btn-write-bashrc", classes="action-button primary-button")
+                    yield Button("写入 zsh", id="btn-write-zshrc", classes="action-button primary-button")
+                    yield Button("移除 bash", id="btn-remove-bashrc", classes="action-button danger-button")
+                    yield Button("移除 zsh", id="btn-remove-zshrc", classes="action-button danger-button")
                 yield Label("─", id="proxy-action-status", classes="action-status")
 
     def on_mount(self) -> None:
@@ -73,24 +70,37 @@ class SystemProxyScreen(Widget):
         port = config.get("mixed-port", 7890)
         return f"127.0.0.1:{port}"
 
+    def _clip_env(self, value: str, limit: int = 42) -> str:
+        text = value or "(未设置)"
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
     def _refresh_status(self) -> None:
         http_proxy = os.environ.get("http_proxy", "")
         https_proxy = os.environ.get("https_proxy", "")
         all_proxy = os.environ.get("all_proxy", "")
+        no_proxy = os.environ.get("no_proxy", "")
 
         self.query_one("#switch-http", Switch).value = bool(http_proxy)
         self.query_one("#switch-https", Switch).value = bool(https_proxy)
         self.query_one("#switch-all", Switch).value = bool(all_proxy)
 
-        self.query_one("#http-proxy-label", Label).update(http_proxy or "[#8b98aa](未设置)[/]")
-        self.query_one("#https-proxy-label", Label).update(https_proxy or "[#8b98aa](未设置)[/]")
-        self.query_one("#all-proxy-label", Label).update(all_proxy or "[#8b98aa](未设置)[/]")
+        self.query_one("#http-proxy-label", Label).update(
+            http_proxy or "[#8b98aa](未设置)[/]"
+        )
+        self.query_one("#https-proxy-label", Label).update(
+            https_proxy or "[#8b98aa](未设置)[/]"
+        )
+        self.query_one("#all-proxy-label", Label).update(
+            all_proxy or "[#8b98aa](未设置)[/]"
+        )
 
         env_text = (
-            f"http_proxy={http_proxy or '(未设置)'}\n"
-            f"https_proxy={https_proxy or '(未设置)'}\n"
-            f"all_proxy={all_proxy or '(未设置)'}\n"
-            f"no_proxy={os.environ.get('no_proxy', '(未设置)')}"
+            f"http={self._clip_env(http_proxy)}\n"
+            f"https={self._clip_env(https_proxy)}\n"
+            f"all={self._clip_env(all_proxy)}\n"
+            f"no={self._clip_env(no_proxy, 36)}"
         )
         self.query_one("#env-status", Label).update(env_text)
 

@@ -40,9 +40,17 @@ from .process import ProcessOwnershipError, restart_process, start_process, stop
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .runtime import render_runtime
 from .services.ops import guard
-from .services.probe import ProbeService
+from .services.probe import ProbeService, resolve_current_leaf
 from .services.query import QueryService
 from .services.refresh import RefreshService
+from .services.switch_tree import (
+    build_switch_tree,
+    delay_label as _delay_label,
+    extra_subscription_names,
+    level_title,
+    resolve_delay as _resolve_delay,
+    resolve_group_query,
+)
 from .support import build_support_bundle
 
 
@@ -129,28 +137,35 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "proxy-shell":
             print(_section_title("进入临时代理 shell，退出后代理环境失效"))
             return run_proxy_shell(default_paths(), args.shell_args)
-        if args.command in {"current", "list-groups", "list-nodes", "ai-status"}:
+        if args.command in {"current", "list-groups", "list-nodes", "ai-status", "groups", "group"}:
             service = QueryService(default_paths())
             if args.command == "current":
-                return _render_current({args.group: service.get_group(args.group)}, args.group, args.raw, args.json)
-            if args.command == "list-groups":
-                return _render_list_groups(service.list_groups(), args.raw, args.json)
+                groups_by_name, tree = _switch_tree_for(service)
+                group_name = resolve_group_query(args.group, groups_by_name, tree)
+                return _render_current(groups_by_name, group_name, args.raw, args.json)
+            if args.command in {"list-groups", "groups", "group"}:
+                groups_by_name, tree = _switch_tree_for(service)
+                return _render_list_groups(list(groups_by_name.values()), args.raw, args.json, tree=tree)
             if args.command == "list-nodes":
-                return _render_list_nodes({args.group: service.get_group(args.group)}, args.group, args.raw, args.json)
+                groups_by_name, tree = _switch_tree_for(service)
+                return _render_list_nodes(groups_by_name, args.group, args.raw, args.json, tree=tree)
             return _render_ai_status(service.get_ai_status_groups(), args.raw, args.json)
         if args.command == "switch":
             service = QueryService(default_paths())
-            group_name, target_name = _resolve_switch(service, args)
-            group = service.switch_group(group_name, target_name)
-            old_raw = service.last_switch_from
-            old_selection = normalize_name(old_raw) if old_raw else None
-            new_selection = normalize_name(group.current)
+            path = _resolve_switch(service, args)
+            root_group = path[0][0]
             snapshot = service.groups_snapshot
+            old_leaf = resolve_current_leaf(snapshot, root_group)
+            group = service.switch_path(path)
+            snapshot = service.groups_snapshot
+            new_leaf = resolve_current_leaf(snapshot, root_group)
+            old_selection = normalize_name(old_leaf) if old_leaf else None
+            new_selection = normalize_name(new_leaf or group.current)
             delays = {name: item.delay for name, item in snapshot.items() if item.delay is not None}
-            new_delay = _resolve_delay(group.current, snapshot, delays) if group.current else None
+            new_delay = _resolve_delay(new_leaf or group.current, snapshot, delays)
 
             print(_section_heading("结果"))
-            print(f"代理组: {group_name}")
+            print(f"代理组: {root_group}")
             if old_selection and old_selection != new_selection:
                 print(f"切换: {old_selection} → {_accent(new_selection)}", end="")
             else:
@@ -253,137 +268,127 @@ def run(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _resolve_switch(service: QueryService, args: Namespace) -> tuple[str, str]:
+def _resolve_switch(service: QueryService, args: Namespace) -> list[tuple[str, str]]:
     """决定 switch 切到哪个组/节点；无法继续时以合适的退出码结束进程。
 
     三种情形：
       两个参数都给 → 原样返回（不碰 API、不进选择器，行为与改造前一致）
       只给了一个   → 维持改造前的「缺少必需参数」报错（退 2）
       一个都没给   → 进交互选择；非交互终端则给出用法与候选后退 2
+
+    返回值是 (组, 目标) 的切换路径；嵌套组下选叶子节点时会含多级 selector。
     """
     if args.group is not None and args.target is not None:
-        return args.group, args.target
+        return [(args.group, args.target)]
 
     if args.group is not None:
         print("cproxy switch: 错误: 缺少必需参数: target", file=sys.stderr)
         print("用法: cproxy switch <代理组> <目标>", file=sys.stderr)
         raise SystemExit(2)
 
-    # 需要**全部**组（不只可切换的那些）来解析候选延迟——候选很可能是组，
-    # 得沿它当前出口往下钻才能拿到真实测速值
     all_groups = service.list_groups()
-    groups = [g.name for g in all_groups if str(g.type).lower() in {"selector", "select"}]
-    groups_by_name = {g.name: g for g in all_groups}
-    delays = {g.name: g.delay for g in all_groups if g.delay is not None}
-    if not groups:
+    groups_by_name = {group.name: group for group in all_groups}
+    delays = {group.name: group.delay for group in all_groups if group.delay is not None}
+    entries = build_switch_tree(
+        groups_by_name,
+        match_group=service.match_rule_group(),
+        extra_names=_extra_names_for_switch(service),
+        delays=delays,
+    )
+    if not entries:
         print("错误: 没有可手动切换的代理组", file=sys.stderr)
         raise SystemExit(1)
 
-    last_group: str | None = None
-    roles = _group_roles(service, groups)
+    last_display: str | None = None
+    default_display = next((entry.display for entry in entries if entry.current), None)
     try:
         while True:
-            group_name = select_one(
-                "选择代理组",
-                groups,
-                current=last_group,  # 从节点列表返回时停在刚才那一组
-                annotations=roles,
+            entry_item = select_one(
+                "选择入口",
+                [entry.display for entry in entries],
+                current=last_display or default_display,
+                annotations={entry.display: entry.annotation for entry in entries if entry.annotation},
             )
-            if group_name is None:
-                raise SystemExit(0)  # 用户主动取消，不是错误
-            last_group = group_name
-            group = groups_by_name.get(group_name) or service.get_group(group_name)
-            if not group.candidates:
-                print(f"错误: 代理组 [{group_name}] 没有候选节点", file=sys.stderr)
+            if entry_item is None:
+                raise SystemExit(0)
+            entry = next(item for item in entries if item.display == entry_item)
+            last_display = entry.display
+            children = entry.children
+            if not children:
+                print(f"错误: 代理组 [{entry.key}] 没有候选节点", file=sys.stderr)
                 raise SystemExit(1)
-            target_name = select_one(
-                "选择节点",
-                group.candidates,
-                current=group.current,  # 高亮当前在用的那个
-                annotations={
-                    name: _delay_label(_resolve_delay(name, groups_by_name, delays)) for name in group.candidates
-                },
-                annotation_styles={
-                    name: _delay_style(_resolve_delay(name, groups_by_name, delays)) for name in group.candidates
-                },
-                back_hint=True,  # 底部提示「返回」；q / Esc / ← 回到分组列表
-            )
-            if target_name is not None:
-                return group_name, target_name
-            # target_name is None → 返回上一级重选分组
+            while True:
+                region_item = select_one(
+                    level_title(children),
+                    [child.display for child in children],
+                    current=next((child.display for child in children if child.current), None),
+                    annotations={child.display: child.annotation for child in children if child.annotation},
+                    annotation_styles={
+                        child.display: child.annotation_style for child in children if child.annotation_style
+                    },
+                    back_hint=True,
+                )
+                if region_item is None:
+                    break
+                child = next(item for item in children if item.display == region_item)
+                if child.drillable:
+                    node_item = select_one(
+                        "选择节点",
+                        [node.display for node in child.children],
+                        current=next((node.display for node in child.children if node.current), None),
+                        annotations={
+                            node.display: node.annotation for node in child.children if node.annotation
+                        },
+                        annotation_styles={
+                            node.display: node.annotation_style
+                            for node in child.children
+                            if node.annotation_style
+                        },
+                        back_hint=True,
+                    )
+                    if node_item is None:
+                        continue
+                    node = next(item for item in child.children if item.display == node_item)
+                    return list(node.path)
+                return list(child.path)
     except NotATerminalError:
-        _explain_switch_usage(groups)
+        _explain_switch_usage(entries)
         raise SystemExit(2) from None
 
 
-def _group_roles(service: QueryService, groups: list[str]) -> dict[str, str]:
-    """选择器里每个组的角色标注。
+def _extra_names_for_switch(service: QueryService) -> list[str]:
+    paths = getattr(service, "paths", None)
+    if paths is None:
+        return []
+    try:
+        from .config import read_config
 
-    只标 **判据可靠** 的三个：`MATCH` 规则指向的组、`AI-MANUAL`、`GLOBAL`。
-    其余一律不标——猜错的分类比没有分类更误导人（比如把某个「地区池」标成
-    「订阅」会让人改错组，这正是这个标注要防的事）。
-    """
-    roles: dict[str, str] = {}
-    match_group = service.match_rule_group()
-    if match_group in groups:
-        roles[match_group] = "默认路由 · 决定其余流量"
-    if "AI-MANUAL" in groups:
-        roles["AI-MANUAL"] = "AI 流量 · 决定 AI 出口"
-    if "GLOBAL" in groups:
-        roles["GLOBAL"] = "全局 · 绕过规则"
-    return roles
+        return extra_subscription_names(read_config(paths))
+    except Exception:
+        return []
 
 
-def _delay_label(delay: int | None) -> str:
-    """选择器里的延迟标注。
-
-    `0` 是 mihomo 的**测速失败**标记，不是「极快」——直接显示 `0 ms` 会让人
-    挑中实际不可用的节点。取不到记录则标 `-`，与「失败」区分开。
-    """
-    if delay is None:
-        return "-"
-    return "超时" if delay <= 0 else f"{delay} ms"
-
-
-def _delay_style(delay: int | None) -> str:
-    """延迟标注的 ANSI 着色：快绿、中黄、慢/超时红、无记录暗灰。"""
-    if delay is None:
-        return "\033[2m"   # dim
-    if delay <= 0:
-        return "\033[31m"  # red — 超时
-    if delay <= 200:
-        return "\033[32m"  # green — 快
-    if delay <= 500:
-        return "\033[33m"  # yellow — 中
-    return "\033[31m"      # red — 慢
+def _switch_tree_for(service: QueryService):
+    all_groups = service.list_groups()
+    groups_by_name = {group.name: group for group in all_groups}
+    delays = {group.name: group.delay for group in all_groups if group.delay is not None}
+    entries = build_switch_tree(
+        groups_by_name,
+        match_group=service.match_rule_group(),
+        extra_names=_extra_names_for_switch(service),
+        delays=delays,
+    )
+    return groups_by_name, entries
 
 
-def _resolve_delay(name: str, groups: dict, delays: dict[str, int], depth: int = 0) -> int | None:
-    """取某个候选的延迟。
-
-    候选可能是节点，也可能是**组**——`AI-MANUAL` 这一层的候选大多是后者
-    （`🇯🇵 Japan` 等 selector 组自己不测速，直接查只会得到空）。所以遇到组就
-    沿它当前出口往下钻，直到拿到真实节点的测速值，这样各组的快慢才可比。
-    """
-    if name in delays:
-        return delays[name]
-    group = groups.get(name)
-    # depth 兜底：配置异常时组之间可能互相引用成环
-    if group is None or depth >= 8:
-        return None
-    current = getattr(group, "current", None)
-    if not current or current == name:
-        return None
-    return _resolve_delay(str(current), groups, delays, depth + 1)
-
-
-def _explain_switch_usage(groups: list[str]) -> None:
-    """非交互终端下的降级说明：给出用法与可选分组，退出码沿用用法错误的 2。"""
+def _explain_switch_usage(entries) -> None:
+    """非交互终端下的降级说明：给出用法与可选入口，退出码沿用用法错误的 2。"""
     print("cproxy switch: 错误: 缺少参数，且当前不是交互终端", file=sys.stderr)
     print("用法: cproxy switch <代理组> <目标>", file=sys.stderr)
-    print("可选的代理组:", file=sys.stderr)
-    for name in groups:
-        print(f"  {name}", file=sys.stderr)
+    print("可选入口:", file=sys.stderr)
+    for entry in entries:
+        print(f"  {entry.display}  ({entry.key})", file=sys.stderr)
+
 
 
 def main() -> None:

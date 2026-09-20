@@ -27,16 +27,16 @@ class ProvidersScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("代理提供方", classes="page-title")
             with Vertical(classes="panel output-panel"):
-                yield Label("代理 Provider", classes="panel-title")
-                yield Label("─", id="providers-status", classes="status-strip")
+                with Horizontal(classes="panel-header"):
+                    yield Label("代理提供方", classes="panel-title")
+                    yield Label("─", id="providers-status", classes="status-strip")
                 yield DataTable(id="providers-table")
                 with Horizontal(classes="toolbar"):
-                    yield Button("更新选中项", id="btn-update-provider", classes="action-button primary-button")
+                    yield Button("更新", id="btn-update-provider", classes="action-button primary-button")
                     yield Button("刷新", id="btn-refresh-providers", classes="action-button muted-button")
                 yield Label(
-                    "↑↓ 移动  u 更新选中项  r 刷新",
+                    "↑↓ 移动  u 更新  r 刷新",
                     id="providers-action-status", classes="action-status",
                 )
 

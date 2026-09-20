@@ -152,12 +152,27 @@ def test_query_commands_use_api_output(tmp_path: Path):
         assert "列表" in groups_result.stdout
         assert "当前选择" in groups_result.stdout
         assert "AI-MANUAL" in groups_result.stdout
+        assert "AI 出口" in groups_result.stdout
+
+        alias_result = _run(env, "group")
+        assert alias_result.returncode == 0
+        assert "AI 出口" in alias_result.stdout
 
         nodes_result = _run(env, "list-nodes", "AI-MANUAL")
         assert nodes_result.returncode == 0
         assert "摘要" in nodes_result.stdout
         assert "列表" in nodes_result.stdout
         assert "当前选择: AI-AUTO" in nodes_result.stdout
+
+        display_nodes = _run(env, "list-nodes", "AI 出口")
+        assert display_nodes.returncode == 0
+        assert "目标组: AI 出口" in display_nodes.stdout
+        assert "内部组: AI-MANUAL" in display_nodes.stdout
+
+        untitled = _run(env, "list-nodes")
+        assert untitled.returncode == 0
+        assert "AI 出口" in untitled.stdout
+        assert "cproxy list-nodes 'AI 出口'" in untitled.stdout
 
         ai_status_result = _run(env, "ai-status")
         assert ai_status_result.returncode == 0
@@ -229,7 +244,7 @@ def test_query_commands_fall_back_to_runtime_when_api_unavailable(tmp_path: Path
     nodes_result = _run(env, "list-nodes", "AI-MANUAL")
     assert nodes_result.returncode == 0
     assert "列表" in nodes_result.stdout
-    assert "AI-US" in nodes_result.stdout
+    assert "当前选择: AI-AUTO" in nodes_result.stdout
 
     current_result = _run(env, "current", "AI-MANUAL")
     assert current_result.returncode == 0

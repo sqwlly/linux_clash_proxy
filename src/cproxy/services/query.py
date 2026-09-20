@@ -151,6 +151,16 @@ class QueryService:
         )
         return updated
 
+    def switch_path(self, path: list[tuple[str, str]]) -> ProxyGroup:
+        """按序切换多级 selector 路径（内层组到外层组），返回最后一步更新后的组。"""
+        if not path:
+            raise SystemExit("错误: 切换路径为空")
+        group: ProxyGroup | None = None
+        for group_name, target_name in path:
+            group = self.switch_group(group_name, target_name)
+        assert group is not None
+        return group
+
     def _drop_stale_ai_connections(self, group_name: str) -> int:
         """切换 AI 出口后立刻掐掉旧 TCP，避免同一会话混用新旧出口 IP。
 

@@ -17,8 +17,27 @@ import yaml
 SUPPORTED_SCHEMES = ("vless", "hysteria2", "tuic", "trojan", "ss")
 
 # 订阅分组地区归纳顺序；节点名命中任一模式即归入该地区
-SUBSCRIPTION_REGION_ORDER = ("HK", "JP", "KR", "SG", "TW", "US", "OTHER")
+SUBSCRIPTION_REGION_ORDER = (
+    "HK", "JP", "KR", "SG", "TW", "US", "AU", "BR", "AE", "DE", "FR", "GB", "IN", "OTHER",
+)
 REGION_LABELS = {"OTHER": "其他"}
+# switch 第二步用中文地区名；不写入 REGION_LABELS，以免附加订阅分组从 Mitce-HK 变成 Mitce-香港
+SWITCH_REGION_LABELS = {
+    "HK": "香港",
+    "JP": "日本",
+    "KR": "韩国",
+    "SG": "新加坡",
+    "TW": "台湾",
+    "US": "美国",
+    "AU": "澳大利亚",
+    "BR": "巴西",
+    "AE": "迪拜",
+    "DE": "德国",
+    "FR": "法国",
+    "GB": "英国",
+    "IN": "印度",
+    "OTHER": "其他",
+}
 REGION_PATTERNS: dict[str, tuple[str, ...]] = {
     "HK": (r"🇭🇰", r"香港", r"\bHKG?\b", r"\bHK\d"),
     "JP": (r"🇯🇵", r"日本", r"Japan", r"\bJPN?\b", r"\bJP\d"),
@@ -26,7 +45,36 @@ REGION_PATTERNS: dict[str, tuple[str, ...]] = {
     "SG": (r"🇸🇬", r"新加坡", r"Singapore", r"\bSGP?\b", r"\bSG\d"),
     "TW": (r"🇹🇼", r"台湾", r"Taiwan", r"\bTWN?\b", r"\bTW\d"),
     "US": (r"🇺🇸", r"美国", r"United States", r"\bUSA?\b", r"\bUS\d"),
+    "AU": (r"🇦🇺", r"澳大利亚", r"Australia", r"\bAUS?\b", r"\bAU\d"),
+    "BR": (r"🇧🇷", r"巴西", r"Brazil", r"\bBRA?\b", r"\bBR\d"),
+    "AE": (r"🇦🇪", r"迪拜", r"Dubai", r"UAE", r"\bAE\b"),
+    "DE": (r"🇩🇪", r"德国", r"Germany", r"\bDEU?\b", r"\bDE\d"),
+    "FR": (r"🇫🇷", r"法国", r"France", r"\bFRA?\b", r"\bFR\d"),
+    "GB": (r"🇬🇧", r"英国", r"Britain", r"United Kingdom", r"\bUK\b", r"\bGB\d"),
+    "IN": (r"🇮🇳", r"印度", r"India", r"\bIND?\b", r"\bIN\d"),
 }
+
+
+PANEL_INFO_NODE_MARKERS: tuple[str, ...] = (
+    "剩余流量",
+    "套餐到期",
+    "过期时间",
+    "到期时间",
+    "流量重置",
+    "有效期",
+    "官网",
+    "expire",
+    "traffic",
+)
+
+
+def is_panel_info_node(name: str) -> bool:
+    """识别机场面板注入的信息节点（剩余流量/套餐到期等）。
+
+    这类节点名携带动态数值（如“剩余流量：160.9 GB”），不能当可切换出口。
+    """
+    lowered = name.lower()
+    return any(marker in lowered for marker in PANEL_INFO_NODE_MARKERS)
 
 
 def match_region(proxy_name: str) -> str:

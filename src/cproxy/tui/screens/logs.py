@@ -33,16 +33,14 @@ class LogsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("日志", classes="page-title")
             with Vertical(classes="panel output-panel"):
-                yield Label("日志查看器", classes="panel-title")
-                with Horizontal(classes="field-row"):
+                with Horizontal(classes="panel-header"):
                     yield Label("─", id="log-file-label", classes="path-label")
-                    yield Label("[#a3e635]● 正在跟随[/]", id="log-status-label", classes="status-strip")
+                    yield Label("[#a3e635]● 跟随[/]", id="log-status-label", classes="status-strip")
                 with Horizontal(classes="toolbar"):
-                    yield Button("清空视图", id="btn-log-clear", classes="action-button danger-button")
-                    yield Button("刷新", id="btn-log-refresh", classes="action-button primary-button")
-                    yield Checkbox("自动跟随", value=True, id="chk-follow")
+                    yield Button("清空", id="btn-log-clear", classes="action-button danger-button")
+                    yield Button("刷新", id="btn-log-refresh", classes="action-button muted-button")
+                    yield Checkbox("跟随", value=True, id="chk-follow")
                 yield TextArea(id="log-viewer", read_only=True, classes="log-viewer")
 
     def on_mount(self) -> None:
@@ -146,7 +144,7 @@ class LogsScreen(Widget):
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if event.checkbox.id == "chk-follow":
             self._following = event.value
-            status = "[#a3e635]● 正在跟随[/]" if self._following else "[#8b98aa]○ 已暂停[/]"
+            status = "[#a3e635]● 跟随[/]" if self._following else "[#8b98aa]○ 暂停[/]"
             self.query_one("#log-status-label", Label).update(status)
 
     def action_clear_logs(self) -> None:
@@ -159,7 +157,7 @@ class LogsScreen(Widget):
     def action_toggle_follow(self) -> None:
         self._following = not self._following
         self.query_one("#chk-follow", Checkbox).value = self._following
-        status = "[#a3e635]● 正在跟随[/]" if self._following else "[#8b98aa]○ 已暂停[/]"
+        status = "[#a3e635]● 跟随[/]" if self._following else "[#8b98aa]○ 暂停[/]"
         self.query_one("#log-status-label", Label).update(status)
 
     def action_refresh_logs(self) -> None:

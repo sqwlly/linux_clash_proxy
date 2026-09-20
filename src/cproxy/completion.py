@@ -146,10 +146,26 @@ def _values_for(paths: AppPaths, source: str, prior_args: list[str]) -> list[str
 
 def _group_names(paths: AppPaths, *, selectable_only: bool = False) -> list[str]:
     """代理组名。`selectable_only` 时只给能手动切换的（与 switch 的校验口径一致）。"""
-    groups = QueryService(paths).list_groups(request_timeout=_API_TIMEOUT_SECONDS)
+    service = QueryService(paths)
+    groups = service.list_groups(request_timeout=_API_TIMEOUT_SECONDS)
     if selectable_only:
         groups = [group for group in groups if str(group.type).lower() in {"selector", "select"}]
-    return [group.name for group in groups]
+    names = [group.name for group in groups]
+    try:
+        from .config import read_config
+        from .services.switch_tree import build_switch_tree, extra_subscription_names
+
+        tree = build_switch_tree(
+            {group.name: group for group in groups},
+            match_group=service.match_rule_group(),
+            extra_names=extra_subscription_names(read_config(paths)),
+        )
+        for entry in tree:
+            if entry.display not in names:
+                names.append(entry.display)
+    except Exception:
+        pass
+    return names
 
 
 def _node_names(paths: AppPaths, group_name: str | None) -> list[str]:

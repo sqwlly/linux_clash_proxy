@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from cproxy.services.nodelist import match_region, parse_share_link, parse_subscription_payload
+from cproxy.services.nodelist import is_panel_info_node, match_region, parse_share_link, parse_subscription_payload
 
 # 测试样例均为虚构凭据，非真实订阅
 VLESS_URI = (
@@ -107,4 +107,13 @@ def test_match_region():
     assert match_region("Mitce TW-1") == "TW"
     assert match_region("Mitce US1-HY2") == "US"
     assert match_region("🇯🇵日本 01 | 1X") == "JP"
+    assert match_region("🇦🇺澳大利亚 01 | 1X") == "AU"
+    assert match_region("🇩🇪德国 01 | 1X") == "DE"
+    assert match_region("🇮🇳印度 01 | 1X") == "IN"
     assert match_region("Mars-1") == "OTHER"
+
+
+def test_is_panel_info_node():
+    assert is_panel_info_node("剩余流量：160.9 GB")
+    assert is_panel_info_node("套餐到期：2026-12-01")
+    assert not is_panel_info_node("🇭🇰香港 01")

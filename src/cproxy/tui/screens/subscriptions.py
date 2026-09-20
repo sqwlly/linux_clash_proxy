@@ -58,10 +58,8 @@ class SubscriptionsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("订阅", classes="page-title")
-
             with Vertical(classes="panel form-panel"):
-                yield Label("导入主订阅", classes="panel-title")
+                yield Label("导入订阅", classes="panel-title")
                 yield Input(
                     placeholder="订阅 URL（Clash / VLESS / Base64）…",
                     id="sub-url-input",
@@ -74,13 +72,14 @@ class SubscriptionsScreen(Widget):
                         classes="subscription-input",
                     )
                     yield Input(
-                        placeholder="挂载到选择器（附加订阅可选）",
+                        placeholder="挂载到选择器（默认不挂，与主订阅同级）",
                         id="sub-attach-input",
                         classes="subscription-input",
                     )
+                with Horizontal(classes="toolbar"):
                     yield Button("预览", id="btn-sub-preview", classes="action-button muted-button")
                     yield Button("应用", id="btn-sub-apply", classes="action-button success-button")
-                    yield Button("验证本地配置", id="btn-sub-update", classes="action-button primary-button")
+                    yield Button("验证", id="btn-sub-update", classes="action-button primary-button")
 
             with Horizontal(classes="workbench-row"):
                 with Vertical(classes="panel output-panel split-main"):
@@ -204,7 +203,12 @@ class SubscriptionsScreen(Widget):
                 else:
                     report = service.refresh(subscription_url=url, groups=[])
                 extra = next((item for item in report.extra_subscriptions if item.name == group), None)
-                target_text = f"\n挂载到: {attach_to}" if attach_to else ""
+                if attach_to:
+                    target_text = f"\n挂载到: {attach_to}"
+                elif group:
+                    target_text = "\n未挂载（与默认流量同级，切此订阅不会改 MATCH）"
+                else:
+                    target_text = ""
                 extra_text = f"\n附加订阅: {extra.status}（{extra.detail}）" if extra is not None else ""
                 output_text = (
                     f"应用: {'附加订阅已更新' if group else report.subscription}\n"

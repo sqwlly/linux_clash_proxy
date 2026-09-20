@@ -120,8 +120,8 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "AI 路由控制",
         (
             ("current", "查看代理组当前选择"),
-            ("list-groups", "列出可切换的代理组"),
-            ("list-nodes", "列出代理组候选项"),
+            ("list-groups", "列出用途入口（默认流量 / AI 出口）"),
+            ("list-nodes", "列出入口或组的候选项"),
             ("switch", "手动切换 Selector 代理组"),
             ("ai-status", "查看 AI 专用路由状态"),
             ("test-group", "测试代理组或节点健康情况"),
@@ -231,7 +231,14 @@ def _localize_help_titles(parser: ArgumentParser) -> None:
         positionals.title = "位置参数"
 
 
-def _add_command(subparsers, name: str, *, raw: bool = False, json_output: bool = False) -> ArgumentParser:
+def _add_command(
+    subparsers,
+    name: str,
+    *,
+    raw: bool = False,
+    json_output: bool = False,
+    aliases: tuple[str, ...] = (),
+) -> ArgumentParser:
     """注册一个子命令。
 
     - `description` 自动取自 `_COMMAND_HELP`，命令表是唯一数据源
@@ -243,7 +250,13 @@ def _add_command(subparsers, name: str, *, raw: bool = False, json_output: bool 
     （`cproxy status --raw`），提到根上后这些调用会被判成「子命令不认识 --raw」；
     而父子同时定义会触发 argparse 的 conflicting option string，整个 CLI 构造失败。
     """
-    parser = subparsers.add_parser(name, description=_COMMAND_HELP[name], add_help=False, formatter_class=CliHelpFormatter)
+    parser = subparsers.add_parser(
+        name,
+        aliases=list(aliases),
+        description=_COMMAND_HELP[name],
+        add_help=False,
+        formatter_class=CliHelpFormatter,
+    )
     parser.add_argument("-h", "--help", action="help", help="显示本帮助并退出")
     if raw or json_output:
         output_group = parser.add_mutually_exclusive_group()
@@ -277,10 +290,10 @@ def build_root_parser() -> ArgumentParser:
     current_parser = _add_command(subparsers, "current", raw=True, json_output=True)
     current_parser.add_argument("group", help="代理组名")
 
-    _add_command(subparsers, "list-groups", raw=True, json_output=True)
+    _add_command(subparsers, "list-groups", raw=True, json_output=True, aliases=("groups", "group"))
 
     nodes_parser = _add_command(subparsers, "list-nodes", raw=True, json_output=True)
-    nodes_parser.add_argument("group", help="代理组名")
+    nodes_parser.add_argument("group", nargs="?", help="入口或组名；可写「默认流量」「AI 出口」或内部组名")
 
     switch_parser = _add_command(subparsers, "switch")
     switch_parser.add_argument("group", nargs="?", help="代理组名；与 target 一并省略时进入交互选择")

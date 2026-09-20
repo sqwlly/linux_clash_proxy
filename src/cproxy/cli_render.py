@@ -14,6 +14,7 @@ from . import __version__
 from .api import APIUnavailableError
 from .backend.api import APIBackend
 from .backend.models import AIProbeReport, ProxyGroup
+from .backend.runtime import ai_standby_peer
 from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
@@ -26,11 +27,13 @@ from .process import get_status, restart_process, start_process
 from .runtime import render_runtime
 from .security import validate_controller_security
 from .services.ipcheck import IpCheckService
+from .services.nodelist import is_panel_info_node
 from .services.ops import build_incident, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
 from .services.refresh import RefreshReport, update_source_from_subscription
 from .services.subscription_info import SubscriptionUsage, display_entries
+from .services.switch_tree import SwitchChoice, lookup_choice, resolve_group_query
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 from .structured_output import emit_json
@@ -246,7 +249,7 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
     active_node = _group_value(active, "now", "-")
     active_delay = _group_value(active, "delay", "-")
     active_alive = _group_value(active, "alive")
-    standby_group = "AI-SG" if active_group == "AI-US" else "AI-US"
+    standby_group = ai_standby_peer(str(active_group))
     standby = _get_group(groups, standby_group)
     standby_node = _group_value(standby, "now", "-")
     standby_delay = _group_value(standby, "delay", "-")
@@ -280,7 +283,7 @@ def _render_current(groups: dict, group_name: str, raw: bool, json_output: bool 
     return 0
 
 
-def _render_list_groups(groups, raw: bool, json_output: bool = False) -> int:
+def _render_list_groups(groups, raw: bool, json_output: bool = False, tree=None) -> int:
     items = []
     iterable = groups.values() if isinstance(groups, dict) else groups
     for group in iterable:
@@ -307,30 +310,92 @@ def _render_list_groups(groups, raw: bool, json_output: bool = False) -> int:
             print(f"{name}\t{group_type}")
         return 0
 
+    if tree:
+        return _render_switch_entries(tree, groups, heading="用途入口")
+
     _print_section("摘要")
     print(f"总组数: {len(items)}")
     print(f"可切换组数: {len(items)}")
     print()
     _print_section("列表")
-    print(f"{'组名':<20} {'类型':<12} 当前选择")
+    name_w = max((_display_width(name) for name, _, _ in items), default=4)
+    type_w = max((_display_width(group_type) for _, group_type, _ in items), default=4)
+    name_w = max(name_w, _display_width("组名"))
+    type_w = max(type_w, _display_width("类型"))
+    print(f"{_pad_right('组名', name_w)}  {_pad_right('类型', type_w)}  当前选择")
     for name, group_type, current in items:
-        print(f"{name:<20} {group_type:<12} {current}")
+        print(f"{_pad_right(name, name_w)}  {_pad_right(group_type, type_w)}  {current}")
     return 0
 
 
-def _render_list_nodes(groups: dict, group_name: str, raw: bool, json_output: bool = False) -> int:
-    group = _get_group(groups, group_name)
-    current = _group_value(group, "now", "")
-    items = _group_value(group, "all", [])
+def _render_switch_entries(tree, groups, *, heading: str) -> int:
+    groups_by_name = groups if isinstance(groups, dict) else {group.name: group for group in groups}
+    _print_section("摘要")
+    print(f"{heading}: {len(tree)}")
+    print()
+    _print_section("列表")
+    name_w = max((_display_width(entry.display) for entry in tree), default=4)
+    key_w = max((_display_width(entry.key) for entry in tree), default=4)
+    name_w = max(name_w, _display_width("名称"))
+    key_w = max(key_w, _display_width("内部组"))
+    print(f"{_pad_right('名称', name_w)}  {_pad_right('内部组', key_w)}  当前选择")
+    for entry in tree:
+        group = groups_by_name.get(entry.key)
+        current = normalize_name(_group_value(group, "now", "-")) if group else "-"
+        print(f"{_pad_right(entry.display, name_w)}  {_pad_right(entry.key, key_w)}  {current}")
+    return 0
+
+
+def _render_list_nodes(groups: dict, group_name: str | None, raw: bool, json_output: bool = False, tree=None) -> int:
+    if not group_name:
+        if raw or json_output:
+            raise SystemExit("错误: 缺少必需参数: group")
+        if tree:
+            _render_switch_entries(tree, groups, heading="用途入口")
+            print()
+            print("指定入口或组名查看候选项，例如: cproxy list-nodes 'AI 出口'")
+            return 0
+        raise SystemExit("错误: 缺少必需参数: group")
+
+    choice = lookup_choice(group_name, tree) if tree else None
+    resolved = None
+    if group_name in groups:
+        resolved = group_name
+    elif choice is not None:
+        if choice.key in groups:
+            resolved = choice.key
+        elif choice.group_name in groups:
+            resolved = choice.group_name
+    if resolved is None:
+        resolved = resolve_group_query(group_name, groups, tree or ())
+
+    group = groups.get(resolved) if resolved else None
+    current = _group_value(group, "now", "") if group else ""
+    use_tree = bool(
+        choice is not None
+        and choice.children
+        and not raw
+        and not json_output
+        and group_name not in groups
+    )
+    if use_tree:
+        items = [child.key for child in choice.children]
+        labels = {child.key: child.display for child in choice.children}
+        current_keys = {child.key for child in choice.children if child.current}
+    else:
+        raw_items = list(_group_value(group, "all", []) or [])
+        items = raw_items if raw or json_output else [item for item in raw_items if not is_panel_info_node(item)]
+        labels = {item: normalize_name(item) for item in items}
+        current_keys = {current} if current else set()
 
     if json_output:
         emit_json(
             "list-nodes",
             {
-                "group": group_name,
+                "group": resolved or group_name,
                 "current": current,
                 "nodes": [
-                    {"name": str(item), "display_name": normalize_name(item), "current": item == current}
+                    {"name": str(item), "display_name": labels.get(item, normalize_name(item)), "current": item == current or item in current_keys}
                     for item in items
                 ],
             },
@@ -338,19 +403,22 @@ def _render_list_nodes(groups: dict, group_name: str, raw: bool, json_output: bo
         return 0
     if raw:
         for item in items:
-            prefix = "* " if item == current else "  "
+            prefix = "* " if item == current or item in current_keys else "  "
             print(f"{prefix}{item}")
         return 0
 
+    display_target = choice.display if choice is not None else group_name
     _print_section("摘要")
-    print(f"目标组: {group_name}")
+    print(f"目标组: {display_target}")
+    if resolved and resolved != display_target:
+        print(f"内部组: {resolved}")
     print(f"当前选择: {_accent(normalize_name(current))}")
     print(f"候选数: {len(items)}")
     print()
     _print_section("列表")
     for item in items:
-        label = "当前" if item == current else "候选"
-        print(f"{label}  {normalize_name(item)}")
+        label = "当前" if item == current or item in current_keys else "候选"
+        print(f"{label}  {labels.get(item, normalize_name(item))}")
     return 0
 
 
@@ -360,8 +428,6 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
         "AI-AUTO",
         "AI-US",
         "AI-SG",
-        "🇺🇸 United States",
-        "🇸🇬 Singapore",
     )
     probe_report = run_ai_probe(default_paths())
     if json_output:

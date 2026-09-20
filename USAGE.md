@@ -217,12 +217,18 @@ autoload -Uz compinit && compinit
 
 ## 交互式选择
 
-`cproxy switch` 不带参数时进入上下键选择（先选分组、再选节点）：
+`cproxy switch` 不带参数时进入上下键选择。人读路径走这棵三层树；`cproxy list-groups` / `list-nodes` 默认也按这棵树显示（`cproxy group` 是 `list-groups` 的别名）。`--raw` / `--json` 仍输出 Mihomo 原始组名，供脚本使用：
+
+1. **用途入口**：默认流量（MATCH 指向的组，现在是 `CyberGuard`）、AI 出口（`AI-MANUAL`）、各附加订阅、`GLOBAL`（若有）。`AI-US` / `AI-SG` 只给自动策略用，不在这一层。
+2. **地区 / 自动**：该入口下的国家选择器和自动策略。`Enter` 进入 selector 地区；`url-test` / `fallback`（自动）直接切过去。AI 出口这一层的国家是按节点分桶，没有第二套 `🇯🇵 Japan` 组。
+3. **节点**：该地区下的真实节点。面板信息节点（剩余流量 / 套餐到期）已剔除，用量看 `cproxy status` 的订阅区块。
+
+默认流量用中文国家组（`日本` / `美国` 等）；AI 出口直接挂对应节点。两者不共用 selector，改默认流量的日本节点不会连带改 AI 出口。附加订阅与主订阅同级——切附加订阅只改该组，不会改 MATCH。要把某家机场当默认出口，应在「默认流量」那一层选节点，而不是把入口挂进 CyberGuard。TUI 导入附加订阅默认不填挂载目标。
 
 **基本操作：**
 - `↑↓` 或 `j k` 移动光标，`Enter` 确认
-- 分组列表：`q` / `Esc` / `Ctrl-C` 取消整个切换
-- 节点列表：`←` / `q` / `Esc` 返回上一级重新选分组（`Ctrl-C` 同样先回到分组列表）
+- 入口列表：`q` / `Esc` / `Ctrl-C` 取消整个切换
+- 地区 / 节点列表：`←` / `q` / `Esc` 返回上一级（`Ctrl-C` 同样先回到入口列表）
 
 **搜索/过滤：**
 - `/` 进入搜索模式，输入即时过滤候选列表（模糊匹配，大小写不敏感）
@@ -242,8 +248,8 @@ autoload -Uz compinit && compinit
 
 **降级行为：**
 - 带全参数时行为与以往完全一致；只给一个参数仍按原来的「缺少必需参数」报错
-- 只列出可手动切换（selector 类型）的分组
-- 在管道等非交互终端下退化为「打印可选分组 + 退出码 2」，不会挂起等待输入
+- 第一层只列出用途入口（默认流量 / AI 出口 / 附加订阅 / GLOBAL），不含 AI 地区池
+- 在管道等非交互终端下退化为「打印可选入口 + 退出码 2」，不会挂起等待输入
 
 ## AI 路由
 
@@ -260,15 +266,16 @@ cproxy current "AI-MANUAL" --raw
 
 ```bash
 cproxy list-groups
+cproxy group
 cproxy list-groups --raw
-cproxy list-nodes "AI-MANUAL"
+cproxy list-nodes
+cproxy list-nodes "AI 出口"
 cproxy list-nodes "AI-MANUAL" --raw
 ```
 
 手动切换：
 
 ```bash
-cproxy switch "AI-MANUAL" "AI-SG"
 cproxy switch "AI-MANUAL" "AI-AUTO"
 ```
 

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 import yaml
 
 from ..config import AppPaths, config_file, runtime_file
 from ..snapshots import snapshot_file
+from ..services.nodelist import (
+    SUBSCRIPTION_REGION_ORDER,
+    SWITCH_REGION_LABELS,
+    is_panel_info_node,
+    match_region,
+)
 from .api import APIBackend
 from .models import ProxyGroup
 
@@ -71,12 +76,11 @@ def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
     # 末段为目标组（no-resolve 等修饰符位于中间）
     return hit and parts[-1] != ai_group
 
-# 当原始订阅没有提供标准区域组时，根据节点名称自动归纳生成。
-# 数字变体（\bJP\d 等）覆盖 "JP6-HY2" 这类机场命名，与 nodelist.REGION_PATTERNS 对齐。
-REGION_PATTERNS = {
-    AI_REGION_JP: (r"🇯🇵", r"Japan", r"日本", r"\bJP\b", r"\bJP\d"),
-    AI_REGION_US: (r"🇺🇸", r"United States", r"美国", r"\bUS\b", r"\bUSA\b", r"\bUS\d"),
-    AI_REGION_SG: (r"🇸🇬", r"Singapore", r"新加坡", r"\bSG\b", r"\bSG\d"),
+EMOJI_REGION_GROUPS = frozenset({AI_REGION_JP, AI_REGION_US, AI_REGION_SG})
+AI_REGION_CODE_BY_GROUP = {
+    AI_REGION_JP: "JP",
+    AI_REGION_US: "US",
+    AI_REGION_SG: "SG",
 }
 
 
@@ -93,32 +97,264 @@ def _prefer_non_iepl_nodes(proxies: list) -> list:
     return other + iepl
 
 
-def _proxy_matches_region(proxy_name: str, patterns: tuple[str, ...]) -> bool:
-    return any(re.search(pat, proxy_name, re.IGNORECASE) for pat in patterns)
+AUTO_POLICY_NAMES = frozenset({AI_AUTO_GROUP, "自动选择", "Auto", "故障转移"})
+SPECIAL_POLICY_LEAVES = frozenset({"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"})
+SELECTABLE_GROUP_TYPES = frozenset({"selector", "select"})
+AUTO_GROUP_TYPES = frozenset({"url-test", "urltest", "fallback", "load-balance", "loadbalance"})
+RESERVED_MATCH_NAMES = frozenset(
+    {
+        AI_MANUAL_GROUP,
+        AI_AUTO_GROUP,
+        AI_US_GROUP,
+        AI_SG_GROUP,
+        AI_REGION_JP,
+        AI_REGION_US,
+        AI_REGION_SG,
+        "GLOBAL",
+        "DIRECT",
+        "REJECT",
+        "PASS",
+    }
+)
 
 
-def _ensure_region_groups(
-    groups: list[dict],
+def ai_standby_peer(active_name: str) -> str:
+    """与当前 AI 出口成对的备用组：自动池用 AI-US/AI-SG，手动按节点地区映射到另一侧 fallback。"""
+    pairs = {
+        AI_US_GROUP: AI_SG_GROUP,
+        AI_SG_GROUP: AI_US_GROUP,
+        AI_REGION_US: AI_SG_GROUP,
+        AI_REGION_SG: AI_US_GROUP,
+    }
+    if active_name in pairs:
+        return pairs[active_name]
+    code = match_region(active_name)
+    if code == "US":
+        return AI_SG_GROUP
+    if code == "SG":
+        return AI_US_GROUP
+    return AI_US_GROUP
+
+
+def ai_manual_toggle_target(candidates: list[str], active_name: str) -> str | None:
+    """手动模式下在 AI-MANUAL 的美/新节点之间切换。"""
+    want = "SG" if match_region(active_name) == "US" else "US"
+    for name in candidates:
+        if name in {AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP}:
+            continue
+        if match_region(name) == want:
+            return name
+    return None
+
+
+def _match_group_name(rules: list | None) -> str | None:
+    if not isinstance(rules, list):
+        return None
+    for rule in reversed(rules):
+        text = str(rule)
+        if text.startswith("MATCH,"):
+            return text.split(",", 1)[1].strip() or None
+    return None
+
+
+def _extra_subscription_names(data: dict) -> list[str]:
+    names: list[str] = []
+    for item in data.get("subscriptions") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _is_extra_node(name: str, extra_names: list[str] | set[str]) -> bool:
+    for extra in extra_names:
+        if name == extra or name.startswith(f"{extra} "):
+            return True
+    return False
+
+
+def _drop_named_groups(groups: list, names: set[str]) -> list:
+    kept: list = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept.append(group)
+            continue
+        if str(group.get("name") or "") in names:
+            continue
+        members = group.get("proxies")
+        if isinstance(members, list):
+            group["proxies"] = [member for member in members if str(member) not in names]
+        kept.append(group)
+    return kept
+
+
+def _collect_ai_region_nodes(
+    proxies: list | None,
     group_map: dict[str, dict],
-    proxies: list[dict] | None,
-    required_names: tuple[str, ...],
-) -> None:
-    proxies = proxies or []
-    for name in required_names:
-        if name in group_map:
+    extra_names: list[str],
+) -> dict[str, list[str]]:
+    """收集 AI 用的日/美/新节点；不创建第二套国家 selector。"""
+    extra_set = set(extra_names)
+    buckets: dict[str, list[str]] = {"JP": [], "US": [], "SG": []}
+    seen: dict[str, set[str]] = {code: set() for code in buckets}
+
+    def add(code: str, name: str) -> None:
+        if (
+            not name
+            or name in seen[code]
+            or is_panel_info_node(name)
+            or name in extra_set
+            or _is_extra_node(name, extra_names)
+            or name in group_map
+        ):
+            return
+        seen[code].add(name)
+        buckets[code].append(name)
+
+    for proxy in proxies or []:
+        if not isinstance(proxy, dict) or not proxy.get("name"):
             continue
-        patterns = REGION_PATTERNS.get(name)
-        if not patterns:
+        name = str(proxy["name"])
+        code = match_region(name)
+        if code in buckets:
+            add(code, name)
+
+    for group_name, code in AI_REGION_CODE_BY_GROUP.items():
+        region = group_map.get(group_name)
+        if not isinstance(region, dict):
             continue
-        members = [
-            str(proxy["name"])
-            for proxy in proxies
-            if isinstance(proxy, dict) and proxy.get("name") and _proxy_matches_region(str(proxy["name"]), patterns)
-        ]
-        if members:
-            group = {"name": name, "type": "select", "proxies": members}
-            groups.append(group)
-            group_map[name] = group
+        for member in region.get("proxies") or []:
+            add(code, str(member))
+
+    return {code: _prefer_non_iepl_nodes(names) for code, names in buckets.items()}
+
+
+def _strip_panel_members(group: dict) -> None:
+    members = group.get("proxies") or []
+    group["proxies"] = [member for member in members if not is_panel_info_node(str(member))]
+
+
+def _collect_match_nodes(
+    match_group: dict,
+    group_map: dict[str, dict],
+    proxies: list | None,
+    extra_names: list[str],
+) -> list[str]:
+    extra_set = set(extra_names)
+    members = [str(item) for item in match_group.get("proxies") or []]
+    nodes: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if (
+            not name
+            or name in seen
+            or is_panel_info_node(name)
+            or name in SPECIAL_POLICY_LEAVES
+            or name in AUTO_POLICY_NAMES
+            or name in extra_set
+            or _is_extra_node(name, extra_names)
+            or name in group_map
+        ):
+            return
+        seen.add(name)
+        nodes.append(name)
+
+    for member in members:
+        if member in extra_set:
+            continue
+        child = group_map.get(member)
+        if child is not None:
+            child_type = str(child.get("type") or "").lower()
+            if member in AUTO_POLICY_NAMES or child_type in AUTO_GROUP_TYPES:
+                for nested in child.get("proxies") or []:
+                    add(str(nested))
+            continue
+        if member in AUTO_POLICY_NAMES or member in SPECIAL_POLICY_LEAVES:
+            continue
+        add(member)
+    if not nodes:
+        for proxy in proxies or []:
+            if isinstance(proxy, dict) and proxy.get("name"):
+                add(str(proxy["name"]))
+    return nodes
+
+
+def _reshape_match_country_groups(data: dict, groups: list, group_map: dict[str, dict]) -> None:
+    """给 MATCH 指向的主订阅 select 组注入独立国家 selector，并剔除面板信息节点。
+
+    不复用 AI 的 `🇯🇵 Japan`：默认流量与 AI 出口必须能各自选日本节点。
+    附加订阅入口从 MATCH 成员里拿掉，保持与主订阅同级。
+    """
+    match_name = _match_group_name(data.get("rules"))
+    extra_names = _extra_subscription_names(data)
+    if not match_name or match_name in RESERVED_MATCH_NAMES or match_name in extra_names:
+        return
+    match_group = group_map.get(match_name)
+    if not isinstance(match_group, dict):
+        return
+    if str(match_group.get("type") or "").lower() not in SELECTABLE_GROUP_TYPES:
+        return
+
+    extra_set = set(extra_names)
+    members = [str(item) for item in match_group.get("proxies") or [] if str(item) not in extra_set]
+    for member in members:
+        child = group_map.get(member)
+        if child is not None and (
+            member in AUTO_POLICY_NAMES or str(child.get("type") or "").lower() in AUTO_GROUP_TYPES
+        ):
+            _strip_panel_members(child)
+
+    nodes = _collect_match_nodes(match_group, group_map, data.get("proxies"), extra_names)
+    region_group_names: list[str] = []
+    if nodes:
+        buckets: dict[str, list[str]] = {}
+        for node in nodes:
+            buckets.setdefault(match_region(node), []).append(node)
+        for region in SUBSCRIPTION_REGION_ORDER:
+            region_members = buckets.get(region) or []
+            if not region_members:
+                continue
+            label = SWITCH_REGION_LABELS.get(region, region)
+            if label == match_name or label in extra_set or label in RESERVED_MATCH_NAMES:
+                continue
+            existing = group_map.get(label)
+            if existing is None:
+                injected = {"name": label, "type": "select", "proxies": list(region_members)}
+                groups.append(injected)
+                group_map[label] = injected
+            elif str(existing.get("type") or "").lower() in SELECTABLE_GROUP_TYPES and existing is not match_group:
+                existing["proxies"] = list(region_members)
+            else:
+                continue
+            region_group_names.append(label)
+
+    auto_members: list[str] = []
+    special_members: list[str] = []
+    leftover_nested: list[str] = []
+    for member in members:
+        if is_panel_info_node(member):
+            continue
+        child = group_map.get(member)
+        child_type = str(child.get("type") or "").lower() if child is not None else ""
+        if member in AUTO_POLICY_NAMES or child_type in AUTO_GROUP_TYPES:
+            auto_members.append(member)
+        elif member in SPECIAL_POLICY_LEAVES:
+            special_members.append(member)
+        elif member in region_group_names:
+            continue
+        elif child is not None:
+            if member in {AI_US_GROUP, AI_SG_GROUP, AI_REGION_JP, AI_REGION_US, AI_REGION_SG}:
+                continue
+            leftover_nested.append(member)
+
+    rebuilt: list[str] = []
+    for member in auto_members + leftover_nested + region_group_names + special_members:
+        if member not in rebuilt:
+            rebuilt.append(member)
+    match_group["proxies"] = rebuilt
 
 
 def _sanitize_dns_fallback_filter(data: dict) -> None:
@@ -192,29 +428,22 @@ class RuntimeBackend:
             raise ValueError("proxy-groups 必须是列表")
 
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
-        _ensure_region_groups(groups, group_map, data.get("proxies"), (AI_REGION_JP, AI_REGION_US, AI_REGION_SG))
-
-        for required in (AI_REGION_US, AI_REGION_SG):
-            if required not in group_map:
-                raise ValueError(f"原始配置缺少必需的区域组: {required}")
-
-        for region_name in (AI_REGION_JP, AI_REGION_US, AI_REGION_SG):
-            region = group_map.get(region_name)
-            if isinstance(region, dict):
-                region["proxies"] = _prefer_non_iepl_nodes(region.get("proxies") or [])
-
-        us_proxies = group_map[AI_REGION_US].get("proxies") or []
-        sg_proxies = group_map[AI_REGION_SG].get("proxies") or []
+        extra_names = _extra_subscription_names(data)
+        region_nodes = _collect_ai_region_nodes(data.get("proxies"), group_map, extra_names)
+        us_proxies = region_nodes["US"]
+        sg_proxies = region_nodes["SG"]
+        jp_proxies = region_nodes["JP"]
         if not us_proxies or not sg_proxies:
-            raise ValueError("美国或新加坡区域组未包含任何节点")
+            raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
 
-        # United States 放首位：热重载/冷启动会把 selector 重置为第一项。
+        groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
+        group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
+
+        # 美国节点放首位：热重载/冷启动会把 selector 重置为第一项。
         # 日本 IEPL 对 Cloud Code generate 仍 400；美国 1X 是实测能
         # streamGenerateContent 的出口。热重载另会恢复重载前的选择器。
-        manual_candidates = [AI_REGION_US, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP]
-        if AI_REGION_JP in group_map:
-            manual_candidates.append(AI_REGION_JP)
-        manual_candidates.append(AI_REGION_SG)
+        # 不再挂 🇯🇵 Japan / 🇺🇸 United States：那些组和中文国家组重复。
+        manual_candidates = list(us_proxies) + [AI_AUTO_GROUP] + list(jp_proxies) + list(sg_proxies)
 
         ai_groups = [
             {"name": AI_US_GROUP, "type": "fallback", "proxies": us_proxies, "url": TEST_URL, "interval": 300},
@@ -322,6 +551,13 @@ class RuntimeBackend:
             clean_rules = front_rules + clean_rules + tail_rules
         else:
             clean_rules = front_rules + clean_rules[:match_index] + tail_rules + clean_rules[match_index:]
+
+        group_map = {
+            group["name"]: group
+            for group in filtered_groups
+            if isinstance(group, dict) and group.get("name")
+        }
+        _reshape_match_country_groups(data, filtered_groups, group_map)
 
         data["proxy-groups"] = filtered_groups
         data["rules"] = clean_rules

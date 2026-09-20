@@ -13,6 +13,7 @@ import pytest
 from cproxy.backend.models import ProxyGroup
 from cproxy.cli import _resolve_switch
 from cproxy.interactive import NotATerminalError, _footer_line, _redraw, _window, select_one
+from cproxy.services.switch_tree import delay_label, delay_style, resolve_delay
 
 
 class _FakeStdin:
@@ -186,7 +187,7 @@ def test_terminal_is_restored_even_on_exception(monkeypatch):
 
 def test_both_args_pass_through_without_touching_service():
     """两个参数都给时原样返回——service 传 None 也不会被解引用。"""
-    assert _resolve_switch(None, Namespace(group="G", target="N")) == ("G", "N")
+    assert _resolve_switch(None, Namespace(group="G", target="N")) == [("G", "N")]
 
 
 def test_single_arg_keeps_previous_error(capsys):
@@ -200,7 +201,7 @@ def test_single_arg_keeps_previous_error(capsys):
 def test_no_args_uses_selector(monkeypatch):
     monkeypatch.setattr("cproxy.cli.select_one", lambda title, items, **kwargs: items[0])
 
-    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == [("G1", "node-1")]
 
 
 def test_no_args_only_offers_selectable_groups():
@@ -224,42 +225,14 @@ def test_selector_receives_current_and_delays(monkeypatch):
     monkeypatch.setattr("cproxy.cli.select_one", fake_select)
     service = _FakeService(delays={"node-1": 123})
 
-    assert _resolve_switch(service, Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert _resolve_switch(service, Namespace(group=None, target=None)) == [("G1", "node-1")]
 
     node_call = captured["选择节点"]
     assert node_call["current"] == "node-1", "应把组当前选择传给选择器做高亮"
     # 有测速记录的给毫秒数；没有的显式标 `-`（留空会让人分不清是没测过还是取数失败）
     assert node_call["annotations"] == {"node-1": "123 ms", "node-2": "-"}
-    # 选组那一步没有「当前组」的概念，不应传 current
-    assert "current" not in captured["选择代理组"] or captured["选择代理组"]["current"] is None
-
-
-def test_group_roles_label_only_reliable_ones():
-    """只标判据可靠的角色。
-
-    猜错的分类比不标更误导——把某个「地区池」标成「订阅」会让人改错组，
-    而改错组正是这次要防的问题（用户切了🇺🇸 United States 却发现 AI 流量没变）。
-    """
-    from cproxy.cli import _group_roles
-
-    service = _FakeService(match_group="CyberGuard")
-    roles = _group_roles(service, ["AI-MANUAL", "CyberGuard", "GLOBAL", "Mitce", "🇯🇵 Japan"])
-
-    assert roles["AI-MANUAL"].startswith("AI 流量")
-    assert roles["CyberGuard"].startswith("默认路由")
-    assert roles["GLOBAL"].startswith("全局")
-    # 判据不可靠的一律不标
-    assert "Mitce" not in roles
-    assert "🇯🇵 Japan" not in roles
-
-
-def test_group_roles_skips_match_group_outside_list():
-    """MATCH 指向的组若不在可切换列表里，不该凭空多出一条标注。"""
-    from cproxy.cli import _group_roles
-
-    service = _FakeService(match_group="DIRECT")
-
-    assert _group_roles(service, ["AI-MANUAL"]) == {"AI-MANUAL": "AI 流量 · 决定 AI 出口"}
+    # 选入口那一步没有「当前组」的概念，不应传 current
+    assert "current" not in captured["选择入口"] or captured["选择入口"]["current"] is None
 
 
 def test_resolve_delay_drills_into_referenced_groups():
@@ -268,27 +241,23 @@ def test_resolve_delay_drills_into_referenced_groups():
     `AI-MANUAL` 的候选大多是 selector 组，而 selector 自身不测速——只查候选名
     永远得到空，各组的快慢也就无从比较（这正是「一排 `-` 看不出谁快」的成因）。
     """
-    from cproxy.cli import _resolve_delay
-
     inner = _group("🇯🇵 Japan", "Selector", ["node-A"])
     outer = _group("AI-MANUAL", "Selector", ["🇯🇵 Japan"])
     groups = {g.name: g for g in (inner, outer)}
     delays = {"node-A": 123}
 
-    assert _resolve_delay("node-A", groups, delays) == 123  # 节点：直接取
-    assert _resolve_delay("🇯🇵 Japan", groups, delays) == 123  # 组：钻到当前节点
-    assert _resolve_delay("AI-MANUAL", groups, delays) == 123  # 多级组：一路钻到底
-    assert _resolve_delay("不存在的项", groups, delays) is None
+    assert resolve_delay("node-A", groups, delays) == 123  # 节点：直接取
+    assert resolve_delay("🇯🇵 Japan", groups, delays) == 123  # 组：钻到当前节点
+    assert resolve_delay("AI-MANUAL", groups, delays) == 123  # 多级组：一路钻到底
+    assert resolve_delay("不存在的项", groups, delays) is None
 
 
 def test_resolve_delay_survives_reference_cycle():
     """组之间互相引用成环时不能无限递归。"""
-    from cproxy.cli import _resolve_delay
-
     a = _group("A", "Selector", ["B"])
     b = _group("B", "Selector", ["A"])
 
-    assert _resolve_delay("A", {"A": a, "B": b}, {}) is None
+    assert resolve_delay("A", {"A": a, "B": b}, {}) is None
 
 
 def test_delay_label_separates_timeout_from_missing():
@@ -297,11 +266,9 @@ def test_delay_label_separates_timeout_from_missing():
     `0` 是 mihomo 的测速失败标记——显示成 `0 ms` 会被读成「极快」，让人挑中
     实际不可用的节点；`-` 则是「没有测速记录」。两者不能混为一谈。
     """
-    from cproxy.cli import _delay_label
-
-    assert _delay_label(None) == "-"
-    assert _delay_label(0) == "超时"
-    assert _delay_label(123) == "123 ms"
+    assert delay_label(None) == "-"
+    assert delay_label(0) == "超时"
+    assert delay_label(123) == "123 ms"
 
 
 def test_cancel_exits_zero(monkeypatch):
@@ -391,15 +358,13 @@ def test_search_navigate_with_arrows():
 
 def test_delay_style_coloring():
     """延迟着色阈值：≤200 绿、≤500 黄、>500 红、超时红、无记录暗灰。"""
-    from cproxy.cli import _delay_style
-
-    assert "\033[2m" in _delay_style(None)      # dim
-    assert "\033[31m" in _delay_style(0)         # red (超时)
-    assert "\033[32m" in _delay_style(100)       # green
-    assert "\033[32m" in _delay_style(200)       # green (边界)
-    assert "\033[33m" in _delay_style(300)       # yellow
-    assert "\033[33m" in _delay_style(500)       # yellow (边界)
-    assert "\033[31m" in _delay_style(600)       # red (慢)
+    assert "\033[2m" in delay_style(None)      # dim
+    assert "\033[31m" in delay_style(0)         # red (超时)
+    assert "\033[32m" in delay_style(100)       # green
+    assert "\033[32m" in delay_style(200)       # green (边界)
+    assert "\033[33m" in delay_style(300)       # yellow
+    assert "\033[33m" in delay_style(500)       # yellow (边界)
+    assert "\033[31m" in delay_style(600)       # red (慢)
 
 
 def test_annotation_styles_passed_through(monkeypatch):
@@ -441,7 +406,7 @@ def test_interactive_switch_does_not_refetch_after_list(monkeypatch):
 
     service = Counting()
     monkeypatch.setattr("cproxy.cli.select_one", lambda title, items, **kwargs: items[0])
-    assert _resolve_switch(service, Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert _resolve_switch(service, Namespace(group=None, target=None)) == [("G1", "node-1")]
     assert service.get_calls == 0
     assert service.delay_calls == 0
 
@@ -483,8 +448,178 @@ def test_node_cancel_returns_to_group_selector(monkeypatch):
         return items[0]
 
     monkeypatch.setattr("cproxy.cli.select_one", fake_select)
-    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == ("G1", "node-1")
-    assert calls == ["选择代理组", "选择节点", "选择代理组", "选择节点"]
+    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == [("G1", "node-1")]
+    assert calls == ["选择入口", "选择节点", "选择入口", "选择节点"]
+
+
+def test_switch_entry_groups_hide_ai_region_pools():
+    """Japan / Singapore / United States 是 AI 地区池，不和 CyberGuard 并列。"""
+    from cproxy.services.switch_tree import build_switch_tree
+
+    groups = {
+        group.name: group
+        for group in [
+            _group("AI-MANUAL", "Selector", ["🇯🇵 Japan"]),
+            _group("CyberGuard", "Selector", ["HK-1"]),
+            _group("GLOBAL", "Selector", ["DIRECT"]),
+            _group("🇯🇵 Japan", "Selector", ["JP-1"]),
+            _group("🇸🇬 Singapore", "Selector", ["SG-1"]),
+            _group("🇺🇸 United States", "Selector", ["US-1"]),
+        ]
+    }
+    entries = build_switch_tree(groups, match_group="CyberGuard")
+    assert [entry.key for entry in entries] == ["CyberGuard", "AI-MANUAL", "GLOBAL"]
+    assert [entry.display for entry in entries] == ["默认流量", "AI 出口", "全局"]
+    assert "决定其余流量" in entries[0].annotation
+    assert "决定 AI 出口" in entries[1].annotation
+    assert "绕过规则" in entries[2].annotation
+
+
+def test_lookup_choice_resolves_display_names_before_nested_regions():
+    from cproxy.services.switch_tree import build_switch_tree, lookup_choice, resolve_group_query
+
+    groups = {
+        group.name: group
+        for group in [
+            _group("AI-MANUAL", "Selector", ["US-01", "JP-01"]),
+            _group("CyberGuard", "Selector", ["日本", "美国"]),
+            _group("GLOBAL", "Selector", ["DIRECT"]),
+            _group("日本", "Selector", ["JP-1"]),
+            _group("美国", "Selector", ["US-1"]),
+        ]
+    }
+    entries = build_switch_tree(groups, match_group="CyberGuard")
+    assert lookup_choice("默认流量", entries).key == "CyberGuard"
+    assert lookup_choice("AI 出口", entries).key == "AI-MANUAL"
+    assert resolve_group_query("默认流量", groups, entries) == "CyberGuard"
+    assert resolve_group_query("日本", groups, entries) == "日本"
+
+
+def test_switch_node_choices_keeps_direct_nodes_from_mixing_other_subs():
+    """CyberGuard 按国家分组，不把挂进来的其它订阅摊成叶子。"""
+    from cproxy.services.switch_tree import build_switch_tree
+
+    nested = {
+        "CyberGuard": ProxyGroup(
+            name="CyberGuard",
+            type="Selector",
+            current="HK-1",
+            candidates=["自动选择", "HK-1", "JP-1", "Mitce"],
+        ),
+        "自动选择": ProxyGroup(
+            name="自动选择",
+            type="URLTest",
+            current="HK-1",
+            candidates=["HK-1", "JP-1"],
+        ),
+        "Mitce": ProxyGroup(
+            name="Mitce",
+            type="Selector",
+            current="Mitce-HK",
+            candidates=["Mitce-HK"],
+        ),
+        "Mitce-HK": ProxyGroup(
+            name="Mitce-HK",
+            type="URLTest",
+            current="Mitce HK-1",
+            candidates=["Mitce HK-1", "Mitce HK-2"],
+        ),
+    }
+    entries = build_switch_tree(nested, match_group="CyberGuard", extra_names=["Mitce"], delays={"HK-1": 80, "JP-1": 120})
+    assert [entry.key for entry in entries] == ["CyberGuard", "Mitce"]
+    cyber = entries[0]
+    assert [child.display for child in cyber.children] == ["自动", "香港", "日本"]
+    assert "Mitce" not in [child.key for child in cyber.children]
+    assert "Mitce HK-1" not in [child.key for child in cyber.children]
+    assert "HK-1" not in [child.display for child in cyber.children]
+    auto = next(child for child in cyber.children if child.display == "自动")
+    assert auto.annotation == "自动"
+    assert auto.path == (("CyberGuard", "自动选择"),)
+    hongkong = next(child for child in cyber.children if child.display == "香港")
+    assert hongkong.children[0].key == "HK-1"
+    assert hongkong.children[0].path == (("CyberGuard", "HK-1"),)
+    japan = next(child for child in cyber.children if child.display == "日本")
+    assert japan.children[0].key == "JP-1"
+    assert hongkong.current is True
+
+
+def test_switch_node_choices_lists_policy_groups_without_flattening():
+    """AI-MANUAL 第二步只列地区和自动策略，不把 AI-US/AI-SG 内部池并列出来。"""
+    from cproxy.services.switch_tree import build_switch_tree
+
+    nested = {
+        "AI-MANUAL": ProxyGroup(
+            name="AI-MANUAL",
+            type="Selector",
+            current="🇯🇵 Japan",
+            candidates=["🇺🇸 United States", "AI-AUTO", "AI-US", "AI-SG", "🇯🇵 Japan", "🇸🇬 Singapore"],
+        ),
+        "AI-AUTO": ProxyGroup(name="AI-AUTO", type="Fallback", current="AI-US", candidates=["AI-US", "AI-SG"]),
+        "AI-US": ProxyGroup(name="AI-US", type="Fallback", current="US-01", candidates=["US-01", "US-02"]),
+        "AI-SG": ProxyGroup(name="AI-SG", type="Fallback", current="SG-01", candidates=["SG-01"]),
+        "🇯🇵 Japan": ProxyGroup(name="🇯🇵 Japan", type="Selector", current="JP-01", candidates=["JP-01"]),
+        "🇺🇸 United States": ProxyGroup(
+            name="🇺🇸 United States", type="Selector", current="US-01", candidates=["US-01", "US-02"]
+        ),
+        "🇸🇬 Singapore": ProxyGroup(name="🇸🇬 Singapore", type="Selector", current="SG-01", candidates=["SG-01"]),
+    }
+    entries = build_switch_tree(nested, delays={"US-01": 100, "JP-01": 150})
+    ai = next(entry for entry in entries if entry.key == "AI-MANUAL")
+    assert [child.display for child in ai.children] == ["日本", "美国", "新加坡", "自动"]
+    assert "AI-US" not in [child.key for child in ai.children]
+    assert "AI-SG" not in [child.key for child in ai.children]
+    japan = next(child for child in ai.children if child.display == "日本")
+    assert japan.annotation == "1 个节点"
+    auto = next(child for child in ai.children if child.display == "自动")
+    assert auto.annotation == "自动"
+    assert auto.path == (("AI-MANUAL", "AI-AUTO"),)
+    assert japan.children[0].key == "JP-01"
+    assert japan.current is True
+
+
+def test_switch_tree_ai_manual_buckets_nodes_without_emoji_groups():
+    from cproxy.services.switch_tree import build_switch_tree
+
+    nested = {
+        "AI-MANUAL": ProxyGroup(
+            name="AI-MANUAL",
+            type="Selector",
+            current="US-01",
+            candidates=["US-01", "AI-AUTO", "JP-01", "SG-01"],
+        ),
+        "AI-AUTO": ProxyGroup(name="AI-AUTO", type="Fallback", current="AI-US", candidates=["AI-US", "AI-SG"]),
+        "AI-US": ProxyGroup(name="AI-US", type="Fallback", current="US-01", candidates=["US-01"]),
+        "AI-SG": ProxyGroup(name="AI-SG", type="Fallback", current="SG-01", candidates=["SG-01"]),
+    }
+    entries = build_switch_tree(nested)
+    ai = next(entry for entry in entries if entry.key == "AI-MANUAL")
+    assert [child.display for child in ai.children] == ["日本", "美国", "新加坡", "自动"]
+    assert "🇯🇵 Japan" not in [child.key for child in ai.children]
+    japan = next(child for child in ai.children if child.display == "日本")
+    assert japan.children[0].path == (("AI-MANUAL", "JP-01"),)
+    auto = next(child for child in ai.children if child.display == "自动")
+    assert auto.path == (("AI-MANUAL", "AI-AUTO"),)
+
+
+def test_resolve_switch_returns_leaf_switch_path(monkeypatch):
+    nested = [
+        _group("AI-MANUAL", "Selector", ["JP"]),
+        _group("JP", "Selector", ["JP-01", "JP-02"]),
+    ]
+    service = _FakeService(nested)
+
+    def fake_select(title, items, **kwargs):
+        if title == "选择入口":
+            return items[0]
+        if title == "选择地区":
+            return items[0]
+        return "JP-02"
+
+    monkeypatch.setattr("cproxy.cli.select_one", fake_select)
+    assert _resolve_switch(service, Namespace(group=None, target=None)) == [
+        ("AI-MANUAL", "JP"),
+        ("JP", "JP-02"),
+    ]
 
 
 def test_back_to_group_keeps_previous_selection(monkeypatch):
@@ -492,7 +627,7 @@ def test_back_to_group_keeps_previous_selection(monkeypatch):
     group_currents: list[object] = []
 
     def fake_select(title, items, **kwargs):
-        if title == "选择代理组":
+        if title == "选择入口":
             group_currents.append(kwargs.get("current"))
             return items[0]
         if len(group_currents) == 1:
@@ -500,7 +635,7 @@ def test_back_to_group_keeps_previous_selection(monkeypatch):
         return items[0]
 
     monkeypatch.setattr("cproxy.cli.select_one", fake_select)
-    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == [("G1", "node-1")]
     assert group_currents[0] is None
     assert group_currents[1] == "G1"
 

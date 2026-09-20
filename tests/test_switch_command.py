@@ -109,7 +109,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert "结果" in switch_result.stdout
         assert "代理组: AI-MANUAL" in switch_result.stdout
         assert "当前选择:" in switch_result.stdout or "切换:" in switch_result.stdout
-        assert "AI-SG" in switch_result.stdout
+        assert "Singapore" in switch_result.stdout
         assert "\x1b[" in switch_result.stdout
 
         color_env = env.copy()

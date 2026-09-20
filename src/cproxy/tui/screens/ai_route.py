@@ -10,6 +10,14 @@ from textual.widget import Widget
 from textual.widgets import Button, Label
 
 from ...api import APIUnavailableError
+from ...backend.runtime import (
+    AI_AUTO_GROUP,
+    AI_MANUAL_GROUP,
+    AI_SG_GROUP,
+    AI_US_GROUP,
+    ai_manual_toggle_target,
+    ai_standby_peer,
+)
 from ...config import AppPaths
 from ...diagnostics import run_ai_probe
 from ...services.query import QueryService
@@ -30,9 +38,7 @@ class AIRouteScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("AI 路由", classes="page-title")
-
-            with Horizontal():
+            with Horizontal(classes="compact-row"):
                 with Vertical(classes="ai-route-panel ai-selector-panel"):
                     yield Label("选择器", classes="ai-route-title")
                     with Horizontal(classes="field-row"):
@@ -50,14 +56,14 @@ class AIRouteScreen(Widget):
                     yield Label("─", id="ai-route-chain", classes="current-info")
 
             with Vertical(classes="panel output-panel"):
-                yield Label("连通性探测", classes="panel-title")
-                yield Label("─", id="ai-probe-status", classes="status-strip")
+                with Horizontal(classes="panel-header"):
+                    yield Label("连通性探测", classes="panel-title")
+                    yield Label("─", id="ai-probe-status", classes="status-strip")
                 yield DataTable(id="ai-probe-table")
-
-            with Horizontal(classes="toolbar"):
-                yield Button("刷新", id="btn-ai-refresh", classes="action-button muted-button")
-                yield Button("探测", id="btn-ai-probe", classes="action-button primary-button")
-                yield Button("切换美国/新加坡", id="btn-ai-switch", classes="action-button success-button")
+                with Horizontal(classes="toolbar"):
+                    yield Button("探测", id="btn-ai-probe", classes="action-button primary-button")
+                    yield Button("切换美/新", id="btn-ai-switch", classes="action-button success-button")
+                    yield Button("刷新", id="btn-ai-refresh", classes="action-button muted-button")
 
     def on_mount(self) -> None:
         probe_table = self.query_one("#ai-probe-table", DataTable)
@@ -101,7 +107,7 @@ class AIRouteScreen(Widget):
             active_group_name = auto.current if auto_mode else manual.current
             active_group = groups.get(active_group_name)
 
-            standby_name = "AI-SG" if active_group_name == "AI-US" else "AI-US"
+            standby_name = ai_standby_peer(active_group_name)
             standby_group = groups.get(standby_name)
 
             mode_text = "[#f6c177]自动[/]" if auto_mode else f"[#f6c177]固定[/]（{manual.current}）"
@@ -228,15 +234,23 @@ class AIRouteScreen(Widget):
                 )
                 return
 
-            auto_mode = manual.current == "AI-AUTO"
+            auto_mode = manual.current == AI_AUTO_GROUP
             active_group_name = auto.current if auto_mode else manual.current
 
-            target = "AI-SG" if active_group_name == "AI-US" else "AI-US"
-
             if auto_mode:
-                service.switch_group("AI-AUTO", target)
+                target = AI_SG_GROUP if active_group_name == AI_US_GROUP else AI_US_GROUP
+                service.switch_group(AI_AUTO_GROUP, target)
             else:
-                service.switch_group("AI-MANUAL", target)
+                target = ai_manual_toggle_target(list(manual.candidates), active_group_name)
+                if not target:
+                    self.app.call_from_thread(
+                        self._finish_switch,
+                        "",
+                        "",
+                        RuntimeError("AI-MANUAL 没有可切换的美国/新加坡节点"),
+                    )
+                    return
+                service.switch_group(AI_MANUAL_GROUP, target)
 
             self.app.call_from_thread(self._finish_switch, active_group_name, target, None)
 

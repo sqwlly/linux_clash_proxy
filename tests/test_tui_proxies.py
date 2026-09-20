@@ -251,3 +251,38 @@ def test_proxies_screen_down_moves_node_cursor(monkeypatch, tmp_path):
             assert app.focused is app.query_one("#btn-switch-node", Button)
 
     asyncio.run(run_case())
+
+
+def test_proxies_screen_left_column_is_usage_entries(monkeypatch, tmp_path):
+    class FakeQueryService:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def load_context(self, require_api=False):
+            return SimpleNamespace(
+                groups={
+                    "AI-MANUAL": _group(),
+                    "CyberGuard": _group("Node C", name="CyberGuard", candidates=["Node C", "Node D"]),
+                    "🇯🇵 Japan": _group("JP-1", name="🇯🇵 Japan", candidates=["JP-1"]),
+                },
+                api_available=True,
+            )
+
+        def match_rule_group(self):
+            return "CyberGuard"
+
+    monkeypatch.setattr(proxies_module, "QueryService", FakeQueryService)
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+
+    async def run_case():
+        app = _ProxiesApp(paths)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            groups_table = app.query_one("#groups-table", DataTable)
+            keys = [str(row.key.value) for row in groups_table.ordered_rows]
+            assert keys == ["CyberGuard", "AI-MANUAL"]
+            assert "🇯🇵 Japan" not in keys
+            assert "默认流量" in str(groups_table.get_row_at(0)[0])
+            assert "AI 出口" in str(groups_table.get_row_at(1)[0])
+
+    asyncio.run(run_case())
