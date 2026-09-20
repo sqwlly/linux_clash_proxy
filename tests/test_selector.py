@@ -12,7 +12,7 @@ import pytest
 
 from cproxy.backend.models import ProxyGroup
 from cproxy.cli import _resolve_switch
-from cproxy.interactive import NotATerminalError, _window, select_one
+from cproxy.interactive import NotATerminalError, _footer_line, _redraw, _window, select_one
 
 
 class _FakeStdin:
@@ -35,7 +35,27 @@ class _FakeService:
         self._match_group = match_group
 
     def list_groups(self):
-        return list(self._groups)
+        groups: list[ProxyGroup] = []
+        seen: set[str] = set()
+        for group in self._groups:
+            delay = self._delays.get(group.name, group.delay)
+            if delay != group.delay:
+                group = ProxyGroup(
+                    name=group.name,
+                    type=group.type,
+                    current=group.current,
+                    candidates=list(group.candidates),
+                    alive=group.alive,
+                    delay=delay,
+                    source=group.source,
+                )
+            groups.append(group)
+            seen.add(group.name)
+        for name, delay in self._delays.items():
+            if name not in seen:
+                groups.append(ProxyGroup(name=name, type="Compatible", current="-", candidates=[], delay=delay))
+                seen.add(name)
+        return groups
 
     def get_group(self, name: str) -> ProxyGroup:
         for group in self._groups:
@@ -129,6 +149,12 @@ def test_window_keeps_current_visible():
 def test_window_clamps_at_both_edges():
     assert _window(100, 0)[0] == 0
     assert _window(100, 99)[1] == 100
+
+
+def test_window_honors_custom_limit():
+    start, end = _window(100, 50, limit=5)
+    assert end - start == 5
+    assert start <= 50 < end
 
 
 # --- 终端状态恢复 ---
@@ -301,3 +327,219 @@ def test_non_tty_lists_candidates_and_exits_two(monkeypatch, capsys):
     stderr = capsys.readouterr().err
     assert "不是交互终端" in stderr
     assert "G1" in stderr
+
+
+# --- 搜索/过滤 ---
+
+
+def test_search_filters_and_selects():
+    """'/' 进入搜索模式，输入字符过滤，Enter 确认。"""
+    items = ["🇺🇸 United States丨01", "🇯🇵 Japan丨01", "🇸🇬 Singapore丨01"]
+    # /jap → 过滤出 Japan → Enter 确认
+    result = select_one("标题", items, keys=["/", "j", "a", "p", "\r"])
+    assert result == "🇯🇵 Japan丨01"
+
+
+def test_search_case_insensitive():
+    """搜索不区分大小写。"""
+    items = ["Alpha", "Beta", "Gamma"]
+    result = select_one("标题", items, keys=["/", "B", "E", "\r"])
+    assert result == "Beta"
+
+
+def test_search_fuzzy_match():
+    """模糊匹配：query 的字符按顺序出现即可。"""
+    from cproxy.interactive import _fuzzy_match
+
+    assert _fuzzy_match("🇺🇸 United States丨01", "us")
+    assert _fuzzy_match("Singapore", "sg")
+    assert _fuzzy_match("Japan", "jpn")
+    assert not _fuzzy_match("Japan", "xyz")
+
+
+def test_search_esc_exits_search_and_restores_list():
+    """Esc 退出搜索后恢复完整列表，再按 Enter 能正常选中。"""
+    items = ["a", "b", "c"]
+    # /x (过滤掉所有) → Esc (恢复) → Enter (选中第一个)
+    result = select_one("标题", items, keys=["/", "x", "\x1b", "\r"])
+    assert result == "a"
+
+
+def test_search_backspace_deletes_char():
+    """搜索模式中退格删除最后一个字符。"""
+    items = ["alpha", "beta", "gamma"]
+    # /be → 匹配 beta → 退格 → 查询变成 "b" → 仍匹配 beta → Enter
+    result = select_one("标题", items, keys=["/", "b", "e", "\x7f", "\r"])
+    assert result == "beta"
+
+
+def test_search_empty_backspace_exits_search():
+    """搜索模式下查询为空时退格退出搜索。"""
+    items = ["a", "b"]
+    # / 进入搜索 → 退格（空查询→退出搜索）→ j 向下 → Enter
+    result = select_one("标题", items, keys=["/", "\x7f", "j", "\r"])
+    assert result == "b"
+
+
+def test_search_navigate_with_arrows():
+    """搜索模式内仍可用方向键移动。"""
+    items = ["ab", "ac", "bc"]
+    # /a → 匹配 ab, ac → ↓ 移到 ac → Enter
+    result = select_one("标题", items, keys=["/", "a", "\x1b[B", "\r"])
+    assert result == "ac"
+
+
+def test_delay_style_coloring():
+    """延迟着色阈值：≤200 绿、≤500 黄、>500 红、超时红、无记录暗灰。"""
+    from cproxy.cli import _delay_style
+
+    assert "\033[2m" in _delay_style(None)      # dim
+    assert "\033[31m" in _delay_style(0)         # red (超时)
+    assert "\033[32m" in _delay_style(100)       # green
+    assert "\033[32m" in _delay_style(200)       # green (边界)
+    assert "\033[33m" in _delay_style(300)       # yellow
+    assert "\033[33m" in _delay_style(500)       # yellow (边界)
+    assert "\033[31m" in _delay_style(600)       # red (慢)
+
+
+def test_annotation_styles_passed_through(monkeypatch):
+    """_resolve_switch 传给 select_one 的 annotation_styles 应含每个候选。"""
+    captured: dict = {}
+
+    def fake_select(title, items, **kwargs):
+        captured[title] = kwargs
+        return items[0]
+
+    monkeypatch.setattr("cproxy.cli.select_one", fake_select)
+    service = _FakeService(delays={"node-1": 123, "node-2": 0})
+
+    _resolve_switch(service, Namespace(group=None, target=None))
+
+    node_call = captured["选择节点"]
+    assert "annotation_styles" in node_call
+    styles = node_call["annotation_styles"]
+    assert "node-1" in styles
+    assert "node-2" in styles
+
+
+def test_interactive_switch_does_not_refetch_after_list(monkeypatch):
+    """选完分组后不应再打 get_group / node_delays——那两下会让节点列表出现前卡一下。"""
+
+    class Counting(_FakeService):
+        def __init__(self):
+            super().__init__(delays={"node-1": 123})
+            self.get_calls = 0
+            self.delay_calls = 0
+
+        def get_group(self, name: str) -> ProxyGroup:
+            self.get_calls += 1
+            return super().get_group(name)
+
+        def node_delays(self) -> dict[str, int]:
+            self.delay_calls += 1
+            return super().node_delays()
+
+    service = Counting()
+    monkeypatch.setattr("cproxy.cli.select_one", lambda title, items, **kwargs: items[0])
+    assert _resolve_switch(service, Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert service.get_calls == 0
+    assert service.delay_calls == 0
+
+
+# --- 返回上一级 / 擦除残帧 ---
+
+
+def test_left_arrow_ignored_without_back_hint():
+    """未开启 back_hint 时左方向键不是取消，Enter 仍能选中。"""
+    assert select_one("标题", ["a", "b"], keys=["\x1b[D", "\r"]) == "a"
+
+
+def test_left_arrow_returns_none_when_back_hinted():
+    assert select_one("标题", ["a", "b"], back_hint=True, keys=["\x1b[D"]) is None
+
+
+def test_h_returns_none_when_back_hinted():
+    assert select_one("标题", ["a", "b"], back_hint=True, keys=["h"]) is None
+
+
+def test_h_is_not_back_without_hint():
+    assert select_one("标题", ["a", "b"], keys=["h", "\r"]) == "a"
+
+
+def test_footer_back_hint_says_return():
+    assert "返回" in _footer_line(back_hint=True)
+    assert "取消" not in _footer_line(back_hint=True)
+    assert "取消" in _footer_line(back_hint=False)
+
+
+def test_node_cancel_returns_to_group_selector(monkeypatch):
+    """节点列表取消应回到分组选择，而不是直接退出。"""
+    calls: list[str] = []
+
+    def fake_select(title, items, **kwargs):
+        calls.append(title)
+        if title == "选择节点" and calls.count("选择节点") == 1:
+            return None
+        return items[0]
+
+    monkeypatch.setattr("cproxy.cli.select_one", fake_select)
+    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert calls == ["选择代理组", "选择节点", "选择代理组", "选择节点"]
+
+
+def test_back_to_group_keeps_previous_selection(monkeypatch):
+    """从节点列表返回后，分组选择应停在刚才那一组。"""
+    group_currents: list[object] = []
+
+    def fake_select(title, items, **kwargs):
+        if title == "选择代理组":
+            group_currents.append(kwargs.get("current"))
+            return items[0]
+        if len(group_currents) == 1:
+            return None
+        return items[0]
+
+    monkeypatch.setattr("cproxy.cli.select_one", fake_select)
+    assert _resolve_switch(_FakeService(), Namespace(group=None, target=None)) == ("G1", "node-1")
+    assert group_currents[0] is None
+    assert group_currents[1] == "G1"
+
+
+def test_redraw_clears_previous_frame_before_writing(monkeypatch):
+    """重绘必须先擦掉上一帧，否则短行会在长行尾巴上留下残字。"""
+    writes: list[str] = []
+    monkeypatch.setattr("cproxy.interactive._write", writes.append)
+    monkeypatch.setattr("cproxy.interactive._visible_capacity", lambda **kwargs: 12)
+
+    drawn = _redraw(["alpha", "beta"], 0, "标题", 0)
+    assert drawn > 0
+    first = "".join(writes)
+    assert not first.startswith("\033[") or "A\r" not in first[:20]
+
+    writes.clear()
+    _redraw(["alpha", "beta"], 1, "标题", drawn)
+    payload = "".join(writes)
+    assert payload.startswith(f"\033[{drawn}A\r\033[J")
+    assert payload.index("\033[J") < payload.index("beta")
+
+
+def test_selector_erases_its_frame_on_exit(monkeypatch):
+    """select_one 退出时必须擦掉菜单，否则下一级会画在下面、看起来像回不去。"""
+    writes: list[str] = []
+    monkeypatch.setattr("cproxy.interactive.interactive_supported", lambda: True)
+    monkeypatch.setattr("cproxy.interactive.sys.stdin", _FakeStdin())
+    monkeypatch.setattr("cproxy.interactive.termios.tcgetattr", lambda fd: ["saved-attrs"])
+    monkeypatch.setattr("cproxy.interactive.termios.tcsetattr", lambda fd, when, attrs: None)
+    monkeypatch.setattr("cproxy.interactive.tty.setcbreak", lambda fd: None)
+    monkeypatch.setattr("cproxy.interactive._write", writes.append)
+    monkeypatch.setattr("cproxy.interactive._visible_capacity", lambda **kwargs: 12)
+
+    keys = iter(["\r"])
+    monkeypatch.setattr("cproxy.interactive._terminal_read_key", lambda fd: lambda: next(keys, None))
+
+    assert select_one("标题", ["a", "b"]) == "a"
+
+    assert writes[0] == "\033[?25l"
+    assert writes[-1] == "\033[?25h"
+    # 退出时单独一帧：CUU 回到菜单起点再 CSI J 擦掉
+    assert any(w.startswith("\033[") and "A\r" in w and w.endswith("\033[J") for w in writes)

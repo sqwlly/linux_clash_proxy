@@ -120,7 +120,7 @@ def test_proxies_screen_reports_api_unavailable_without_switching(monkeypatch, t
             nodes_table.move_cursor(row=1, animate=False)
             screen.action_select_node()
             await pilot.pause(0.1)
-            assert "API unavailable" in str(screen.query_one("#proxy-action-status").render())
+            assert "API 不可访问" in str(screen.query_one("#proxy-action-status").render())
 
     asyncio.run(run_case())
 

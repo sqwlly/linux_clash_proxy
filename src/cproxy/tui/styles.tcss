@@ -118,7 +118,7 @@ TabPane {
 
 .label-key {
     color: #8794a6;
-    width: 9;
+    width: 10;
 }
 
 .metric-value {
@@ -513,6 +513,28 @@ Switch {
 
 .compact .label-key {
     width: 8;
+}
+
+.compact #dashboard-grid {
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: 8 6;
+    height: 1fr;
+}
+
+.compact #dashboard-grid .status-card {
+    width: 1fr;
+    min-height: 4;
+    margin: 0;
+}
+
+.compact #dashboard-grid .runtime-card {
+    min-height: 8;
+}
+
+.compact #dashboard-grid .traffic-card {
+    column-span: 2;
 }
 
 .compact .split-sidebar {

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime
+
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Label
 
-from ...api import APIUnavailableError
 from ...config import AppPaths
 from ...process import get_status
 from ...services.query import QueryService
@@ -20,49 +22,50 @@ class DashboardScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Overview", classes="page-title")
+            yield Label("概览", classes="page-title")
+            yield Label("等待刷新", id="dash-refresh-status", classes="status-strip")
 
             with Horizontal(id="dashboard-grid"):
                 with Vertical(classes="status-card runtime-card"):
-                    yield Label("Runtime", classes="status-card-title")
+                    yield Label("运行状态", classes="status-card-title")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Process", classes="label-key")
+                        yield Label("进程", classes="label-key")
                         yield Label("─", id="dash-status", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("API", classes="label-key")
                         yield Label("─", id="dash-api-status", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Port", classes="label-key")
+                        yield Label("端口", classes="label-key")
                         yield Label("─", id="dash-port", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Controller", classes="label-key")
+                        yield Label("控制接口", classes="label-key")
                         yield Label("─", id="dash-controller", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("PID", classes="label-key")
                         yield Label("─", id="dash-pid", classes="metric-value")
 
                 with Vertical(classes="status-card ai-card"):
-                    yield Label("AI Route", classes="status-card-title")
+                    yield Label("AI 路由", classes="status-card-title")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Mode", classes="label-key")
+                        yield Label("模式", classes="label-key")
                         yield Label("─", id="dash-ai-mode", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Active", classes="label-key")
+                        yield Label("当前", classes="label-key")
                         yield Label("─", id="dash-ai-active", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Standby", classes="label-key")
+                        yield Label("备用", classes="label-key")
                         yield Label("─", id="dash-ai-standby", classes="metric-value")
 
                 with Vertical(classes="status-card traffic-card"):
-                    yield Label("Traffic", classes="status-card-title")
+                    yield Label("实时流量", classes="status-card-title")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Upload", classes="label-key")
+                        yield Label("上传", classes="label-key")
                         yield Label("─", id="dash-upload", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Download", classes="label-key")
+                        yield Label("下载", classes="label-key")
                         yield Label("─", id="dash-download", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("Connections", classes="label-key")
+                        yield Label("连接", classes="label-key")
                         yield Label("─", id="dash-connections", classes="metric-value")
 
     def on_mount(self) -> None:
@@ -74,26 +77,71 @@ class DashboardScreen(Widget):
             self._refresh_timer.stop()
 
     def refresh_data(self) -> None:
-        self._update_status()
-        service = QueryService(self.paths)
-        self._update_ai_route(service)
-        self._update_traffic(service)
-
-    def _update_status(self) -> None:
         try:
-            snapshot = get_status(self.paths)
-            status_text = "[#a3e635]● Running[/]" if snapshot.running else "[#fb7185]○ Stopped[/]"
+            self.query_one("#dash-refresh-status", Label).update("[#f6c177]刷新中…[/]")
+        except Exception:
+            return
+        self._load_dashboard()
+
+    @work(thread=True, exclusive=True, group="dashboard-refresh")
+    def _load_dashboard(self) -> None:
+        result: dict = {"snapshot": None, "status_error": None, "groups": None, "api_error": None, "traffic": None}
+        try:
+            result["snapshot"] = get_status(self.paths)
+        except Exception as exc:
+            result["status_error"] = str(exc)
+
+        service = QueryService(self.paths)
+        try:
+            result["groups"] = service.get_ai_status_groups()
+        except Exception as exc:
+            result["api_error"] = str(exc)
+        try:
+            data = service.api.request("GET", "/connections")
+            result["traffic"] = {
+                "upload": data.get("uploadTotal", 0),
+                "download": data.get("downloadTotal", 0),
+                "connections": len(data.get("connections", [])),
+            }
+        except Exception:
+            result["traffic"] = None
+        self.app.call_from_thread(self._apply_dashboard, result)
+
+    def _apply_dashboard(self, result: dict) -> None:
+        snapshot = result["snapshot"]
+        if snapshot is not None:
+            status_text = "[#a3e635]● 运行中[/]" if snapshot.running else "[#fb7185]○ 已停止[/]"
             self.query_one("#dash-status", Label).update(status_text)
             self.query_one("#dash-port", Label).update(str(snapshot.port))
             self.query_one("#dash-controller", Label).update(snapshot.controller)
             self.query_one("#dash-pid", Label).update(str(snapshot.pid) if snapshot.pid else "─")
-        except Exception as e:
-            self.query_one("#dash-status", Label).update(f"[#fb7185]Error: {e}[/]")
+        else:
+            self.query_one("#dash-status", Label).update(f"[#fb7185]错误: {result['status_error']}[/]")
 
-    def _update_ai_route(self, service: QueryService) -> None:
+        groups = result["groups"]
+        if groups is not None:
+            self._apply_ai_route(groups)
+        else:
+            self.query_one("#dash-api-status", Label).update("[#fb7185]○ 不可访问[/]")
+            self.query_one("#dash-ai-mode", Label).update("[#8b98aa]─[/]")
+            self.query_one("#dash-ai-active", Label).update("[#8b98aa]─[/]")
+            self.query_one("#dash-ai-standby", Label).update("[#8b98aa]─[/]")
+
+        traffic = result["traffic"]
+        if traffic is None:
+            for selector in ("#dash-upload", "#dash-download", "#dash-connections"):
+                self.query_one(selector, Label).update("[#8b98aa]─[/]")
+        else:
+            self.query_one("#dash-upload", Label).update(f"[#5eead4]{self._format_bytes(traffic['upload'])}[/]")
+            self.query_one("#dash-download", Label).update(f"[#5eead4]{self._format_bytes(traffic['download'])}[/]")
+            self.query_one("#dash-connections", Label).update(f"[#5eead4]{traffic['connections']}[/]")
+        self.query_one("#dash-refresh-status", Label).update(
+            f"[#8b98aa]最后刷新 {datetime.now():%H:%M:%S} · F5 手动刷新[/]"
+        )
+
+    def _apply_ai_route(self, groups: dict) -> None:
         try:
-            groups = service.get_ai_status_groups()
-            self.query_one("#dash-api-status", Label).update("[#a3e635]● Connected[/]")
+            self.query_one("#dash-api-status", Label).update("[#a3e635]● 已连接[/]")
 
             manual = groups.get("AI-MANUAL")
             auto = groups.get("AI-AUTO")
@@ -102,7 +150,7 @@ class DashboardScreen(Widget):
                 active_group_name = auto.current if auto_mode else manual.current
                 active = groups.get(active_group_name)
 
-                mode_text = "Auto" if auto_mode else f"Manual ({manual.current})"
+                mode_text = "自动" if auto_mode else f"固定（{manual.current}）"
                 self.query_one("#dash-ai-mode", Label).update(f"[#f6c177]{mode_text}[/]")
 
                 if active:
@@ -125,29 +173,8 @@ class DashboardScreen(Widget):
                         f"{standby_name} → {standby.current} ({delay_str}) {alive_str}"
                     )
 
-        except APIUnavailableError:
-            self.query_one("#dash-api-status", Label).update("[#fb7185]○ Disconnected[/]")
-            self.query_one("#dash-ai-mode", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-ai-active", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-ai-standby", Label).update("[#8b98aa]─[/]")
         except Exception:
             pass
-
-    def _update_traffic(self, service: QueryService) -> None:
-        try:
-            api = service.api
-            data = api.request("GET", "/connections")
-            upload_total = data.get("uploadTotal", 0)
-            download_total = data.get("downloadTotal", 0)
-            active_count = len(data.get("connections", []))
-
-            self.query_one("#dash-upload", Label).update(f"[#5eead4]{self._format_bytes(upload_total)}[/]")
-            self.query_one("#dash-download", Label).update(f"[#5eead4]{self._format_bytes(download_total)}[/]")
-            self.query_one("#dash-connections", Label).update(f"[#5eead4]{active_count}[/]")
-        except Exception:
-            self.query_one("#dash-upload", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-download", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-connections", Label).update("[#8b98aa]─[/]")
 
     def _format_bytes(self, bytes_val: int) -> str:
         if bytes_val == 0:

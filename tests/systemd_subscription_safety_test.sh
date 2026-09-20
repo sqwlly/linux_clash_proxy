@@ -251,6 +251,7 @@ EOF
 run_subscription() {
     local tmp_dir="$1"
 
+    PATH="${tmp_dir}:${PATH}" \
     PROJECT_DIR="$tmp_dir" \
     PROXY_SH="${tmp_dir}/proxy.sh" \
     SOURCE_CONFIG="${tmp_dir}/config.yaml" \

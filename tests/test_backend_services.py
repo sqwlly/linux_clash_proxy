@@ -182,6 +182,9 @@ def test_query_service_writes_audit_for_mutations(tmp_path: Path):
                 )
             }
 
+        def get_connections(self):
+            return {"connections": []}
+
         def switch_group(self, group_name, target_name):
             self.calls.append(("switch", group_name, target_name))
 
@@ -213,7 +216,7 @@ def test_query_service_writes_audit_for_mutations(tmp_path: Path):
         "close_all_connections",
         "update_proxy_provider",
     ]
-    assert events[0]["detail"] == {"selected": "Node B"}
+    assert events[0]["detail"] == {"selected": "Node B", "dropped": 0}
 
 
 def test_query_service_writes_audit_for_failed_mutation(tmp_path: Path):
@@ -251,3 +254,131 @@ def test_query_service_writes_audit_for_failed_mutation(tmp_path: Path):
     assert event["action"] == "switch_group"
     assert event["result"] == "error"
     assert event["detail"]["selected"] == "Node B"
+
+
+def test_switch_drops_agy_and_ai_manual_connections(tmp_path: Path):
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import default_paths
+    from cproxy.services.query import QueryService
+
+    class FakeAPI:
+        def __init__(self):
+            self.closed: list[str] = []
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(
+                    name="AI-MANUAL",
+                    type="select",
+                    current="Node A",
+                    candidates=["Node A", "Node B"],
+                ),
+                "CyberGuard": ProxyGroup(
+                    name="CyberGuard",
+                    type="select",
+                    current="JP",
+                    candidates=["JP", "US"],
+                ),
+            }
+
+        def get_connections(self):
+            return {
+                "connections": [
+                    {
+                        "id": "ai-1",
+                        "chains": ["🇺🇸美国 01 | 1X", "AI-MANUAL"],
+                        "metadata": {"process": "agy", "host": "daily-cloudcode-pa.googleapis.com"},
+                    },
+                    {
+                        "id": "agy-leak",
+                        "chains": ["🇯🇵日本 02", "CyberGuard"],
+                        "metadata": {"process": "agy", "host": "github.com"},
+                    },
+                    {
+                        "id": "cursor",
+                        "chains": ["🇯🇵日本 02", "CyberGuard"],
+                        "metadata": {"process": "node", "host": "api2.cursor.sh"},
+                    },
+                ]
+            }
+
+        def switch_group(self, group_name, target_name):
+            return None
+
+        def close_connection(self, connection_id):
+            self.closed.append(connection_id)
+
+    paths = default_paths(tmp_path)
+    service = QueryService(paths)
+    fake = FakeAPI()
+    service.api = fake
+    service.switch_group("AI-MANUAL", "Node B")
+    assert fake.closed == ["ai-1", "agy-leak"]
+    assert service.last_switch_from == "Node A"
+
+    fake.closed.clear()
+    service.switch_group("CyberGuard", "US")
+    assert fake.closed == []
+
+
+def test_node_delays_uses_groups_snapshot(tmp_path: Path):
+    """同一次会话已有 /proxies 快照时，延迟不再打第二遍 API。"""
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import default_paths
+    from cproxy.services.query import QueryService
+
+    class FakeAPI:
+        def get_delays(self):
+            raise AssertionError("should use snapshot")
+
+    paths = default_paths(tmp_path)
+    service = QueryService(paths)
+    service.api = FakeAPI()
+    service.groups_snapshot = {
+        "n": ProxyGroup(name="n", type="ss", current="-", candidates=[], delay=42),
+    }
+    assert service.node_delays() == {"n": 42}
+
+
+def test_reload_config_restores_selectors(tmp_path: Path, monkeypatch):
+    from cproxy.backend.api import APIBackend
+    from cproxy.config import default_paths
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "external-controller: 127.0.0.1:9090\nmixed-port: 7890\n",
+        encoding="utf-8",
+    )
+    paths = default_paths(tmp_path)
+    api = APIBackend(paths)
+    state = {"now": "🇺🇸 United States"}
+    puts: list[tuple[str, dict | None]] = []
+
+    def request(method, path, payload=None, request_timeout=None):
+        if method == "GET" and path == "/proxies":
+            return {
+                "proxies": {
+                    "AI-MANUAL": {
+                        "type": "Selector",
+                        "now": state["now"],
+                        "all": ["🇺🇸 United States", "🇯🇵 Japan"],
+                        "history": [],
+                    }
+                }
+            }
+        if method == "PUT" and path.startswith("/configs"):
+            puts.append((path, payload))
+            state["now"] = "🇯🇵 Japan"
+            return {}
+        if method == "PUT" and path.startswith("/proxies/"):
+            state["now"] = payload["name"]
+            return {}
+        if method == "GET" and path == "/connections":
+            return {"connections": []}
+        return {}
+
+    monkeypatch.setattr(api, "request", request)
+    api.reload_config("/tmp/runtime.yaml")
+    assert puts == [("/configs?force=true", {"path": "/tmp/runtime.yaml"})]
+    assert state["now"] == "🇺🇸 United States"

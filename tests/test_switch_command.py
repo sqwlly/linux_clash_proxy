@@ -48,6 +48,9 @@ def test_switch_updates_remote_selection(tmp_path: Path):
             if self.path == "/proxies":
                 self._send({"proxies": state})
                 return
+            if self.path == "/connections":
+                self._send({"connections": []})
+                return
             if self.path == "/version":
                 self._send({"version": "test"})
                 return
@@ -105,7 +108,7 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert switch_result.returncode == 0
         assert "结果" in switch_result.stdout
         assert "代理组: AI-MANUAL" in switch_result.stdout
-        assert "当前选择:" in switch_result.stdout
+        assert "当前选择:" in switch_result.stdout or "切换:" in switch_result.stdout
         assert "AI-SG" in switch_result.stdout
         assert "\x1b[" in switch_result.stdout
 
@@ -159,7 +162,8 @@ def test_switch_updates_remote_selection(tmp_path: Path):
         assert "状态        ○ 未运行" in status_result.stdout
         assert "API         ✓ 可访问" in status_result.stdout
         assert "API 可能来自其它 Mihomo 实例" in status_result.stdout
-        assert "clash-proxy status" in status_result.stdout
+        assert "cproxy doctor" in status_result.stdout
+        assert "clash-proxy status" not in status_result.stdout
         assert "cproxy render" in status_result.stdout
 
         no_icons_env = status_env.copy()

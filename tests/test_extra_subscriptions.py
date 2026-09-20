@@ -3,10 +3,15 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
+import pytest
 import yaml
 
 from cproxy.config import AppPaths
-from cproxy.services.refresh import apply_extra_subscriptions, update_source_from_subscription
+from cproxy.services.refresh import (
+    apply_extra_subscriptions,
+    update_source_from_subscription,
+    upsert_extra_subscription,
+)
 
 # 测试样例均为虚构凭据，非真实订阅
 NODELIST_LINKS = "\n".join(
@@ -83,6 +88,49 @@ def test_apply_adds_prefixed_nodes_and_region_groups(tmp_path, monkeypatch):
     assert groups["Mitce-HK"]["proxies"] == ["Mitce HK-1"]
     assert groups["Mitce-US"]["proxies"] == ["Mitce US1-HY2"]
     assert groups["Mitce-HK"]["url"] == "https://cp.cloudflare.com/generate_204"
+
+
+def test_upsert_extra_subscription_attaches_generated_group(tmp_path, monkeypatch):
+    paths = make_paths(tmp_path)
+    config = base_config()
+    config.pop("subscriptions")
+    write_config(paths, config)
+    patch_download(monkeypatch, {"https://example.com/extra": nodelist_raw()})
+
+    upsert_extra_subscription(paths, "Extra", "https://example.com/extra", "CyberGuard")
+    results = apply_extra_subscriptions(paths)
+
+    assert [(item.name, item.status) for item in results] == [("Extra", "已更新")]
+    updated = read_config(paths)
+    assert updated["subscriptions"] == [
+        {
+            "name": "Extra",
+            "url": "https://example.com/extra",
+            "attach-to": "CyberGuard",
+        }
+    ]
+    cyber = next(group for group in updated["proxy-groups"] if group["name"] == "CyberGuard")
+    assert cyber["proxies"] == ["🇭🇰香港 01", "Extra"]
+
+
+def test_upsert_extra_subscription_rejects_unknown_attach_group(tmp_path):
+    paths = make_paths(tmp_path)
+    write_config(paths, base_config())
+
+    with pytest.raises(ValueError, match="挂载目标分组不存在"):
+        upsert_extra_subscription(paths, "Extra", "https://example.com/extra", "Missing")
+
+    assert read_config(paths) == base_config()
+
+
+def test_upsert_extra_subscription_rejects_existing_non_subscription_group_name(tmp_path):
+    paths = make_paths(tmp_path)
+    write_config(paths, base_config())
+
+    with pytest.raises(ValueError, match="与现有分组冲突"):
+        upsert_extra_subscription(paths, "CyberGuard", "https://example.com/extra")
+
+    assert read_config(paths) == base_config()
 
 
 def test_apply_is_idempotent(tmp_path, monkeypatch):

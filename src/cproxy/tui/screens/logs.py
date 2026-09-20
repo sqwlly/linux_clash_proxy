@@ -17,9 +17,9 @@ class LogsScreen(Widget):
     FOLLOW_LINE_LIMIT = 1000
 
     BINDINGS = [
-        Binding("c", "clear_logs", "Clear"),
-        Binding("f", "toggle_follow", "Follow"),
-        Binding("r", "refresh_logs", "Refresh"),
+        Binding("c", "clear_logs", "清空视图"),
+        Binding("f", "toggle_follow", "跟随"),
+        Binding("r", "refresh_logs", "刷新"),
     ]
 
     def __init__(self, paths: AppPaths, **kwargs):
@@ -33,16 +33,16 @@ class LogsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Logs", classes="page-title")
+            yield Label("日志", classes="page-title")
             with Vertical(classes="panel output-panel"):
-                yield Label("Log Viewer", classes="panel-title")
-                with Horizontal():
+                yield Label("日志查看器", classes="panel-title")
+                with Horizontal(classes="field-row"):
                     yield Label("─", id="log-file-label", classes="path-label")
-                    yield Label("[#a3e635]● Following[/]", id="log-status-label", classes="status-strip")
+                    yield Label("[#a3e635]● 正在跟随[/]", id="log-status-label", classes="status-strip")
                 with Horizontal(classes="toolbar"):
-                    yield Button("Clear", id="btn-log-clear", classes="action-button danger-button")
-                    yield Button("Refresh", id="btn-log-refresh", classes="action-button primary-button")
-                    yield Checkbox("Auto-follow", value=True, id="chk-follow")
+                    yield Button("清空视图", id="btn-log-clear", classes="action-button danger-button")
+                    yield Button("刷新", id="btn-log-refresh", classes="action-button primary-button")
+                    yield Checkbox("自动跟随", value=True, id="chk-follow")
                 yield TextArea(id="log-viewer", read_only=True, classes="log-viewer")
 
     def on_mount(self) -> None:
@@ -68,7 +68,7 @@ class LogsScreen(Widget):
         viewer = self.query_one("#log-viewer", TextArea)
 
         if not log_path.exists():
-            viewer.load_text(f"Log file not found: {log_path}")
+            viewer.load_text(f"日志文件不存在: {log_path}")
             return
 
         try:
@@ -85,7 +85,7 @@ class LogsScreen(Widget):
                 viewer.move_cursor((len(lines), 0))
 
         except Exception as e:
-            viewer.load_text(f"Error reading logs: {e}")
+            viewer.load_text(f"读取日志失败: {e}")
 
     def _start_tail(self) -> None:
         if self._tail_thread and self._tail_thread.is_alive():
@@ -146,7 +146,7 @@ class LogsScreen(Widget):
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if event.checkbox.id == "chk-follow":
             self._following = event.value
-            status = "[#a3e635]● Following[/]" if self._following else "[#8b98aa]○ Paused[/]"
+            status = "[#a3e635]● 正在跟随[/]" if self._following else "[#8b98aa]○ 已暂停[/]"
             self.query_one("#log-status-label", Label).update(status)
 
     def action_clear_logs(self) -> None:
@@ -159,7 +159,7 @@ class LogsScreen(Widget):
     def action_toggle_follow(self) -> None:
         self._following = not self._following
         self.query_one("#chk-follow", Checkbox).value = self._following
-        status = "[#a3e635]● Following[/]" if self._following else "[#8b98aa]○ Paused[/]"
+        status = "[#a3e635]● 正在跟随[/]" if self._following else "[#8b98aa]○ 已暂停[/]"
         self.query_one("#log-status-label", Label).update(status)
 
     def action_refresh_logs(self) -> None:

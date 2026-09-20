@@ -146,6 +146,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "诊断与排障",
         (
             ("test", "测试代理连通性"),
+            ("doctor", "检查本地状态并给出恢复建议"),
             ("security-check", "校验本地 GA 安全配置"),
             ("support-bundle", "生成脱敏支持包"),
             ("ip-check", "检测出口 IP 纯净度"),
@@ -230,7 +231,7 @@ def _localize_help_titles(parser: ArgumentParser) -> None:
         positionals.title = "位置参数"
 
 
-def _add_command(subparsers, name: str, *, raw: bool = False) -> ArgumentParser:
+def _add_command(subparsers, name: str, *, raw: bool = False, json_output: bool = False) -> ArgumentParser:
     """注册一个子命令。
 
     - `description` 自动取自 `_COMMAND_HELP`，命令表是唯一数据源
@@ -244,8 +245,12 @@ def _add_command(subparsers, name: str, *, raw: bool = False) -> ArgumentParser:
     """
     parser = subparsers.add_parser(name, description=_COMMAND_HELP[name], add_help=False, formatter_class=CliHelpFormatter)
     parser.add_argument("-h", "--help", action="help", help="显示本帮助并退出")
-    if raw:
-        parser.add_argument("--raw", action="store_true", help="输出机器可读格式")
+    if raw or json_output:
+        output_group = parser.add_mutually_exclusive_group()
+        if raw:
+            output_group.add_argument("--raw", action="store_true", help="输出兼容旧脚本的纯文本格式")
+        if json_output:
+            output_group.add_argument("--json", action="store_true", help="输出带 schema_version 的 JSON")
     _localize_help_titles(parser)
     return parser
 
@@ -266,21 +271,22 @@ def build_root_parser() -> ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="<命令>", title="命令")
 
     _add_command(subparsers, "init")
-    _add_command(subparsers, "bootstrap")
+    bootstrap_parser = _add_command(subparsers, "bootstrap")
+    bootstrap_parser.add_argument("--subscription-url", help="没有可迁移配置时，从该订阅初始化")
 
-    current_parser = _add_command(subparsers, "current", raw=True)
+    current_parser = _add_command(subparsers, "current", raw=True, json_output=True)
     current_parser.add_argument("group", help="代理组名")
 
-    _add_command(subparsers, "list-groups", raw=True)
+    _add_command(subparsers, "list-groups", raw=True, json_output=True)
 
-    nodes_parser = _add_command(subparsers, "list-nodes", raw=True)
+    nodes_parser = _add_command(subparsers, "list-nodes", raw=True, json_output=True)
     nodes_parser.add_argument("group", help="代理组名")
 
     switch_parser = _add_command(subparsers, "switch")
     switch_parser.add_argument("group", nargs="?", help="代理组名；与 target 一并省略时进入交互选择")
     switch_parser.add_argument("target", nargs="?", help="要切换到的节点或子组名")
 
-    _add_command(subparsers, "ai-status", raw=True)
+    _add_command(subparsers, "ai-status", raw=True, json_output=True)
 
     migrate_parser = _add_command(subparsers, "migrate-from-legacy")
     migrate_parser.add_argument("legacy_root", help="旧仓库根目录")
@@ -291,11 +297,11 @@ def build_root_parser() -> ArgumentParser:
     rollback_parser = _add_command(subparsers, "rollback")
     rollback_parser.add_argument("name", nargs="?", help="快照文件名（默认取最近一份运行时快照）")
 
-    refresh_parser = _add_command(subparsers, "refresh", raw=True)
+    refresh_parser = _add_command(subparsers, "refresh", raw=True, json_output=True)
     refresh_parser.add_argument("--subscription-url", help="订阅地址（覆盖配置里的 subscription-url）")
     refresh_parser.add_argument("--group", action="append", default=[], help="要探测并自动切换的分组（可重复）")
 
-    status_parser = _add_command(subparsers, "status", raw=True)
+    status_parser = _add_command(subparsers, "status", raw=True, json_output=True)
     status_parser.add_argument(
         "--top",
         type=int,
@@ -314,7 +320,8 @@ def build_root_parser() -> ArgumentParser:
     logs_parser.add_argument("--lines", type=int, default=50, help="显示末尾行数（默认 50）")
     logs_parser.add_argument("--follow", action="store_true", help="持续跟踪新增日志")
 
-    _add_command(subparsers, "test")
+    _add_command(subparsers, "test", json_output=True)
+    _add_command(subparsers, "doctor", json_output=True)
 
     security_parser = _add_command(subparsers, "security-check")
     security_parser.add_argument("--strict", action="store_true", help="将告警视为失败")
@@ -322,7 +329,7 @@ def build_root_parser() -> ArgumentParser:
     support_parser = _add_command(subparsers, "support-bundle")
     support_parser.add_argument("--output", help="输出 tar.gz 路径")
 
-    test_group_parser = _add_command(subparsers, "test-group", raw=True)
+    test_group_parser = _add_command(subparsers, "test-group", raw=True, json_output=True)
     test_group_parser.add_argument("group", help="代理组名")
 
     _add_command(subparsers, "proxy-env")
@@ -377,7 +384,7 @@ def build_root_parser() -> ArgumentParser:
     )
     ai_use_parser.add_argument("--group", default="AI-MANUAL", help="代理组名（默认 AI-MANUAL）")
 
-    traffic_parser = _add_command(subparsers, "traffic", raw=True)
+    traffic_parser = _add_command(subparsers, "traffic", raw=True, json_output=True)
     traffic_parser.add_argument(
         "action", nargs="?", choices=TRAFFIC_ACTIONS, default="show", help="报表动作（默认 show）"
     )

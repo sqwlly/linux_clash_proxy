@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -17,15 +18,15 @@ from ..widgets import NavigationDataTable as DataTable
 
 class ProxiesScreen(Widget):
     BINDINGS = [
-        Binding("enter", "activate_row", "Open/Select", priority=True),
-        Binding("right", "focus_nodes", "Nodes", priority=True),
-        Binding("left", "focus_groups", "Groups", priority=True),
-        Binding("escape", "back", "Back", priority=True),
-        Binding("s", "select_node", "Switch"),
-        Binding("t", "test_delay", "Test"),
-        Binding("r", "refresh_data", "Refresh"),
-        Binding("g", "focus_groups", "Groups"),
-        Binding("n", "focus_nodes", "Nodes"),
+        Binding("enter", "activate_row", "打开/选择", priority=True),
+        Binding("right", "focus_nodes", "节点", priority=True),
+        Binding("left", "focus_groups", "分组", priority=True),
+        Binding("escape", "back", "返回", priority=True),
+        Binding("s", "select_node", "切换"),
+        Binding("t", "test_delay", "测速"),
+        Binding("r", "refresh_data", "刷新"),
+        Binding("g", "focus_groups", "分组"),
+        Binding("n", "focus_nodes", "节点"),
     ]
 
     def __init__(self, paths: AppPaths, **kwargs):
@@ -37,23 +38,23 @@ class ProxiesScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Nodes", classes="page-title")
+            yield Label("节点与分组", classes="page-title")
             with Horizontal(classes="workbench-row"):
                 with Vertical(classes="proxy-group-card split-sidebar proxy-sidebar"):
-                    yield Label("Groups", classes="proxy-group-title")
+                    yield Label("分组", classes="proxy-group-title")
                     yield DataTable(id="groups-table")
                 with Vertical(classes="proxy-group-card split-main proxy-main"):
-                    yield Label("Nodes", classes="proxy-group-title")
+                    yield Label("节点", classes="proxy-group-title")
                     yield Label("─", id="current-node", classes="node-current")
                     yield Label("─", id="api-status", classes="status-strip")
                     yield DataTable(id="nodes-table")
                     with Horizontal(classes="toolbar"):
-                        yield Button("Switch", id="btn-switch-node", classes="action-button success-button")
-                        yield Button("Test", id="btn-test-delay", classes="action-button primary-button")
-                        yield Button("Refresh", id="btn-refresh-proxies", classes="action-button muted-button")
-                        yield Button("Restart", id="btn-restart-proxy", classes="action-button muted-button")
+                        yield Button("切换", id="btn-switch-node", classes="action-button success-button")
+                        yield Button("测速", id="btn-test-delay", classes="action-button primary-button")
+                        yield Button("刷新", id="btn-refresh-proxies", classes="action-button muted-button")
+                        yield Button("重启", id="btn-restart-proxy", classes="action-button muted-button")
                     yield Label(
-                        "up/down: move  left/esc: groups  right: nodes  enter/s: switch",
+                        "↑↓ 移动  ←/Esc 返回分组  → 进入节点  Enter/s 切换",
                         id="proxy-action-status", classes="action-status",
                     )
 
@@ -64,77 +65,80 @@ class ProxiesScreen(Widget):
 
     def _init_tables(self) -> None:
         groups_table = self.query_one("#groups-table", DataTable)
-        groups_table.add_columns("Name", "Type", "Current")
+        groups_table.add_columns("名称", "类型", "当前选择")
         groups_table.cursor_type = "row"
         groups_table.show_header = True
         groups_table.navigation_next_handler = self.action_focus_nodes
 
         nodes_table = self.query_one("#nodes-table", DataTable)
-        nodes_table.add_columns("Node", "Delay")
+        nodes_table.add_columns("节点", "延迟")
         nodes_table.cursor_type = "row"
         nodes_table.show_header = True
         nodes_table.navigation_previous_handler = self.action_focus_groups
 
 
     def refresh_data(self) -> None:
+        self.query_one("#api-status", Label).update("[#f6c177]刷新中…[/]")
+        self._load_groups()
+
+    @work(thread=True, exclusive=True, group="proxies-refresh")
+    def _load_groups(self) -> None:
         try:
             service = QueryService(self.paths)
             context = service.load_context(require_api=False)
-            self._api_available = context.api_available
-            self._groups = list(context.groups.values())
-            self._update_api_status()
+            self.app.call_from_thread(self._apply_groups, context, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._apply_groups, None, str(exc))
 
-            groups_table = self.query_one("#groups-table", DataTable)
-            groups_table.clear()
-
-            rendered_group_count = 0
-            rendered_groups: list[ProxyGroup] = []
-            for group in self._groups:
-                group_type = str(group.type).lower()
-                if group_type in {"selector", "select", "fallback", "url-test", "load-balance"}:
-                    groups_table.add_row(
-                        group.name,
-                        group.type,
-                        group.current or "─",
-                        key=group.name,
-                    )
-                    rendered_group_count += 1
-                    rendered_groups.append(group)
-
-            if not rendered_group_count:
-                groups_table.add_row("[#8b98aa]No switchable groups[/]", "─", "─")
-                self._current_group = None
-                self._update_nodes_table()
-                return
-
-            previous_group_name = self._current_group.name if self._current_group else None
-            chosen = next((group for group in rendered_groups if group.name == previous_group_name), None)
-            if chosen is None:
-                selectable = [group for group in rendered_groups if str(group.type).lower() in {"selector", "select"}]
-                fallback = [
-                    group
-                    for group in rendered_groups
-                    if str(group.type).lower() in {"fallback", "url-test", "load-balance"}
-                ]
-                chosen = selectable[0] if selectable else fallback[0] if fallback else None
-            if chosen:
-                self._current_group = chosen
-                self._update_nodes_table()
-                groups_table.move_cursor(row=rendered_groups.index(chosen), animate=False)
-
-        except Exception as e:
+    def _apply_groups(self, context, error: str | None) -> None:
+        groups_table = self.query_one("#groups-table", DataTable)
+        if error is not None or context is None:
             self._api_available = False
             self._update_api_status()
-            groups_table = self.query_one("#groups-table", DataTable)
             groups_table.clear()
-            groups_table.add_row(f"Error: {e}", "─", "─")
+            groups_table.add_row(f"错误: {error}", "─", "─")
+            return
+
+        self._api_available = context.api_available
+        self._groups = list(context.groups.values())
+        self._update_api_status()
+
+        groups_table.clear()
+
+        rendered_group_count = 0
+        rendered_groups: list[ProxyGroup] = []
+        for group in self._groups:
+            group_type = str(group.type).lower()
+            if group_type in {"selector", "select", "fallback", "url-test", "load-balance"}:
+                groups_table.add_row(group.name, group.type, group.current or "─", key=group.name)
+                rendered_group_count += 1
+                rendered_groups.append(group)
+
+        if not rendered_group_count:
+            groups_table.add_row("[#8b98aa]没有可显示的代理组[/]", "─", "─")
+            self._current_group = None
+            self._update_nodes_table()
+            return
+
+        previous_group_name = self._current_group.name if self._current_group else None
+        chosen = next((group for group in rendered_groups if group.name == previous_group_name), None)
+        if chosen is None:
+            selectable = [group for group in rendered_groups if str(group.type).lower() in {"selector", "select"}]
+            fallback = [
+                group for group in rendered_groups if str(group.type).lower() in {"fallback", "url-test", "load-balance"}
+            ]
+            chosen = selectable[0] if selectable else fallback[0] if fallback else None
+        if chosen:
+            self._current_group = chosen
+            self._update_nodes_table()
+            groups_table.move_cursor(row=rendered_groups.index(chosen), animate=False)
 
     def _update_api_status(self) -> None:
         label = self.query_one("#api-status", Label)
         if self._api_available:
-            label.update("[#a3e635]● API connected[/]")
+            label.update("[#a3e635]● API 已连接[/]")
         else:
-            label.update("[#f6c177]○ Runtime view only; start/restart proxy before switching[/]")
+            label.update("[#f6c177]○ 仅显示运行配置；切换前请启动或重启代理[/]")
 
     def _update_nodes_table(self) -> None:
         nodes_table = self.query_one("#nodes-table", DataTable)
@@ -144,8 +148,8 @@ class ProxiesScreen(Widget):
         current_label = self.query_one("#current-node", Label)
 
         if not self._current_group:
-            current_label.update("[#8b98aa]No group selected[/]")
-            nodes_table.add_row("[#8b98aa]Select a group to view nodes[/]", "─")
+            current_label.update("[#8b98aa]尚未选择分组[/]")
+            nodes_table.add_row("[#8b98aa]选择分组后查看节点[/]", "─")
             return
 
         current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
@@ -188,7 +192,7 @@ class ProxiesScreen(Widget):
         if event.data_table.id != "groups-table":
             return
         group_name = str(event.row_key.value)
-        self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]Selected group: {group_name}[/]")
+        self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]已选分组: {group_name}[/]")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "groups-table":
@@ -233,7 +237,7 @@ class ProxiesScreen(Widget):
         focused = getattr(self.app, "focused", None)
         if not (isinstance(focused, DataTable) and focused.id == "groups-table"):
             self.action_focus_groups()
-            self.query_one("#proxy-action-status", Label).update("[#8b98aa]Back to groups[/]")
+            self.query_one("#proxy-action-status", Label).update("[#8b98aa]已返回分组列表[/]")
         else:
             for tabbed in self.app.query("#main-tabs"):
                 for child in tabbed.walk_children():
@@ -249,80 +253,109 @@ class ProxiesScreen(Widget):
 
         nodes_table = self.query_one("#nodes-table", DataTable)
         if nodes_table.cursor_row is None:
-            self.query_one("#proxy-action-status", Label).update("[#f6c177]No node selected[/]")
+            self.query_one("#proxy-action-status", Label).update("[#f6c177]尚未选择节点[/]")
             return
 
         if not self._api_available:
             self.query_one("#proxy-action-status", Label).update(
-                "[#f6c177]API unavailable; use Restart or run cproxy restart[/]"
+                "[#f6c177]API 不可访问；请点击重启或执行 cproxy restart[/]"
             )
             return
 
+        row = nodes_table.ordered_rows[nodes_table.cursor_row]
+        node_name = str(row.key.value)
+
+        if str(self._current_group.type).lower() not in {"selector", "select"}:
+            self.notify(f"分组 [{self._current_group.name}] 不支持手动切换", severity="warning")
+            return
+
+        group_name = self._current_group.name
+        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在切换 {group_name} → {node_name}…[/]")
+        self._switch_node(group_name, node_name)
+
+    @work(thread=True, exclusive=True, group="proxy-action")
+    def _switch_node(self, group_name: str, node_name: str) -> None:
         try:
-            row = nodes_table.ordered_rows[nodes_table.cursor_row]
-            node_name = str(row.key.value)
+            QueryService(self.paths).switch_group(group_name, node_name)
+            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, exc)
 
-            if str(self._current_group.type).lower() not in {"selector", "select"}:
-                self.notify(f"Group [{self._current_group.name}] is not selectable", severity="warning")
-                return
-
-            service = QueryService(self.paths)
-            service.switch_group(self._current_group.name, node_name)
-            self.query_one("#proxy-action-status", Label).update(
-                f"[#a3e635]Switched {self._current_group.name} -> {node_name}[/]"
-            )
-            self.notify(f"Switched: {self._current_group.name} → {node_name}", severity="information")
+    def _finish_switch_node(self, group_name: str, node_name: str, error: Exception | None) -> None:
+        status = self.query_one("#proxy-action-status", Label)
+        if error is None:
+            status.update(f"[#a3e635]已切换 {group_name} → {node_name}[/]")
+            self.notify(f"已切换: {group_name} → {node_name}", severity="information")
             self.refresh_data()
-
-        except APIUnavailableError:
-            self.query_one("#proxy-action-status", Label).update("[#fb7185]API unavailable[/]")
-            self.notify("API unavailable", severity="error")
-        except Exception as e:
-            self.query_one("#proxy-action-status", Label).update(f"[#fb7185]Switch failed: {e}[/]")
-            self.notify(f"Switch failed: {e}", severity="error")
+        elif isinstance(error, APIUnavailableError):
+            status.update("[#fb7185]API 不可访问[/]")
+            self.notify("API 不可访问", severity="error")
+        else:
+            status.update(f"[#fb7185]切换失败: {error}[/]")
+            self.notify(f"切换失败: {error}", severity="error")
 
     def action_restart_proxy(self) -> None:
-        status = self.query_one("#proxy-action-status", Label)
+        self.query_one("#proxy-action-status", Label).update("[#f6c177]正在生成配置并重启…[/]")
+        self._restart_proxy()
+
+    @work(thread=True, exclusive=True, group="proxy-action")
+    def _restart_proxy(self) -> None:
         try:
             runtime_path = render_runtime(self.paths)
             pid = restart_process(self.paths)
-            status.update(f"[#a3e635]Restarted PID {pid}; runtime {runtime_path}[/]")
+            self.app.call_from_thread(self._finish_restart, runtime_path, pid, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._finish_restart, None, None, exc)
+
+    def _finish_restart(self, runtime_path, pid: int | None, error: Exception | None) -> None:
+        status = self.query_one("#proxy-action-status", Label)
+        if error is None:
+            status.update(f"[#a3e635]已重启 PID {pid}；运行配置 {runtime_path}[/]")
             self.refresh_data()
-        except Exception as e:
-            status.update(f"[#fb7185]Restart failed: {e}[/]")
-            self.notify(f"Restart failed: {e}", severity="error")
+        else:
+            status.update(f"[#fb7185]重启失败: {error}[/]")
+            self.notify(f"重启失败: {error}", severity="error")
 
     def action_test_delay(self) -> None:
         if not self._current_group:
             return
+        group_name = self._current_group.name
+        current_name = self._current_group.current
+        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在测速: {group_name}…[/]")
+        self._test_delay(group_name, current_name)
 
+    @work(thread=True, exclusive=True, group="proxy-action")
+    def _test_delay(self, group_name: str, current_name: str | None) -> None:
         try:
             from ...diagnostics import test_group
-            report = test_group(self.paths, self._current_group.name)
+            report = test_group(self.paths, group_name)
+            self.app.call_from_thread(self._finish_test_delay, group_name, current_name, report, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._finish_test_delay, group_name, current_name, None, exc)
 
-            nodes_table = self.query_one("#nodes-table", DataTable)
-            nodes_table.clear()
+    def _finish_test_delay(self, group_name: str, current_name: str | None, report, error: Exception | None) -> None:
+        status = self.query_one("#proxy-action-status", Label)
+        if error is not None:
+            message = "API 不可访问" if isinstance(error, APIUnavailableError) else f"测速失败: {error}"
+            status.update(f"[#fb7185]{message}[/]")
+            self.notify(message, severity="error")
+            return
 
-            current_label = self.query_one("#current-node", Label)
-            current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
-
-            for result in report.results:
-                is_current = result.name == self._current_group.current
-                prefix = "[#a3e635]●[/] " if is_current else "  "
-                if result.ok and result.delay:
-                    if result.delay < 200:
-                        delay = f"[#a3e635]{result.delay}ms[/]"
-                    elif result.delay < 500:
-                        delay = f"[#f6c177]{result.delay}ms[/]"
-                    else:
-                        delay = f"[#fb7185]{result.delay}ms[/]"
+        nodes_table = self.query_one("#nodes-table", DataTable)
+        nodes_table.clear()
+        self.query_one("#current-node", Label).update(f"[#a3e635]● {current_name}[/]")
+        for result in report.results:
+            is_current = result.name == current_name
+            prefix = "[#a3e635]●[/] " if is_current else "  "
+            if result.ok and result.delay:
+                if result.delay < 200:
+                    delay = f"[#a3e635]{result.delay}ms[/]"
+                elif result.delay < 500:
+                    delay = f"[#f6c177]{result.delay}ms[/]"
                 else:
-                    delay = "[#fb7185]FAIL[/]"
-                nodes_table.add_row(f"{prefix}{result.name}", delay, key=result.name)
-
-            self.notify(f"Test complete: {self._current_group.name}", severity="information")
-
-        except APIUnavailableError:
-            self.notify("API unavailable", severity="error")
-        except Exception as e:
-            self.notify(f"Test failed: {e}", severity="error")
+                    delay = f"[#fb7185]{result.delay}ms[/]"
+            else:
+                delay = "[#fb7185]失败[/]"
+            nodes_table.add_row(f"{prefix}{result.name}", delay, key=result.name)
+        status.update(f"[#a3e635]测速完成: {group_name}[/]")
+        self.notify(f"测速完成: {group_name}", severity="information")

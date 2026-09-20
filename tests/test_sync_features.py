@@ -182,7 +182,41 @@ def test_render_japan_group_in_manual(tmp_path: Path):
     groups = {g["name"]: g for g in data["proxy-groups"]}
     manual = groups["AI-MANUAL"]
     assert "🇯🇵 Japan" in manual["proxies"]
-    assert manual["proxies"].index("🇯🇵 Japan") > manual["proxies"].index("AI-SG")
+    assert manual["proxies"][0] == "🇺🇸 United States"
+    assert "🇯🇵 Japan" in manual["proxies"]
+
+
+def test_render_prefers_non_iepl_nodes_in_region_groups(tmp_path: Path):
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: 🇺🇸 US 01 | 1X
+  - name: 🇺🇸 US 02 | IEPL
+  - name: 🇸🇬 SG 01 | 1X
+  - name: 🇯🇵 JP 01 | 1X
+  - name: 🇯🇵 JP 02 | IEPL + UDP 3X | CM
+proxy-groups:
+  - name: Auto
+    type: fallback
+    proxies: [🇺🇸 US 01 | 1X]
+  - name: 🇺🇸 United States
+    type: select
+    proxies: [🇺🇸 US 01 | 1X, 🇺🇸 US 02 | IEPL]
+  - name: 🇸🇬 Singapore
+    type: select
+    proxies: [🇸🇬 SG 01 | 1X]
+  - name: 🇯🇵 Japan
+    type: select
+    proxies: [🇯🇵 JP 01 | 1X, 🇯🇵 JP 02 | IEPL + UDP 3X | CM]
+rules:
+  - MATCH,Auto
+"""
+    data = _render_config(tmp_path, config)
+    groups = {g["name"]: g for g in data["proxy-groups"]}
+    assert groups["🇯🇵 Japan"]["proxies"][0] == "🇯🇵 JP 01 | 1X"
+    assert groups["🇺🇸 United States"]["proxies"][0] == "🇺🇸 US 01 | 1X"
+    assert groups["AI-MANUAL"]["proxies"][0] == "🇺🇸 United States"
 
 
 def test_render_no_japan_when_absent(tmp_path: Path):
@@ -223,7 +257,7 @@ def test_render_ssrdog_rules_removed(tmp_path: Path):
     ssrdog = [r for r in data["rules"] if "SSRDOG" in str(r)]
     assert ssrdog == []
     ai_rules = [r for r in data["rules"] if "AI-MANUAL" in str(r)]
-    assert len(ai_rules) == 18
+    assert len(ai_rules) == 24
     # 注入规则需前移到订阅规则之前（首条规则即 AI 规则）
     assert "AI-MANUAL" in str(data["rules"][0])
 

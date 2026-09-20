@@ -13,7 +13,10 @@ from ..proxyenv import proxy_http_url
 from .probe import ProbeService
 from .probe_history import load_history_rows, probe_history_file
 
-AI_HOST_KEYWORDS = ("chatgpt", "openai", "claude", "anthropic", "github")
+AI_HOST_KEYWORDS = (
+    "chatgpt", "openai", "claude", "anthropic", "github",
+    "gemini", "google", "antigravity", "googleapis",
+)
 
 
 @dataclass(frozen=True)

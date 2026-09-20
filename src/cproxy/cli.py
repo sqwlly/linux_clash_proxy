@@ -7,10 +7,12 @@ from pathlib import Path
 from . import __version__
 from .api import APIUnavailableError
 from .cli_render import (
+    _accent,
     _render_ai_connections,
     _render_ai_status,
     _render_connectivity_report,
     _render_current,
+    _render_doctor,
     _render_group_check,
     _render_incident,
     _render_ipcheck,
@@ -67,7 +69,7 @@ def run(argv: list[str] | None = None) -> int:
             print(f"已初始化配置: {config_file}")
             return 0
         if args.command == "bootstrap":
-            return _run_bootstrap()
+            return _run_bootstrap(args.subscription_url)
         if args.command == "migrate-from-legacy":
             config_file = migrate_from_legacy(default_paths(), Path(args.legacy_root))
             print(f"已迁移配置: {config_file}")
@@ -85,7 +87,7 @@ def run(argv: list[str] | None = None) -> int:
                 subscription_url=args.subscription_url,
                 groups=args.group,
             )
-            return _render_refresh(report, args.raw)
+            return _render_refresh(report, args.raw, args.json)
         if args.command == "start":
             pid = start_process(default_paths())
             print(f"代理已启动 (PID: {pid})")
@@ -104,9 +106,11 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "logs":
             return _render_logs(args.lines, args.follow)
         if args.command == "status":
-            return _render_status(args.raw, 0 if args.no_process else args.top)
+            return _render_status(args.raw, 0 if args.no_process else args.top, args.json)
         if args.command == "test":
-            return _render_connectivity_report(run_connectivity_test(default_paths()))
+            return _render_connectivity_report(run_connectivity_test(default_paths()), args.json)
+        if args.command == "doctor":
+            return _render_doctor(args.json)
         if args.command == "security-check":
             return _render_security_check(args.strict)
         if args.command == "support-bundle":
@@ -115,7 +119,7 @@ def run(argv: list[str] | None = None) -> int:
             print(f"已生成支持包: {bundle_path}")
             return 0
         if args.command == "test-group":
-            return _render_group_check(test_group(default_paths(), args.group), args.raw)
+            return _render_group_check(test_group(default_paths(), args.group), args.raw, args.json)
         if args.command == "proxy-env":
             for line in proxy_env_lines(default_paths()):
                 print(line)
@@ -128,19 +132,33 @@ def run(argv: list[str] | None = None) -> int:
         if args.command in {"current", "list-groups", "list-nodes", "ai-status"}:
             service = QueryService(default_paths())
             if args.command == "current":
-                return _render_current({args.group: service.get_group(args.group)}, args.group, args.raw)
+                return _render_current({args.group: service.get_group(args.group)}, args.group, args.raw, args.json)
             if args.command == "list-groups":
-                return _render_list_groups(service.list_groups(), args.raw)
+                return _render_list_groups(service.list_groups(), args.raw, args.json)
             if args.command == "list-nodes":
-                return _render_list_nodes({args.group: service.get_group(args.group)}, args.group, args.raw)
-            return _render_ai_status(service.get_ai_status_groups(), args.raw)
+                return _render_list_nodes({args.group: service.get_group(args.group)}, args.group, args.raw, args.json)
+            return _render_ai_status(service.get_ai_status_groups(), args.raw, args.json)
         if args.command == "switch":
             service = QueryService(default_paths())
             group_name, target_name = _resolve_switch(service, args)
             group = service.switch_group(group_name, target_name)
+            old_raw = service.last_switch_from
+            old_selection = normalize_name(old_raw) if old_raw else None
+            new_selection = normalize_name(group.current)
+            snapshot = service.groups_snapshot
+            delays = {name: item.delay for name, item in snapshot.items() if item.delay is not None}
+            new_delay = _resolve_delay(group.current, snapshot, delays) if group.current else None
+
             print(_section_heading("结果"))
             print(f"代理组: {group_name}")
-            print(f"当前选择: {normalize_name(group.current)}")
+            if old_selection and old_selection != new_selection:
+                print(f"切换: {old_selection} → {_accent(new_selection)}", end="")
+            else:
+                print(f"当前选择: {_accent(new_selection)}", end="")
+            if new_delay is not None and new_delay > 0:
+                print(f"  ({_delay_label(new_delay)})")
+            else:
+                print()
             return 0
         if args.command == "probe-stable-node":
             probe_report = ProbeService(default_paths()).probe(
@@ -201,6 +219,7 @@ def run(argv: list[str] | None = None) -> int:
                 by=args.by,
                 top=args.top,
                 raw=args.raw,
+                json_output=args.json,
             )
         if args.command == "ip-check":
             return _render_ipcheck(
@@ -216,7 +235,7 @@ def run(argv: list[str] | None = None) -> int:
 
             return run_completion(args.shell, install=args.install)
         if args.command == "tui":
-            from .tui.app import run_tui
+            from .tui_launcher import run_tui
             run_tui(default_paths())
             return 0
         return 0
@@ -255,34 +274,46 @@ def _resolve_switch(service: QueryService, args: Namespace) -> tuple[str, str]:
     all_groups = service.list_groups()
     groups = [g.name for g in all_groups if str(g.type).lower() in {"selector", "select"}]
     groups_by_name = {g.name: g for g in all_groups}
+    delays = {g.name: g.delay for g in all_groups if g.delay is not None}
     if not groups:
         print("错误: 没有可手动切换的代理组", file=sys.stderr)
         raise SystemExit(1)
 
+    last_group: str | None = None
+    roles = _group_roles(service, groups)
     try:
-        group_name = select_one("选择代理组", groups, annotations=_group_roles(service, groups))
-        if group_name is None:
-            raise SystemExit(0)  # 用户主动取消，不是错误
-        group = service.get_group(group_name)
-        if not group.candidates:
-            print(f"错误: 代理组 [{group_name}] 没有候选节点", file=sys.stderr)
-            raise SystemExit(1)
-        delays = service.node_delays()
-        target_name = select_one(
-            "选择节点",
-            group.candidates,
-            current=group.current,  # 高亮当前在用的那个
-            annotations={
-                name: _delay_label(_resolve_delay(name, groups_by_name, delays)) for name in group.candidates
-            },
-        )
+        while True:
+            group_name = select_one(
+                "选择代理组",
+                groups,
+                current=last_group,  # 从节点列表返回时停在刚才那一组
+                annotations=roles,
+            )
+            if group_name is None:
+                raise SystemExit(0)  # 用户主动取消，不是错误
+            last_group = group_name
+            group = groups_by_name.get(group_name) or service.get_group(group_name)
+            if not group.candidates:
+                print(f"错误: 代理组 [{group_name}] 没有候选节点", file=sys.stderr)
+                raise SystemExit(1)
+            target_name = select_one(
+                "选择节点",
+                group.candidates,
+                current=group.current,  # 高亮当前在用的那个
+                annotations={
+                    name: _delay_label(_resolve_delay(name, groups_by_name, delays)) for name in group.candidates
+                },
+                annotation_styles={
+                    name: _delay_style(_resolve_delay(name, groups_by_name, delays)) for name in group.candidates
+                },
+                back_hint=True,  # 底部提示「返回」；q / Esc / ← 回到分组列表
+            )
+            if target_name is not None:
+                return group_name, target_name
+            # target_name is None → 返回上一级重选分组
     except NotATerminalError:
         _explain_switch_usage(groups)
         raise SystemExit(2) from None
-
-    if target_name is None:
-        raise SystemExit(0)
-    return group_name, target_name
 
 
 def _group_roles(service: QueryService, groups: list[str]) -> dict[str, str]:
@@ -312,6 +343,19 @@ def _delay_label(delay: int | None) -> str:
     if delay is None:
         return "-"
     return "超时" if delay <= 0 else f"{delay} ms"
+
+
+def _delay_style(delay: int | None) -> str:
+    """延迟标注的 ANSI 着色：快绿、中黄、慢/超时红、无记录暗灰。"""
+    if delay is None:
+        return "\033[2m"   # dim
+    if delay <= 0:
+        return "\033[31m"  # red — 超时
+    if delay <= 200:
+        return "\033[32m"  # green — 快
+    if delay <= 500:
+        return "\033[33m"  # yellow — 中
+    return "\033[31m"      # red — 慢
 
 
 def _resolve_delay(name: str, groups: dict, delays: dict[str, int], depth: int = 0) -> int | None:

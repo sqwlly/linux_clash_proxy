@@ -4,8 +4,26 @@
 
 ## [Unreleased]
 
+### 改进
+
+- TUI 完成中文化、80 列响应式布局与后台任务化；配置保存增加 YAML 校验、快照和原子替换，重启/丢弃修改/shell rc 变更增加二次确认与恢复备份
+- 安装默认包含 `textual` TUI extra，root clean-host 路径先安装运行依赖；可用 `CPROXY_INSTALL_TUI=0` 选择纯 CLI
+- `cproxy switch` 交互式选择器增强：`/` 键进入搜索模式（模糊匹配，大小写不敏感），输入即时过滤候选列表，`Esc` 退出搜索恢复完整列表；延迟标注着色（≤200ms 绿、≤500ms 黄、>500ms 或超时红、无记录暗灰）；当前活跃节点标 `✓`；列表超出窗口时显示 `▲`/`▼` 滚动提示与剩余项数；标题行含位置指示 `[3/15]`（搜索过滤后显示匹配数与总数）；底部显示按键提示行；切换结果输出改为 `旧选择 → 新选择` 对比格式并附延迟信息
+
+### 修复
+
+- 订阅 TUI 不再调用冻结的 legacy 导入器，改为原生预览与应用，并支持附加订阅及选择器挂载
+- 安装脚本默认不再为已停用 legacy 日志写入轮转配置；缺少 Textual 时 `cproxy-tui` 给出可执行安装指引而非 traceback
+- `cproxy switch` 交互选择器：重绘先擦旧帧再画，退出时清掉菜单，避免分组/节点两级画面叠在一起、滚动时短行留下残字；节点列表 `q` / `Esc` / `←` 返回分组选择（底栏改为「返回」），再取消才退出
+- `cproxy switch` 卡顿：每次打 Mihomo API 都把约 60KB 的 config.yaml 用纯 Python YAML 解析三遍（单次约 120ms，一次切换合计约 2s）；现改为 C 解析器 + mtime 缓存，同一次选择复用 `/proxies` 快照，确认后不再重复拉延迟
+- AI-MANUAL 覆盖 Google / Gemini / Antigravity：原先只精确匹配 `gemini.google.com` 等四个主机，`agy` 实际请求的 `daily-cloudcode-pa.googleapis.com`、`oauth2.googleapis.com`、`antigravity.google` 会落到订阅的 `DOMAIN-KEYWORD,google` 走 CyberGuard，与 ChatGPT/Claude 出口 IP 不一致。现改为 `google.com` / `googleapis.com` / `appspot.com` 等后缀 + `antigravity`/`gemini` 关键字 + **`PROCESS-NAME,agy` 兜底**，并让 `ai-connections` 能看到这些连接
+- 切换 AI 出口组时断开旧连接：mihomo 换组不会拆掉已建立的 TCP，Google 会按新旧 IP 混用把会话判成 `User location is not supported`；`cproxy switch` / TUI 切 `AI-MANUAL` 等组后主动 close 相关连接
+- AI-MANUAL 热重载默认改为日本（不再是 AI-AUTO→美国）；区域组把 IEPL 节点排到 1X 前面，避免每次 render 后又落到 Google 不认的数据中心 IP
+
 ### 新增
 
+- `cproxy doctor` 提供配置、进程、配置时效、Mihomo API 与 GeoIP 的统一体检和恢复命令；状态、查询、诊断、刷新与流量命令新增带版本信封的 `--json`
+- `cproxy bootstrap --subscription-url URL` 支持在没有 legacy 配置时直接完成首次初始化；新增 `scripts/test.sh` 固定使用同一 Python 的 `python -m pytest`
 - legacy 入口弃用警告与安装解耦：`clash-proxy` / `clash-proxy-update` / `cproxy-update` 三个 wrapper 每次调用都向 **stderr** 打印弃用警告并指向 cproxy 等价命令（走 stderr 是为了不污染 stdout——`clash-proxy status --raw` 的脚本消费仍可正常解析）；直接执行 `./proxy.sh` 也会提示，经 wrapper 调用时靠 `CPROXY_LEGACY_WARNED=1` 去重、只打一次。`scripts/install-system-commands.sh` 与 `systemd/install-systemd.sh` 默认**不再安装** legacy（前者需 `--with-legacy`；后者同理，但始终安装活跃的 `clash-proxy-traffic-collector`），`install.sh` 侧对应 `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`——这样将来任何一次重跑都不会把已停用的入口重新装回 PATH。另修一处隐患：`--with-cproxy-alias` 会把 pip 安装的 `/usr/local/bin/cproxy` 覆盖成指向 `proxy.sh` 的 wrapper、令 cproxy 命令直接失效，现已加保护并在检测到非本脚本产物时拒绝覆盖
 - CLI 入口与帮助重做：`cproxy` 不带参数时输出按功能分组的命令清单（此前完全静默、exit 0）；顶层 `--help` 从 49 行平铺列表收敛为分组清单，`usage:` 行不再把 34 个命令名罗列两遍（此前 choices 列表与 positional 列表各列一遍）；命令与参数描述统一为中文（此前命令摘要全英文，`probe-stable-node` 的 8 个参数与 positional 无任何描述）；`usage:` / `options:` / `positional arguments:` 等 argparse 英文段落标题一并中文化。分组名沿用 proxy.sh `usage()` 的既有词汇（配置与进程 / AI 路由控制 / 命令级代理 / 诊断与排障），另加「流量与维护」「交互界面」两组覆盖 cproxy 独有命令
 - CLI 错误路径：拼错命令或取值时给出「您是不是想输入 X」建议（此前把全部 34 个命令名整个列一遍）；argparse 报错中文化（`缺少必需参数: group`、`参数 --top 需要整数，收到: 'abc'` 等）；stderr 错误统一着红并随 `NO_COLOR` / `CPROXY_COLOR` 门控，**整条消息包裹**而非只染「错误: 」前缀——只染前缀会把 ANSI 复位码插进 `错误: ...` 子串中间，打爆按子串断言的测试与脚本；散落各处的 `raise SystemExit("错误: ...")` 一并纳入同一出口

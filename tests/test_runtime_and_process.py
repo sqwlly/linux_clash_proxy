@@ -787,6 +787,13 @@ rules:
     assert "DOMAIN-SUFFIX,openai.azure.com,AI-MANUAL" in rules
     assert "DOMAIN,cdn.auth0.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,challenges.cloudflare.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,google.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,googleapis.com,AI-MANUAL" in rules
+    assert "DOMAIN-KEYWORD,antigravity,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,goog,AI-MANUAL" in rules
+    assert "PROCESS-NAME,agy,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,appspot.com,AI-MANUAL" in rules
+    assert rules.index("PROCESS-NAME,agy,AI-MANUAL") < rules.index("DOMAIN-SUFFIX,google.com,AI-MANUAL")
     idx_pytorch = rules.index("DOMAIN-SUFFIX,pytorch.org,DIRECT")
     assert "DOMAIN-SUFFIX,npmjs.org,DIRECT" in rules
     assert idx_ai < idx_pytorch < idx_match

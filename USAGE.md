@@ -1,11 +1,11 @@
 # cproxy 速查
 
-详细排障见 [TROUBLESHOOTING.md](/root/clash_proxy/TROUBLESHOOTING.md)。
+详细排障见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
 ## 安装
 
 ```bash
-pipx install /path/to/clash_proxy
+pipx install '/path/to/clash_proxy[tui]'
 ```
 
 或：
@@ -15,9 +15,9 @@ pipx install /path/to/clash_proxy
 ```
 
 `./scripts/install.sh` 会自动尝试一键部署（等价于 `cproxy bootstrap`）。
-它也会刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令——这两者是
-**legacy 入口**（已停用待退役，见 [legacy 入口](#legacy-入口已停用)），不需要可设置
-`CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过。脚本不会默认覆盖 `cproxy` alias。
+它默认安装 Textual TUI；只需要 CLI 时可设置 `CPROXY_INSTALL_TUI=0`。默认不会安装或
+刷新已停用的 `clash-proxy` / `clash-proxy-update` legacy wrapper；只有明确回滚时才设置
+`CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`。脚本不会覆盖 pip 安装的 `cproxy` 真入口。
 
 默认以 editable 方式安装（开发便利，改动立即生效）。生产环境应使用非
 editable 安装，避免未提交的工作区改动直接影响生产命令：
@@ -76,10 +76,10 @@ render 与探测。输出中的订阅地址会脱敏。
 `proxy.sh` 工作流已于 2026-09-11 停用，生产入口是 cproxy 用户级链路
 （见 [README 的生产入口识别](README.md#生产入口识别)）。本节内容保留仅供回滚对照。
 
-如仍需安装 root 级 wrapper（不需要可设 `CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过）：
+如因回滚确需安装 root 级 wrapper：
 
 ```bash
-sudo ./scripts/install-system-commands.sh
+sudo ./scripts/install-system-commands.sh --with-legacy
 ```
 
 - `clash-proxy`：转发到仓库内 `proxy.sh`
@@ -110,6 +110,12 @@ cproxy init
 
 ```bash
 cproxy bootstrap
+```
+
+没有可迁移配置时，可直接传订阅地址，避免生成占位配置后无路可走：
+
+```bash
+cproxy bootstrap --subscription-url 'https://example.invalid/subscription'
 ```
 
 配置文件位置：
@@ -149,6 +155,7 @@ GA 本地检查和脱敏支持包：
 cproxy security-check
 cproxy security-check --strict
 cproxy support-bundle --output /tmp/cproxy-support.tar.gz
+cproxy doctor
 ```
 
 如果 `cproxy test` 提示缺少 `country.mmdb`，先把该文件放到：
@@ -162,7 +169,27 @@ cproxy tui
 cproxy-tui
 ```
 
-TUI 是当前 Python/Textual `cproxy` 的用户级控制台，使用 `~/.config/cproxy`、`~/.local/share/cproxy` 和 `~/.local/state/cproxy`。页签包括 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy 和 Logs。Providers 支持手动更新 `/providers/proxies`；Connections 支持查看 `/connections`、断开选中连接，并对断开全部连接做二次确认。
+TUI 是当前 Python/Textual `cproxy` 的用户级控制台，使用 `~/.config/cproxy`、`~/.local/share/cproxy` 和 `~/.local/state/cproxy`。页签包括概览、节点、Provider、连接、AI 路由、订阅、配置、代理环境和日志。耗时请求在后台执行；破坏性操作要求二次确认并在可恢复场景创建备份。代理环境页显示供父 shell 执行的命令，TUI 本身不能修改父进程环境。
+
+## 机器可读输出
+
+状态、查询、诊断、刷新和流量命令支持 `--json`，例如：
+
+```bash
+cproxy status --json
+cproxy list-groups --json
+cproxy doctor --json
+```
+
+JSON 顶层稳定字段为 `schema_version`、`command`、`generated_at`、`ok`、
+`warnings`、`recommended_actions` 和 `data`。兼容旧脚本时继续使用 `--raw`；两者互斥。
+
+仓库测试统一通过当前 Python 解释器运行，避免命中 PATH 中其它虚拟环境的 `pytest`：
+
+```bash
+./scripts/test.sh
+./scripts/test.sh tests/test_query_commands.py -q
+```
 
 ## Shell 补全
 
@@ -191,8 +218,29 @@ autoload -Uz compinit && compinit
 ## 交互式选择
 
 `cproxy switch` 不带参数时进入上下键选择（先选分组、再选节点）：
-`↑↓` 或 `j k` 移动、`Enter` 确认、`q` / `Esc` / `Ctrl-C` 取消。
 
+**基本操作：**
+- `↑↓` 或 `j k` 移动光标，`Enter` 确认
+- 分组列表：`q` / `Esc` / `Ctrl-C` 取消整个切换
+- 节点列表：`←` / `q` / `Esc` 返回上一级重新选分组（`Ctrl-C` 同样先回到分组列表）
+
+**搜索/过滤：**
+- `/` 进入搜索模式，输入即时过滤候选列表（模糊匹配，大小写不敏感）
+- 搜索时 `↑↓` 仍可在过滤结果中移动，`Enter` 确认当前选中
+- `Esc` 退出搜索恢复完整列表，`Backspace` 删除末位字符（空查询时退出搜索）
+
+**视觉增强：**
+- 节点延迟着色：≤200ms 绿色、≤500ms 黄色、>500ms 或超时红色、无记录暗灰
+- 当前活跃节点标 `✓`，便于识别切换前的出口
+- 列表超出窗口时显示 `▲`/`▼` 滚动提示与剩余项数
+- 标题行含位置指示 `[3/15]`，搜索过滤后显示 `[2/5｜共15]`
+- 底部显示按键提示行
+
+**切换结果：**
+- 切换后显示 `旧选择 → 新选择` 对比，附延迟信息
+- 重选同一节点时显示 `当前选择: 节点名`
+
+**降级行为：**
 - 带全参数时行为与以往完全一致；只给一个参数仍按原来的「缺少必需参数」报错
 - 只列出可手动切换（selector 类型）的分组
 - 在管道等非交互终端下退化为「打印可选分组 + 退出码 2」，不会挂起等待输入

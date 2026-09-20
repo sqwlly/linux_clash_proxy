@@ -2,14 +2,34 @@ from __future__ import annotations
 
 from typing import Any
 
-import yaml
-
 from ..audit import write_audit_event
 from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ConnectionEntry, ProviderEntry, ProxyGroup, QueryContext
-from ..backend.runtime import RuntimeBackend
-from ..config import AppPaths, runtime_file
+from ..backend.runtime import (
+    AI_AUTO_GROUP,
+    AI_MANUAL_GROUP,
+    AI_PROCESS_NAMES,
+    AI_REGION_JP,
+    AI_REGION_SG,
+    AI_REGION_US,
+    AI_SG_GROUP,
+    AI_US_GROUP,
+    RuntimeBackend,
+)
+from ..config import AppPaths, load_yaml_file, runtime_file
 from ..names import resolve_candidate
+
+AI_SWITCH_DROP_GROUPS = frozenset(
+    {
+        AI_MANUAL_GROUP,
+        AI_AUTO_GROUP,
+        AI_US_GROUP,
+        AI_SG_GROUP,
+        AI_REGION_JP,
+        AI_REGION_US,
+        AI_REGION_SG,
+    }
+)
 
 
 class QueryService:
@@ -17,15 +37,20 @@ class QueryService:
         self.paths = paths
         self.api = APIBackend(paths)
         self.runtime = RuntimeBackend(paths)
+        # 最近一次 /proxies 快照：同一次 `cproxy switch` 里复用，避免选组后再打两遍
+        self.groups_snapshot: dict[str, ProxyGroup] = {}
+        self.last_switch_from: str | None = None
 
     def load_context(self, require_api: bool = False, *, request_timeout: float | None = None) -> QueryContext:
         try:
             groups = self.api.get_groups(request_timeout=request_timeout)
+            self.groups_snapshot = groups
             return QueryContext(groups=groups, api_available=True, runtime_available=False)
         except APIUnavailableError:
             if require_api:
                 raise
             groups = self.runtime.get_groups()
+            self.groups_snapshot = groups
             return QueryContext(groups=groups, api_available=False, runtime_available=True)
 
     def list_groups(self, *, request_timeout: float | None = None) -> list[ProxyGroup]:
@@ -39,10 +64,12 @@ class QueryService:
         读的是 runtime.yaml（规则就在那里），失败返回 None：标注只是辅助信息。
         """
         try:
-            data = yaml.safe_load(runtime_file(self.paths).read_text(encoding="utf-8"))
+            data = load_yaml_file(runtime_file(self.paths))
         except Exception:
             return None
-        rules = data.get("rules") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        rules = data.get("rules")
         if not isinstance(rules, list):
             return None
         # MATCH 是最后一条，倒着找最快
@@ -56,14 +83,19 @@ class QueryService:
         """各节点最近一次延迟（毫秒）。取不到就返回空。
 
         延迟只是选择器上的锦上添花，不该因为它查询失败就阻塞选择流程，
-        所以这里吞掉异常而非上抛。
+        所以这里吞掉异常而非上抛。同一次会话里若已有 /proxies 快照，直接从
+        里面抽 history，不再打第二遍 API。
         """
+        if self.groups_snapshot:
+            return {name: group.delay for name, group in self.groups_snapshot.items() if group.delay is not None}
         try:
             return self.api.get_delays()
         except Exception:
             return {}
 
     def get_group(self, name: str, require_api: bool = False) -> ProxyGroup:
+        if not require_api and name in self.groups_snapshot:
+            return self.groups_snapshot[name]
         context = self.load_context(require_api=require_api)
         group = context.groups.get(name)
         if not group:
@@ -75,6 +107,7 @@ class QueryService:
 
     def switch_group(self, group_name: str, target_name: str) -> ProxyGroup:
         groups = self.api.get_groups()
+        self.groups_snapshot = groups
         group = groups.get(group_name)
         if not group:
             raise SystemExit(f"错误: 未找到代理组: {group_name}")
@@ -92,10 +125,14 @@ class QueryService:
                 f"提示: cproxy list-nodes {group_name} 查看候选"
             )
         target_name = resolved
+        self.last_switch_from = group.current
 
         try:
             self.api.switch_group(group_name, target_name)
-            updated = self.api.get_groups()[group_name]
+            updated_groups = self.api.get_groups()
+            self.groups_snapshot = updated_groups
+            updated = updated_groups[group_name]
+            dropped = self._drop_stale_ai_connections(group_name)
         except Exception as exc:
             write_audit_event(
                 self.paths,
@@ -110,9 +147,50 @@ class QueryService:
             action="switch_group",
             target=group_name,
             result="ok",
-            detail={"selected": target_name},
+            detail={"selected": target_name, "dropped": dropped},
         )
         return updated
+
+    def _drop_stale_ai_connections(self, group_name: str) -> int:
+        """切换 AI 出口后立刻掐掉旧 TCP，避免同一会话混用新旧出口 IP。
+
+        Google Cloud Code / Gemini 会按请求 IP 做地区校验；mihomo 换组不会
+        自动拆掉已建立的长连接，必须显式关闭。
+        """
+        if group_name not in AI_SWITCH_DROP_GROUPS:
+            return 0
+        try:
+            payload = self.api.get_connections()
+        except Exception:
+            return 0
+        connections = payload.get("connections") if isinstance(payload, dict) else []
+        if not isinstance(connections, list):
+            return 0
+        dropped = 0
+        for item in connections:
+            if not isinstance(item, dict) or not self._connection_follows_ai_switch(item, group_name):
+                continue
+            conn_id = str(item.get("id") or "")
+            if not conn_id:
+                continue
+            try:
+                self.api.close_connection(conn_id)
+                dropped += 1
+            except Exception:
+                continue
+        return dropped
+
+    @staticmethod
+    def _connection_follows_ai_switch(item: dict[str, Any], group_name: str) -> bool:
+        chains = item.get("chains") or []
+        chain_names = {str(part) for part in chains} if isinstance(chains, list) else set()
+        if group_name in chain_names or AI_MANUAL_GROUP in chain_names:
+            return True
+        raw_metadata = item.get("metadata")
+        metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        process = str(metadata.get("process") or metadata.get("processPath") or "").lower()
+        base = process.rsplit("/", 1)[-1].split()[0] if process else ""
+        return base in AI_PROCESS_NAMES
 
     def list_connections(self) -> list[ConnectionEntry]:
         payload = self.api.get_connections()

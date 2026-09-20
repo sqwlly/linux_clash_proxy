@@ -5,6 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+package_target() {
+    if [ "${CPROXY_INSTALL_TUI:-1}" = "0" ]; then
+        printf '%s\n' "$ROOT_DIR"
+    else
+        printf '%s[tui]\n' "$ROOT_DIR"
+    fi
+}
+
 require_cmd() {
     local name="$1"
     if ! command -v "$name" >/dev/null 2>&1; then
@@ -14,19 +22,32 @@ require_cmd() {
 }
 
 install_with_pipx() {
+    local target
+    target="$(package_target)"
     if [ "${CPROXY_EDITABLE:-1}" = "0" ]; then
-        pipx install --force "$ROOT_DIR"
+        pipx install --force "$target"
     else
-        pipx install --force --editable "$ROOT_DIR"
+        pipx install --force --editable "$target"
     fi
 }
 
 install_with_pip() {
+    local target
+    target="$(package_target)"
     if [ "${CPROXY_EDITABLE:-1}" = "0" ]; then
-        python3 -m pip install --user "$ROOT_DIR"
+        python3 -m pip install --user "$target"
     else
-        python3 -m pip install --user --editable "$ROOT_DIR"
+        python3 -m pip install --user --editable "$target"
     fi
+}
+
+install_runtime_dependencies() {
+    local specs=("PyYAML>=6" "requests>=2" "tqdm>=4" "urllib3>=2.7.0" "idna>=3.15")
+    if [ "${CPROXY_INSTALL_TUI:-1}" != "0" ]; then
+        specs+=("textual>=5.0")
+    fi
+    # 不带 --upgrade：已满足约束的系统包保持原版本，只补缺失或不满足最低版本的依赖。
+    python3 -m pip install "${specs[@]}"
 }
 
 # root 下的安装路径。刻意不带 --user：root 的 --user 会装到 /root/.local，而
@@ -34,11 +55,14 @@ install_with_pip() {
 # systemd 服务走系统级副本（unit 硬编码 /usr/local/bin/cproxy），两者可能跑
 # 不同版本的代码。统一装到 /usr/local 可根除这种分叉。
 install_system_wide() {
+    local target
+    target="$(package_target)"
+    install_runtime_dependencies
     if [ "${CPROXY_EDITABLE:-1}" = "0" ]; then
-        # --force-reinstall 覆盖旧副本；--no-deps 不动系统依赖
-        python3 -m pip install --force-reinstall --no-deps "$ROOT_DIR"
+        # 依赖已按最低版本单独检查；这里只替换项目本体，不重复重装系统包。
+        python3 -m pip install --force-reinstall --no-deps "$target"
     else
-        python3 -m pip install --editable "$ROOT_DIR"
+        python3 -m pip install --no-deps --editable "$target"
     fi
 }
 
@@ -229,11 +253,14 @@ main() {
     ensure_geodata
 
     setup_logrotate
-    setup_legacy_logrotate
+    if [ "${CPROXY_INSTALL_SYSTEM_COMMANDS:-1}" = "legacy" ]; then
+        setup_legacy_logrotate
+    fi
     install_system_commands
 
     if PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
         CPROXY_LEGACY_ROOT="${ROOT_DIR}" \
+        CPROXY_NONINTERACTIVE=1 \
         python3 -m cproxy.cli bootstrap; then
         echo "一键部署: 完成"
     else

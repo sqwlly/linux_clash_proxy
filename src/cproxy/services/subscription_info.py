@@ -150,7 +150,9 @@ def display_entries(paths: AppPaths) -> list[tuple[str, SubscriptionUsage]]:
 def _opt_int(value: object) -> int | None:
     if value is None:
         return None
-    return int(value)
+    if isinstance(value, (int, float, str, bytes, bytearray)):
+        return int(value)
+    return int(str(value))
 
 
 def _write_state(path: Path, data: dict) -> None:

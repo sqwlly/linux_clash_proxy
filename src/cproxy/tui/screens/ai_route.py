@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -17,9 +18,9 @@ from ..widgets import NavigationDataTable as DataTable
 
 class AIRouteScreen(Widget):
     BINDINGS = [
-        Binding("p", "probe_ai", "Probe"),
-        Binding("s", "switch_us_sg", "Switch"),
-        Binding("r", "refresh_data", "Refresh"),
+        Binding("p", "probe_ai", "探测"),
+        Binding("s", "switch_us_sg", "切换"),
+        Binding("r", "refresh_data", "刷新"),
     ]
 
     def __init__(self, paths: AppPaths, **kwargs):
@@ -29,55 +30,71 @@ class AIRouteScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("AI Route", classes="page-title")
+            yield Label("AI 路由", classes="page-title")
 
             with Horizontal():
                 with Vertical(classes="ai-route-panel ai-selector-panel"):
-                    yield Label("Selector", classes="ai-route-title")
+                    yield Label("选择器", classes="ai-route-title")
                     with Horizontal(classes="field-row"):
-                        yield Label("Mode", classes="label-key")
+                        yield Label("模式", classes="label-key")
                         yield Label("─", id="ai-route-mode", classes="metric-value")
                     with Horizontal(classes="field-row"):
-                        yield Label("Active", classes="label-key")
+                        yield Label("当前", classes="label-key")
                         yield Label("─", id="ai-route-active", classes="metric-value")
                     with Horizontal(classes="field-row"):
-                        yield Label("Standby", classes="label-key")
+                        yield Label("备用", classes="label-key")
                         yield Label("─", id="ai-route-standby", classes="metric-value")
 
                 with Vertical(classes="ai-route-panel ai-chain-panel"):
-                    yield Label("Route Chain", classes="ai-route-title")
+                    yield Label("路由链", classes="ai-route-title")
                     yield Label("─", id="ai-route-chain", classes="current-info")
 
             with Vertical(classes="panel output-panel"):
-                yield Label("Connectivity Probe", classes="panel-title")
+                yield Label("连通性探测", classes="panel-title")
                 yield Label("─", id="ai-probe-status", classes="status-strip")
                 yield DataTable(id="ai-probe-table")
 
             with Horizontal(classes="toolbar"):
-                yield Button("Refresh", id="btn-ai-refresh", classes="action-button muted-button")
-                yield Button("Probe", id="btn-ai-probe", classes="action-button primary-button")
-                yield Button("Switch US/SG", id="btn-ai-switch", classes="action-button success-button")
+                yield Button("刷新", id="btn-ai-refresh", classes="action-button muted-button")
+                yield Button("探测", id="btn-ai-probe", classes="action-button primary-button")
+                yield Button("切换美国/新加坡", id="btn-ai-switch", classes="action-button success-button")
 
     def on_mount(self) -> None:
         probe_table = self.query_one("#ai-probe-table", DataTable)
-        probe_table.add_columns("Target", "Status", "Detail")
+        probe_table.add_columns("目标", "状态", "详情")
         probe_table.show_header = True
         if not list(self.app.query("#main-tabs")):
             self.call_later(self.refresh_data)
 
     def refresh_data(self) -> None:
-        try:
-            service = QueryService(self.paths)
-            groups = service.get_ai_status_groups()
+        self.query_one("#ai-route-mode", Label).update("[#f6c177]刷新中…[/]")
+        self._refresh_route_worker()
 
+    @work(thread=True, exclusive=True, group="ai-route-refresh")
+    def _refresh_route_worker(self) -> None:
+        try:
+            groups = QueryService(self.paths).get_ai_status_groups()
+            self.app.call_from_thread(self._apply_route, groups, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._apply_route, None, exc)
+
+    def _apply_route(self, groups: dict | None, error: Exception | None) -> None:
+        if error is not None or groups is None:
+            label = "API 不可访问" if isinstance(error, APIUnavailableError) else f"错误: {error}"
+            self.query_one("#ai-route-mode", Label).update(f"[#fb7185]{label}[/]")
+            self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
+            self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
+            self.query_one("#ai-route-chain", Label).update("[#8b98aa]─[/]")
+            return
+        try:
             manual = groups.get("AI-MANUAL")
             auto = groups.get("AI-AUTO")
 
             if manual is None or auto is None:
-                self.query_one("#ai-route-mode", Label).update("[#8b98aa]Not configured[/]")
+                self.query_one("#ai-route-mode", Label).update("[#8b98aa]尚未配置[/]")
                 self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
                 self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
-                self.query_one("#ai-route-chain", Label).update("[#8b98aa]Render runtime config first[/]")
+                self.query_one("#ai-route-chain", Label).update("[#8b98aa]请先生成运行配置[/]")
                 return
 
             auto_mode = manual.current == "AI-AUTO"
@@ -87,7 +104,7 @@ class AIRouteScreen(Widget):
             standby_name = "AI-SG" if active_group_name == "AI-US" else "AI-US"
             standby_group = groups.get(standby_name)
 
-            mode_text = "[#f6c177]Auto[/]" if auto_mode else f"[#f6c177]Manual[/] ({manual.current})"
+            mode_text = "[#f6c177]自动[/]" if auto_mode else f"[#f6c177]固定[/]（{manual.current}）"
             self.query_one("#ai-route-mode", Label).update(mode_text)
 
             if active_group:
@@ -124,13 +141,8 @@ class AIRouteScreen(Widget):
                     chain_lines.append(f"   └─ [#a3e635]{active_group.current}[/]")
             self.query_one("#ai-route-chain", Label).update("\n".join(chain_lines))
 
-        except APIUnavailableError:
-            self.query_one("#ai-route-mode", Label).update("[#fb7185]API Unavailable[/]")
-            self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
-            self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
-            self.query_one("#ai-route-chain", Label).update("[#8b98aa]─[/]")
         except Exception as e:
-            self.query_one("#ai-route-mode", Label).update(f"[#fb7185]Error: {e}[/]")
+            self.query_one("#ai-route-mode", Label).update(f"[#fb7185]错误: {e}[/]")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-ai-refresh":
@@ -144,7 +156,7 @@ class AIRouteScreen(Widget):
         if self._probe_running:
             return
         self._probe_running = True
-        self.query_one("#ai-probe-status", Label).update("[#f6c177]◐ Probing...[/]")
+        self.query_one("#ai-probe-status", Label).update("[#f6c177]◐ 探测中…[/]")
         self.query_one("#btn-ai-probe", Button).disabled = True
         threading.Thread(target=self._probe_ai_worker, daemon=True).start()
 
@@ -169,33 +181,38 @@ class AIRouteScreen(Widget):
         probe_table.clear()
 
         for item in report.results:
-            status = "[#a3e635]● OK[/]" if item.ok else "[#fb7185]○ FAIL[/]"
+            status = "[#a3e635]● 正常[/]" if item.ok else "[#fb7185]○ 失败[/]"
             probe_table.add_row(item.name, status, item.detail or item.url)
 
         ok_count = sum(1 for item in report.results if item.ok)
         total = len(report.results)
 
         if ok_count == total:
-            probe_status = f"[#a3e635]● {ok_count}/{total} OK[/]"
+            probe_status = f"[#a3e635]● {ok_count}/{total} 正常[/]"
         elif ok_count == 0:
-            probe_status = f"[#fb7185]○ {ok_count}/{total} Failed[/]"
+            probe_status = f"[#fb7185]○ {ok_count}/{total} 失败[/]"
         else:
-            probe_status = f"[#f6c177]◐ {ok_count}/{total} Partial[/]"
+            probe_status = f"[#f6c177]◐ {ok_count}/{total} 部分正常[/]"
         self.query_one("#ai-probe-status", Label).update(probe_status)
         self.query_one("#btn-ai-probe", Button).disabled = False
         self._probe_running = False
-        self.notify("Probe complete", severity="information")
+        self.notify("探测完成", severity="information")
 
     def _fail_probe_ai(self, error: Exception) -> None:
         if not self.is_mounted:
             self._probe_running = False
             return
-        self.query_one("#ai-probe-status", Label).update(f"[#fb7185]Probe failed: {error}[/]")
+        self.query_one("#ai-probe-status", Label).update(f"[#fb7185]探测失败: {error}[/]")
         self.query_one("#btn-ai-probe", Button).disabled = False
         self._probe_running = False
-        self.notify(f"Probe failed: {error}", severity="error")
+        self.notify(f"探测失败: {error}", severity="error")
 
     def action_switch_us_sg(self) -> None:
+        self.query_one("#ai-route-mode", Label).update("[#f6c177]切换中…[/]")
+        self._switch_us_sg_worker()
+
+    @work(thread=True, exclusive=True, group="ai-route-action")
+    def _switch_us_sg_worker(self) -> None:
         try:
             service = QueryService(self.paths)
             groups = service.get_ai_status_groups()
@@ -203,6 +220,12 @@ class AIRouteScreen(Widget):
             auto = groups.get("AI-AUTO")
 
             if manual is None or auto is None:
+                self.app.call_from_thread(
+                    self._finish_switch,
+                    "",
+                    "",
+                    RuntimeError("AI-MANUAL 或 AI-AUTO 尚未配置"),
+                )
                 return
 
             auto_mode = manual.current == "AI-AUTO"
@@ -215,10 +238,16 @@ class AIRouteScreen(Widget):
             else:
                 service.switch_group("AI-MANUAL", target)
 
-            self.notify(f"Switched: {active_group_name} → {target}", severity="information")
-            self.refresh_data()
+            self.app.call_from_thread(self._finish_switch, active_group_name, target, None)
 
-        except APIUnavailableError:
-            self.notify("API unavailable", severity="error")
-        except Exception as e:
-            self.notify(f"Switch failed: {e}", severity="error")
+        except Exception as exc:
+            self.app.call_from_thread(self._finish_switch, "", "", exc)
+
+    def _finish_switch(self, active: str, target: str, error: Exception | None) -> None:
+        if error is None:
+            self.notify(f"已切换: {active} → {target}", severity="information")
+            self.refresh_data()
+        elif isinstance(error, APIUnavailableError):
+            self.notify("API 不可访问", severity="error")
+        else:
+            self.notify(f"切换失败: {error}", severity="error")

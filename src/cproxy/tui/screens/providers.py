@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -15,8 +16,8 @@ from ..widgets import NavigationDataTable as DataTable
 
 class ProvidersScreen(Widget):
     BINDINGS = [
-        Binding("r", "refresh_data", "Refresh"),
-        Binding("u", "update_provider", "Update"),
+        Binding("r", "refresh_data", "刷新"),
+        Binding("u", "update_provider", "更新"),
     ]
 
     def __init__(self, paths: AppPaths, **kwargs):
@@ -26,22 +27,22 @@ class ProvidersScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Providers", classes="page-title")
+            yield Label("代理提供方", classes="page-title")
             with Vertical(classes="panel output-panel"):
-                yield Label("Proxy Providers", classes="panel-title")
+                yield Label("代理 Provider", classes="panel-title")
                 yield Label("─", id="providers-status", classes="status-strip")
                 yield DataTable(id="providers-table")
                 with Horizontal(classes="toolbar"):
-                    yield Button("Update", id="btn-update-provider", classes="action-button primary-button")
-                    yield Button("Refresh", id="btn-refresh-providers", classes="action-button muted-button")
+                    yield Button("更新选中项", id="btn-update-provider", classes="action-button primary-button")
+                    yield Button("刷新", id="btn-refresh-providers", classes="action-button muted-button")
                 yield Label(
-                    "up/down: move  u: update selected  r: refresh",
+                    "↑↓ 移动  u 更新选中项  r 刷新",
                     id="providers-action-status", classes="action-status",
                 )
 
     def on_mount(self) -> None:
         table = self.query_one("#providers-table", DataTable)
-        table.add_columns("Name", "Type", "Vehicle", "Nodes", "Updated")
+        table.add_columns("名称", "类型", "载体", "节点数", "更新时间")
         table.cursor_type = "row"
         table.show_header = True
         if not list(self.app.query("#main-tabs")):
@@ -49,37 +50,49 @@ class ProvidersScreen(Widget):
 
     def refresh_data(self) -> None:
         status = self.query_one("#providers-status", Label)
+        status.update("[#f6c177]刷新中…[/]")
+        self._load_providers()
+
+    @work(thread=True, exclusive=True, group="providers-refresh")
+    def _load_providers(self) -> None:
+        try:
+            providers = QueryService(self.paths).list_proxy_providers()
+            self.app.call_from_thread(self._apply_providers, providers, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._apply_providers, [], exc)
+
+    def _apply_providers(self, providers: list[ProviderEntry], error: Exception | None) -> None:
+        status = self.query_one("#providers-status", Label)
         table = self.query_one("#providers-table", DataTable)
         previous_provider = self._selected_provider_name()
         table.clear()
-
-        try:
-            service = QueryService(self.paths)
-            self._providers = service.list_proxy_providers()
-            status.update(f"[#a3e635]● {len(self._providers)} providers[/]")
-
-            if not self._providers:
-                table.add_row("[#8b98aa]No proxy providers[/]", "─", "─", "0", "─")
-                return
-
-            for provider in self._providers:
-                table.add_row(
-                    provider.name,
-                    provider.type,
-                    provider.vehicle,
-                    str(provider.proxy_count),
-                    provider.updated_at,
-                    key=provider.name,
-                )
-            self._move_provider_cursor(previous_provider)
-        except APIUnavailableError:
+        if error is not None:
             self._providers = []
-            status.update("[#fb7185]○ API unavailable[/]")
-            table.add_row("[#fb7185]Mihomo API unavailable[/]", "─", "─", "0", "─")
-        except Exception as e:
-            self._providers = []
-            status.update(f"[#fb7185]Error: {e}[/]")
-            table.add_row(f"Error: {e}", "─", "─", "0", "─")
+            if isinstance(error, APIUnavailableError):
+                status.update("[#fb7185]○ API 不可访问[/]")
+                table.add_row("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "0", "─")
+            else:
+                status.update(f"[#fb7185]错误: {error}[/]")
+                table.add_row(f"错误: {error}", "─", "─", "0", "─")
+            return
+
+        self._providers = providers
+        status.update(f"[#a3e635]● {len(self._providers)} 个提供方[/]")
+
+        if not self._providers:
+            table.add_row("[#8b98aa]没有代理提供方[/]", "─", "─", "0", "─")
+            return
+
+        for provider in self._providers:
+            table.add_row(
+                provider.name,
+                provider.type,
+                provider.vehicle,
+                str(provider.proxy_count),
+                provider.updated_at,
+                key=provider.name,
+            )
+        self._move_provider_cursor(previous_provider)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-update-provider":
@@ -91,17 +104,28 @@ class ProvidersScreen(Widget):
         provider = self._selected_provider()
         status = self.query_one("#providers-action-status", Label)
         if provider is None:
-            status.update("[#f6c177]No provider selected[/]")
+            status.update("[#f6c177]尚未选择提供方[/]")
             return
+        status.update(f"[#f6c177]正在更新: {provider.name}…[/]")
+        self._update_provider(provider.name)
 
+    @work(thread=True, exclusive=True, group="provider-action")
+    def _update_provider(self, provider_name: str) -> None:
         try:
-            QueryService(self.paths).update_proxy_provider(provider.name)
-            status.update(f"[#a3e635]Updated provider: {provider.name}[/]")
+            QueryService(self.paths).update_proxy_provider(provider_name)
+            self.app.call_from_thread(self._finish_provider_update, provider_name, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._finish_provider_update, provider_name, exc)
+
+    def _finish_provider_update(self, provider_name: str, error: Exception | None) -> None:
+        status = self.query_one("#providers-action-status", Label)
+        if error is None:
+            status.update(f"[#a3e635]已更新提供方: {provider_name}[/]")
             self.refresh_data()
-        except APIUnavailableError:
-            status.update("[#fb7185]API unavailable[/]")
-        except Exception as e:
-            status.update(f"[#fb7185]Update failed: {e}[/]")
+        elif isinstance(error, APIUnavailableError):
+            status.update("[#fb7185]API 不可访问[/]")
+        else:
+            status.update(f"[#fb7185]更新失败: {error}[/]")
 
     def _selected_provider(self) -> ProviderEntry | None:
         table = self.query_one("#providers-table", DataTable)

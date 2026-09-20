@@ -14,7 +14,7 @@ tui = ["textual>=5.0"]
 
 [project.scripts]
 cproxy = "cproxy.cli:main"
-cproxy-tui = "cproxy.tui.app:run_tui"
+cproxy-tui = "cproxy.tui_launcher:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

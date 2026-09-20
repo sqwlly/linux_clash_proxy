@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import shutil
-import subprocess
 import tempfile
 import threading
 from pathlib import Path
@@ -13,47 +11,12 @@ from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
 from textual.widgets import Button, Label
 
-from ...config import AppPaths, config_file, read_config, runtime_file
+from ...backend.runtime import RuntimeBackend
+from ...config import AppPaths, config_file, read_config
+from ...services.refresh import RefreshService, preview_subscription
 from ..widgets import NavigationDataTable as DataTable
 from ..widgets import NavigationInput as Input
 from ..widgets import NavigationTextArea as TextArea
-
-
-def build_import_subscription_command(
-    clash_proxy: str,
-    url: str,
-    dry_run: bool,
-    group: str = "",
-    attach_to: str = "",
-    config_path: Path | None = None,
-    update_script: str = "",
-) -> list[str]:
-    cmd = [clash_proxy, "import-subscription", url, "--dry-run" if dry_run else "--apply"]
-    if config_path is not None:
-        cmd.extend(["--config-file", str(config_path)])
-    if update_script:
-        cmd.extend(["--update-script", update_script])
-    if group:
-        cmd.extend(["--group", group])
-    if attach_to:
-        cmd.extend(["--attach-to", attach_to])
-    return cmd
-
-
-def build_import_update_env(paths: AppPaths, refresh_script: Path, proxy_sh: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env.update(
-        {
-            "CONFIG_FILE": str(config_file(paths)),
-            "RUNTIME_CONFIG": str(runtime_file(paths)),
-            "REFRESH_SCRIPT": str(refresh_script),
-            "PROXY_SH": proxy_sh,
-            "CPROXY_CONFIG_DIR": str(paths.config_dir),
-            "CPROXY_DATA_DIR": str(paths.data_dir),
-            "CPROXY_STATE_DIR": str(paths.state_dir),
-        }
-    )
-    return env
 
 
 def redact_subscription_url(url: str) -> str:
@@ -87,73 +50,6 @@ def subscription_group_rows(config: dict) -> list[tuple[str, str, str, str]]:
     return rows
 
 
-def format_subscription_result(
-    stdout: str,
-    stderr: str,
-    returncode: int,
-    dry_run: bool,
-    group: str,
-    attach_to: str,
-) -> str:
-    mode = "Preview" if dry_run else "Apply"
-    status = "OK" if returncode == 0 else f"Failed ({returncode})"
-    summary_line = next(
-        (
-            line.strip()
-            for line in stdout.splitlines()
-            if line.strip().startswith(("订阅下载完成:", "订阅挂载完成:"))
-        ),
-        "",
-    )
-    lines = [f"{mode}: {status}"]
-    if group:
-        lines.append(f"Group: {group}")
-    if attach_to:
-        lines.append(f"Attach to: {attach_to}")
-    if summary_line:
-        lines.append(f"Summary: {summary_line}")
-    if stdout.strip():
-        lines.extend(["", "stdout:", stdout.strip()])
-    if stderr.strip():
-        lines.extend(["", "stderr:", stderr.strip()])
-    return "\n".join(lines)
-
-
-def write_user_refresh_script() -> Path:
-    handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        prefix="cproxy-tui-refresh-",
-        suffix=".sh",
-        delete=False,
-    )
-    try:
-        handle.write(
-            """#!/bin/sh
-set -eu
-python3 - <<'PY'
-import os
-from pathlib import Path
-
-from cproxy.config import AppPaths
-from cproxy.runtime import render_runtime
-
-paths = AppPaths(
-    config_dir=Path(os.environ["CPROXY_CONFIG_DIR"]),
-    data_dir=Path(os.environ["CPROXY_DATA_DIR"]),
-    state_dir=Path(os.environ["CPROXY_STATE_DIR"]),
-)
-runtime_path = render_runtime(paths)
-print(f"runtime rendered: {runtime_path}")
-PY
-"""
-        )
-        return Path(handle.name)
-    finally:
-        handle.close()
-        os.chmod(handle.name, 0o700)
-
-
 class SubscriptionsScreen(Widget):
     def __init__(self, paths: AppPaths, **kwargs):
         super().__init__(**kwargs)
@@ -162,37 +58,37 @@ class SubscriptionsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Subscriptions", classes="page-title")
+            yield Label("订阅", classes="page-title")
 
             with Vertical(classes="panel form-panel"):
-                yield Label("Import", classes="panel-title")
+                yield Label("导入主订阅", classes="panel-title")
                 yield Input(
-                    placeholder="Subscription URL (Clash/VLESS/Base64)...",
+                    placeholder="订阅 URL（Clash / VLESS / Base64）…",
                     id="sub-url-input",
                     classes="subscription-input",
                 )
                 with Horizontal(classes="input-row"):
                     yield Input(
-                        placeholder="Group name (optional)",
+                        placeholder="附加订阅分组名（留空表示主订阅）",
                         id="sub-group-input",
                         classes="subscription-input",
                     )
                     yield Input(
-                        placeholder="Attach to selector (optional)",
+                        placeholder="挂载到选择器（附加订阅可选）",
                         id="sub-attach-input",
                         classes="subscription-input",
                     )
-                    yield Button("Preview", id="btn-sub-preview", classes="action-button muted-button")
-                    yield Button("Apply", id="btn-sub-apply", classes="action-button success-button")
-                    yield Button("Validate", id="btn-sub-update", classes="action-button primary-button")
+                    yield Button("预览", id="btn-sub-preview", classes="action-button muted-button")
+                    yield Button("应用", id="btn-sub-apply", classes="action-button success-button")
+                    yield Button("验证本地配置", id="btn-sub-update", classes="action-button primary-button")
 
             with Horizontal(classes="workbench-row"):
                 with Vertical(classes="panel output-panel split-main"):
-                    yield Label("Output", classes="panel-title")
+                    yield Label("输出", classes="panel-title")
                     yield TextArea(id="sub-output", read_only=True, classes="output-area")
 
                 with Vertical(classes="panel split-sidebar summary-panel"):
-                    yield Label("Subscription Groups", classes="panel-title")
+                    yield Label("订阅分组", classes="panel-title")
                     yield Label("─", id="sub-current-info", classes="current-info")
                     yield DataTable(id="sub-groups-table")
 
@@ -203,7 +99,7 @@ class SubscriptionsScreen(Widget):
         except Exception:
             pass
         groups_table = self.query_one("#sub-groups-table", DataTable)
-        groups_table.add_columns("Group", "Type", "Nodes", "Attached")
+        groups_table.add_columns("分组", "类型", "节点数", "挂载到")
         groups_table.cursor_type = "row"
         groups_table.show_header = True
         if not list(self.app.query("#main-tabs")):
@@ -223,11 +119,11 @@ class SubscriptionsScreen(Widget):
 
             info_text = "\n".join(
                 [
-                    f"[#8b98aa]Path[/]\n{config_path}",
-                    f"[#8b98aa]Proxies[/] {len(proxies)}",
-                    f"[#8b98aa]Groups[/] {len(groups)}",
-                    f"[#8b98aa]Port[/] {config.get('mixed-port', '─')}",
-                    f"[#8b98aa]Mode[/] {config.get('mode', '─')}",
+                    f"[#8b98aa]路径[/]\n{config_path}",
+                    f"[#8b98aa]节点[/] {len(proxies)}",
+                    f"[#8b98aa]分组[/] {len(groups)}",
+                    f"[#8b98aa]端口[/] {config.get('mixed-port', '─')}",
+                    f"[#8b98aa]模式[/] {config.get('mode', '─')}",
                 ]
             )
             self.query_one("#sub-current-info", Label).update(info_text)
@@ -236,9 +132,9 @@ class SubscriptionsScreen(Widget):
             for row in group_rows:
                 groups_table.add_row(*row, key=row[0])
             if not group_rows:
-                groups_table.add_row("No groups", "─", "0", "─")
+                groups_table.add_row("没有分组", "─", "0", "─")
         except Exception as e:
-            self.query_one("#sub-current-info", Label).update(f"[#fb7185]Error: {e}[/]")
+            self.query_one("#sub-current-info", Label).update(f"[#fb7185]错误: {e}[/]")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-sub-preview":
@@ -258,92 +154,69 @@ class SubscriptionsScreen(Widget):
 
         url = url_input.value.strip()
         if not url:
-            output.load_text("Please enter a subscription URL")
-            return
-
-        clash_proxy = shutil.which("clash-proxy")
-        if not clash_proxy:
-            output.load_text("Error: clash-proxy command not found")
-            return
-
-        update_script = shutil.which("clash-proxy-update")
-        if not update_script:
-            output.load_text("Error: clash-proxy-update command not found")
+            output.load_text("请输入订阅 URL")
             return
 
         group = group_input.value.strip()
         attach_to = attach_input.value.strip()
-        config_path = config_file(self.paths)
-        cmd = build_import_subscription_command(
-            clash_proxy,
-            url,
-            dry_run,
-            group,
-            attach_to,
-            config_path=config_path,
-            update_script=update_script,
-        )
+        if attach_to and not group:
+            output.load_text("填写挂载目标时，也必须填写附加订阅分组名。")
+            return
 
         output.load_text(
             "\n".join(
                 [
-                    "Previewing subscription..." if dry_run else "Applying subscription...",
+                    "正在预览订阅…" if dry_run else "正在应用订阅…",
                     f"URL: {redact_subscription_url(url)}",
-                    f"Group: {group or '(from subscription)'}",
-                    f"Attach to: {attach_to or '(not attached)'}",
-                    "",
-                    "Please wait...",
+                    "请稍候…",
                 ]
             )
         )
 
-        refresh_script: Path | None = None
-        env = None
         try:
-            if not dry_run:
-                refresh_script = write_user_refresh_script()
-                env = build_import_update_env(self.paths, refresh_script, clash_proxy)
             self._set_subscription_busy(True)
             threading.Thread(
-                target=self._import_subscription_worker,
-                args=(cmd, env, dry_run, group, attach_to, refresh_script),
+                target=self._native_subscription_worker,
+                args=(url, group, attach_to, dry_run),
                 daemon=True,
             ).start()
         except Exception as e:
-            output.load_text(f"Error: {e}")
+            output.load_text(f"错误: {e}")
             self._set_subscription_busy(False)
 
-    def _import_subscription_worker(
-        self,
-        cmd: list[str],
-        env: dict[str, str] | None,
-        dry_run: bool,
-        group: str,
-        attach_to: str,
-        refresh_script: Path | None,
-    ) -> None:
+    def _native_subscription_worker(self, url: str, group: str, attach_to: str, dry_run: bool) -> None:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-            output_text = format_subscription_result(
-                result.stdout,
-                result.stderr,
-                result.returncode,
-                dry_run=dry_run,
-                group=group,
-                attach_to=attach_to,
-            )
-            self._call_from_subscription_thread(
-                self._finish_import_subscription,
-                output_text,
-                result.returncode == 0 and not dry_run,
-            )
-        except subprocess.TimeoutExpired:
-            self._call_from_subscription_thread(self._fail_subscription_command, "Error: Command timeout (30s)")
-        except Exception as e:
-            self._call_from_subscription_thread(self._fail_subscription_command, f"Error: {e}")
-        finally:
-            if refresh_script is not None:
-                refresh_script.unlink(missing_ok=True)
+            if dry_run:
+                preview = preview_subscription(self.paths, url)
+                output_text = (
+                    "预览: 正常\n"
+                    f"格式: {preview.source}\n"
+                    f"大小: {preview.bytes} bytes\n"
+                    f"节点: {preview.proxy_count}\n"
+                    f"分组: {preview.group_count}\n"
+                    "未写入任何文件。"
+                )
+                imported = False
+            else:
+                service = RefreshService(self.paths)
+                if group:
+                    report = service.refresh_extra_subscription(group, url, attach_to)
+                else:
+                    report = service.refresh(subscription_url=url, groups=[])
+                extra = next((item for item in report.extra_subscriptions if item.name == group), None)
+                target_text = f"\n挂载到: {attach_to}" if attach_to else ""
+                extra_text = f"\n附加订阅: {extra.status}（{extra.detail}）" if extra is not None else ""
+                output_text = (
+                    f"应用: {'附加订阅已更新' if group else report.subscription}\n"
+                    f"分组: {group or '主订阅'}{target_text}{extra_text}\n"
+                    f"运行配置: {report.runtime_path}\n"
+                    f"热重载: {'是' if report.hot_reloaded else '否'}\n"
+                    f"进程重启: {'是' if report.restarted else '否'}"
+                )
+                imported = report.subscription != "失败"
+            self._call_from_subscription_thread(self._finish_import_subscription, output_text, imported)
+        except Exception as exc:
+            self._call_from_subscription_thread(self._fail_subscription_command, f"错误: {exc}")
 
     def _finish_import_subscription(self, output_text: str, imported: bool) -> None:
         if not self.is_mounted:
@@ -353,7 +226,7 @@ class SubscriptionsScreen(Widget):
         self._set_subscription_busy(False)
         if imported:
             self._load_current_info()
-            self.notify("Subscription imported", severity="information")
+            self.notify("订阅已应用", severity="information")
 
     def _fail_subscription_command(self, output_text: str) -> None:
         if not self.is_mounted:
@@ -370,31 +243,26 @@ class SubscriptionsScreen(Widget):
             return
 
         if not config_path.exists():
-            output.load_text(f"Config not found: {config_path}")
+            output.load_text(f"配置不存在: {config_path}")
             return
 
-        update_script = shutil.which("clash-proxy-update")
-        if not update_script:
-            output.load_text("Error: clash-proxy-update command not found")
-            return
-
-        cmd = [update_script, "--dry-run", str(config_path)]
-        output.load_text(f"Running: {' '.join(cmd)}\n\nPlease wait...")
+        output.load_text("正在隔离目录中验证配置，不会覆盖当前运行配置…")
 
         self._set_subscription_busy(True)
-        threading.Thread(target=self._validate_config_worker, args=(cmd,), daemon=True).start()
+        threading.Thread(target=self._validate_config_worker, daemon=True).start()
 
-    def _validate_config_worker(self, cmd: list[str]) -> None:
+    def _validate_config_worker(self) -> None:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            output_text = ""
-            if result.stdout:
-                output_text += result.stdout
-            if result.stderr:
-                output_text += "\n" + result.stderr
-            self._call_from_subscription_thread(self._finish_validate_config, output_text or "Validation passed")
+            with tempfile.TemporaryDirectory(prefix="cproxy-validate-") as temp_dir:
+                root = Path(temp_dir)
+                paths = AppPaths(root / "config", root / "data", root / "state")
+                paths.config_dir.mkdir(parents=True)
+                shutil.copy2(config_file(self.paths), config_file(paths))
+                runtime_path = RuntimeBackend(paths).render_runtime()
+                output_text = f"验证通过\n隔离运行配置: {runtime_path}\n当前运行配置未修改。"
+            self._call_from_subscription_thread(self._finish_validate_config, output_text)
         except Exception as e:
-            self._call_from_subscription_thread(self._fail_subscription_command, f"Error: {e}")
+            self._call_from_subscription_thread(self._fail_subscription_command, f"验证失败: {e}")
 
     def _finish_validate_config(self, output_text: str) -> None:
         if not self.is_mounted:

@@ -32,7 +32,8 @@ from .screens.system_proxy import SystemProxyScreen
 
 class CProxyApp(App):
     TITLE = "CProxy"
-    SUB_TITLE = "Mihomo Proxy Manager"
+    SUB_TITLE = "Mihomo 代理管理器"
+    ENABLE_COMMAND_PALETTE = False
 
     CSS_PATH = "styles.tcss"
     TAB_ORDER = [
@@ -48,22 +49,22 @@ class CProxyApp(App):
     ]
 
     BINDINGS = [
-        Binding("q", "quit", "Quit", priority=True),
-        Binding("ctrl+r", "refresh_all", "Refresh Page", priority=True),
-        Binding("[", "previous_tab", "Prev Tab", priority=True),
-        Binding("]", "next_tab", "Next Tab", priority=True),
-        Binding("ctrl+left", "previous_tab", "Prev Tab", priority=True),
-        Binding("ctrl+right", "next_tab", "Next Tab", priority=True),
-        Binding("escape", "back", "Back", priority=True),
-        Binding("1", "switch_tab('dashboard')", "Overview"),
-        Binding("2", "switch_tab('proxies')", "Nodes"),
-        Binding("3", "switch_tab('providers')", "Providers"),
-        Binding("4", "switch_tab('connections')", "Connections"),
-        Binding("5", "switch_tab('ai-route')", "AI Route"),
-        Binding("6", "switch_tab('subscriptions')", "Subs"),
-        Binding("7", "switch_tab('config')", "Config"),
-        Binding("8", "switch_tab('system-proxy')", "Proxy"),
-        Binding("9", "switch_tab('logs')", "Logs"),
+        Binding("q", "quit", "退出", priority=True),
+        Binding("f5", "refresh_all", "刷新当前页", priority=True),
+        Binding("[", "previous_tab", "上一页", priority=True),
+        Binding("]", "next_tab", "下一页", priority=True),
+        Binding("ctrl+left", "previous_tab", "上一页", priority=True),
+        Binding("ctrl+right", "next_tab", "下一页", priority=True),
+        Binding("escape", "back", "返回", priority=True),
+        Binding("1", "switch_tab('dashboard')", "概览", show=False),
+        Binding("2", "switch_tab('proxies')", "节点", show=False),
+        Binding("3", "switch_tab('providers')", "提供方", show=False),
+        Binding("4", "switch_tab('connections')", "连接", show=False),
+        Binding("5", "switch_tab('ai-route')", "AI 路由", show=False),
+        Binding("6", "switch_tab('subscriptions')", "订阅", show=False),
+        Binding("7", "switch_tab('config')", "配置", show=False),
+        Binding("8", "switch_tab('system-proxy')", "代理环境", show=False),
+        Binding("9", "switch_tab('logs')", "日志", show=False),
     ]
 
     def __init__(self, paths: AppPaths | None = None):
@@ -80,23 +81,23 @@ class CProxyApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(initial="dashboard", id="main-tabs"):
-            with TabPane("Overview", id="dashboard"):
+            with TabPane("概览", id="dashboard"):
                 yield DashboardScreen(self.paths)
-            with TabPane("Nodes", id="proxies"):
+            with TabPane("节点", id="proxies"):
                 yield ProxiesScreen(self.paths)
-            with TabPane("Providers", id="providers"):
+            with TabPane("提供方", id="providers"):
                 yield ProvidersScreen(self.paths)
-            with TabPane("Connections", id="connections"):
+            with TabPane("连接", id="connections"):
                 yield ConnectionsScreen(self.paths)
-            with TabPane("AI Route", id="ai-route"):
+            with TabPane("AI 路由", id="ai-route"):
                 yield AIRouteScreen(self.paths)
-            with TabPane("Subs", id="subscriptions"):
+            with TabPane("订阅", id="subscriptions"):
                 yield SubscriptionsScreen(self.paths)
-            with TabPane("Config", id="config"):
+            with TabPane("配置", id="config"):
                 yield ConfigEditorScreen(self.paths)
-            with TabPane("Proxy", id="system-proxy"):
+            with TabPane("代理环境", id="system-proxy"):
                 yield SystemProxyScreen(self.paths)
-            with TabPane("Logs", id="logs"):
+            with TabPane("日志", id="logs"):
                 yield LogsScreen(self.paths)
         yield Footer()
 

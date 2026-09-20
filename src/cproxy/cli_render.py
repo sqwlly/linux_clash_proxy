@@ -17,6 +17,7 @@ from .backend.models import AIProbeReport, ProxyGroup
 from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
+from .doctor import run_doctor
 from .geodata import check_country_mmdb
 from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config
 from .logs import follow_lines, read_recent_lines
@@ -28,10 +29,11 @@ from .services.ipcheck import IpCheckService
 from .services.ops import build_incident, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
-from .services.refresh import RefreshReport
+from .services.refresh import RefreshReport, update_source_from_subscription
 from .services.subscription_info import SubscriptionUsage, display_entries
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
+from .structured_output import emit_json
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -264,11 +266,13 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
     }
 
 
-def _render_current(groups: dict, group_name: str, raw: bool) -> int:
+def _render_current(groups: dict, group_name: str, raw: bool, json_output: bool = False) -> int:
     current = _group_value(_get_group(groups, group_name), "now")
     if not current:
         raise SystemExit(f"错误: 代理组 [{group_name}] 当前无可读的 now 状态")
-    if raw:
+    if json_output:
+        emit_json("current", {"group": group_name, "current": current, "display_name": normalize_name(current)})
+    elif raw:
         print(current)
     else:
         _print_section("摘要")
@@ -276,7 +280,7 @@ def _render_current(groups: dict, group_name: str, raw: bool) -> int:
     return 0
 
 
-def _render_list_groups(groups, raw: bool) -> int:
+def _render_list_groups(groups, raw: bool, json_output: bool = False) -> int:
     items = []
     iterable = groups.values() if isinstance(groups, dict) else groups
     for group in iterable:
@@ -286,6 +290,18 @@ def _render_list_groups(groups, raw: bool) -> int:
             normalized_type = "select" if group_type == "selector" else group_type
             items.append((name, normalized_type, normalize_name(_group_value(group, "now", "-"))))
 
+    if json_output:
+        emit_json(
+            "list-groups",
+            {
+                "count": len(items),
+                "groups": [
+                    {"name": name, "type": group_type, "current": current}
+                    for name, group_type, current in items
+                ],
+            },
+        )
+        return 0
     if raw:
         for name, group_type, _ in items:
             print(f"{name}\t{group_type}")
@@ -302,11 +318,24 @@ def _render_list_groups(groups, raw: bool) -> int:
     return 0
 
 
-def _render_list_nodes(groups: dict, group_name: str, raw: bool) -> int:
+def _render_list_nodes(groups: dict, group_name: str, raw: bool, json_output: bool = False) -> int:
     group = _get_group(groups, group_name)
     current = _group_value(group, "now", "")
     items = _group_value(group, "all", [])
 
+    if json_output:
+        emit_json(
+            "list-nodes",
+            {
+                "group": group_name,
+                "current": current,
+                "nodes": [
+                    {"name": str(item), "display_name": normalize_name(item), "current": item == current}
+                    for item in items
+                ],
+            },
+        )
+        return 0
     if raw:
         for item in items:
             prefix = "* " if item == current else "  "
@@ -325,7 +354,7 @@ def _render_list_nodes(groups: dict, group_name: str, raw: bool) -> int:
     return 0
 
 
-def _render_ai_status(groups: dict, raw: bool) -> int:
+def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int:
     names = (
         "AI-MANUAL",
         "AI-AUTO",
@@ -335,6 +364,33 @@ def _render_ai_status(groups: dict, raw: bool) -> int:
         "🇸🇬 Singapore",
     )
     probe_report = run_ai_probe(default_paths())
+    if json_output:
+        route = _resolve_ai_route(groups)
+        emit_json(
+            "ai-status",
+            {
+                "route": route,
+                "probe_status": _probe_summary_status(probe_report),
+                "probes": [
+                    {"name": item.name, "url": item.url, "ok": item.ok, "detail": item.detail}
+                    for item in probe_report.results
+                ],
+                "groups": {
+                    name: {
+                        "type": _group_value(group, "type", "-"),
+                        "current": _group_value(group, "now", "-"),
+                        "alive": _group_value(group, "alive"),
+                        "delay": _group_value(group, "delay"),
+                    }
+                    for name in names
+                    if (group := groups.get(name)) is not None
+                },
+            },
+            ok=all(item.ok for item in probe_report.results),
+            warnings=[item.detail for item in probe_report.results if not item.ok],
+            recommended_actions=["cproxy incident"] if any(not item.ok for item in probe_report.results) else [],
+        )
+        return 0 if all(item.ok for item in probe_report.results) else 1
     if raw:
         for name in names:
             group = groups.get(name)
@@ -581,7 +637,7 @@ def _render_subscription_info(entries: list[tuple[str, SubscriptionUsage]]) -> N
     _render_kv([(label, _format_subscription_usage(usage)) for label, usage in entries])
 
 
-def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> int:
+def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, json_output: bool = False) -> int:
     paths = default_paths()
     snapshot = get_status(paths)
     config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
@@ -599,6 +655,58 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
             ai_summary = f"{ai_summary} ({route['active_delay']}ms)"
     except APIUnavailableError:
         pass
+
+    recommended_actions: list[str] = []
+    warnings: list[str] = []
+    if not snapshot.runtime_ready:
+        warnings.append("运行配置尚未生成")
+        recommended_actions.append("cproxy render")
+    if snapshot.runtime_stale:
+        warnings.append("运行实例尚未应用磁盘上的最新运行配置")
+        recommended_actions.append("cproxy restart")
+    if not snapshot.running:
+        warnings.append("cproxy 代理进程未运行")
+        recommended_actions.append("cproxy start")
+    if api_text != "可访问":
+        warnings.append("Mihomo API 不可访问")
+        recommended_actions.append("cproxy logs --lines 100")
+
+    if json_output:
+        metrics = collect_runtime_metrics(paths, snapshot.pid)
+        traffic = _today_traffic_summary(paths)
+        subscriptions = [
+            {"label": label, **usage.to_dict()}
+            for label, usage in display_entries(paths)
+        ]
+        emit_json(
+            "status",
+            {
+                "version": __version__,
+                "source_config": snapshot.source_config,
+                "runtime_config": snapshot.runtime_config,
+                "controller": snapshot.controller,
+                "port": snapshot.port,
+                "runtime_ready": snapshot.runtime_ready,
+                "runtime_stale": snapshot.runtime_stale,
+                "running": snapshot.running,
+                "pid": snapshot.pid,
+                "api_available": api_text == "可访问",
+                "ai_mode": ai_mode,
+                "ai_route": ai_summary,
+                "metrics": {
+                    "connections": _connection_count(paths) if api_text == "可访问" else None,
+                    "uptime_seconds": metrics.uptime_seconds,
+                    "memory_bytes": metrics.memory_bytes,
+                    "log_bytes": metrics.log_bytes,
+                },
+                "traffic_today": traffic,
+                "subscriptions": subscriptions,
+            },
+            ok=not warnings,
+            warnings=warnings,
+            recommended_actions=recommended_actions,
+        )
+        return 0
 
     if raw:
         print(f"版本: {__version__}")
@@ -681,13 +789,38 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT) -> 
         print()
         _print_section("提示")
         print("当前用户级 cproxy 未运行，API 可能来自其它 Mihomo 实例。")
-        print("生产入口状态请优先查看 clash-proxy status 或在仓库根目录运行 ./proxy.sh status。")
+        print("请先执行 cproxy doctor 确认实例归属，再按建议启动 cproxy。")
     if not snapshot.runtime_ready:
         print("如需使用用户级 cproxy，请先运行 cproxy render 生成运行配置。")
+    if snapshot.runtime_stale:
+        if not (not snapshot.running and api_text == "可访问"):
+            print()
+            _print_section("建议操作")
+        print("执行 cproxy restart 应用最新运行配置。")
+    elif api_text != "可访问":
+        print()
+        _print_section("建议操作")
+        print("执行 cproxy logs --lines 100 查看 API 不可访问原因。")
     return 0
 
 
-def _render_group_check(report: GroupCheckReport, raw: bool) -> int:
+def _render_group_check(report: GroupCheckReport, raw: bool, json_output: bool = False) -> int:
+    if json_output:
+        ok = all(item.ok for item in report.results)
+        emit_json(
+            "test-group",
+            {
+                "group": report.group_name,
+                "results": [
+                    {"name": item.name, "ok": item.ok, "delay": item.delay}
+                    for item in report.results
+                ],
+            },
+            ok=ok,
+            warnings=[item.name for item in report.results if not item.ok],
+            recommended_actions=[f"cproxy test-group {report.group_name}"] if not ok else [],
+        )
+        return 0 if ok else 1
     if raw:
         for item in report.results:
             print(f"{item.name}: {item.delay}ms" if item.ok and item.delay is not None else f"{item.name}: 失败")
@@ -712,8 +845,24 @@ def _render_group_check(report: GroupCheckReport, raw: bool) -> int:
     return 0 if len(ok_items) == len(report.results) else 1
 
 
-def _render_connectivity_report(report: ConnectivityReport) -> int:
+def _render_connectivity_report(report: ConnectivityReport, json_output: bool = False) -> int:
     passed = sum(1 for item in report.results if item.ok)
+    if json_output:
+        ok = passed == len(report.results)
+        emit_json(
+            "test",
+            {
+                "exit_ip": report.exit_ip,
+                "results": [
+                    {"name": item.name, "ok": item.ok, "detail": item.detail}
+                    for item in report.results
+                ],
+            },
+            ok=ok,
+            warnings=[f"{item.name}: {item.detail}" for item in report.results if not item.ok],
+            recommended_actions=["cproxy doctor", "cproxy logs --lines 100"] if not ok else [],
+        )
+        return 0 if ok else 1
     _print_section("摘要")
     print("目标: 代理连通性")
     print(f"可用: {passed}/{len(report.results)}")
@@ -725,6 +874,10 @@ def _render_connectivity_report(report: ConnectivityReport) -> int:
             print(f"{_status_label('正常')}  {item.name}  {item.detail}")
         else:
             print(f"{_status_label('失败')}  {item.name}  {item.detail}")
+    if passed != len(report.results):
+        print()
+        _print_section("建议操作")
+        print("执行 cproxy doctor 查看本地配置与进程状态。")
     return 0 if passed == len(report.results) else 1
 
 
@@ -751,19 +904,32 @@ def _render_logs(lines: int, follow: bool) -> int:
     return 0
 
 
-def _run_bootstrap() -> int:
+def _run_bootstrap(subscription_url: str | None = None) -> int:
     paths = default_paths()
     config_path = init_user_layout(paths)
     migrated_from: Path | None = None
+    initialized_from_subscription = False
 
     if is_placeholder_config(paths):
         migrated_path = auto_migrate_from_default_legacy(paths)
-        if migrated_path is None:
-            legacy_root = Path(os.environ.get("CPROXY_LEGACY_ROOT", "/root/clash_proxy"))
-            legacy_config = legacy_root / "config.yaml"
-            raise RuntimeError(f"错误: 当前配置为空，且未找到可迁移配置: {legacy_config}")
-        migrated_from = Path(os.environ.get("CPROXY_LEGACY_ROOT", "/root/clash_proxy")) / "config.yaml"
-        config_path = migrated_path
+        if migrated_path is not None:
+            migrated_from = Path(os.environ.get("CPROXY_LEGACY_ROOT", "/root/clash_proxy")) / "config.yaml"
+            config_path = migrated_path
+        else:
+            if not subscription_url and sys.stdin.isatty() and not _truthy(os.environ.get("CPROXY_NONINTERACTIVE", "")):
+                print("未找到可迁移配置。可输入订阅 URL 初始化；直接回车则退出。", file=sys.stderr)
+                subscription_url = input("订阅 URL: ").strip()
+            if not subscription_url:
+                legacy_root = Path(os.environ.get("CPROXY_LEGACY_ROOT", "/root/clash_proxy"))
+                legacy_config = legacy_root / "config.yaml"
+                raise RuntimeError(
+                    "错误: 当前配置为空，且未找到可迁移配置: "
+                    f"{legacy_config}\n"
+                    "下一步: cproxy bootstrap --subscription-url '<订阅地址>'\n"
+                    f"或编辑 {config_path} 后重新执行 cproxy bootstrap"
+                )
+            config_path = update_source_from_subscription(paths, subscription_url)
+            initialized_from_subscription = True
 
     runtime_path = render_runtime(paths)
     pid = start_process(paths)
@@ -777,6 +943,8 @@ def _run_bootstrap() -> int:
     print(f"配置文件: {config_path}")
     if migrated_from is not None:
         print(f"已自动迁移旧配置: {migrated_from}")
+    if initialized_from_subscription:
+        print("已从订阅初始化配置（订阅地址已隐藏）")
     print(f"运行配置: {runtime_path}")
     print(f"代理进程: 运行中 (PID: {pid})")
     if geodata_check.ok:
@@ -784,6 +952,29 @@ def _run_bootstrap() -> int:
     else:
         print(f"GeoIP: {geodata_check.detail}")
     return 0
+
+
+def _render_doctor(json_output: bool = False) -> int:
+    report = run_doctor(default_paths())
+    if json_output:
+        emit_json(
+            "doctor",
+            {"checks": report["checks"]},
+            ok=bool(report["ok"]),
+            warnings=[item["detail"] for item in report["checks"] if item["status"] == "失败"],
+            recommended_actions=report["recommended_actions"],
+        )
+        return 0 if report["ok"] else 1
+
+    _print_section("体检结果")
+    for item in report["checks"]:
+        print(f"{_status_label(item['status'])}  {item['name']}  {item['detail']}")
+    if report["recommended_actions"]:
+        print()
+        _print_section("建议操作")
+        for action in report["recommended_actions"]:
+            print(f"- {action}")
+    return 0 if report["ok"] else 1
 
 
 def _render_security_check(strict: bool) -> int:
@@ -845,7 +1036,23 @@ def _run_rollback(paths, name: str | None) -> int:
     return 0
 
 
-def _render_refresh(report: RefreshReport, raw: bool) -> int:
+def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False) -> int:
+    if json_output:
+        warnings = [
+            f"附加订阅 {item.name}: {item.detail or item.status}"
+            for item in report.extra_subscriptions
+            if item.status == "失败"
+        ]
+        if report.subscription == "失败":
+            warnings.insert(0, report.subscription_detail or "主订阅更新失败")
+        emit_json(
+            "refresh",
+            report,
+            ok=not warnings,
+            warnings=warnings,
+            recommended_actions=["cproxy doctor"] if warnings else [],
+        )
+        return 0 if not warnings else 1
     if raw:
         print(f"subscription={report.subscription} detail={report.subscription_detail}")
         for extra in report.extra_subscriptions:
@@ -928,7 +1135,7 @@ def _render_ai_connections(paths, raw: bool) -> int:
 
     _print_section("AI 连接")
     if not connections:
-        print("未发现 ChatGPT/OpenAI/Claude/GitHub 相关活动连接")
+        print("未发现 ChatGPT/Claude/Gemini/Antigravity/GitHub 相关活动连接")
         return 0
     for conn in connections:
         print(f"{conn.host}  {conn.count} active  {conn.route}")
@@ -1220,10 +1427,30 @@ def _render_traffic_table(
         print(f"{line}  {bar}  {label_of(row)}")
 
 
-def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, raw: bool) -> int:
+def _traffic_row_payload(row) -> dict:
+    payload = {"label": row.label, "download": row.download, "upload": row.upload}
+    if hasattr(row, "proxy_download"):
+        payload["proxy_download"] = row.proxy_download
+        payload["proxy_upload"] = row.proxy_upload
+    return payload
+
+
+def _render_traffic(
+    paths,
+    *,
+    action: str,
+    days: int,
+    by: str | None,
+    top: int,
+    raw: bool,
+    json_output: bool = False,
+) -> int:
     service = TrafficService(paths)
     if action == "collect":
         result = service.collect()
+        if json_output:
+            emit_json("traffic", {"action": action, "result": result})
+            return 0
         if raw:
             print(
                 f"TRAFFIC_COLLECT\tconnections={result.connections}"
@@ -1237,6 +1464,24 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
 
     if action == "audit":
         audit = service.audit(days=days, top=top)
+        if json_output:
+            processes = service.process_breakdown(days=days, top=top)
+            emit_json(
+                "traffic",
+                {
+                    "action": action,
+                    "since": audit["since"],
+                    "until": audit["until"],
+                    "proxy_download": audit["proxy_download"],
+                    "proxy_upload": audit["proxy_upload"],
+                    "direct_download": audit["direct_download"],
+                    "direct_upload": audit["direct_upload"],
+                    "hosts": [_traffic_row_payload(row) for row in audit["rows"]],
+                    "processes": [_traffic_row_payload(row) for row in processes.rows],
+                    "process_total": processes.total,
+                },
+            )
+            return 0
         if raw:
             # 进程查询只在确实要输出时才做：下文的“暂无流量记录”早退不应白跑一次查询
             processes = service.process_breakdown(days=days, top=top)
@@ -1304,6 +1549,23 @@ def _render_traffic(paths, *, action: str, days: int, by: str | None, top: int, 
         return 0
 
     report = service.report(days=days, dimension=by, top=top)
+    if json_output:
+        emit_json(
+            "traffic",
+            {
+                "action": action,
+                "since": report["since"],
+                "until": report["until"],
+                "total_download": report["total_download"],
+                "total_upload": report["total_upload"],
+                "daily": [_traffic_row_payload(row) for row in report["daily"]],
+                "dimensions": {
+                    name: [_traffic_row_payload(row) for row in rows]
+                    for name, rows in report["dimensions"].items()
+                },
+            },
+        )
+        return 0
     if raw:
         print(
             f"TRAFFIC_REPORT\tsince={report['since']}\tuntil={report['until']}"
@@ -1385,10 +1647,10 @@ def _render_ipcheck(paths, *, ip: str | None, group: str | None, node: str | Non
             f"\tblocklist={','.join(report.blocklist_listed) or 'clean'}"
             f"\tdatacenter={report.datacenter or '-'}"
         )
-        for item in report.services:
-            print(f"IP_SERVICE\t{item.key}\t{item.status}")
-        for item in report.sources:
-            print(f"IP_SOURCE\t{item.source}\trisk={item.risk}\tweight={item.weight}")
+        for service_status in report.services:
+            print(f"IP_SERVICE\t{service_status.key}\t{service_status.status}")
+        for source_score in report.sources:
+            print(f"IP_SOURCE\t{source_score.source}\trisk={source_score.risk}\tweight={source_score.weight}")
         return 0
 
     target = f"指定 IP {report.ip}" if ip else "当前代理出口"
@@ -1413,19 +1675,19 @@ def _render_ipcheck(paths, *, ip: str | None, group: str | None, node: str | Non
     if report.ai_services:
         print()
         print("AI 服务快照:")
-        for item in report.ai_services:
-            print(f"  {item.key:<10} {item.label}")
+        for service_status in report.ai_services:
+            print(f"  {service_status.key:<10} {service_status.label}")
     if report.services and not report.ai_services:
         print()
         print("服务快照:")
-        for item in report.services:
-            print(f"  {item.key:<10} {item.label}")
+        for service_status in report.services:
+            print(f"  {service_status.key:<10} {service_status.label}")
 
     if report.sources:
         print()
         print("多源评分:")
-        for item in report.sources:
-            print(f"  {item.source:<14} risk={item.risk:<3} weight={item.weight}")
+        for source_score in report.sources:
+            print(f"  {source_score.source:<14} risk={source_score.risk:<3} weight={source_score.weight}")
 
     if report.switched:
         print()

@@ -1,9 +1,8 @@
 import os
 import subprocess
 import sys
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
@@ -123,7 +122,7 @@ exit 0
     assert python_log.is_file()
     log_text = pipx_log.read_text(encoding="utf-8")
     python_log_text = python_log.read_text(encoding="utf-8")
-    assert f"install --force --editable {ROOT_DIR}" in log_text
+    assert f"install --force --editable {ROOT_DIR}[tui]" in log_text
     assert "-m cproxy.cli init" in python_log_text
     assert "-m cproxy.cli bootstrap" in python_log_text
     assert not (tmp_path / ".local" / "state" / "cproxy" / "cproxy.pid").exists()
@@ -179,7 +178,7 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     assert config_file.is_file()
     assert python_log.is_file()
     log_text = python_log.read_text(encoding="utf-8")
-    assert f"-m pip install --user --editable {ROOT_DIR}" in log_text
+    assert f"-m pip install --user --editable {ROOT_DIR}[tui]" in log_text
     assert "-m cproxy.cli init" in log_text
     assert "-m cproxy.cli bootstrap" in log_text
     assert not (tmp_path / ".local" / "state" / "cproxy" / "cproxy.pid").exists()
@@ -244,6 +243,9 @@ def test_install_script_uses_system_wide_install_when_root(tmp_path: Path):
     assert any("--force-reinstall" in line and "--no-deps" in line for line in pip_lines), (
         "非 editable 的系统级安装应带 --force-reinstall --no-deps"
     )
+    assert any("PyYAML>=6" in line and "textual>=5.0" in line for line in pip_lines), (
+        "系统级 clean-host 安装必须先补齐声明的运行依赖与默认 TUI 依赖"
+    )
 
 
 def test_root_branch_takes_precedence_over_pipx(tmp_path: Path):
@@ -280,6 +282,8 @@ def test_pyproject_declares_runtime_dependencies():
     assert "tqdm>=4" in dependencies
     assert "urllib3>=2.7.0" in dependencies
     assert "idna>=3.15" in dependencies
+    assert data["project"]["optional-dependencies"]["tui"] == ["textual>=5.0"]
+    assert data["project"]["scripts"]["cproxy-tui"] == "cproxy.tui_launcher:main"
 
 
 def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
@@ -321,15 +325,11 @@ def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
 
     assert result.returncode == 0
     assert cproxy_conf.is_file()
-    assert legacy_conf.is_file()
+    assert not legacy_conf.exists(), "默认安装不应继续创建已停用 legacy 的轮转配置"
     cproxy_text = cproxy_conf.read_text(encoding="utf-8")
-    legacy_text = legacy_conf.read_text(encoding="utf-8")
     assert str(tmp_path / ".local" / "state" / "cproxy" / "cproxy.log") in cproxy_text
-    assert str(tmp_path / ".local" / "state" / "clash_proxy" / "clash.log") in legacy_text
     assert "copytruncate" in cproxy_text
     assert "postrotate" not in cproxy_text
-    assert "copytruncate" in legacy_text
-    assert "postrotate" not in legacy_text
 
     cproxy_check = subprocess.run(
         ["logrotate", "-d", str(cproxy_conf)],
@@ -338,16 +338,7 @@ def test_install_script_writes_valid_logrotate_configs(tmp_path: Path):
         cwd=ROOT_DIR,
         env=env,
     )
-    legacy_check = subprocess.run(
-        ["logrotate", "-d", str(legacy_conf)],
-        capture_output=True,
-        text=True,
-        cwd=ROOT_DIR,
-        env=env,
-    )
-
     assert cproxy_check.returncode == 0, cproxy_check.stderr
-    assert legacy_check.returncode == 0, legacy_check.stderr
 
 
 def test_pyproject_declares_subscription_downloader_dependencies():

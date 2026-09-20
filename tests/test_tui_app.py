@@ -271,6 +271,12 @@ def test_tui_app_ga_layout_smoke_80_and_120_columns(tmp_path):
         app = CProxyApp(paths)
         async with app.run_test(size=size) as pilot:
             await pilot.pause(0.1)
+            if size[0] == 80:
+                runtime_card = app.query_one(".runtime-card")
+                traffic_card = app.query_one(".traffic-card")
+                assert runtime_card.region.height >= 8
+                assert traffic_card.region.height >= 6
+                assert traffic_card.region.bottom <= app.size.height - 1
             tabs = app.query_one("#main-tabs")
             for tab_id in ("dashboard", "proxies", "providers", "connections", "logs"):
                 tabs.active = tab_id

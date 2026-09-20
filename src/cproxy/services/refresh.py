@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
@@ -90,6 +92,14 @@ class RefreshReport:
     restarted: bool = False
     hot_reloaded: bool = False
     groups: list[GroupSwitchResult] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SubscriptionPreview:
+    bytes: int
+    proxy_count: int
+    group_count: int
+    source: str
 
 
 def _rebuild_groups_with_new_nodes(local_groups: list, old_node_names: list[str], new_node_names: list[str]) -> list:
@@ -232,7 +242,7 @@ def _download_subscription(paths: AppPaths, url: str, timeout: int) -> tuple[byt
             return _read_subscription_response(response)
 
 
-def _read_subscription_response(response: object) -> tuple[bytes, str | None]:
+def _read_subscription_response(response: Any) -> tuple[bytes, str | None]:
     """读出订阅响应体与 ``subscription-userinfo`` 头（机场账户用量，可缺省）。"""
     body = response.read(SUBSCRIPTION_MAX_BYTES + 1)
     try:
@@ -250,14 +260,15 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
     if len(raw) > SUBSCRIPTION_MAX_BYTES:
         raise RuntimeError("错误: 订阅内容超过大小限制")
 
-    data = yaml.safe_load(raw.decode("utf-8"))
-    if not isinstance(data, dict) or not (data.get("proxies") or data.get("proxy-groups")):
+    try:
+        data = parse_subscription_payload(raw)
+    except ValueError as exc:
         hint = ""
         if "flag=meta" not in url:
             hint = "；如果订阅提供商支持 Clash 格式，尝试在 URL 末尾追加 &flag=meta"
-        if isinstance(data, dict) and not data.get("proxies"):
-            raise RuntimeError(f"错误: 订阅返回了有效 YAML 但 proxies 为空{hint}")
-        raise RuntimeError(f"错误: 订阅内容不是有效的 Clash/Mihomo 配置{hint}")
+        raise RuntimeError(f"{exc}{hint}") from exc
+    if not isinstance(data, dict) or not data.get("proxies"):
+        raise RuntimeError("错误: 订阅未返回任何节点")
 
     path = config_file(paths)
     existing = read_config(paths)
@@ -297,6 +308,24 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
     return path
 
 
+def preview_subscription(paths: AppPaths, url: str, timeout: int = SUBSCRIPTION_TIMEOUT) -> SubscriptionPreview:
+    """只下载并解析订阅，不写配置、用量或快照。"""
+    raw, _userinfo = _download_subscription(paths, url, timeout)
+    if len(raw) > SUBSCRIPTION_MAX_BYTES:
+        raise RuntimeError("错误: 订阅内容超过大小限制")
+    data = parse_subscription_payload(raw)
+    proxies = [item for item in data.get("proxies") or [] if isinstance(item, dict) and item.get("name")]
+    if not proxies:
+        raise RuntimeError("错误: 订阅未返回任何节点")
+    groups = [item for item in data.get("proxy-groups") or [] if isinstance(item, dict)]
+    return SubscriptionPreview(
+        bytes=len(raw),
+        proxy_count=len(proxies),
+        group_count=len(groups),
+        source="yaml" if groups else "nodelist",
+    )
+
+
 def _config_groups(value: object) -> list[str]:
     if isinstance(value, str):
         return [value.strip()] if value.strip() else []
@@ -312,20 +341,80 @@ class ExtraSubscriptionResult:
     detail: str = ""
 
 
-def _extra_subscriptions_from_config(config: dict) -> list[tuple[str, str]]:
-    """读取 subscriptions 列表（附加机场订阅），返回 (名称, URL) 列表。"""
+def _extra_subscriptions_from_config(config: dict) -> list[tuple[str, str, str]]:
+    """读取 subscriptions 列表，返回 (名称, URL, 挂载分组) 列表。"""
     subs = config.get("subscriptions")
     if not isinstance(subs, list):
         return []
-    entries: list[tuple[str, str]] = []
+    entries: list[tuple[str, str, str]] = []
     for item in subs:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
         url = str(item.get("url") or "").strip()
+        attach_to = str(item.get("attach-to") or "").strip()
         if name and url:
-            entries.append((name, url))
+            entries.append((name, url, attach_to))
     return entries
+
+
+def upsert_extra_subscription(paths: AppPaths, name: str, url: str, attach_to: str = "") -> Path:
+    """新增或更新附加订阅定义；写入前校验挂载分组并保留配置快照。"""
+    name = name.strip()
+    url = url.strip()
+    attach_to = attach_to.strip()
+    if not name:
+        raise ValueError("附加订阅分组名不能为空")
+    if not url:
+        raise ValueError("订阅 URL 不能为空")
+
+    config = read_config(paths)
+    group_names = {
+        str(group.get("name"))
+        for group in config.get("proxy-groups") or []
+        if isinstance(group, dict) and group.get("name")
+    }
+    if attach_to and attach_to not in group_names:
+        raise ValueError(f"挂载目标分组不存在: {attach_to}")
+
+    subscriptions = [item for item in config.get("subscriptions") or [] if isinstance(item, dict)]
+    existing_subscription_names = {
+        str(item.get("name") or "").strip()
+        for item in subscriptions
+        if str(item.get("name") or "").strip()
+    }
+    if name in group_names and name not in existing_subscription_names:
+        raise ValueError(f"附加订阅名与现有分组冲突: {name}")
+    if attach_to == name:
+        raise ValueError("附加订阅不能挂载到自身")
+    entry = {"name": name, "url": url}
+    if attach_to:
+        entry["attach-to"] = attach_to
+    replaced = False
+    updated: list[dict] = []
+    for item in subscriptions:
+        if str(item.get("name") or "").strip() == name:
+            if not replaced:
+                updated.append(entry)
+                replaced = True
+            continue
+        updated.append(item)
+    if not replaced:
+        updated.append(entry)
+    config["subscriptions"] = updated
+
+    path = config_file(paths)
+    snapshot_file(paths, path, "config")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temp_path.open("w", encoding="utf-8") as fh:
+            yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=False)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return path
 
 
 def _subscription_region_groups(sub_name: str, proxies: list) -> list:
@@ -368,8 +457,8 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
         return []
 
     results: list[ExtraSubscriptionResult] = []
-    downloaded: list[tuple[str, list]] = []
-    for name, url in subs:
+    downloaded: list[tuple[str, list, str]] = []
+    for name, url, attach_to in subs:
         try:
             raw, userinfo = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
             record_subscription_info(paths, name, userinfo)
@@ -381,14 +470,14 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
             ]
             if not valid_proxies:
                 raise ValueError("错误: 订阅未返回任何节点")
-            downloaded.append((name, valid_proxies))
+            downloaded.append((name, valid_proxies, attach_to))
             results.append(ExtraSubscriptionResult(name, "已更新", f"{len(valid_proxies)} 个节点"))
         except Exception as exc:
             results.append(ExtraSubscriptionResult(name, "失败", redact_text(str(exc))))
     if not downloaded:
         return results
 
-    sub_names = {name for name, _ in downloaded}
+    sub_names = {name for name, _, _ in downloaded}
     proxies: list = [
         proxy
         for proxy in config.get("proxies") or []
@@ -407,7 +496,17 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
             and any(group["name"] == n or group["name"].startswith(f"{n}-") for n in sub_names)
         )
     ]
-    for name, sub_proxies in downloaded:
+    managed_attachments = {name: attach_to for name, _, attach_to in downloaded if attach_to}
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("proxies"), list):
+            continue
+        group["proxies"] = [
+            member
+            for member in group["proxies"]
+            if str(member) not in managed_attachments
+        ]
+
+    for name, sub_proxies, attach_to in downloaded:
         prefixed: list = []
         for proxy in sub_proxies:
             renamed = dict(proxy)
@@ -415,6 +514,15 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
             prefixed.append(renamed)
         proxies.extend(prefixed)
         groups.extend(_subscription_region_groups(name, prefixed))
+        if attach_to:
+            parent = next(
+                (group for group in groups if isinstance(group, dict) and str(group.get("name")) == attach_to),
+                None,
+            )
+            if parent is not None:
+                members = parent.setdefault("proxies", [])
+                if name not in members:
+                    members.append(name)
     config["proxies"] = proxies
     config["proxy-groups"] = groups
 
@@ -493,6 +601,27 @@ class RefreshService:
                 report.groups.append(self._probe_and_switch(name))
             else:
                 report.groups.append(GroupSwitchResult(group=name, current=None, action="跳过", detail="代理未运行"))
+        return report
+
+    def refresh_extra_subscription(self, name: str, url: str, attach_to: str = "") -> RefreshReport:
+        """保存并刷新一项附加订阅，不隐式刷新主订阅。"""
+        upsert_extra_subscription(self.paths, name, url, attach_to)
+        report = RefreshReport(subscription="跳过", subscription_detail="仅刷新附加订阅")
+        report.extra_subscriptions = apply_extra_subscriptions(self.paths)
+        selected = next((item for item in report.extra_subscriptions if item.name == name), None)
+        if selected is None or selected.status == "失败":
+            detail = selected.detail if selected is not None else "未找到订阅刷新结果"
+            raise RuntimeError(f"附加订阅刷新失败: {detail}")
+
+        report.runtime_path = RuntimeBackend(self.paths).render_runtime()
+        report.was_running = self.process.is_running()
+        if report.was_running:
+            try:
+                self._api_factory(self.paths).reload_config(str(report.runtime_path))
+                report.hot_reloaded = True
+            except Exception:
+                self.process.restart()
+                report.restarted = True
         return report
 
     def _wait_for_api(self) -> None:

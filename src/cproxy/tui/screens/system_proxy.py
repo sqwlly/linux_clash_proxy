@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from textual.app import ComposeResult
@@ -9,25 +11,27 @@ from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
 from textual.widgets import Button, Label, Switch
 
+from ...audit import write_audit_event
 from ...config import AppPaths, read_config
 
 
 class SystemProxyScreen(Widget):
     BINDINGS = [
-        Binding("t", "toggle_proxy", "Toggle"),
+        Binding("t", "toggle_proxy", "切换"),
     ]
 
     def __init__(self, paths: AppPaths, **kwargs):
         super().__init__(**kwargs)
         self.paths = paths
+        self._pending_action: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("System Proxy", classes="page-title")
+            yield Label("代理环境", classes="page-title")
 
             with Horizontal(classes="workbench-row compact-row"):
                 with Vertical(classes="panel form-panel split-main"):
-                    yield Label("Session", classes="panel-title")
+                    yield Label("临时命令范围", classes="panel-title")
                     with Horizontal(classes="field-row"):
                         yield Label("HTTP", classes="label-key")
                         yield Switch(id="switch-http", value=False)
@@ -42,16 +46,19 @@ class SystemProxyScreen(Widget):
                         yield Label("─", id="all-proxy-label", classes="metric-value")
 
                 with Vertical(classes="panel summary-panel split-sidebar"):
-                    yield Label("Environment", classes="panel-title")
+                    yield Label("当前 TUI 进程环境", classes="panel-title")
                     yield Label("─", id="env-status", classes="current-info")
 
             with Vertical(classes="panel output-panel"):
-                yield Label("Persist", classes="panel-title")
+                yield Label("生成命令与持久配置", classes="panel-title")
                 with Horizontal(classes="toolbar"):
-                    yield Button("Set Session", id="btn-set-all", classes="action-button success-button")
-                    yield Button("Clear Session", id="btn-clear-all", classes="action-button danger-button")
-                    yield Button("Write bashrc", id="btn-write-bashrc", classes="action-button primary-button")
-                    yield Button("Write zshrc", id="btn-write-zshrc", classes="action-button primary-button")
+                    yield Button("显示 export", id="btn-set-all", classes="action-button success-button")
+                    yield Button("显示 unset", id="btn-clear-all", classes="action-button muted-button")
+                    yield Button("写入 bashrc", id="btn-write-bashrc", classes="action-button primary-button")
+                    yield Button("写入 zshrc", id="btn-write-zshrc", classes="action-button primary-button")
+                with Horizontal(classes="toolbar"):
+                    yield Button("移除 bashrc 配置", id="btn-remove-bashrc", classes="action-button danger-button")
+                    yield Button("移除 zshrc 配置", id="btn-remove-zshrc", classes="action-button danger-button")
                 yield Label("─", id="proxy-action-status", classes="action-status")
 
     def on_mount(self) -> None:
@@ -75,15 +82,15 @@ class SystemProxyScreen(Widget):
         self.query_one("#switch-https", Switch).value = bool(https_proxy)
         self.query_one("#switch-all", Switch).value = bool(all_proxy)
 
-        self.query_one("#http-proxy-label", Label).update(http_proxy or "[#8b98aa](not set)[/]")
-        self.query_one("#https-proxy-label", Label).update(https_proxy or "[#8b98aa](not set)[/]")
-        self.query_one("#all-proxy-label", Label).update(all_proxy or "[#8b98aa](not set)[/]")
+        self.query_one("#http-proxy-label", Label).update(http_proxy or "[#8b98aa](未设置)[/]")
+        self.query_one("#https-proxy-label", Label).update(https_proxy or "[#8b98aa](未设置)[/]")
+        self.query_one("#all-proxy-label", Label).update(all_proxy or "[#8b98aa](未设置)[/]")
 
         env_text = (
-            f"http_proxy={http_proxy or '(not set)'}\n"
-            f"https_proxy={https_proxy or '(not set)'}\n"
-            f"all_proxy={all_proxy or '(not set)'}\n"
-            f"no_proxy={os.environ.get('no_proxy', '(not set)')}"
+            f"http_proxy={http_proxy or '(未设置)'}\n"
+            f"https_proxy={https_proxy or '(未设置)'}\n"
+            f"all_proxy={all_proxy or '(未设置)'}\n"
+            f"no_proxy={os.environ.get('no_proxy', '(未设置)')}"
         )
         self.query_one("#env-status", Label).update(env_text)
 
@@ -93,25 +100,34 @@ class SystemProxyScreen(Widget):
 
         if event.button.id == "btn-set-all":
             proxy_url = f"http://{addr}"
-            os.environ["http_proxy"] = proxy_url
-            os.environ["https_proxy"] = proxy_url
-            os.environ["all_proxy"] = proxy_url
-            status_label.update(f"[#a3e635]Set (session only): {proxy_url}[/]")
-            self._refresh_status()
-            self.notify(f"Proxy set: {addr}", severity="information")
+            status_label.update(
+                "\n".join(
+                    [
+                        f"export http_proxy={proxy_url}",
+                        f"export https_proxy={proxy_url}",
+                        f"export all_proxy={proxy_url}",
+                        'export no_proxy="localhost,127.0.0.1,::1"',
+                        "[#8b98aa]请复制到父 shell 执行；TUI 无法修改父进程环境。[/]",
+                    ]
+                )
+            )
+            self.notify("已生成临时代理命令", severity="information")
 
         elif event.button.id == "btn-clear-all":
-            for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-                os.environ.pop(key, None)
-            status_label.update("[#a3e635]Cleared (session only)[/]")
-            self._refresh_status()
-            self.notify("Proxy cleared", severity="information")
+            status_label.update("unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY")
+            self.notify("已生成清理命令", severity="information")
 
         elif event.button.id == "btn-write-bashrc":
             self._write_shell_config(Path.home() / ".bashrc", addr, status_label)
 
         elif event.button.id == "btn-write-zshrc":
             self._write_shell_config(Path.home() / ".zshrc", addr, status_label)
+
+        elif event.button.id == "btn-remove-bashrc":
+            self._remove_shell_config(Path.home() / ".bashrc", status_label)
+
+        elif event.button.id == "btn-remove-zshrc":
+            self._remove_shell_config(Path.home() / ".zshrc", status_label)
 
     def _write_shell_config(self, shell_rc: Path, addr: str, status_label: Label) -> None:
         proxy_url = f"http://{addr}"
@@ -126,7 +142,14 @@ class SystemProxyScreen(Widget):
             f"{marker_end}\n"
         )
 
+        action = f"write:{shell_rc}"
+        if self._pending_action != action:
+            self._pending_action = action
+            status_label.update(f"[#f6c177]将修改 {shell_rc}；请再次点击同一按钮确认[/]")
+            return
+
         try:
+            self._pending_action = None
             existing = shell_rc.read_text(encoding="utf-8") if shell_rc.exists() else ""
 
             if marker in existing:
@@ -136,22 +159,83 @@ class SystemProxyScreen(Widget):
             else:
                 existing = existing.rstrip() + "\n" + block
 
-            shell_rc.write_text(existing, encoding="utf-8")
-            status_label.update(f"[#a3e635]Written to {shell_rc}[/] (run 'source {shell_rc}' to apply)")
-            self.notify(f"Written to {shell_rc.name}", severity="information")
+            backup = self._backup_shell_config(shell_rc)
+            self._atomic_write(shell_rc, existing)
+            write_audit_event(
+                self.paths,
+                action="write_shell_proxy",
+                target=str(shell_rc),
+                result="ok",
+                detail={"backup": str(backup) if backup else ""},
+            )
+            backup_text = f"；备份 {backup}" if backup else ""
+            status_label.update(f"[#a3e635]已写入 {shell_rc}{backup_text}[/]；执行 source {shell_rc} 生效")
+            self.notify(f"已写入 {shell_rc.name}", severity="information")
 
         except Exception as e:
-            status_label.update(f"[#fb7185]Write failed: {e}[/]")
-            self.notify(f"Write failed: {e}", severity="error")
+            status_label.update(f"[#fb7185]写入失败: {e}[/]")
+            self.notify(f"写入失败: {e}", severity="error")
+
+    def _remove_shell_config(self, shell_rc: Path, status_label: Label) -> None:
+        action = f"remove:{shell_rc}"
+        if self._pending_action != action:
+            self._pending_action = action
+            status_label.update(f"[#f6c177]将移除 {shell_rc} 中的 cproxy 管理块；请再次点击确认[/]")
+            return
+        self._pending_action = None
+        marker = "# >>> cproxy proxy >>>"
+        marker_end = "# <<< cproxy proxy <<<"
+        try:
+            existing = shell_rc.read_text(encoding="utf-8") if shell_rc.exists() else ""
+            if marker not in existing or marker_end not in existing:
+                status_label.update(f"[#8b98aa]{shell_rc} 中没有 cproxy 管理块[/]")
+                return
+            start = existing.index(marker)
+            end = existing.index(marker_end, start) + len(marker_end)
+            updated = (existing[:start].rstrip() + "\n" + existing[end:].lstrip("\n")).lstrip("\n")
+            backup = self._backup_shell_config(shell_rc)
+            self._atomic_write(shell_rc, updated)
+            write_audit_event(
+                self.paths,
+                action="remove_shell_proxy",
+                target=str(shell_rc),
+                result="ok",
+                detail={"backup": str(backup) if backup else ""},
+            )
+            status_label.update(f"[#a3e635]已移除 cproxy 管理块；备份 {backup}[/]")
+            self.notify(f"已清理 {shell_rc.name}", severity="information")
+        except Exception as e:
+            status_label.update(f"[#fb7185]移除失败: {e}[/]")
+            self.notify(f"移除失败: {e}", severity="error")
+
+    def _backup_shell_config(self, shell_rc: Path) -> Path | None:
+        if not shell_rc.exists():
+            return None
+        backup_dir = self.paths.state_dir / "shell-backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        backup = backup_dir / f"{shell_rc.name.lstrip('.')}-{stamp}.bak"
+        shutil.copy2(shell_rc, backup)
+        os.chmod(backup, 0o600)
+        return backup
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.cproxy-tmp-{os.getpid()}")
+        try:
+            temp_path.write_text(content, encoding="utf-8")
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def action_toggle_proxy(self) -> None:
-        addr = self._get_proxy_addr()
-        if os.environ.get("all_proxy"):
-            for key in ("http_proxy", "https_proxy", "all_proxy"):
-                os.environ.pop(key, None)
-        else:
-            proxy_url = f"http://{addr}"
-            os.environ["http_proxy"] = proxy_url
-            os.environ["https_proxy"] = proxy_url
-            os.environ["all_proxy"] = proxy_url
-        self._refresh_status()
+        switches = [
+            self.query_one("#switch-http", Switch),
+            self.query_one("#switch-https", Switch),
+            self.query_one("#switch-all", Switch),
+        ]
+        new_value = not all(item.value for item in switches)
+        for item in switches:
+            item.value = new_value

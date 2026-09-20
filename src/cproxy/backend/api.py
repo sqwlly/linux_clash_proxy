@@ -7,7 +7,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import BaseHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import BaseHandler, HTTPSHandler, OpenerDirector, ProxyHandler, Request, build_opener
 
 from ..config import AppPaths, read_config
 from .models import ProxyGroup
@@ -22,9 +22,12 @@ class APIBackend:
 
     def __init__(self, paths: AppPaths):
         self.paths = paths
+        self._opener: OpenerDirector | None = None
 
     def controller_url(self) -> str:
-        config = read_config(self.paths)
+        return self._controller_url_from_config(read_config(self.paths))
+
+    def _controller_url_from_config(self, config: dict[str, Any]) -> str:
         if config.get("external-controller-unix"):
             raise APIUnavailableError(
                 "错误: 当前不支持 external-controller-unix；"
@@ -44,7 +47,9 @@ class APIBackend:
         return f"{default_scheme}://{addr}"
 
     def api_secret(self) -> str:
-        config = read_config(self.paths)
+        return self._secret_from_config(read_config(self.paths))
+
+    def _secret_from_config(self, config: dict[str, Any]) -> str:
         credential_name = str(config.get("secret-systemd-credential", "") or "").strip()
         if credential_name:
             credentials_dir = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -84,7 +89,9 @@ class APIBackend:
         return str(secret)
 
     def request_timeout(self) -> int:
-        config = read_config(self.paths)
+        return self._timeout_from_config(read_config(self.paths))
+
+    def _timeout_from_config(self, config: dict[str, Any]) -> int:
         value = config.get("api-timeout", self.DEFAULT_TIMEOUT)
         try:
             return int(value)
@@ -92,11 +99,14 @@ class APIBackend:
             return self.DEFAULT_TIMEOUT
 
     def request(self, method: str, path: str, payload: dict | None = None, *, request_timeout: float | None = None) -> Any:
-        url = f"{self.controller_url()}{path}"
+        # 一次 request 里 controller / secret / timeout 以前各自 read_config，
+        # 大 config.yaml 会把 localhost 的 5ms 调用拖成 300ms+。
+        config = read_config(self.paths)
+        url = f"{self._controller_url_from_config(config)}{path}"
         body = None
         headers: dict[str, str] = {}
 
-        secret = self.api_secret()
+        secret = self._secret_from_config(config)
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
 
@@ -106,13 +116,8 @@ class APIBackend:
 
         request = Request(url, data=body, method=method, headers=headers)
         try:
-            context = self._tls_context(url)
-            # Controller traffic must not recurse through the proxy being managed.
-            handlers: list[BaseHandler] = [ProxyHandler({})]
-            if context is not None:
-                handlers.append(HTTPSHandler(context=context))
-            effective_timeout = request_timeout if request_timeout is not None else self.request_timeout()
-            handle = build_opener(*handlers).open(request, timeout=effective_timeout)
+            effective_timeout = request_timeout if request_timeout is not None else self._timeout_from_config(config)
+            handle = self._http_opener(url).open(request, timeout=effective_timeout)
             with handle as response:
                 response_body = response.read().decode("utf-8")
                 if not response_body.strip():
@@ -120,6 +125,19 @@ class APIBackend:
                 return json.loads(response_body)
         except Exception as exc:
             raise APIUnavailableError("错误: Mihomo API 不可访问，请检查 external-controller、secret 或服务状态") from exc
+
+    def _http_opener(self, url: str) -> OpenerDirector:
+        """同一进程内复用 opener，避免每发一个 DELETE 就新建 TCP。
+
+        Controller 流量不能再套一层正在管理的代理，所以固定 `ProxyHandler({})`。
+        """
+        if self._opener is None:
+            handlers: list[BaseHandler] = [ProxyHandler({})]
+            context = self._tls_context(url)
+            if context is not None:
+                handlers.append(HTTPSHandler(context=context))
+            self._opener = build_opener(*handlers)
+        return self._opener
 
     def _tls_context(self, url: str) -> ssl.SSLContext | None:
         parsed = urlparse(url)
@@ -182,8 +200,79 @@ class APIBackend:
     def patch_config(self, patch: dict[str, Any]) -> dict[str, Any]:
         return self.request("PATCH", "/configs", patch)
 
+    def selector_now(self) -> dict[str, str]:
+        """当前 Selector 组的选中项，供热重载后原样写回。"""
+        snapshot: dict[str, str] = {}
+        for name, group in self.get_groups().items():
+            if str(group.type).lower() not in {"select", "selector"}:
+                continue
+            current = str(group.current or "").strip()
+            if current and current != "-":
+                snapshot[name] = current
+        return snapshot
+
+    def restore_selectors(self, snapshot: dict[str, str]) -> dict[str, str]:
+        """把仍存在于候选列表里的选中项写回。节点已从订阅消失的项跳过。"""
+        restored: dict[str, str] = {}
+        if not snapshot:
+            return restored
+        groups = self.get_groups()
+        for name, wanted in snapshot.items():
+            group = groups.get(name)
+            if group is None or str(group.type).lower() not in {"select", "selector"}:
+                continue
+            if wanted not in group.candidates:
+                continue
+            if group.current == wanted:
+                continue
+            self.switch_group(name, wanted)
+            restored[name] = wanted
+        if restored:
+            self._drop_connections_using_groups(set(restored))
+        return restored
+
+    def _drop_connections_using_groups(self, group_names: set[str]) -> int:
+        if not group_names:
+            return 0
+        try:
+            payload = self.get_connections()
+        except APIUnavailableError:
+            return 0
+        connections = payload.get("connections") if isinstance(payload, dict) else []
+        if not isinstance(connections, list):
+            return 0
+        dropped = 0
+        for item in connections:
+            if not isinstance(item, dict):
+                continue
+            chains = item.get("chains") or []
+            if not any(str(part) in group_names for part in chains):
+                continue
+            conn_id = str(item.get("id") or "")
+            if not conn_id:
+                continue
+            try:
+                self.close_connection(conn_id)
+            except APIUnavailableError:
+                continue
+            dropped += 1
+        return dropped
+
     def reload_config(self, path: str) -> dict[str, Any]:
-        return self.request("PUT", "/configs?force=true", {"path": path})
+        # PUT /configs?force=true 会把所有 selector 重置成 YAML 第一项。
+        # Gemini/Antigravity 对出口 IP 粘滞，重载后若从美国跳回日本会立刻 400。
+        snapshot: dict[str, str] = {}
+        try:
+            snapshot = self.selector_now()
+        except APIUnavailableError:
+            snapshot = {}
+        result = self.request("PUT", "/configs?force=true", {"path": path})
+        if snapshot:
+            try:
+                self.restore_selectors(snapshot)
+            except APIUnavailableError:
+                pass
+        return result
 
     def switch_group(self, group_name: str, target_name: str) -> None:
         self.request("PUT", f"/proxies/{quote(group_name, safe='')}", {"name": target_name})

@@ -1,6 +1,6 @@
 # 项目状态
 
-更新日期：2026-09-11
+更新日期：2026-09-20
 
 ## 当前阶段
 
@@ -16,6 +16,8 @@
 
 ## 最近里程碑
 
+- 2026-09-20 体验与可恢复性收口：TUI 全面中文化并适配 80 列布局，耗时 API 操作移出 UI 主线程；配置编辑增加 YAML 校验、快照、原子写入与危险操作二次确认，代理环境页明确父 shell 边界并支持带备份的 rc 写入/移除；订阅页脱离 legacy 导入器，原生支持主订阅、附加订阅与挂载目标。CLI 新增 `doctor`、统一 `--json` 信封和可直接传订阅的 bootstrap；安装默认带 TUI 且 clean-host root 路径先补齐依赖，默认不再生成 legacy 日志轮转配置
+- 2026-09-20 `cproxy switch`：修画面残留与返回上一级；并去掉切组卡顿（config.yaml 重复 YAML 解析 + 多次 `/proxies`），选组/切节点应接近即时
 - 2026-09-15 CLI 入口与错误路径重做：`cproxy` 无参数运行不再静默退出（此前 exit 0 且零输出），改为按功能分组的命令清单；顶层 `--help` 从 49 行平铺收敛为分组清单，`usage:` 行不再把 34 个命令名罗列两遍；命令摘要与参数描述统一为中文（此前摘要全英文、`probe-stable-node` 的 8 个参数无任何描述）；拼错命令给「您是不是想输入 X」建议（此前把全部命令名列一遍）；argparse 报错中文化、stderr 错误统一着色（整条包裹以免 ANSI 复位码插进按子串断言的文案）；`--raw` 的 15 处重复定义收敛为单一入口。新增 **shell 补全**（`cproxy completion bash|zsh [--install]`，候选来自隐藏命令 `__complete`，分组/节点名动态拉取且短超时兜底防卡 `<Tab>`）与 **`switch` 无参数时的交互式选择**（纯标准库，不依赖可选依赖 textual；非 TTY 降级为列候选 + 退 2）。新增 61 个测试
 - 2026-09-11 `cproxy status` 面板产品化与退役 parity 补齐：`◆`/`▸` 区块（与 proxy.sh 视觉统一）、键值列东亚宽度对齐、长路径压缩；新增「按进程」流量归因（`--top`/`--no-process`），按链路拆分为 `代理↓/代理↑/直连↓/直连↑` 四列；补齐 `连接数/运行时间/内存/日志/配置时效` 五项 proxy.sh 面板指标（新增 `backend/runtime_metrics.py`，纯 `/proc` 只读）。功能对账表「启动/停止/重启/状态」行的"已有等价"结论此前与实际不符，已补齐并附核对依据。安装沿用系统级非 editable 路径（`pip install --force-reinstall --no-deps .`），**未**走 `install.sh` 的 `--user` 分支以免产生 ~/.local 跨副本遮蔽
 - 2026-09-11 code review 修复（cproxy）：`--raw` 的 `TRAFFIC_AUDIT_PROCESS` 字段 `down`/`up` 改名 `total_down`/`total_up`（口径已改全量，复用旧名会让脚本静默算错）；直连判据改为「链路末端动作是 DIRECT」（原子串匹配受 LIKE 大小写不敏感影响，且会误判名字含 direct 的代理节点）；`实际配置` 行原为恒不触发的死代码，改为 `配置时效` + 内容指纹；`/proc` 读取加 `errors="replace"` 防 `UnicodeDecodeError` 穿透；`_traffic_bar` 零值行补定宽占位；`_shorten_path` 末段超宽补最终 clamp
@@ -33,7 +35,7 @@
 
 1. 观察期（至 2026-10-09）内确认 cproxy 链路无 P0/P1 事故
 2. ~~复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令~~ 已于 2026-09-15 复跑：静态审计 0 failure、TUI 回归 39 passed、后端与运行时 22 passed、运维示例与安装 dry-run 6/6、GA 产物 build+verify 通过、本地 smoke 通过。**唯一未过项**是 `security-check --strict`（本机未配 `external-controller-tls`，返回 1）——acceptance.md 已将这类失败归类为「环境未达 GA 配置，不表示仓库测试失败」
-3. 观察期满后执行阶段 3：legacy 入口打 deprecation 警告 → 停装 `/usr/local/bin/clash-proxy*` → 删除 legacy 文件。**前两步不依赖观察期**，随时可做：legacy 侧现已无任何运行组件，剩余风险仅为「`clash-proxy` / `cproxy-update` 仍在 PATH，可能被误用」（其中 `cproxy-update` 名字形似 cproxy 子命令，误用风险更高）
+3. 观察期满后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper。弃用警告和默认停装已经完成；当前剩余风险是旧 wrapper 仍可被手工调用
 
 ## 发布
 
@@ -62,7 +64,7 @@
 改动直接影响生产 `cproxy` 命令。约定如下：
 
 - 生产安装一律使用干净的工作区 + `CPROXY_EDITABLE=0 ./scripts/install.sh`（非 editable）
-- **root 下安装只落系统级副本**：`install.sh` 检测到 uid 0 即走 `pip install --force-reinstall --no-deps` 装到 `/usr/local`，不再用 pipx / `--user`。原因是 `cproxy.service` 硬编码 `/usr/local/bin/cproxy`，而 PATH 里 `~/.local/bin` 排在它前面——两份副本会让交互命令与 systemd 服务跑不同版本的代码。若日后又出现 `/root/.local/bin/cproxy`，说明有绕开 `install.sh` 的 `pip install --user`，应删除该副本以恢复单副本状态
+- **root 下安装只落系统级副本**：`install.sh` 检测到 uid 0 后先补齐声明依赖，再用 `pip install --force-reinstall --no-deps` 把项目本体装到 `/usr/local`，不使用 pipx / `--user`。原因是 `cproxy.service` 硬编码 `/usr/local/bin/cproxy`，而 PATH 里 `~/.local/bin` 排在它前面——两份副本会让交互命令与 systemd 服务跑不同版本的代码
 - 日常开发实验在另一个 clone 或 `git worktree` 里进行，不在生产目录直接改
 - 生产目录只通过 `git pull`（或 checkout 固定 tag）+ 重新安装来变更
 - 运行中 mihomo 由 cproxy 启动，`-d` 是 `~/.local/share/cproxy`，不再依赖仓库根目录（历史上 legacy mihomo 曾以 `/root/clash_proxy` 为 `-d`，该链路已停用）

@@ -29,7 +29,7 @@
 正式入口优先用 `pipx`：
 
 ```bash
-pipx install /path/to/clash_proxy
+pipx install '/path/to/clash_proxy[tui]'
 ```
 
 仓库内也提供了本地安装脚本：
@@ -42,15 +42,18 @@ pipx install /path/to/clash_proxy
 
 安装脚本会：
 
-- **root 下一律装到系统级 `/usr/local`**（`pip install --force-reinstall --no-deps`），
+- **root 下一律装到系统级 `/usr/local`**（先补齐声明的运行依赖，再以
+  `pip install --force-reinstall --no-deps` 替换项目本体），
   刻意不用 `--user`：`systemd-user/cproxy.service` 硬编码 `/usr/local/bin/cproxy`，
   而 PATH 里 `~/.local/bin` 排在它前面——同时存在两份副本时，交互命令与 systemd
   服务会跑不同版本的代码
+- 默认安装 `Textual` TUI；只需要 CLI 时可设 `CPROXY_INSTALL_TUI=0`
 - 非 root 时优先 `pipx install --force --editable`，回退
   `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
 - 安装 GeoIP 数据到默认路径：优先复用已有用户级文件和仓库根目录遗留的 `Country.mmdb`（该文件已不入库），缺失时尝试从 meta-rules-dat 下载，仍失败则打印手动放置警告
-- 刷新 root 级 `clash-proxy` / `clash-proxy-update` 系统命令；这两者是 **legacy 入口**（已停用待退役），不需要可设 `CPROXY_INSTALL_SYSTEM_COMMANDS=0` 跳过。脚本不会默认覆盖 `cproxy` alias
+- 默认不安装或刷新任何 legacy wrapper；仅在明确回滚时设置
+  `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`。脚本不会覆盖 pip 安装的 `cproxy` 真入口
 
 安装脚本**不会中断正在运行的代理**：
 
@@ -135,6 +138,12 @@ cproxy migrate-from-legacy /root/clash_proxy
 cproxy bootstrap
 ```
 
+没有旧配置时，也可直接从订阅完成初始化：
+
+```bash
+cproxy bootstrap --subscription-url 'https://example.invalid/subscription'
+```
+
 ## 用户级目录
 
 默认使用 XDG 用户目录：
@@ -158,6 +167,8 @@ cproxy logs
 cproxy logs --lines 200
 cproxy status
 cproxy status --raw
+cproxy status --json
+cproxy doctor
 cproxy security-check
 cproxy support-bundle --output /tmp/cproxy-support.tar.gz
 ```
@@ -191,6 +202,8 @@ cproxy proxy-shell -- -c 'env | rg "PROXY"'
 
 ```bash
 cproxy test
+cproxy test --json
+cproxy doctor --json
 ```
 
 交互界面：
@@ -203,7 +216,7 @@ cproxy completion bash --install
 
 分组名与 `cproxy --help` 保持一致；完整命令清单见 `cproxy` 或 `cproxy --help`，shell 补全见 [USAGE.md](USAGE.md#shell-补全)。
 
-TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy 和 Logs；其中 Providers 可手动更新 `/providers/proxies`，Connections 可查看 `/connections` 并断开选中连接，断开全部连接需要二次确认。
+TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖概览、节点、Provider、连接、AI 路由、订阅、配置、代理环境和日志；耗时 API 操作在后台执行，连接全部断开、配置重启、丢弃未保存配置和 shell rc 写入/移除均需要二次确认。代理环境页只生成供父 shell 执行的 `export` / `unset`，不会伪装成已经修改当前终端。
 
 ## 输出策略
 
@@ -230,6 +243,8 @@ TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前
   是因为低占比进程（如 0.1%）在百分比下几乎看不出量，拆成字节后
   `0 B` 与 `324 MB` 的对比一目了然
 - `--raw` 仍保持脚本友好，不引入这些人类阅读区块
+- 自动化优先使用 `--json`；顶层包含 `schema_version`、`ok`、`warnings`、
+  `recommended_actions` 与 `data`。`--raw` 和 `--json` 互斥
 - 颜色默认开启；可用 `FORCE_COLOR=1` 或 `CPROXY_COLOR=always` 显式强制开启
 - 可用 `NO_COLOR=1` 或 `CPROXY_COLOR=never` 禁用颜色
 - `cproxy` 默认启用状态 icon；可用 `CPROXY_ICONS=0` 或 `output-icons: false` 关闭
@@ -298,10 +313,11 @@ ai-probe-timeout: 8
 - `oaiusercontent.com`
 - `anthropic.com`
 - `claude.ai`
-- `gemini.google.com`
-- `aistudio.google.com`
-- `ai.google.dev`
-- `generativelanguage.googleapis.com`
+- `google.com` / `googleapis.com` / `googleusercontent.com` / `gstatic.com` / `google.dev` / `appspot.com`（含 Gemini、AI Studio）
+- `PROCESS-NAME,agy`：Antigravity CLI 全部出站走同一 AI 出口（含 github / playwright CDN 等域名规则盖不到的请求）
+- `antigravity` 关键字（`antigravity.google`、`antigravity-unleash.goog` 等）
+
+切换 `AI-MANUAL` / `AI-AUTO` / `AI-US` / `AI-SG` 时会立刻断开这些组上的旧连接（以及残留的 `agy` 连接），避免同一会话混用新旧出口 IP。Google Cloud Code 按请求 IP 做地区校验，换节点后需要新开 `agy` 对话。
 
 并且会在 `MATCH` 前补一条：
 

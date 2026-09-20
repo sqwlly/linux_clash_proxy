@@ -198,14 +198,16 @@ def parse_subscription_payload(raw: bytes) -> dict:
             data = loaded
     except yaml.YAMLError:
         data = None
-    if isinstance(data, dict) and data.get("proxies"):
-        return data
+    if isinstance(data, dict) and "proxies" in data:
+        if data.get("proxies"):
+            return data
+        raise ValueError("错误: 订阅配置的 proxies 为空")
 
     compact = "".join(text.split())
     try:
         decoded = base64.b64decode(compact + "=" * (-len(compact) % 4)).decode("utf-8", errors="replace")
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("错误: 订阅内容既不是 Clash YAML 也不是 base64 节点列表") from exc
+        raise ValueError("错误: 订阅内容不是有效的 Clash YAML 或 base64 节点列表") from exc
     proxies: list = []
     for line in decoded.splitlines():
         line = line.strip()
@@ -222,5 +224,5 @@ def parse_subscription_payload(raw: bytes) -> dict:
         proxy["name"] = name
         proxies.append(proxy)
     if not proxies:
-        raise ValueError("错误: 订阅 base64 解码后未找到可用节点")
+        raise ValueError("错误: 订阅内容不是有效的 Clash YAML，且 base64 解码后未找到可用节点")
     return {"proxies": proxies}
