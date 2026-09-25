@@ -13,10 +13,13 @@ sys.path.insert(0, str(SRC_DIR))
 from cproxy.backend.api import APIUnavailableError
 from cproxy.backend.models import ProxyGroup
 from cproxy.config import default_paths
+from cproxy.output import _probe_table_lines
 from cproxy.services.probe import (
     STRATEGIES,
+    ProbeReport,
     ProbeService,
     ProbeSummary,
+    StabilityVerdict,
     _preview_reason,
     active_candidates_after_round,
     collect_leaf_candidates,
@@ -24,6 +27,7 @@ from cproxy.services.probe import (
     stability_verdict,
     switch_skip_reason,
 )
+from cproxy.textwidth import display_width
 
 
 def _g(name, gtype, now, candidates):
@@ -307,3 +311,29 @@ def test_cli_human_preview(tmp_path, monkeypatch, capsys):
     assert run2(["probe-stable-node", "G"] + ARGS3) == 0
     out2 = capsys.readouterr().out
     assert "会切换到" in out2 and "不会切换 ()" not in out2
+
+def test_probe_table_lines_are_display_width_aligned():
+    strategy = STRATEGIES["conservative"]
+    summaries = (
+        ProbeSummary("🇸🇬新加坡 02 IEPL + UDP 3.1X CM", (301, 319, 269, 305, 311), 0),
+        ProbeSummary("🇯🇵日本 01 IEPL + UDP 1.7X CM", (574, 1011, 304), 0),
+        ProbeSummary("🇺🇸美国 01 1X", (856, 994), 0),
+        ProbeSummary("🇺🇸美国 01 1X CMI 01", (), 1),
+    )
+    report = ProbeReport(
+        group="G", profile="codex", strategy_name="conservative", strategy=strategy,
+        rounds=5, url="http://probe.local", current=None,
+        current_verdict=StabilityVerdict(False, "没有成功节点"), best=summaries[0],
+        verdict=StabilityVerdict(True, "满足稳定门槛"), summaries=summaries,
+        switch_requested=False, switched=False, skip_reason="", preview_reason="",
+    )
+
+    lines = _probe_table_lines(report)
+    assert lines == [
+        "节点                            成功  失败   平均    最大   最小  score",
+        "🇸🇬新加坡 02 IEPL + UDP 3.1X CM   5/5     0  301ms   319ms  269ms     94",
+        "🇯🇵日本 01 IEPL + UDP 1.7X CM     3/5     0  630ms  1011ms  304ms     39",
+        "🇺🇸美国 01 1X                     2/5     0  925ms   994ms  856ms     21",
+        "🇺🇸美国 01 1X CMI 01              0/5     1      -       -      -      0",
+    ]
+    assert len({display_width(line) for line in lines}) == 1

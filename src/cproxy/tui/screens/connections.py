@@ -4,6 +4,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.coordinate import Coordinate
 from textual.widget import Widget
 from textual.widgets import Button, Label
 
@@ -13,6 +14,38 @@ from ...config import AppPaths
 from ...services.query import QueryService
 from ..widgets import NavigationDataTable as DataTable
 from ..widgets import NavigationInput as Input
+
+_PLACEHOLDER_ROW_KEY = "__placeholder__"
+
+
+def _connection_row_key(connection: ConnectionEntry, index: int) -> str:
+    return connection.id or f"connection-{index}"
+
+
+def _cursor_row_key(table: DataTable) -> str | None:
+    """返回当前光标所在行的 row key（字符串），无有效光标时返回 None。"""
+    if table.row_count == 0 or table.cursor_row is None or table.cursor_row >= table.row_count:
+        return None
+    try:
+        return table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0))[0].value
+    except Exception:
+        return None
+
+
+def _sync_table_rows(table: DataTable, column_keys, desired: list[tuple[str, tuple[str, ...]]]) -> None:
+    """按 row key 增量同步表格：更新变化单元格、增删行，避免 clear+重建造成的闪烁与光标丢失。"""
+    desired_keys = {key for key, _ in desired}
+    for row_key in list(table.rows.keys()):
+        if row_key.value not in desired_keys:
+            table.remove_row(row_key)
+    for key, cells in desired:
+        if key in table.rows:
+            existing = table.get_row(key)
+            for column_key, old, new in zip(column_keys, existing, cells):
+                if old != new:
+                    table.update_cell(key, column_key, new)
+        else:
+            table.add_row(*cells, key=key)
 
 
 class ConnectionsScreen(Widget):
@@ -51,7 +84,7 @@ class ConnectionsScreen(Widget):
 
     def on_mount(self) -> None:
         table = self.query_one("#connections-table", DataTable)
-        table.add_columns("主机", "规则", "代理链路", "进程", "上传", "下载")
+        self._table_columns = table.add_columns("主机", "规则", "代理链路", "进程", "上传", "下载")
         table.cursor_type = "row"
         table.show_header = True
         if not list(self.app.query("#main-tabs")):
@@ -73,41 +106,61 @@ class ConnectionsScreen(Widget):
 
     def _apply_connections(self, connections: list[ConnectionEntry], error: Exception | None) -> None:
         status = self.query_one("#connections-status", Label)
-        table = self.query_one("#connections-table", DataTable)
-        previous_connection = self._selected_connection_key()
-        table.clear()
         if error is not None:
             self._connections = []
             self._visible_connections = []
             if isinstance(error, APIUnavailableError):
                 status.update("[#fb7185]○ API 不可访问[/]")
-                table.add_row("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "─", "─", "─")
+                placeholder = ("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "─", "─", "─")
             else:
                 status.update(f"[#fb7185]错误: {error}[/]")
-                table.add_row(f"错误: {error}", "─", "─", "─", "─", "─")
+                placeholder = (f"错误: {error}", "─", "─", "─", "─", "─")
+            table = self.query_one("#connections-table", DataTable)
+            _sync_table_rows(table, self._table_columns, [(_PLACEHOLDER_ROW_KEY, placeholder)])
             self._update_connection_detail(None)
             return
 
         self._connections = connections
+        self._render_visible_connection_rows()
+
+    def _render_visible_connection_rows(self) -> None:
+        table = self.query_one("#connections-table", DataTable)
+        previous_key = _cursor_row_key(table)
         self._visible_connections = self._filtered_connections()
         self._update_connection_status()
 
         if not self._visible_connections:
-            table.add_row(f"[#8b98aa]{self._empty_state_text()}[/]", "─", "─", "─", "─", "─")
+            placeholder = (f"[#8b98aa]{self._empty_state_text()}[/]", "─", "─", "─", "─", "─")
+            _sync_table_rows(table, self._table_columns, [(_PLACEHOLDER_ROW_KEY, placeholder)])
             self._update_connection_detail(None)
             return
 
-        for connection in self._visible_connections:
-            table.add_row(
-                self._compact_text(connection.host, 40),
-                connection.rule,
-                self._compact_text(" -> ".join(connection.proxy_chain) or "─", 34),
-                self._compact_text(connection.process, 24),
-                self._format_bytes(connection.upload),
-                self._format_bytes(connection.download),
-                key=connection.id or f"connection-{len(table.rows)}",
+        desired: list[tuple[str, tuple[str, ...]]] = []
+        by_key: dict[str, ConnectionEntry] = {}
+        for index, connection in enumerate(self._visible_connections):
+            key = _connection_row_key(connection, index)
+            by_key[key] = connection
+            desired.append(
+                (
+                    key,
+                    (
+                        self._compact_text(connection.host, 40),
+                        connection.rule,
+                        self._compact_text(" -> ".join(connection.proxy_chain) or "─", 34),
+                        self._compact_text(connection.process, 24),
+                        self._format_bytes(connection.upload),
+                        self._format_bytes(connection.download),
+                    ),
+                )
             )
-        self._move_connection_cursor(previous_connection)
+        _sync_table_rows(table, self._table_columns, desired)
+
+        # 表格保持插入序（增量同步只追加新行），_visible_connections 按表格行序对齐，
+        # 保证 cursor_row 索引映射不变
+        self._visible_connections = [
+            connection for row_key in table.rows if (connection := by_key.get(row_key.value)) is not None
+        ]
+        self._restore_connection_cursor(previous_key)
         self._update_connection_detail(self._selected_connection())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -122,7 +175,7 @@ class ConnectionsScreen(Widget):
         if event.input.id != "connections-filter":
             return
         self._filter_text = event.value.strip().lower()
-        self._render_connection_rows()
+        self._render_visible_connection_rows()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id == "connections-table":
@@ -181,19 +234,18 @@ class ConnectionsScreen(Widget):
             return None
         return self._visible_connections[table.cursor_row]
 
-    def _selected_connection_key(self) -> str | None:
-        connection = self._selected_connection()
-        if connection is None:
-            return None
-        return connection.id or connection.host
-
-    def _move_connection_cursor(self, connection_key: str | None) -> None:
-        if not connection_key:
+    def _restore_connection_cursor(self, row_key: str | None) -> None:
+        table = self.query_one("#connections-table", DataTable)
+        if table.row_count == 0:
             return
-        for row_index, connection in enumerate(self._visible_connections):
-            if connection.id == connection_key or connection.host == connection_key:
-                self.query_one("#connections-table", DataTable).move_cursor(row=row_index, animate=False)
+        if row_key:
+            try:
+                table.move_cursor(row=table.get_row_index(row_key), animate=False)
                 return
+            except Exception:
+                pass
+        if table.cursor_row is None or table.cursor_row >= table.row_count:
+            table.move_cursor(row=table.row_count - 1, animate=False)
 
     def _filtered_connections(self) -> list[ConnectionEntry]:
         if not self._filter_text:
@@ -214,27 +266,7 @@ class ConnectionsScreen(Widget):
         ]
 
     def _render_connection_rows(self) -> None:
-        previous_connection = self._selected_connection_key()
-        table = self.query_one("#connections-table", DataTable)
-        table.clear()
-        self._visible_connections = self._filtered_connections()
-        self._update_connection_status()
-        if not self._visible_connections:
-            table.add_row("[#8b98aa]没有匹配的连接[/]", "─", "─", "─", "─", "─")
-            self._update_connection_detail(None)
-            return
-        for connection in self._visible_connections:
-            table.add_row(
-                self._compact_text(connection.host, 40),
-                connection.rule,
-                self._compact_text(" -> ".join(connection.proxy_chain) or "─", 34),
-                self._compact_text(connection.process, 24),
-                self._format_bytes(connection.upload),
-                self._format_bytes(connection.download),
-                key=connection.id or f"connection-{len(table.rows)}",
-            )
-        self._move_connection_cursor(previous_connection)
-        self._update_connection_detail(self._selected_connection())
+        self._render_visible_connection_rows()
 
     def _update_connection_detail(self, connection: ConnectionEntry | None) -> None:
         detail = self.query_one("#connection-detail", Label)

@@ -13,9 +13,9 @@ SRC_DIR = ROOT_DIR / "src"
 
 sys.path.insert(0, str(SRC_DIR))
 
-from cproxy.config import default_paths
-from cproxy.services import diagnostics as diagnostics_module
-from cproxy.services.diagnostics import DiagnosticsService
+from cproxy.config import default_paths  # noqa: E402
+from cproxy.services import diagnostics as diagnostics_module  # noqa: E402
+from cproxy.services.diagnostics import DiagnosticsService  # noqa: E402
 
 
 class _ApiHandler(BaseHTTPRequestHandler):
@@ -422,3 +422,63 @@ def test_ai_probe_waits_between_retries(tmp_path: Path, monkeypatch):
     assert report.results[0].ok is True
     assert attempts["http://probe.local/chatgpt"] == 3
     assert sleeps == [0.2, 0.5]
+
+
+def test_test_group_reports_progress_per_node(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+
+    class _FakeAPI:
+        def get_groups(self):
+            return {"G1": SimpleNamespace(candidates=["n1", "n2", "n3"])}
+
+        def delay_test(self, name, url, timeout):
+            if name == "n2":
+                raise RuntimeError("boom")
+            return {"delay": 120}
+
+    service = DiagnosticsService(default_paths(tmp_path))
+    monkeypatch.setattr(service, "api", _FakeAPI())
+
+    events = []
+    report = service.test_group("G1", on_progress=lambda *args: events.append(args))
+
+    assert events == [(1, 3, "n1", 120), (2, 3, "n2", None), (3, 3, "n3", 120)]
+    assert [(item.name, item.ok) for item in report.results] == [("n1", True), ("n2", False), ("n3", True)]
+
+    report_no_callback = service.test_group("G1")
+    assert [(item.name, item.ok) for item in report_no_callback.results] == [("n1", True), ("n2", False), ("n3", True)]
+
+
+def test_run_ai_probe_reports_each_result(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\n",
+        encoding="utf-8",
+    )
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self):
+            return self.status
+
+    class _Opener:
+        def open(self, request, timeout):
+            return _Response()
+
+    monkeypatch.setattr("cproxy.services.diagnostics._proxy_opener", lambda paths: _Opener())
+
+    seen = []
+    report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe(on_result=seen.append)
+
+    assert [item.name for item in seen] == ["ChatGPT Web", "OpenAI API"]
+    assert seen == report.results
+    assert all(item.ok for item in report.results)

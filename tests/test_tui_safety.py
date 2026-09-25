@@ -35,6 +35,16 @@ def _paths(tmp_path) -> AppPaths:
     return AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
 
 
+async def _wait_op_done(screen: ConfigEditorScreen, pilot, timeout: float = 2.0) -> None:
+    """轮询等待 config 后台 worker 完成；wall-clock 猜测在慢机器上会抖动。"""
+    elapsed = 0.0
+    while screen._op_running and elapsed < timeout:
+        await pilot.pause(0.05)
+        elapsed += 0.05
+    await pilot.pause()
+    assert not screen._op_running, "配置 worker 未在超时内完成"
+
+
 def test_config_editor_starts_clean_and_invalid_yaml_does_not_overwrite(tmp_path):
     paths = _paths(tmp_path)
     paths.config_dir.mkdir(parents=True)
@@ -52,6 +62,7 @@ def test_config_editor_starts_clean_and_invalid_yaml_does_not_overwrite(tmp_path
             editor.load_text("mixed-port: [\n")
             await pilot.pause(0.05)
             screen.action_save_config()
+            await _wait_op_done(screen, pilot)
             assert config_path.read_text(encoding="utf-8") == original
             assert "保存失败，原文件未变更" in str(app.query_one("#config-log", Label).render())
 
@@ -73,6 +84,7 @@ def test_config_editor_valid_save_is_atomic_and_snapshotted(tmp_path):
             editor.load_text("mixed-port: 7891\nmode: rule\n")
             await pilot.pause(0.05)
             screen.action_save_config()
+            await _wait_op_done(screen, pilot)
             assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["mixed-port"] == 7891
             assert config_path.stat().st_mode & 0o777 == 0o600
             snapshots = list((paths.state_dir / "snapshots").glob("config-*.yaml"))

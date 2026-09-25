@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-import unicodedata
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -19,6 +18,7 @@ from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
 from .doctor import run_doctor
+from .feedback import Spinner
 from .geodata import check_country_mmdb
 from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config
 from .logs import follow_lines, read_recent_lines
@@ -37,6 +37,9 @@ from .services.switch_tree import SwitchChoice, lookup_choice, resolve_group_que
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
 from .structured_output import emit_json
+from .textwidth import display_width as _display_width
+from .textwidth import pad_left as _pad_left
+from .textwidth import pad_right as _pad_right
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -705,22 +708,25 @@ def _render_subscription_info(entries: list[tuple[str, SubscriptionUsage]]) -> N
 
 def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, json_output: bool = False) -> int:
     paths = default_paths()
-    snapshot = get_status(paths)
-    config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
-    status_text = "运行中" if snapshot.running else "未运行"
-    api_text = "不可访问"
-    ai_mode = "-"
-    ai_summary = "-"
+    # 慢点集中在这段收集（systemctl 探测 + AI 路由 API），延迟 spinner 只在真慢时出现；
+    # 后续的 metrics/流量/订阅信息都是本地读取，且打印开始前 spinner 已退出，不会互擦
+    with Spinner("正在收集状态…", delay=0.4, enabled=not (raw or json_output)):
+        snapshot = get_status(paths)
+        config_state = "已就绪" if snapshot.runtime_ready else "待刷新"
+        status_text = "运行中" if snapshot.running else "未运行"
+        api_text = "不可访问"
+        ai_mode = "-"
+        ai_summary = "-"
 
-    try:
-        route = _resolve_ai_route(QueryService(paths).get_ai_status_groups())
-        api_text = "可访问"
-        ai_mode = str(route["mode_label"])
-        ai_summary = f"{route['active_group']} -> {normalize_name(route['active_node'])}"
-        if isinstance(route["active_delay"], int):
-            ai_summary = f"{ai_summary} ({route['active_delay']}ms)"
-    except APIUnavailableError:
-        pass
+        try:
+            route = _resolve_ai_route(QueryService(paths).get_ai_status_groups())
+            api_text = "可访问"
+            ai_mode = str(route["mode_label"])
+            ai_summary = f"{route['active_group']} -> {normalize_name(route['active_node'])}"
+            if isinstance(route["active_delay"], int):
+                ai_summary = f"{ai_summary} ({route['active_delay']}ms)"
+        except APIUnavailableError:
+            pass
 
     recommended_actions: list[str] = []
     warnings: list[str] = []
@@ -994,12 +1000,16 @@ def _run_bootstrap(subscription_url: str | None = None) -> int:
                     "下一步: cproxy bootstrap --subscription-url '<订阅地址>'\n"
                     f"或编辑 {config_path} 后重新执行 cproxy bootstrap"
                 )
-            config_path = update_source_from_subscription(paths, subscription_url)
+            with Spinner("正在下载订阅…"):
+                config_path = update_source_from_subscription(paths, subscription_url)
             initialized_from_subscription = True
 
-    runtime_path = render_runtime(paths)
-    pid = start_process(paths)
-    snapshot = get_status(paths)
+    with Spinner("正在渲染运行配置…") as bootstrap_spinner:
+        runtime_path = render_runtime(paths)
+        bootstrap_spinner.update("正在启动代理进程…")
+        pid = start_process(paths)
+        bootstrap_spinner.update("正在校验运行状态…")
+        snapshot = get_status(paths)
     if not snapshot.running:
         raise RuntimeError("错误: 代理启动后状态异常，请执行 cproxy logs --lines 100 排查")
 
@@ -1093,7 +1103,8 @@ def _run_rollback(paths, name: str | None) -> int:
     print(f"目标文件: {target}")
     if kind == "runtime":
         if get_status(paths).running:
-            restart_process(paths)
+            with Spinner("正在重启代理以应用回滚…", delay=0.3):
+                restart_process(paths)
             print("代理已重启以应用回滚")
         else:
             print("提示: 代理未运行，配置将在下次启动时生效")
@@ -1193,7 +1204,8 @@ def _render_shadow_history(paths, limit: int, raw: bool) -> int:
 
 
 def _render_ai_connections(paths, raw: bool) -> int:
-    connections = get_ai_connections(paths)
+    with Spinner("正在连接 Mihomo API…", delay=0.4, enabled=not raw):
+        connections = get_ai_connections(paths)
     if raw:
         for conn in connections:
             print(f"AI_CONNECTION\t{conn.host}\tcount={conn.count}\troute={conn.route}")
@@ -1209,7 +1221,8 @@ def _render_ai_connections(paths, raw: bool) -> int:
 
 
 def _render_incident(paths, profile: str) -> int:
-    sections = build_incident(paths, profile)
+    with Spinner("正在收集故障排查信息（含多轮探测）…"):
+        sections = build_incident(paths, profile)
     for section in sections:
         _print_section(section.title)
         for line in section.lines:
@@ -1234,18 +1247,6 @@ _DIMENSION_LABEL_TITLES = {
 
 _TRAFFIC_BAR_WIDTH = 20
 _TRAFFIC_BAR_PARTIALS = "▏▎▍▌▋▊▉"
-
-
-def _display_width(text: str) -> int:
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
-
-
-def _pad_left(text: str, width: int) -> str:
-    return " " * max(0, width - _display_width(text)) + text
-
-
-def _pad_right(text: str, width: int) -> str:
-    return text + " " * max(0, width - _display_width(text))
 
 
 def _traffic_bar(value: int, max_value: int, *, pad: bool = True, color: str = ANSI_GREEN) -> str:
@@ -1702,7 +1703,12 @@ def _render_traffic(
 
 def _render_ipcheck(paths, *, ip: str | None, group: str | None, node: str | None, timeout: int, raw: bool) -> int:
     service = IpCheckService(paths)
-    report = service.check(ip=ip, group=group, node=node, timeout=timeout)
+    warnings: list[str] = []
+    with Spinner("正在检测出口 IP 纯净度…", enabled=not raw):
+        report = service.check(ip=ip, group=group, node=node, timeout=timeout, warn=warnings.append)
+    # 恢复失败等警告延迟到 Spinner 退出后再打，否则会被动画帧整行擦掉
+    for warning in warnings:
+        print(warning, file=sys.stderr)
 
     if raw:
         print(

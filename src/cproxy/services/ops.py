@@ -69,7 +69,7 @@ def guard(
     profile: str = "codex",
     command: list[str] | None = None,
 ) -> int:
-    report = ProbeService(paths).probe(profile=profile, switch=True)
+    report = ProbeService(paths).probe(profile=profile, switch=True, show_progress=True)
     if not report.switched and report.skip_reason and report.skip_reason != "当前已是推荐稳定节点":
         if not report.current_verdict.stable:
             print(f"警告: AI 出口不稳定 ({report.skip_reason})", file=sys.stderr)

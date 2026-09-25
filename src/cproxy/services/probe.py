@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from math import ceil
 
 from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ProxyGroup
 from ..config import AppPaths
+from ..feedback import ProgressLine
+from ..names import normalize_name
 from .probe_history import load_history_penalties, probe_history_file, record_probe_history
 
 DEFAULT_GROUP = "AI-MANUAL"
@@ -292,14 +293,18 @@ class ProbeService:
         results: dict[str, dict] = {n: {"delays": [], "failures": 0} for n in candidates}
         active = set(candidates)
 
+        progress = ProgressLine(enabled=show_progress)
         if show_progress:
-            print(f"探测 | {group} | {len(candidates)} 节点 | {probe_rounds} 轮", file=sys.stderr)
+            progress.commit(f"探测 | {group} | {len(candidates)} 节点 | {probe_rounds} 轮")
 
         for rnd in range(probe_rounds):
             round_candidates = [c for c in candidates if c in active]
             if show_progress:
-                print(f"轮 {rnd + 1}/{probe_rounds} | {len(round_candidates)} 节点...", file=sys.stderr)
-            for name in round_candidates:
+                if progress.live:
+                    progress.update(f"轮 {rnd + 1}/{probe_rounds} | {len(round_candidates)} 节点…")
+                else:
+                    progress.commit(f"轮 {rnd + 1}/{probe_rounds} | {len(round_candidates)} 节点...")
+            for index, name in enumerate(round_candidates, start=1):
                 try:
                     payload = self.api.delay_test(name, probe_url, timeout, request_timeout=req_timeout)
                     delay = int(payload["delay"])
@@ -309,15 +314,21 @@ class ProbeService:
                     results[name]["failures"] += 1
                 else:
                     results[name]["delays"].append(delay)
+                if show_progress:
+                    outcome = f"{delay}ms" if delay is not None else "超时"
+                    progress.update(
+                        f"轮 {rnd + 1}/{probe_rounds} | 节点 {index}/{len(round_candidates)}"
+                        f" · {normalize_name(name)} {outcome}"
+                    )
 
             if rnd < probe_rounds - 1 and len(active) > 1:
                 before = len(active)
                 active = active_candidates_after_round({n: results[n] for n in active}, current, penalties)
                 if show_progress:
-                    print(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}", file=sys.stderr)
+                    progress.commit(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}")
 
         if show_progress:
-            print("完成", file=sys.stderr)
+            progress.commit("完成")
 
         summaries = tuple(
             ProbeSummary(

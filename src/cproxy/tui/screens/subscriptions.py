@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-import threading
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
@@ -162,28 +162,36 @@ class SubscriptionsScreen(Widget):
             output.load_text("填写挂载目标时，也必须填写附加订阅分组名。")
             return
 
-        output.load_text(
-            "\n".join(
-                [
-                    "正在预览订阅…" if dry_run else "正在应用订阅…",
-                    f"URL: {redact_subscription_url(url)}",
-                    "请稍候…",
-                ]
-            )
-        )
+        action = "正在预览订阅…" if dry_run else "正在应用订阅…"
+        self._render_subscription_progress(action, url, "下载并解析订阅…" if dry_run else "下载订阅并合并配置…")
 
         try:
             self._set_subscription_busy(True)
-            threading.Thread(
-                target=self._native_subscription_worker,
-                args=(url, group, attach_to, dry_run),
-                daemon=True,
-            ).start()
+            self._run_subscription_import(url, group, attach_to, dry_run)
         except Exception as e:
             output.load_text(f"错误: {e}")
             self._set_subscription_busy(False)
 
-    def _native_subscription_worker(self, url: str, group: str, attach_to: str, dry_run: bool) -> None:
+    def _render_subscription_progress(self, action: str, url: str, stage: str) -> None:
+        lines = [action]
+        if url:
+            lines.append(f"URL: {redact_subscription_url(url)}")
+        lines.extend(["", f"阶段: {stage}"])
+        self.query_one("#sub-output", TextArea).load_text("\n".join(lines))
+
+    def _set_subscription_stage(self, stage: str) -> None:
+        if not self.is_mounted:
+            return
+        output = self.query_one("#sub-output", TextArea)
+        lines = output.text.rstrip("\n").splitlines()
+        if lines and lines[-1].startswith("阶段: "):
+            lines[-1] = f"阶段: {stage}"
+        else:
+            lines.append(f"阶段: {stage}")
+        output.load_text("\n".join(lines))
+
+    @work(thread=True, exclusive=True, group="subscription-ops")
+    def _run_subscription_import(self, url: str, group: str, attach_to: str, dry_run: bool) -> None:
         try:
             if dry_run:
                 preview = preview_subscription(self.paths, url)
@@ -202,6 +210,13 @@ class SubscriptionsScreen(Widget):
                     report = service.refresh_extra_subscription(group, url, attach_to)
                 else:
                     report = service.refresh(subscription_url=url, groups=[])
+                if report.hot_reloaded:
+                    stage = "热重载完成"
+                elif report.restarted:
+                    stage = "进程重启完成"
+                else:
+                    stage = "配置已写入（等待重启生效）"
+                self._call_from_subscription_thread(self._set_subscription_stage, stage)
                 extra = next((item for item in report.extra_subscriptions if item.name == group), None)
                 if attach_to:
                     target_text = f"\n挂载到: {attach_to}"
@@ -250,18 +265,24 @@ class SubscriptionsScreen(Widget):
             output.load_text(f"配置不存在: {config_path}")
             return
 
-        output.load_text("正在隔离目录中验证配置，不会覆盖当前运行配置…")
+        self._render_subscription_progress("正在隔离目录中验证配置，不会覆盖当前运行配置…", "", "复制配置到隔离目录…")
 
-        self._set_subscription_busy(True)
-        threading.Thread(target=self._validate_config_worker, daemon=True).start()
+        try:
+            self._set_subscription_busy(True)
+            self._run_validate_config()
+        except Exception as e:
+            output.load_text(f"错误: {e}")
+            self._set_subscription_busy(False)
 
-    def _validate_config_worker(self) -> None:
+    @work(thread=True, exclusive=True, group="subscription-ops")
+    def _run_validate_config(self) -> None:
         try:
             with tempfile.TemporaryDirectory(prefix="cproxy-validate-") as temp_dir:
                 root = Path(temp_dir)
                 paths = AppPaths(root / "config", root / "data", root / "state")
                 paths.config_dir.mkdir(parents=True)
                 shutil.copy2(config_file(self.paths), config_file(paths))
+                self._call_from_subscription_thread(self._set_subscription_stage, "渲染隔离运行配置…")
                 runtime_path = RuntimeBackend(paths).render_runtime()
                 output_text = f"验证通过\n隔离运行配置: {runtime_path}\n当前运行配置未修改。"
             self._call_from_subscription_thread(self._finish_validate_config, output_text)

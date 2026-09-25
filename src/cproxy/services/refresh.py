@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -465,11 +466,17 @@ def _subscription_region_groups(sub_name: str, proxies: list) -> list:
     return groups
 
 
-def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
+def apply_extra_subscriptions(
+    paths: AppPaths,
+    on_item: Callable[[str, int, int], None] | None = None,
+) -> list[ExtraSubscriptionResult]:
     """更新 subscriptions 列表中的附加机场订阅：下载并解析（Clash YAML 或
     base64 分享链接 nodelist 均可），节点按 `{订阅名} ` 前缀重命名后并入
     config，并重建该订阅的地区分组。先全部下载成功再落盘，单项下载失败时
-    保留该订阅原有节点与分组，不阻断其它订阅。"""
+    保留该订阅原有节点与分组，不阻断其它订阅。
+
+    on_item 若提供，在每份订阅开始下载前回调 (名称, 序号, 总数)——供 CLI
+    进度反馈，不影响任何返回内容。"""
     config = read_config(paths)
     subs = _extra_subscriptions_from_config(config)
     if not subs:
@@ -477,7 +484,9 @@ def apply_extra_subscriptions(paths: AppPaths) -> list[ExtraSubscriptionResult]:
 
     results: list[ExtraSubscriptionResult] = []
     downloaded: list[tuple[str, list, str]] = []
-    for name, url, attach_to in subs:
+    for index, (name, url, attach_to) in enumerate(subs, start=1):
+        if on_item is not None:
+            on_item(name, index, len(subs))
         try:
             raw, userinfo = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
             record_subscription_info(paths, name, userinfo)
@@ -562,7 +571,18 @@ class RefreshService:
         # 测试可注入假的 API 工厂以隔离热重载行为
         self._api_factory = APIBackend
 
-    def refresh(self, subscription_url: str | None = None, groups: list[str] | None = None) -> RefreshReport:
+    def refresh(
+        self,
+        subscription_url: str | None = None,
+        groups: list[str] | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> RefreshReport:
+        # on_stage 供 CLI/TUI 做阶段化进度反馈（Spinner.update 之类）；纯回调，
+        # 不改变任何流程与返回内容
+        def stage(text: str) -> None:
+            if on_stage is not None:
+                on_stage(text)
+
         config = read_config(self.paths)
         url = (subscription_url or str(config.get("subscription-url") or "")).strip()
         if groups:
@@ -575,10 +595,12 @@ class RefreshService:
         # 避免"代理挂了 → 拉不到订阅 → 无法自愈"的 bootstrap 死锁
         if url and not self.process.is_running() and runtime_file(self.paths).exists():
             try:
+                stage("正在启动本地代理（沿用旧配置）…")
                 self.process.start()
                 # 等待 mihomo 就绪（监听 mixed-port/controller）再拉订阅，
                 # 避免启动竞态导致订阅下载 Connection refused
                 try:
+                    stage("正在等待 Mihomo API 就绪…")
                     self._wait_for_api()
                 except Exception:
                     pass  # 等不到 API 时维持原行为（订阅走直连回退）
@@ -587,10 +609,14 @@ class RefreshService:
         # 附加机场订阅（subscriptions 列表）先于主订阅应用：先落地各机场
         # 分组，主订阅合并时才能把这些分组与其入口引用（如 CyberGuard 组里
         # 挂的 "Mitce"）作为本地附加内容保留；单项失败保留旧节点不阻断
-        report.extra_subscriptions = apply_extra_subscriptions(self.paths)
+        report.extra_subscriptions = apply_extra_subscriptions(
+            self.paths,
+            on_item=lambda name, index, total: stage(f"正在下载附加订阅 {name} ({index}/{total})…"),
+        )
 
         if url:
             try:
+                stage("正在更新主订阅…")
                 update_source_from_subscription(self.paths, url)
                 report.subscription = "已更新"
                 report.subscription_detail = redact_text(url)
@@ -599,6 +625,7 @@ class RefreshService:
                 report.subscription = "失败"
                 report.subscription_detail = redact_text(str(exc))
 
+        stage("正在渲染运行配置…")
         report.runtime_path = RuntimeBackend(self.paths).render_runtime()
 
         report.was_running = self.process.is_running()
@@ -606,17 +633,21 @@ class RefreshService:
             # 优先热重载：mihomo PUT /configs 重新加载配置但不中断既有连接，
             # 避免打断长会话/长任务；API 不可用时回退为进程重启
             try:
+                stage("正在热重载代理配置…")
                 self._api_factory(self.paths).reload_config(str(report.runtime_path))
                 report.hot_reloaded = True
             except Exception:
+                stage("热重载不可用，正在重启代理…")
                 self.process.restart()
                 report.restarted = True
 
         config_applied = report.restarted or report.hot_reloaded
         if target_groups and config_applied:
+            stage("正在等待 Mihomo API 就绪…")
             self._wait_for_api()
-        for name in target_groups:
+        for index, name in enumerate(target_groups, start=1):
             if config_applied:
+                stage(f"正在探测分组 {name} ({index}/{len(target_groups)})…")
                 report.groups.append(self._probe_and_switch(name))
             else:
                 report.groups.append(GroupSwitchResult(group=name, current=None, action="跳过", detail="代理未运行"))

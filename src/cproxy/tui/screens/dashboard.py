@@ -20,6 +20,7 @@ class DashboardScreen(Widget):
         super().__init__(**kwargs)
         self.paths = paths
         self._refresh_timer: Timer | None = None
+        self._timer_paused = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -72,9 +73,24 @@ class DashboardScreen(Widget):
         self.call_later(self.refresh_data)
         self._refresh_timer = self.set_interval(5, self.refresh_data)
 
+    def on_hide(self) -> None:
+        # 切走 tab 后暂停轮询，避免空转
+        if self._refresh_timer is not None:
+            self._refresh_timer.pause()
+            self._timer_paused = True
+
+    def on_show(self) -> None:
+        # 初次挂载也会收到 Show；那时 timer 尚未暂停，交给 on_mount 的 call_later 刷新
+        if self._refresh_timer is None or not self._timer_paused:
+            return
+        self._timer_paused = False
+        self._refresh_timer.resume()
+        self.refresh_data()
+
     def on_unmount(self) -> None:
         if self._refresh_timer:
             self._refresh_timer.stop()
+            self._refresh_timer = None
 
     def refresh_data(self) -> None:
         try:

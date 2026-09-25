@@ -253,6 +253,63 @@ def test_refresh_falls_back_to_restart_when_reload_fails(tmp_path: Path):
     assert report.hot_reloaded is False
 
 
+def test_refresh_reports_stage_progress(tmp_path: Path):
+    """on_stage 回调应按序报告关键阶段，供 CLI/TUI 阶段化进度展示。"""
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import RefreshService
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, RENDERABLE_CONFIG)
+
+    class StubProcess:
+        def is_running(self):
+            return True
+
+        def restart(self):
+            raise AssertionError("热重载可用时不应重启进程")
+
+    class StubAPI:
+        def reload_config(self, path):
+            return {"message": "ok"}
+
+    stages: list[str] = []
+    service = RefreshService(paths)
+    service.process = StubProcess()
+    service._api_factory = lambda _paths: StubAPI()
+    # 订阅站不可达：阶段仍应上报，失败由 report 承载而非异常
+    service.refresh(subscription_url="http://127.0.0.1:1/unreachable", on_stage=stages.append)
+
+    assert stages == ["正在更新主订阅…", "正在渲染运行配置…", "正在热重载代理配置…"]
+
+
+def test_refresh_stage_progress_reports_restart_fallback(tmp_path: Path):
+    """热重载失败时 on_stage 应继续上报回退重启阶段。"""
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import RefreshService
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, RENDERABLE_CONFIG)
+
+    class StubProcess:
+        def is_running(self):
+            return True
+
+        def restart(self):
+            return None
+
+    class StubAPI:
+        def reload_config(self, path):
+            raise RuntimeError("api down")
+
+    stages: list[str] = []
+    service = RefreshService(paths)
+    service.process = StubProcess()
+    service._api_factory = lambda _paths: StubAPI()
+    service.refresh(on_stage=stages.append)
+
+    assert stages == ["正在渲染运行配置…", "正在热重载代理配置…", "热重载不可用，正在重启代理…"]
+
+
 def test_refresh_without_subscription_and_process(tmp_path: Path):
     from cproxy.config import default_paths, runtime_file
     from cproxy.services.refresh import RefreshService

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from .cli_args import CliArgumentParser, CliHelpFormatter
 from .names import normalize_name as normalize_name  # 再导出：既有 import 路径保持可用
 from .services.probe import ProbeReport, format_delay, stable_score
+from .textwidth import display_width, pad_left, pad_right
 
 # `cproxy status` 按进程明细的默认行数。定义在此处是因为它属于 CLI 契约，
 # argparse 默认值与渲染层共用同一来源（渲染层不能反向 import 本模块之外的定义）。
@@ -81,16 +82,30 @@ def build_probe_output(
 
 
 def _probe_table_lines(report: ProbeReport) -> list[str]:
-    header = f"{'节点':<16} {'成功':>4}  {'失败':>4}  {'平均':>6}  {'最大':>6}  {'最小':>6}  {'score':>5}"
-    lines = [header]
-    for summary in sorted(report.summaries, key=lambda item: item.rank_key()):
-        score = stable_score(summary, report.rounds, report.strategy)
-        lines.append(
-            f"{normalize_name(summary.name):<16} {summary.success_count}/{report.rounds:>3}  "
-            f"{summary.failures:>4}  {format_delay(summary.avg_delay):>6}  "
-            f"{format_delay(summary.max_delay):>6}  {format_delay(summary.min_delay):>6}  {score:>5}"
+    headers = ("节点", "成功", "失败", "平均", "最大", "最小", "score")
+    rows = [
+        (
+            normalize_name(summary.name),
+            f"{summary.success_count}/{report.rounds}",
+            str(summary.failures),
+            format_delay(summary.avg_delay),
+            format_delay(summary.max_delay),
+            format_delay(summary.min_delay),
+            str(stable_score(summary, report.rounds, report.strategy)),
         )
-    return lines
+        for summary in sorted(report.summaries, key=lambda item: item.rank_key())
+    ]
+    widths = [
+        max([display_width(headers[index]), *(display_width(row[index]) for row in rows)])
+        for index in range(len(headers))
+    ]
+
+    def render(values: tuple[str, ...]) -> str:
+        cells = [pad_right(values[0], widths[0])]
+        cells.extend(pad_left(value, widths[index]) for index, value in enumerate(values[1:], start=1))
+        return "  ".join(cells)
+
+    return [render(headers), *(render(row) for row in rows)]
 
 
 # 命令清单的**单一数据源**：分组名 → ((命令名, 一句话描述), ...)。

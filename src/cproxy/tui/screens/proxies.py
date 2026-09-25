@@ -12,9 +12,32 @@ from ...backend.models import ProxyGroup
 from ...config import AppPaths, read_config
 from ...process import restart_process
 from ...runtime import render_runtime
+from ...services.diagnostics import DiagnosticsService
 from ...services.query import QueryService
 from ...services.switch_tree import SwitchChoice, build_switch_tree, extra_subscription_names
 from ..widgets import NavigationDataTable as DataTable
+
+_PLACEHOLDER_KEY = "__placeholder__"
+_ERROR_KEY = "__error__"
+
+
+def _sync_table_rows(table: DataTable, rows: dict[str, tuple[str, ...]]) -> None:
+    """按 row key 增量同步表格内容：更新变化单元格、补充新行、移除消失行。
+
+    相比 clear() 后整表重建，光标位置、滚动偏移与选择状态都得以保留。
+    """
+    existing = {str(row_key.value): row_key for row_key in table.rows}
+    for key in list(existing):
+        if key not in rows:
+            table.remove_row(existing[key])
+    column_keys = [column.key for column in table.ordered_columns]
+    for key, cells in rows.items():
+        if key in table.rows:
+            for column_key, value in zip(column_keys, cells):
+                if table.get_cell(key, column_key) != value:
+                    table.update_cell(key, column_key, value, update_width=True)
+        else:
+            table.add_row(*cells, key=key)
 
 
 class ProxiesScreen(Widget):
@@ -68,13 +91,13 @@ class ProxiesScreen(Widget):
 
     def _init_tables(self) -> None:
         groups_table = self.query_one("#groups-table", DataTable)
-        groups_table.add_columns("用途", "当前")
+        groups_table.add_columns(("用途", "usage"), ("当前", "current"))
         groups_table.cursor_type = "row"
         groups_table.show_header = True
         groups_table.navigation_next_handler = self.action_focus_nodes
 
         nodes_table = self.query_one("#nodes-table", DataTable)
-        nodes_table.add_columns("节点", "延迟")
+        nodes_table.add_columns(("节点", "node"), ("延迟", "delay"))
         nodes_table.cursor_type = "row"
         nodes_table.show_header = True
         nodes_table.navigation_previous_handler = self.action_focus_groups
@@ -112,8 +135,7 @@ class ProxiesScreen(Widget):
         if error is not None or context is None:
             self._api_available = False
             self._update_api_status()
-            groups_table.clear()
-            groups_table.add_row(f"错误: {error}", "─")
+            _sync_table_rows(groups_table, {_ERROR_KEY: (f"错误: {error}", "─")})
             return
 
         self._api_available = context.api_available
@@ -122,18 +144,20 @@ class ProxiesScreen(Widget):
         self._drilled = None
         self._update_api_status()
 
-        groups_table.clear()
+        rows: dict[str, tuple[str, str]] = {}
+        for entry in self._tree_entries:
+            group = context.groups.get(entry.key)
+            current = group.current if group else "─"
+            rows[entry.key] = (entry.display, current or "─")
+        if not rows:
+            rows[_PLACEHOLDER_KEY] = ("[#8b98aa]没有可显示的代理组[/]", "─")
+        _sync_table_rows(groups_table, rows)
+
         if not self._tree_entries:
-            groups_table.add_row("[#8b98aa]没有可显示的代理组[/]", "─")
             self._current_group = None
             self._current_entry = None
             self._update_nodes_table()
             return
-
-        for entry in self._tree_entries:
-            group = context.groups.get(entry.key)
-            current = group.current if group else "─"
-            groups_table.add_row(entry.display, current or "─", key=entry.key)
 
         previous_group_name = self._current_group.name if self._current_group else None
         chosen = next((entry for entry in self._tree_entries if entry.key == previous_group_name), None)
@@ -161,39 +185,42 @@ class ProxiesScreen(Widget):
     def _update_nodes_table(self) -> None:
         nodes_table = self.query_one("#nodes-table", DataTable)
         previous_node = self._current_node_key(nodes_table)
-        nodes_table.clear()
 
         current_label = self.query_one("#current-node", Label)
+        rows: dict[str, tuple[str, str]] = {}
 
         if not self._current_group:
             current_label.update("[#8b98aa]尚未选择分组[/]")
-            nodes_table.add_row("[#8b98aa]选择分组后查看节点[/]", "─")
-            return
-
-        if self._drilled is not None:
-            current_label.update(f"[#a3e635]● {self._drilled.display}[/]")
+            rows[_PLACEHOLDER_KEY] = ("[#8b98aa]选择分组后查看节点[/]", "─")
         else:
-            current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
+            if self._drilled is not None:
+                current_label.update(f"[#a3e635]● {self._drilled.display}[/]")
+            else:
+                current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
+            choices = self._visible_choices()
+            if not choices:
+                for node in self._current_group.candidates:
+                    is_current = node == self._current_group.current
+                    delay = "─"
+                    if is_current and self._current_group.delay:
+                        delay = f"{self._current_group.delay}ms"
+                    prefix = "[#a3e635]●[/] " if is_current else "  "
+                    rows[node] = (f"{prefix}{node}", delay)
+            else:
+                for choice in choices:
+                    prefix = "[#a3e635]●[/] " if choice.current else "  "
+                    rows[choice.key] = (f"{prefix}{choice.display}", choice.annotation or "─")
+
+        _sync_table_rows(nodes_table, rows)
+
+        if not self._current_group:
+            return
 
         choices = self._visible_choices()
-        if not choices:
-            for node in self._current_group.candidates:
-                is_current = node == self._current_group.current
-                delay = "─"
-                if is_current and self._current_group.delay:
-                    delay = f"{self._current_group.delay}ms"
-                prefix = "[#a3e635]●[/] " if is_current else "  "
-                nodes_table.add_row(f"{prefix}{node}", delay, key=node)
-            preferred_node = previous_node or self._current_group.current
-            self._move_nodes_cursor(preferred_node)
-            return
-
-        for choice in choices:
-            prefix = "[#a3e635]●[/] " if choice.current else "  "
-            delay = choice.annotation or "─"
-            nodes_table.add_row(f"{prefix}{choice.display}", delay, key=choice.key)
-
-        preferred = previous_node or next((choice.key for choice in choices if choice.current), None)
+        if choices:
+            preferred = previous_node or next((choice.key for choice in choices if choice.current), None)
+        else:
+            preferred = previous_node or self._current_group.current
         self._move_nodes_cursor(preferred)
 
     def _set_current_group(self, group_name: str, focus_nodes: bool) -> None:
@@ -216,7 +243,10 @@ class ProxiesScreen(Widget):
         if not node_name:
             return
         choices = self._visible_choices()
-        keys = [choice.key for choice in choices] if choices else list(self._current_group.candidates if self._current_group else [])
+        if choices:
+            keys = [choice.key for choice in choices]
+        else:
+            keys = list(self._current_group.candidates if self._current_group else [])
         try:
             row_index = keys.index(node_name)
         except ValueError:
@@ -394,12 +424,56 @@ class ProxiesScreen(Widget):
 
     @work(thread=True, exclusive=True, group="proxy-action")
     def _test_delay(self, group_name: str, current_name: str | None) -> None:
+        def on_progress(done: int, total: int, node_name: str, delay: int | None) -> None:
+            try:
+                self.app.call_from_thread(self._on_test_progress, group_name, current_name, done, total, node_name, delay)
+            except Exception:
+                # 界面已卸载或应用正在关闭，丢弃进度即可
+                pass
+
         try:
-            from ...diagnostics import test_group
-            report = test_group(self.paths, group_name)
+            report = DiagnosticsService(self.paths).test_group(group_name, on_progress=on_progress)
             self.app.call_from_thread(self._finish_test_delay, group_name, current_name, report, None)
         except Exception as exc:
             self.app.call_from_thread(self._finish_test_delay, group_name, current_name, None, exc)
+
+    def _delay_view_matches(self, group_name: str) -> bool:
+        if self._drilled is not None:
+            return self._drilled.key == group_name
+        return self._current_group is not None and self._current_group.name == group_name
+
+    @staticmethod
+    def _format_delay_cell(delay: int | None) -> str:
+        if not delay:
+            return "[#fb7185]失败[/]"
+        if delay < 200:
+            return f"[#a3e635]{delay}ms[/]"
+        if delay < 500:
+            return f"[#f6c177]{delay}ms[/]"
+        return f"[#fb7185]{delay}ms[/]"
+
+    def _on_test_progress(
+        self,
+        group_name: str,
+        current_name: str | None,
+        done: int,
+        total: int,
+        node_name: str,
+        delay: int | None,
+    ) -> None:
+        result_text = f"{delay}ms" if delay else "失败"
+        self.query_one("#proxy-action-status", Label).update(
+            f"[#f6c177]正在测速 {done}/{total} · {node_name} · {result_text}[/]"
+        )
+        if not self._delay_view_matches(group_name):
+            return
+        nodes_table = self.query_one("#nodes-table", DataTable)
+        delay_cell = self._format_delay_cell(delay)
+        if node_name in nodes_table.rows:
+            nodes_table.update_cell(node_name, "delay", delay_cell, update_width=True)
+        else:
+            prefix = "[#a3e635]●[/] " if node_name == current_name else "  "
+            nodes_table.add_row(f"{prefix}{node_name}", delay_cell, key=node_name)
 
     def _finish_test_delay(self, group_name: str, current_name: str | None, report, error: Exception | None) -> None:
         status = self.query_one("#proxy-action-status", Label)
@@ -409,21 +483,15 @@ class ProxiesScreen(Widget):
             self.notify(message, severity="error")
             return
 
-        nodes_table = self.query_one("#nodes-table", DataTable)
-        nodes_table.clear()
         self.query_one("#current-node", Label).update(f"[#a3e635]● {current_name}[/]")
-        for result in report.results:
-            is_current = result.name == current_name
-            prefix = "[#a3e635]●[/] " if is_current else "  "
-            if result.ok and result.delay:
-                if result.delay < 200:
-                    delay = f"[#a3e635]{result.delay}ms[/]"
-                elif result.delay < 500:
-                    delay = f"[#f6c177]{result.delay}ms[/]"
+        if self._delay_view_matches(group_name):
+            nodes_table = self.query_one("#nodes-table", DataTable)
+            for result in report.results:
+                delay_cell = self._format_delay_cell(result.delay if (result.ok and result.delay) else None)
+                if result.name in nodes_table.rows:
+                    nodes_table.update_cell(result.name, "delay", delay_cell, update_width=True)
                 else:
-                    delay = f"[#fb7185]{result.delay}ms[/]"
-            else:
-                delay = "[#fb7185]失败[/]"
-            nodes_table.add_row(f"{prefix}{result.name}", delay, key=result.name)
+                    prefix = "[#a3e635]●[/] " if result.name == current_name else "  "
+                    nodes_table.add_row(f"{prefix}{result.name}", delay_cell, key=result.name)
         status.update(f"[#a3e635]测速完成: {group_name}[/]")
         self.notify(f"测速完成: {group_name}", severity="information")

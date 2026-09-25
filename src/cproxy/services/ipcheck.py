@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -174,6 +175,7 @@ class IpCheckService:
         group: str | None = None,
         node: str | None = None,
         timeout: int = DEFAULT_TIMEOUT,
+        warn: Callable[[str], None] | None = None,
     ) -> IpPurityReport:
         timeout = max(1, timeout)
         if node and not group:
@@ -206,8 +208,9 @@ class IpCheckService:
                 try:
                     self.api.switch_group(group or "", previous)
                 except Exception as exc:  # noqa: BLE001 - 恢复失败不掩盖检测结果，但必须告知用户
-                    print(
+                    message = (
                         f"警告: 检测后恢复 {group} -> {previous} 失败 ({exc})，请手动执行 "
-                        f"cproxy switch {group} {previous}",
-                        file=sys.stderr,
+                        f"cproxy switch {group} {previous}"
                     )
+                    # 调用方可传入 warn 收集（如 Spinner 场景退出后再打印），默认直接写 stderr
+                    (warn or (lambda line: print(line, file=sys.stderr)))(message)

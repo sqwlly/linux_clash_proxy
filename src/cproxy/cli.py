@@ -33,6 +33,7 @@ from .cli_render import (
 )
 from .config import default_paths
 from .diagnostics import run_connectivity_test, test_group
+from .feedback import Spinner
 from .install import init_user_layout, migrate_from_legacy
 from .interactive import NotATerminalError, select_one
 from .output import build_probe_output, build_root_parser, normalize_name, render_command_overview
@@ -91,24 +92,29 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "rollback":
             return _run_rollback(default_paths(), args.name)
         if args.command == "refresh":
-            report = RefreshService(default_paths()).refresh(
-                subscription_url=args.subscription_url,
-                groups=args.group,
-            )
+            with Spinner("正在刷新订阅并应用配置…", enabled=not (args.raw or args.json)) as spinner:
+                report = RefreshService(default_paths()).refresh(
+                    subscription_url=args.subscription_url,
+                    groups=args.group,
+                    on_stage=spinner.update,
+                )
             return _render_refresh(report, args.raw, args.json)
         if args.command == "start":
-            pid = start_process(default_paths())
+            with Spinner("正在启动代理…", delay=0.3):
+                pid = start_process(default_paths())
             print(f"代理已启动 (PID: {pid})")
             return 0
         if args.command == "stop":
-            stopped = stop_process(default_paths())
+            with Spinner("正在停止代理…", delay=0.3):
+                stopped = stop_process(default_paths())
             if stopped:
                 print("代理已停止")
             else:
                 print("代理未运行")
             return 0
         if args.command == "restart":
-            pid = restart_process(default_paths())
+            with Spinner("正在重启代理…", delay=0.3):
+                pid = restart_process(default_paths())
             print(f"代理已启动 (PID: {pid})")
             return 0
         if args.command == "logs":
@@ -116,7 +122,9 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "status":
             return _render_status(args.raw, 0 if args.no_process else args.top, args.json)
         if args.command == "test":
-            return _render_connectivity_report(run_connectivity_test(default_paths()), args.json)
+            with Spinner("正在测试连通性…", enabled=not args.json):
+                connectivity_report = run_connectivity_test(default_paths())
+            return _render_connectivity_report(connectivity_report, args.json)
         if args.command == "doctor":
             return _render_doctor(args.json)
         if args.command == "security-check":
@@ -127,7 +135,9 @@ def run(argv: list[str] | None = None) -> int:
             print(f"已生成支持包: {bundle_path}")
             return 0
         if args.command == "test-group":
-            return _render_group_check(test_group(default_paths(), args.group), args.raw, args.json)
+            with Spinner(f"正在测试分组 {args.group}…", enabled=not (args.raw or args.json)):
+                group_report = test_group(default_paths(), args.group)
+            return _render_group_check(group_report, args.raw, args.json)
         if args.command == "proxy-env":
             for line in proxy_env_lines(default_paths()):
                 print(line)
@@ -139,17 +149,23 @@ def run(argv: list[str] | None = None) -> int:
             return run_proxy_shell(default_paths(), args.shell_args)
         if args.command in {"current", "list-groups", "list-nodes", "ai-status", "groups", "group"}:
             service = QueryService(default_paths())
+            api_feedback = Spinner("正在连接 Mihomo API…", delay=0.4, enabled=not (args.raw or args.json))
             if args.command == "current":
-                groups_by_name, tree = _switch_tree_for(service)
+                with api_feedback:
+                    groups_by_name, tree = _switch_tree_for(service)
                 group_name = resolve_group_query(args.group, groups_by_name, tree)
                 return _render_current(groups_by_name, group_name, args.raw, args.json)
             if args.command in {"list-groups", "groups", "group"}:
-                groups_by_name, tree = _switch_tree_for(service)
+                with api_feedback:
+                    groups_by_name, tree = _switch_tree_for(service)
                 return _render_list_groups(list(groups_by_name.values()), args.raw, args.json, tree=tree)
             if args.command == "list-nodes":
-                groups_by_name, tree = _switch_tree_for(service)
+                with api_feedback:
+                    groups_by_name, tree = _switch_tree_for(service)
                 return _render_list_nodes(groups_by_name, args.group, args.raw, args.json, tree=tree)
-            return _render_ai_status(service.get_ai_status_groups(), args.raw, args.json)
+            with api_feedback:
+                ai_groups = service.get_ai_status_groups()
+            return _render_ai_status(ai_groups, args.raw, args.json)
         if args.command == "switch":
             service = QueryService(default_paths())
             path = _resolve_switch(service, args)

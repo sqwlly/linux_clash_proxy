@@ -90,6 +90,24 @@ def test_apply_adds_prefixed_nodes_and_region_groups(tmp_path, monkeypatch):
     assert groups["Mitce-HK"]["url"] == "https://cp.cloudflare.com/generate_204"
 
 
+def test_apply_reports_per_item_progress(tmp_path, monkeypatch):
+    """on_item 回调应在每份订阅下载前按 (名称, 序号, 总数) 上报，供 CLI 进度展示。"""
+    paths = make_paths(tmp_path)
+    config = base_config()
+    config["subscriptions"] = [
+        {"name": "Mitce", "url": "https://example.com/mitce"},
+        {"name": "Broken", "url": "https://example.com/broken"},
+    ]
+    write_config(paths, config)
+    patch_download(monkeypatch, {"https://example.com/mitce": nodelist_raw()})
+
+    seen: list[tuple[str, int, int]] = []
+    results = apply_extra_subscriptions(paths, on_item=lambda name, index, total: seen.append((name, index, total)))
+
+    assert seen == [("Mitce", 1, 2), ("Broken", 2, 2)], "失败项也应上报进度"
+    assert [(r.name, r.status) for r in results] == [("Mitce", "已更新"), ("Broken", "失败")]
+
+
 def test_upsert_extra_subscription_attaches_generated_group(tmp_path, monkeypatch):
     paths = make_paths(tmp_path)
     config = base_config()

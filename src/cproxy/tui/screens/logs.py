@@ -5,6 +5,7 @@ import threading
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.document._edit import Edit
 from textual.widget import Widget
 from textual.widgets import Button, Checkbox, Label
 
@@ -66,6 +67,7 @@ class LogsScreen(Widget):
         viewer = self.query_one("#log-viewer", TextArea)
 
         if not log_path.exists():
+            self._log_lines = []
             viewer.load_text(f"日志文件不存在: {log_path}")
             return
 
@@ -83,6 +85,7 @@ class LogsScreen(Widget):
                 viewer.move_cursor((len(lines), 0))
 
         except Exception as e:
+            self._log_lines = []
             viewer.load_text(f"读取日志失败: {e}")
 
     def _start_tail(self) -> None:
@@ -126,11 +129,23 @@ class LogsScreen(Widget):
         new_lines = content.rstrip().splitlines()
         if not new_lines:
             return
-        self._log_lines.extend(new_lines)
-        if len(self._log_lines) > self.FOLLOW_LINE_LIMIT:
-            self._log_lines = self._log_lines[-self.FOLLOW_LINE_LIMIT:]
+        if len(new_lines) > self.FOLLOW_LINE_LIMIT:
+            new_lines = new_lines[-self.FOLLOW_LINE_LIMIT:]
 
-        viewer.load_text("\n".join(self._log_lines))
+        # 文档内容正常时等于 "\n".join(self._log_lines)（无结尾换行）；占位文本
+        # （文件不存在/读取失败）与清空后的空状态靠整体重建回到该不变式
+        overflow = len(self._log_lines) + len(new_lines) - self.FOLLOW_LINE_LIMIT
+        if not self._log_lines or overflow >= len(self._log_lines):
+            self._log_lines = new_lines
+            viewer.load_text("\n".join(self._log_lines))
+        else:
+            if overflow > 0:
+                viewer.edit(Edit("", (0, 0), (overflow, 0), maintain_selection_offset=True))
+                del self._log_lines[:overflow]
+            insert_at = (len(self._log_lines) - 1, len(self._log_lines[-1]))
+            text = "\n" + "\n".join(new_lines)
+            viewer.edit(Edit(text, insert_at, insert_at, maintain_selection_offset=False))
+            self._log_lines.extend(new_lines)
 
         if self._following:
             viewer.move_cursor((len(self._log_lines), 0))

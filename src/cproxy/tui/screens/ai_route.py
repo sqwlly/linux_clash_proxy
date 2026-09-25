@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import threading
-
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -10,6 +8,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Label
 
 from ...api import APIUnavailableError
+from ...backend.models import AIProbeResult
 from ...backend.runtime import (
     AI_AUTO_GROUP,
     AI_MANUAL_GROUP,
@@ -19,7 +18,7 @@ from ...backend.runtime import (
     ai_standby_peer,
 )
 from ...config import AppPaths
-from ...diagnostics import run_ai_probe
+from ...services.diagnostics import DiagnosticsService
 from ...services.query import QueryService
 from ..widgets import NavigationDataTable as DataTable
 
@@ -67,7 +66,7 @@ class AIRouteScreen(Widget):
 
     def on_mount(self) -> None:
         probe_table = self.query_one("#ai-probe-table", DataTable)
-        probe_table.add_columns("目标", "状态", "详情")
+        probe_table.add_columns(("目标", "target"), ("状态", "status"), ("详情", "detail"))
         probe_table.show_header = True
         if not list(self.app.query("#main-tabs")):
             self.call_later(self.refresh_data)
@@ -162,16 +161,22 @@ class AIRouteScreen(Widget):
         if self._probe_running:
             return
         self._probe_running = True
+        self.query_one("#ai-probe-table", DataTable).clear()
         self.query_one("#ai-probe-status", Label).update("[#f6c177]◐ 探测中…[/]")
         self.query_one("#btn-ai-probe", Button).disabled = True
-        threading.Thread(target=self._probe_ai_worker, daemon=True).start()
+        self._probe_ai_worker()
 
+    @work(thread=True, exclusive=True, group="ai-route-probe")
     def _probe_ai_worker(self) -> None:
         try:
-            report = run_ai_probe(self.paths)
-            self._call_from_probe_thread(self._finish_probe_ai, report)
-        except Exception as e:
-            self._call_from_probe_thread(self._fail_probe_ai, e)
+            report = DiagnosticsService(self.paths).run_ai_probe(on_result=self._probe_result_from_worker)
+        except Exception as exc:
+            self._call_from_probe_thread(self._fail_probe_ai, exc)
+            return
+        self._call_from_probe_thread(self._finish_probe_ai, report)
+
+    def _probe_result_from_worker(self, item: AIProbeResult) -> None:
+        self._call_from_probe_thread(self._apply_probe_result, item)
 
     def _call_from_probe_thread(self, callback, *args) -> None:
         try:
@@ -179,16 +184,29 @@ class AIRouteScreen(Widget):
         except Exception:
             self._probe_running = False
 
+    def _apply_probe_result(self, item: AIProbeResult) -> None:
+        if not self.is_mounted:
+            return
+        probe_table = self.query_one("#ai-probe-table", DataTable)
+        status = "[#a3e635]● 正常[/]" if item.ok else "[#fb7185]○ 失败[/]"
+        detail = item.detail or item.url
+        if item.name in probe_table.rows:
+            probe_table.update_cell(item.name, "status", status, update_width=True)
+            probe_table.update_cell(item.name, "detail", detail, update_width=True)
+        else:
+            probe_table.add_row(item.name, status, detail, key=item.name)
+
     def _finish_probe_ai(self, report) -> None:
         if not self.is_mounted:
             self._probe_running = False
             return
         probe_table = self.query_one("#ai-probe-table", DataTable)
-        probe_table.clear()
-
+        expected = {item.name for item in report.results}
+        for row_key in list(probe_table.rows.keys()):
+            if row_key.value not in expected:
+                probe_table.remove_row(row_key)
         for item in report.results:
-            status = "[#a3e635]● 正常[/]" if item.ok else "[#fb7185]○ 失败[/]"
-            probe_table.add_row(item.name, status, item.detail or item.url)
+            self._apply_probe_result(item)
 
         ok_count = sum(1 for item in report.results if item.ok)
         total = len(report.results)

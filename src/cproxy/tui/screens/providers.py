@@ -12,6 +12,7 @@ from ...backend.models import ProviderEntry
 from ...config import AppPaths
 from ...services.query import QueryService
 from ..widgets import NavigationDataTable as DataTable
+from .connections import _PLACEHOLDER_ROW_KEY, _cursor_row_key, _sync_table_rows
 
 
 class ProvidersScreen(Widget):
@@ -42,7 +43,7 @@ class ProvidersScreen(Widget):
 
     def on_mount(self) -> None:
         table = self.query_one("#providers-table", DataTable)
-        table.add_columns("名称", "类型", "载体", "节点数", "更新时间")
+        self._table_columns = table.add_columns("名称", "类型", "载体", "节点数", "更新时间")
         table.cursor_type = "row"
         table.show_header = True
         if not list(self.app.query("#main-tabs")):
@@ -64,35 +65,44 @@ class ProvidersScreen(Widget):
     def _apply_providers(self, providers: list[ProviderEntry], error: Exception | None) -> None:
         status = self.query_one("#providers-status", Label)
         table = self.query_one("#providers-table", DataTable)
-        previous_provider = self._selected_provider_name()
-        table.clear()
+        previous_key = _cursor_row_key(table)
         if error is not None:
             self._providers = []
             if isinstance(error, APIUnavailableError):
                 status.update("[#fb7185]○ API 不可访问[/]")
-                table.add_row("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "0", "─")
+                placeholder = ("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "0", "─")
             else:
                 status.update(f"[#fb7185]错误: {error}[/]")
-                table.add_row(f"错误: {error}", "─", "─", "0", "─")
+                placeholder = (f"错误: {error}", "─", "─", "0", "─")
+            _sync_table_rows(table, self._table_columns, [(_PLACEHOLDER_ROW_KEY, placeholder)])
             return
 
         self._providers = providers
         status.update(f"[#a3e635]● {len(self._providers)} 个提供方[/]")
 
         if not self._providers:
-            table.add_row("[#8b98aa]没有代理提供方[/]", "─", "─", "0", "─")
+            _sync_table_rows(
+                table,
+                self._table_columns,
+                [(_PLACEHOLDER_ROW_KEY, ("[#8b98aa]没有代理提供方[/]", "─", "─", "0", "─"))],
+            )
             return
 
-        for provider in self._providers:
-            table.add_row(
+        desired = [
+            (
                 provider.name,
-                provider.type,
-                provider.vehicle,
-                str(provider.proxy_count),
-                provider.updated_at,
-                key=provider.name,
+                (provider.name, provider.type, provider.vehicle, str(provider.proxy_count), provider.updated_at),
             )
-        self._move_provider_cursor(previous_provider)
+            for provider in self._providers
+        ]
+        _sync_table_rows(table, self._table_columns, desired)
+
+        # 表格保持插入序，_providers 按表格行序对齐，保证 cursor_row 索引映射不变
+        by_key = {provider.name: provider for provider in self._providers}
+        self._providers = [
+            provider for row_key in table.rows if (provider := by_key.get(row_key.value)) is not None
+        ]
+        self._restore_provider_cursor(previous_key)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-update-provider":
@@ -133,14 +143,15 @@ class ProvidersScreen(Widget):
             return None
         return self._providers[table.cursor_row]
 
-    def _selected_provider_name(self) -> str | None:
-        provider = self._selected_provider()
-        return provider.name if provider else None
-
-    def _move_provider_cursor(self, provider_name: str | None) -> None:
-        if not provider_name:
+    def _restore_provider_cursor(self, row_key: str | None) -> None:
+        table = self.query_one("#providers-table", DataTable)
+        if table.row_count == 0:
             return
-        for row_index, provider in enumerate(self._providers):
-            if provider.name == provider_name:
-                self.query_one("#providers-table", DataTable).move_cursor(row=row_index, animate=False)
+        if row_key:
+            try:
+                table.move_cursor(row=table.get_row_index(row_key), animate=False)
                 return
+            except Exception:
+                pass
+        if table.cursor_row is None or table.cursor_row >= table.row_count:
+            table.move_cursor(row=table.row_count - 1, animate=False)

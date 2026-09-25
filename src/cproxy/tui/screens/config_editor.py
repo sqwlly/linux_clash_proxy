@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import yaml
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -29,6 +31,7 @@ class ConfigEditorScreen(Widget):
         self._modified = False
         self._loaded_text = ""
         self._pending_action: str | None = None
+        self._op_running = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -92,53 +95,94 @@ class ConfigEditorScreen(Widget):
         elif event.button.id == "btn-config-reload":
             self.action_reload_config()
 
-    def action_save_config(self) -> None:
-        config_path = config_file(self.paths)
-        editor = self.query_one("#config-editor", TextArea)
-        log_label = self.query_one("#config-log", Label)
+    def _set_op_buttons_disabled(self, disabled: bool) -> None:
+        for button_id in ("btn-config-save", "btn-config-render", "btn-config-restart", "btn-config-reload"):
+            self.query_one(f"#{button_id}", Button).disabled = disabled
 
+    def action_save_config(self) -> None:
+        if self._op_running:
+            return
+        editor_text = self.query_one("#config-editor", TextArea).text
+        self.query_one("#config-log", Label).update("[#f6c177]正在保存…[/]")
+        self._op_running = True
+        self._set_op_buttons_disabled(True)
+        self._save_config(editor_text)
+
+    @work(thread=True, exclusive=True, group="config-ops")
+    def _save_config(self, text: str) -> None:
+        error: Exception | None = None
         try:
-            parsed = yaml.safe_load(editor.text)
+            parsed = yaml.safe_load(text)
             if not isinstance(parsed, dict):
                 raise ValueError("YAML 顶层必须是映射")
+            config_path = config_file(self.paths)
             config_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_file(self.paths, config_path, "config")
             temp_path = config_path.with_name(f".{config_path.name}.tmp-{os.getpid()}")
             try:
-                temp_path.write_text(editor.text, encoding="utf-8")
+                temp_path.write_text(text, encoding="utf-8")
                 os.chmod(temp_path, 0o600)
                 os.replace(temp_path, config_path)
             finally:
                 temp_path.unlink(missing_ok=True)
-            self._loaded_text = editor.text
+        except Exception as exc:
+            error = exc
+        self.app.call_from_thread(self._finish_save_config, text, error)
+
+    def _finish_save_config(self, text: str, error: Exception | None) -> None:
+        self._op_running = False
+        self._set_op_buttons_disabled(False)
+        log_label = self.query_one("#config-log", Label)
+        if error is None:
+            self._loaded_text = text
             self._modified = False
             self._pending_action = None
-
+            config_path = config_file(self.paths)
             self.query_one("#config-modified-label", Label).update("[#a3e635](已保存)[/]")
             log_label.update(f"[#a3e635]已校验并保存: {config_path}[/]")
             self.notify("配置已校验、快照并保存", severity="information")
-
-        except Exception as e:
-            log_label.update(f"[#fb7185]保存失败，原文件未变更: {e}[/]")
-            self.notify(f"保存失败: {e}", severity="error")
+        else:
+            log_label.update(f"[#fb7185]保存失败，原文件未变更: {error}[/]")
+            self.notify(f"保存失败: {error}", severity="error")
 
     def action_render_config(self) -> None:
+        if self._op_running:
+            return
         log_label = self.query_one("#config-log", Label)
 
         if self._modified:
             log_label.update("[#f6c177]请先保存配置，再生成运行配置[/]")
             return
 
+        log_label.update("[#f6c177]正在生成配置…[/]")
+        self._op_running = True
+        self._set_op_buttons_disabled(True)
+        self._render_config()
+
+    @work(thread=True, exclusive=True, group="config-ops")
+    def _render_config(self) -> None:
+        error: Exception | None = None
+        runtime_path: Path | None = None
         try:
             runtime_path = render_runtime(self.paths)
+        except Exception as exc:
+            error = exc
+        self.app.call_from_thread(self._finish_render_config, runtime_path, error)
+
+    def _finish_render_config(self, runtime_path: Path | None, error: Exception | None) -> None:
+        self._op_running = False
+        self._set_op_buttons_disabled(False)
+        log_label = self.query_one("#config-log", Label)
+        if error is None:
             log_label.update(f"[#a3e635]已生成: {runtime_path}[/]")
             self.notify("运行配置已生成", severity="information")
-
-        except Exception as e:
-            log_label.update(f"[#fb7185]生成失败: {e}[/]")
-            self.notify(f"生成失败: {e}", severity="error")
+        else:
+            log_label.update(f"[#fb7185]生成失败: {error}[/]")
+            self.notify(f"生成失败: {error}", severity="error")
 
     def action_restart_config(self) -> None:
+        if self._op_running:
+            return
         log_label = self.query_one("#config-log", Label)
 
         if self._modified:
@@ -149,8 +193,18 @@ class ConfigEditorScreen(Widget):
             log_label.update("[#f6c177]重启会中断现有连接；请再次点击“重启并应用”确认[/]")
             return
 
+        self._pending_action = None
+        log_label.update("[#f6c177]正在生成配置并重启…[/]")
+        self._op_running = True
+        self._set_op_buttons_disabled(True)
+        self._restart_config()
+
+    @work(thread=True, exclusive=True, group="config-ops")
+    def _restart_config(self) -> None:
+        error: Exception | None = None
+        runtime_path: Path | None = None
+        pid: int | None = None
         try:
-            self._pending_action = None
             runtime_path = render_runtime(self.paths)
             pid = restart_process(self.paths)
             write_audit_event(
@@ -160,14 +214,24 @@ class ConfigEditorScreen(Widget):
                 result="ok",
                 detail={"pid": pid},
             )
+        except Exception as exc:
+            error = exc
+        self.app.call_from_thread(self._finish_restart_config, runtime_path, pid, error)
+
+    def _finish_restart_config(self, runtime_path: Path | None, pid: int | None, error: Exception | None) -> None:
+        self._op_running = False
+        self._set_op_buttons_disabled(False)
+        log_label = self.query_one("#config-log", Label)
+        if error is None:
             log_label.update(f"[#a3e635]已生成 {runtime_path}；代理已重启，PID {pid}[/]")
             self.notify("运行配置已生成并重启代理", severity="information")
-
-        except Exception as e:
-            log_label.update(f"[#fb7185]重启失败: {e}[/]")
-            self.notify(f"重启失败: {e}", severity="error")
+        else:
+            log_label.update(f"[#fb7185]重启失败: {error}[/]")
+            self.notify(f"重启失败: {error}", severity="error")
 
     def action_reload_config(self) -> None:
+        if self._op_running:
+            return
         log_label = self.query_one("#config-log", Label)
         if self._modified and self._pending_action != "reload":
             self._pending_action = "reload"

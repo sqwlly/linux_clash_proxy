@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from textual.app import App, ComposeResult
 from textual.widgets import Button, DataTable
 
-from cproxy.backend.models import ProxyGroup
+from cproxy.backend.models import DelayCheckResult, GroupCheckReport, ProxyGroup
 from cproxy.config import AppPaths
 from cproxy.tui.screens import proxies as proxies_module
 from cproxy.tui.screens.proxies import ProxiesScreen
@@ -284,5 +284,105 @@ def test_proxies_screen_left_column_is_usage_entries(monkeypatch, tmp_path):
             assert "🇯🇵 Japan" not in keys
             assert "默认流量" in str(groups_table.get_row_at(0)[0])
             assert "AI 出口" in str(groups_table.get_row_at(1)[0])
+
+    asyncio.run(run_case())
+
+
+def test_proxies_delay_test_streams_progress_and_preserves_cursor(monkeypatch, tmp_path):
+    class FakeQueryService:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def load_context(self, require_api=False):
+            return SimpleNamespace(groups={"AI-MANUAL": _group()}, api_available=True)
+
+    class FakeDiagnostics:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def test_group(self, group_name, *, on_progress=None):
+            on_progress(1, 2, "Node A", 120)
+            on_progress(2, 2, "Node B", None)
+            return GroupCheckReport(
+                group_name=group_name,
+                results=[
+                    DelayCheckResult(name="Node A", ok=True, delay=120),
+                    DelayCheckResult(name="Node B", ok=False, delay=None),
+                ],
+            )
+
+    monkeypatch.setattr(proxies_module, "QueryService", FakeQueryService)
+    monkeypatch.setattr(proxies_module, "DiagnosticsService", FakeDiagnostics)
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+
+    async def run_case():
+        app = _ProxiesApp(paths)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            screen = app.query_one(ProxiesScreen)
+            nodes_table = screen.query_one("#nodes-table", DataTable)
+            nodes_table.move_cursor(row=1, animate=False)
+
+            streamed = []
+            original = screen._on_test_progress
+
+            def spy(group_name, current_name, done, total, node_name, delay):
+                original(group_name, current_name, done, total, node_name, delay)
+                streamed.append((done, str(nodes_table.get_row(node_name)[1])))
+
+            screen._on_test_progress = spy
+            screen.action_test_delay()
+            await pilot.pause(0.3)
+
+            assert streamed == [(1, "[#a3e635]120ms[/]"), (2, "[#fb7185]失败[/]")]
+            assert nodes_table.row_count == 2
+            assert nodes_table.cursor_row == 1
+            assert "测速完成" in str(screen.query_one("#proxy-action-status").render())
+
+    asyncio.run(run_case())
+
+
+def test_proxies_refresh_updates_cells_in_place_without_cursor_events(monkeypatch, tmp_path):
+    current = {"value": "Node A"}
+
+    class FakeQueryService:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def load_context(self, require_api=False):
+            return SimpleNamespace(groups={"AI-MANUAL": _group(current["value"])}, api_available=True)
+
+    monkeypatch.setattr(proxies_module, "QueryService", FakeQueryService)
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+
+    original_handler = ProxiesScreen.on_data_table_row_highlighted
+
+    def counting_handler(self, event):
+        highlights.append(event.row_key.value)
+        original_handler(self, event)
+
+    highlights = []
+    monkeypatch.setattr(ProxiesScreen, "on_data_table_row_highlighted", counting_handler)
+
+    async def run_case():
+        app = _ProxiesApp(paths)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            screen = app.query_one(ProxiesScreen)
+            nodes_table = screen.query_one("#nodes-table", DataTable)
+            nodes_table.move_cursor(row=1, animate=False)
+            await pilot.pause(0.05)
+            highlights.clear()
+
+            current["value"] = "Node B"
+            screen.refresh_data()
+            await pilot.pause(0.3)
+
+            assert nodes_table.cursor_row == 1
+            first_row = str(nodes_table.get_row_at(0)[0])
+            second_row = str(nodes_table.get_row_at(1)[0])
+            assert "●" not in first_row and "Node A" in first_row
+            assert "●" in second_row and "Node B" in second_row
+            assert highlights == []
 
     asyncio.run(run_case())

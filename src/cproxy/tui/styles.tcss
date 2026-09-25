@@ -415,20 +415,23 @@ Switch {
     color: #e8edf3;
 }
 
-.notification {
-    dock: bottom;
-    height: 3;
+/* Textual 8 Toast 组件样式（原 .notification* 选择器从未匹配到任何节点，死代码） */
+Toast {
     background: #5eead4;
     color: #071013;
-    padding: 1;
 }
 
-.notification-error {
-    background: #fb7185;
+Toast .toast--title {
+    color: #071013;
 }
 
-.notification-success {
+/* 代码库中“成功”类提示均用 severity="information"（无独立 success 级别） */
+Toast.-information {
     background: #a3e635;
+}
+
+Toast.-error {
+    background: #fb7185;
 }
 
 #dashboard-grid {

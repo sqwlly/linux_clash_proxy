@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import socket
 import time
-from typing import Iterable
+from collections.abc import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -111,7 +111,18 @@ class DiagnosticsService:
         self.api = APIBackend(paths)
         self.process = ProcessBackend(paths)
 
-    def test_group(self, group_name: str) -> GroupCheckReport:
+    def test_group(
+        self,
+        group_name: str,
+        *,
+        on_progress: Callable[[int, int, str, int | None], None] | None = None,
+    ) -> GroupCheckReport:
+        """测组内每个节点的延迟。
+
+        `on_progress(done, total, node_name, delay_ms)` 每测完一个节点回调一次；
+        `delay_ms` 为 `None` 表示该节点测速失败。回调在调用方线程内同步执行，
+        默认 `None` 时行为与输出和历史版本完全一致。
+        """
         config = read_config(self.paths)
         groups = self.api.get_groups()
         group = groups.get(group_name)
@@ -122,13 +133,16 @@ class DiagnosticsService:
         timeout = _config_int(config, "test-timeout", DEFAULT_TEST_TIMEOUT)
         results: list[DelayCheckResult] = []
         members = group.candidates or [group_name]
-        for member in members:
+        total = len(members)
+        for index, member in enumerate(members, start=1):
             try:
                 payload = self.api.delay_test(str(member), url, timeout)
                 delay = payload.get("delay")
                 results.append(DelayCheckResult(name=str(member), ok=True, delay=int(delay) if delay is not None else None))
             except Exception:
                 results.append(DelayCheckResult(name=str(member), ok=False, delay=None))
+            if on_progress is not None:
+                on_progress(index, total, results[-1].name, results[-1].delay if results[-1].ok else None)
         return GroupCheckReport(group_name=group_name, results=results)
 
     def run_connectivity_test(self) -> ConnectivityReport:
@@ -173,7 +187,12 @@ class DiagnosticsService:
         )
         return ConnectivityReport(results=results, exit_ip=exit_ip)
 
-    def run_ai_probe(self) -> AIProbeReport:
+    def run_ai_probe(self, *, on_result: Callable[[AIProbeResult], None] | None = None) -> AIProbeReport:
+        """逐个探测 AI 目标。
+
+        `on_result(result)` 每出一个目标结果回调一次（供界面流式上表）；
+        回调在调用方线程内同步执行。默认 `None` 时行为与输出和历史版本完全一致。
+        """
         config = read_config(self.paths)
         timeout = _config_int(
             config,
@@ -189,5 +208,8 @@ class DiagnosticsService:
         results: list[AIProbeResult] = []
         for name, url in targets:
             ok, detail = _probe_target(opener, url, timeout)
-            results.append(AIProbeResult(name=name, url=url, ok=ok, detail=detail))
+            result = AIProbeResult(name=name, url=url, ok=ok, detail=detail)
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
         return AIProbeReport(results=results)
