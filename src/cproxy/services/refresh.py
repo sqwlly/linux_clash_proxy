@@ -32,6 +32,10 @@ from .subscription_info import MAIN_SUBSCRIPTION_KEY, record_subscription_info
 
 SUBSCRIPTION_MAX_BYTES = 4 * 1024 * 1024
 SUBSCRIPTION_TIMEOUT = 20
+# 直连回退的重试次数与间隔：到订阅站的直连 TLS 握手可能被间歇重置
+# （实测同一 URL 连续请求会出现 200/EOF 交替），重试可把成功率拉回来
+SUBSCRIPTION_DIRECT_ATTEMPTS = 3
+SUBSCRIPTION_RETRY_INTERVAL = 2.0
 API_READY_TIMEOUT = 5.0
 API_READY_INTERVAL = 0.2
 
@@ -191,12 +195,27 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         group["proxies"] = group_members
 
 
+def _direct_opener() -> Any:
+    """禁用环境变量代理的 opener。
+
+    回退直连时若 shell 里 export 了指向本机代理的 ``http_proxy``/``https_proxy``
+    （默认 ``urlopen`` 会自动拾取），请求会绕回可能已死的本机代理，回退形同虚设。
+    """
+    return build_opener(ProxyHandler({}))
+
+
 def _download_subscription(paths: AppPaths, url: str, timeout: int) -> tuple[bytes, str | None]:
     """下载订阅内容：优先显式走本机代理（订阅域名常被墙且 timer 环境无代理
-    环境变量），代理不可达时回退直连（适用于未被墙的订阅）。
-    代理已通但订阅站返回 HTTP 错误（4xx/5xx）时直接抛出，不做直连重试。
-    返回 (订阅内容, subscription-userinfo 头)；头缺失时为 None。"""
-    request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
+    环境变量）；代理链路失败（未运行/节点全挂/TLS 被重置）时回退直连并重试
+    ``SUBSCRIPTION_DIRECT_ATTEMPTS`` 次（到订阅站的直连 TLS 握手可能被间歇重置）。
+    任一路径收到订阅站 HTTP 错误（4xx/5xx，含 token 失效的 401/403）时直接抛出，
+    因为此时站点可达，重试无意义。两条路都失败时抛出带双侧错误的 RuntimeError。
+    返回 (订阅内容, subscription-userinfo 头)；头缺失时为 None。
+
+    注意：每次尝试都必须新建 Request——urllib 经代理发送时会原地改写
+    req.host/req.selector 为代理地址（绝对 URI 形式），复用同一对象会让
+    "直连回退"实际又连回代理，回退形同虚设（2026-09-25 生产事故根因）。
+    """
     host = (urlparse(url).hostname or "").strip("[]").lower()
     loopback = host in ("127.0.0.1", "localhost", "::1")
     try:
@@ -204,20 +223,42 @@ def _download_subscription(paths: AppPaths, url: str, timeout: int) -> tuple[byt
     except Exception:
         port = 7890
     proxy_url = f"http://127.0.0.1:{port}"
+
+    def _make_request() -> Request:
+        return Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
+
+    def _direct_attempt() -> tuple[bytes, str | None]:
+        with _direct_opener().open(_make_request(), timeout=timeout) as response:
+            return _read_subscription_response(response)
+
+    if loopback:
+        # 本机地址（本地测试/镜像）无需经代理，直接请求
+        return _direct_attempt()
+
     try:
-        if loopback:
-            # 本机地址（本地测试/镜像）无需经代理，直接请求
-            with urlopen(request, timeout=timeout) as response:
-                return _read_subscription_response(response)
         opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(_make_request(), timeout=timeout) as response:
             return _read_subscription_response(response)
     except HTTPError:
+        # 代理链路已连通且站点返回 HTTP 错误：站点可达，属于真实错误（如
+        # token 失效），不做直连重试
         raise
-    except OSError:
-        # 本机代理未运行/不可达：回退默认行为（按环境变量或直连）
-        with urlopen(request, timeout=timeout) as response:
-            return _read_subscription_response(response)
+    except OSError as proxied_exc:
+        last_exc: OSError = proxied_exc
+
+    for attempt in range(SUBSCRIPTION_DIRECT_ATTEMPTS):
+        if attempt:
+            time.sleep(SUBSCRIPTION_RETRY_INTERVAL)
+        try:
+            return _direct_attempt()
+        except HTTPError:
+            raise
+        except OSError as direct_exc:
+            last_exc = direct_exc
+    raise RuntimeError(
+        f"订阅经本机代理({proxy_url})与直连均失败"
+        f"（重试 {SUBSCRIPTION_DIRECT_ATTEMPTS} 次）: {last_exc}"
+    ) from last_exc
 
 
 def _read_subscription_response(response: Any) -> tuple[bytes, str | None]:

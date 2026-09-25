@@ -732,3 +732,192 @@ def test_refresh_raises_when_api_never_ready(tmp_path: Path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="未就绪"):
         service.refresh(groups=["SSRDOG"])
+
+
+class _FakeSubResponse:
+    """够用的最小响应对象：_read_subscription_response 只用到 read() 与 headers.get。"""
+
+    def __init__(self, body: bytes = b"payload"):
+        self._body = body
+        self.headers: dict = {}
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body[:n] if n and n > 0 else self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _patch_opener_factory(monkeypatch, proxied_behavior, direct_behavior):
+    """替换 build_opener：按 ProxyHandler 是否带代理区分本机代理/直连两次尝试。
+
+    proxied_behavior / direct_behavior: 异常实例（直接抛出）或返回 _FakeSubResponse 的可调用。
+    返回计数器 dict，记录两条路各被调用了多少次。
+    """
+    import cproxy.services.refresh as refresh_module
+
+    counters = {"proxied": 0, "direct": 0}
+
+    def fake_build_opener(*handlers):
+        from urllib.request import ProxyHandler
+
+        handler = next((h for h in handlers if isinstance(h, ProxyHandler)), None)
+        is_proxied = bool(handler and handler.proxies)
+        key = "proxied" if is_proxied else "direct"
+        behavior = proxied_behavior if is_proxied else direct_behavior
+
+        class _Opener:
+            def open(self, request, timeout=None):
+                counters[key] += 1
+                if isinstance(behavior, Exception):
+                    raise behavior
+                return behavior(request)
+
+        return _Opener()
+
+    monkeypatch.setattr(refresh_module, "build_opener", fake_build_opener)
+    return counters
+
+
+def test_download_subscription_falls_back_to_direct_bypassing_env_proxy(tmp_path: Path, monkeypatch):
+    """代理链路失败时回退直连，且直连必须忽略 http(s)_proxy 环境变量——
+    否则 shell 里指向本机代理的变量会把回退请求又送回死代理。"""
+    import cproxy.services.refresh as refresh_module
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import _download_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, LOCAL_CONFIG)
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+    monkeypatch.setattr(refresh_module, "SUBSCRIPTION_RETRY_INTERVAL", 0)
+
+    counters = _patch_opener_factory(
+        monkeypatch,
+        proxied_behavior=OSError("dead node"),
+        direct_behavior=lambda request: _FakeSubResponse(b"via-direct"),
+    )
+
+    raw, _ = _download_subscription(paths, "https://sub.example.com/api", timeout=5)
+
+    assert raw == b"via-direct"
+    assert counters["proxied"] == 1
+    assert counters["direct"] == 1
+
+
+def test_download_subscription_direct_retries_until_success(tmp_path: Path, monkeypatch):
+    """直连 TLS 握手可能被间歇重置：直连失败应重试多次，成功即返回。"""
+    import cproxy.services.refresh as refresh_module
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import SUBSCRIPTION_DIRECT_ATTEMPTS, _download_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, LOCAL_CONFIG)
+    monkeypatch.setattr(refresh_module, "SUBSCRIPTION_RETRY_INTERVAL", 0)
+
+    direct_failures = iter([OSError("rst 1"), OSError("rst 2")])
+
+    def direct_behavior(request):
+        failure = next(direct_failures, None)
+        if failure is not None:
+            raise failure
+        return _FakeSubResponse(b"finally")
+
+    counters = _patch_opener_factory(
+        monkeypatch,
+        proxied_behavior=OSError("dead node"),
+        direct_behavior=direct_behavior,
+    )
+
+    raw, _ = _download_subscription(paths, "https://sub.example.com/api", timeout=5)
+
+    assert raw == b"finally"
+    assert counters["direct"] == 3
+
+
+def test_download_subscription_raises_after_direct_attempts_exhausted(tmp_path: Path, monkeypatch):
+    """两条路都失败时抛出 RuntimeError，信息里带重试次数与最后错误。"""
+    import cproxy.services.refresh as refresh_module
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import SUBSCRIPTION_DIRECT_ATTEMPTS, _download_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, LOCAL_CONFIG)
+    monkeypatch.setattr(refresh_module, "SUBSCRIPTION_RETRY_INTERVAL", 0)
+
+    counters = _patch_opener_factory(
+        monkeypatch,
+        proxied_behavior=OSError("dead node"),
+        direct_behavior=OSError("direct rst"),
+    )
+
+    with pytest.raises(RuntimeError, match="均失败"):
+        _download_subscription(paths, "https://sub.example.com/api", timeout=5)
+
+    assert counters == {"proxied": 1, "direct": SUBSCRIPTION_DIRECT_ATTEMPTS}
+
+
+def test_download_subscription_proxied_http_error_raises_without_direct_retry(tmp_path: Path, monkeypatch):
+    """代理链路连通但站点返回 HTTP 错误（如 token 失效 403）：直接抛出，不回退不重试。"""
+    from urllib.error import HTTPError
+
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import _download_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, LOCAL_CONFIG)
+
+    counters = _patch_opener_factory(
+        monkeypatch,
+        proxied_behavior=HTTPError("https://sub.example.com/api", 403, "Forbidden", hdrs=None, fp=None),
+        direct_behavior=AssertionError("直连不应被尝试"),
+    )
+
+    with pytest.raises(HTTPError):
+        _download_subscription(paths, "https://sub.example.com/api", timeout=5)
+
+    assert counters == {"proxied": 1, "direct": 0}
+
+
+def test_download_subscription_rebuilds_request_between_attempts(tmp_path: Path, monkeypatch):
+    """回归：urllib 经代理发送会原地改写 req.host/req.selector 为代理地址，
+    若直连回退复用同一 Request 对象，"直连"实际又连回代理导致回退必然失败。
+    每次尝试必须拿到 host 未被污染的全新 Request。"""
+    import cproxy.services.refresh as refresh_module
+    from cproxy.config import default_paths
+    from cproxy.services.refresh import _download_subscription
+
+    paths = default_paths(tmp_path)
+    _write_config(paths, LOCAL_CONFIG)
+    monkeypatch.setattr(refresh_module, "SUBSCRIPTION_RETRY_INTERVAL", 0)
+    seen_hosts: list[str] = []
+
+    def fake_build_opener(*handlers):
+        from urllib.request import ProxyHandler
+
+        handler = next((h for h in handlers if isinstance(h, ProxyHandler)), None)
+        is_proxied = bool(handler and handler.proxies)
+
+        class _Opener:
+            def open(self, request, timeout=None):
+                seen_hosts.append(request.host)
+                if is_proxied:
+                    # 模拟 urllib 真实行为：经代理发送后原地改写 request
+                    request.host = "127.0.0.1:7890"
+                    request.selector = request.full_url
+                    raise OSError("dead node")
+                return _FakeSubResponse(b"via-direct")
+
+        return _Opener()
+
+    monkeypatch.setattr(refresh_module, "build_opener", fake_build_opener)
+
+    raw, _ = _download_subscription(paths, "https://sub.example.com/api", timeout=5)
+
+    assert raw == b"via-direct"
+    # 直连尝试拿到的必须是原始订阅站 host：若复用被 urllib 原地改写的
+    # Request，第二次看到的会是代理地址 127.0.0.1:7890
+    assert seen_hosts == ["sub.example.com", "sub.example.com"]
