@@ -12,11 +12,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
 
-# codex 实测路径，用于验证“智能压缩保留辨识尾段”
-LONG_CODEX_PATH = (
-    "/root/versions/node/v22.23.1/lib/node_modules/@openai/.codex-qWKjdDCx"
+# 沿用 codex 实测路径的尾段，并放在当前用户主目录下。
+CODEX_RELATIVE_PATH = (
+    "versions/node/v22.23.1/lib/node_modules/@openai/.codex-qWKjdDCx"
     "/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
 )
+LONG_CODEX_PATH = str(Path.home() / CODEX_RELATIVE_PATH)
 
 
 def _write_config(tmp_path: Path) -> None:
@@ -76,7 +77,7 @@ def test_shorten_path_keeps_home_relative_when_it_fits():
     from cproxy.cli_render import _shorten_path
 
     assert _shorten_path("/usr/bin/curl", 46) == "/usr/bin/curl"
-    assert _shorten_path(LONG_CODEX_PATH, 200).startswith("~/")
+    assert _shorten_path(LONG_CODEX_PATH, 200) == f"~/{CODEX_RELATIVE_PATH}"
 
 
 def test_shorten_path_compresses_long_path_keeping_identifying_tail():
