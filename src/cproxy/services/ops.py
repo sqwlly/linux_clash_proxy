@@ -132,7 +132,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
     try:
         api = APIBackend(paths)
         groups = api.get_groups()
-        for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
+        for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG", "AI-GEMINI"):
             group = groups.get(name)
             if group:
                 ai_lines.append(f"{name}: type={group.type} now={group.current} alive={group.alive} delay={group.delay}")

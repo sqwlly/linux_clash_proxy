@@ -5,6 +5,7 @@ import time
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.theme import Theme
 from textual.widgets import (
     Button,
     Checkbox,
@@ -28,6 +29,45 @@ from .screens.providers import ProvidersScreen
 from .screens.proxies import ProxiesScreen
 from .screens.subscriptions import SubscriptionsScreen
 from .screens.system_proxy import SystemProxyScreen
+
+
+# 主题令牌（与 styles.tcss 的 $primary/$warning/... 同源）。
+# 这些颜色会被 Textual 的 TCSS 变量系统使用：CSS 里写 ``$primary`` 就会自动
+# 解析为当前主题的 primary 字段。改这里 = 改全套 widget 默认色。
+DARK_THEME = Theme(
+    name="cproxy-dark",
+    primary="#5eead4",          # teal：默认强调色（Header / Tab focus / DataTable focus）
+    secondary="#8794a6",        # muted text：Footer / Tabs 未激活态
+    warning="#f2c166",          # 警告黄：AI 卡片 / 备用面板 / Footer 键名
+    error="#fb7185",            # 错误红：danger-button / Toast.-error
+    success="#a3e635",          # 成功绿：traffic 卡片 / 当前节点 / Toast.-information
+    accent="#5eead4",
+    foreground="#d9e2ec",       # 主文本
+    background="#0f1419",       # 屏幕底色
+    surface="#151c26",          # 卡片底色
+    panel="#101821",            # Header / Footer / Tabs 底色
+    dark=True,
+)
+
+# 浅色主题：为亮底重新调一组对比度合理的色（teal 加深、warning 偏橙、success 加深）；
+# Textual 切换主题后会立刻把 $primary/$background/... 替换成这套值，CSS 里
+# 写 ``$primary`` 的地方自动跟着变。注意：内嵌 Rich markup（dashboard 里的
+# ``[#a3e635]...[/]``）不走主题系统——它们是固定语义色（运行中=绿、停止=红），
+# 故意跨主题保持一致。
+LIGHT_THEME = Theme(
+    name="cproxy-light",
+    primary="#0e7490",
+    secondary="#475569",
+    warning="#b45309",
+    error="#be123c",
+    success="#15803d",
+    accent="#0e7490",
+    foreground="#1f2937",
+    background="#f8fafc",
+    surface="#ffffff",
+    panel="#e2e8f0",
+    dark=False,
+)
 
 
 class CProxyApp(App):
@@ -55,6 +95,7 @@ class CProxyApp(App):
         Binding("]", "next_tab", "下一页", priority=True),
         Binding("ctrl+left", "previous_tab", "上一页", priority=True),
         Binding("ctrl+right", "next_tab", "下一页", priority=True),
+        Binding("ctrl+t", "toggle_theme", "切换主题", priority=False),
         Binding("escape", "back", "返回", priority=True),
         Binding("1", "switch_tab('dashboard')", "概览", show=False),
         Binding("2", "switch_tab('proxies')", "节点", show=False),
@@ -67,8 +108,15 @@ class CProxyApp(App):
         Binding("9", "switch_tab('logs')", "日志", show=False),
     ]
 
-    def __init__(self, paths: AppPaths | None = None):
+    def __init__(self, paths: AppPaths | None = None, theme: str = "cproxy-dark"):
+        # 主题**必须**先于 CSS 解析注册——TCSS 里的 ``$primary`` 是在 CSS
+        # 解析时查表拿值，没注册的主题对应的变量会拿不到。但 ``register_theme``
+        # 依赖 ``self._registered_themes``，而它是在父类 ``__init__`` 里创建的，
+        # 所以这里只能先把父类跑起来，再补注册。
         super().__init__()
+        self.register_theme(DARK_THEME)
+        self.register_theme(LIGHT_THEME)
+        self.theme = theme
         self.paths = paths or default_paths()
         self._last_refresh_by_tab: dict[str, float] = {}
 
@@ -107,6 +155,13 @@ class CProxyApp(App):
 
     def action_refresh_all(self) -> None:
         self._refresh_active_page(force=True)
+
+    def action_toggle_theme(self) -> None:
+        # 在我们注册的两套主题之间翻转。Textual 的 ``theme`` reactive 在赋值
+        # 时会触发 ``watch_theme``，把新主题的 ``$primary``/``$background``/...
+        # 重新写一遍 CSS 变量——所以 styles.tcss 里写的 ``$primary`` 之类的
+        # 选择器全部自动跟着换，无需手动重画 widget。
+        self.theme = "cproxy-light" if self.theme == "cproxy-dark" else "cproxy-dark"
 
     def _refresh_active_page(self, force: bool = False) -> None:
         tabbed = self.query_one(TabbedContent)

@@ -45,6 +45,8 @@ _POSITIONAL_SOURCES: dict[str, tuple[str, ...]] = {
     "ai-use": ("profiles",),
     "shadow-probe": ("profiles",),
     "traffic": ("traffic-actions",),
+    "tun": ("tun-actions",),
+    "snapshots": ("snapshots-actions",),
 }
 
 # `--flag` 取值补什么
@@ -54,6 +56,7 @@ _FLAG_SOURCES: dict[str, str] = {
     "--by": "traffic-dimensions",
     "--group": "groups",
     "--node": "nodes",
+    "--kind": "snapshot-kinds",
 }
 
 
@@ -133,6 +136,12 @@ def _values_for(paths: AppPaths, source: str, prior_args: list[str]) -> list[str
         return list(STRATEGY_CHOICES)
     if source == "traffic-actions":
         return list(TRAFFIC_ACTIONS)
+    if source == "tun-actions":
+        return ["status", "on", "off"]
+    if source == "snapshots-actions":
+        return ["list", "compact", "diff"]
+    if source == "snapshot-kinds":
+        return ["runtime", "config"]
     if source == "traffic-dimensions":
         return list(TRAFFIC_DIMENSIONS)
     if source == "groups":

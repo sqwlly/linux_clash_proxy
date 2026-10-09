@@ -6,6 +6,8 @@
 
 ### 改进
 
+- Gemini 单独分流：新增 `AI-GEMINI`（fallback，优先韩/台/德/法/英/巴/迪拜/澳），Google / Gemini / Antigravity 域名规则排在 `PROCESS-NAME,agy` 之前；ChatGPT/Claude 与 agy 非 Google 流量仍走 `AI-MANUAL`（美日新），避免美日新出口触发 `User location is not supported`
+- `cproxy status` / `ai-status`（及 TUI）同步展示通用出口与 Gemini 出口；AI 探测新增 Gemini API 目标（可用 `ai-gemini-api-url` 覆盖）
 - `cproxy list-groups` / `list-nodes` 人读输出改走用途树：入口显示「默认流量 / AI 出口」，`list-nodes 默认流量` 可用；`cproxy group` 作为 `list-groups` 别名。`--raw` / `--json` 仍是 Mihomo 原始组名
 - TUI 去掉与页签重复的页面大标题，状态条收进各面板标题行；操作按钮改为单行内容宽度的短标签（主操作实心、次要幽灵、危险描边），工具栏不再撑满整行
 - `cproxy switch` 与 TUI 代理页共用三层用途树（默认流量 / AI 出口 / 附加订阅 → 地区或自动 → 节点）；render 时去掉与中文国家组重复的 `🇯🇵 Japan` / `🇺🇸 United States` / `🇸🇬 Singapore`，`AI-MANUAL` 直接挂日美新节点，主订阅仍按国家注入独立 selector。热重载会把旧的 `AI-US` / `🇯🇵 Japan` 选择映射到对应节点
@@ -25,6 +27,10 @@
 
 ### 新增
 
+- 配置快照阶梯管理与静默去重：`cproxy snapshots` 列表展示人性化相对时间、保留阶梯标签（`[近期全量]`、`[每小时]`、`[每日采样]`、`[每周采样]`）与格式化大小；基于内容 SHA-256 哈希实现零改动时自动跳过；在生成快照时全自动后台静默分级清理，无需用户手动维护
+- 交互式安全回滚与 Diff 预览：`cproxy rollback` 在终端下自动唤起交互选择器与快照差异（Unified Diff）彩色对比，提供 `[Y/n]` 防手抖确认；支持独立比对命令 `cproxy snapshots diff [target]`
+- CLI 全命令视觉排版规范化：重构 `security-check` 为结构化安全体检面板并提供精准修复建议；`ai-connections` 增加汇总摘要与域名列宽自动对齐；`shadow-history` 引入易读时间戳与状态徽标；`current` 补充组类型、延迟与存活状态；`test-group`、`test`、`doctor` 延迟与体检项全面实现垂直对齐
+- TUN 透明代理服务与内核状态管理：提供 `cproxy tun` 命令用于管理并查看 TUN 网卡及透明代理状态
 - `cproxy doctor` 提供配置、进程、配置时效、Mihomo API 与 GeoIP 的统一体检和恢复命令；状态、查询、诊断、刷新与流量命令新增带版本信封的 `--json`
 - `cproxy bootstrap --subscription-url URL` 支持在没有 legacy 配置时直接完成首次初始化；新增 `scripts/test.sh` 固定使用同一 Python 的 `python -m pytest`
 - legacy 入口弃用警告与安装解耦：`clash-proxy` / `clash-proxy-update` / `cproxy-update` 三个 wrapper 每次调用都向 **stderr** 打印弃用警告并指向 cproxy 等价命令（走 stderr 是为了不污染 stdout——`clash-proxy status --raw` 的脚本消费仍可正常解析）；直接执行 `./proxy.sh` 也会提示，经 wrapper 调用时靠 `CPROXY_LEGACY_WARNED=1` 去重、只打一次。`scripts/install-system-commands.sh` 与 `systemd/install-systemd.sh` 默认**不再安装** legacy（前者需 `--with-legacy`；后者同理，但始终安装活跃的 `clash-proxy-traffic-collector`），`install.sh` 侧对应 `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`——这样将来任何一次重跑都不会把已停用的入口重新装回 PATH。另修一处隐患：`--with-cproxy-alias` 会把 pip 安装的 `/usr/local/bin/cproxy` 覆盖成指向 `proxy.sh` 的 wrapper、令 cproxy 命令直接失效，现已加保护并在检测到非本脚本产物时拒绝覆盖

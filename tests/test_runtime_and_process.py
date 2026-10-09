@@ -91,7 +91,7 @@ rules:
     assert "摘要" in status_result.stdout
     assert "资源" in status_result.stdout
     assert "路径" in status_result.stdout
-    # 摘要区块的值列对齐到 12 显示列（最长标签“运行配置/当前出口”8 + 间距 4）
+    # 摘要区块的值列对齐到 12 显示列（最长标签“运行配置/通用出口”8 + 间距 4）
     assert "状态        未运行" in status_result.stdout
     assert "运行配置    已就绪" in status_result.stdout
 
@@ -346,7 +346,7 @@ rules:
         assert status_result.returncode == 0
         assert "状态        运行中" in status_result.stdout
         assert "AI 路由     自动切换" in status_result.stdout
-        assert "当前出口    AI-US -> United States 01 (95ms)" in status_result.stdout
+        assert "通用出口    AI-US -> United States 01 (95ms)" in status_result.stdout
     finally:
         subprocess.run(
             [sys.executable, "-m", "cproxy.cli", "stop"],
@@ -788,13 +788,13 @@ rules:
     assert "DOMAIN-SUFFIX,openai.azure.com,AI-MANUAL" in rules
     assert "DOMAIN,cdn.auth0.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,challenges.cloudflare.com,AI-MANUAL" in rules
-    assert "DOMAIN-SUFFIX,google.com,AI-MANUAL" in rules
-    assert "DOMAIN-SUFFIX,googleapis.com,AI-MANUAL" in rules
-    assert "DOMAIN-KEYWORD,antigravity,AI-MANUAL" in rules
-    assert "DOMAIN-SUFFIX,goog,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,google.com,AI-GEMINI" in rules
+    assert "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI" in rules
+    assert "DOMAIN-KEYWORD,antigravity,AI-GEMINI" in rules
+    assert "DOMAIN-SUFFIX,goog,AI-GEMINI" in rules
+    assert "DOMAIN-SUFFIX,appspot.com,AI-GEMINI" in rules
     assert "PROCESS-NAME,agy,AI-MANUAL" in rules
-    assert "DOMAIN-SUFFIX,appspot.com,AI-MANUAL" in rules
-    assert rules.index("PROCESS-NAME,agy,AI-MANUAL") < rules.index("DOMAIN-SUFFIX,google.com,AI-MANUAL")
+    assert rules.index("DOMAIN-SUFFIX,google.com,AI-GEMINI") < rules.index("PROCESS-NAME,agy,AI-MANUAL")
     idx_pytorch = rules.index("DOMAIN-SUFFIX,pytorch.org,DIRECT")
     assert "DOMAIN-SUFFIX,npmjs.org,DIRECT" in rules
     assert idx_ai < idx_pytorch < idx_match

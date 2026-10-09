@@ -239,13 +239,65 @@ def resolve_group_query(
         return needle
     choice = lookup_choice(needle, entries)
     if choice is None:
-        hints = "、".join(f"{entry.display} ({entry.key})" for entry in entries[:6]) or "cproxy list-groups"
-        raise SystemExit(f"错误: 未找到代理组: {query}\n提示: 试试 {hints}")
+        raise SystemExit(f"错误: 未找到代理组: {query}\n{_suggest_group_hints(query, entries)}")
     if choice.key in groups:
         return choice.key
     if choice.group_name in groups:
         return choice.group_name
     raise SystemExit(f"错误: 未找到代理组: {query}")
+
+
+def _suggest_group_hints(query: str, entries: tuple[SwitchChoice, ...]) -> str:
+    """did-you-mean 风格的提示行：优先子串/前缀匹配的入口，否则列前 6 个。
+
+    把这串提示集中在一处，``services/diagnostics`` / ``services/probe`` 等
+    没有 switch tree 的代码也能复用——直接传一个最小 SwitchChoice 列表
+    （只有 ``display`` 和 ``key``）进来即可。空列表时退化为 ``cproxy list-groups``。
+    """
+    if not entries:
+        return "提示: 运行 cproxy list-groups 查看可用代理组"
+    needle = query.strip().lower()
+    scored: list[tuple[int, SwitchChoice]] = []
+    for entry in entries:
+        display = entry.display.lower()
+        key = entry.key.lower()
+        if needle and needle in display:
+            scored.append((0, entry))
+        elif needle and needle in key:
+            scored.append((1, entry))
+        elif needle and (display.startswith(needle) or key.startswith(needle)):
+            scored.append((2, entry))
+        else:
+            scored.append((3, entry))
+    scored.sort(key=lambda pair: pair[0])
+    picks = [entry for _, entry in scored[:6]]
+    joined = "、".join(f"{entry.display} ({entry.key})" for entry in picks)
+    return f"提示: 试试 {joined}"
+
+
+def suggest_groups_from_names(query: str, names: list[str]) -> str:
+    """没 switch tree 时用：传入裸组名列表，返回 did-you-mean 行。
+
+    与 :func:`_suggest_group_hints` 同形——一个面向 SwitchChoice、一个面向
+    内部名裸列表——但保持返回字符串格式一致（``"提示: 试试 ..."``），
+    上游只需 ``f"错误: 未找到代理组: {q}\\n{suggest_groups_from_names(q, names)}"``
+    一种拼法即可。
+    """
+    if not names:
+        return "提示: 运行 cproxy list-groups 查看可用代理组"
+    needle = query.strip().lower()
+    scored: list[tuple[int, str]] = []
+    for name in names:
+        lower = name.lower()
+        if needle and needle in lower:
+            scored.append((0, name))
+        elif needle and lower.startswith(needle):
+            scored.append((1, name))
+        else:
+            scored.append((2, name))
+    scored.sort(key=lambda pair: pair[0])
+    picks = [name for _, name in scored[:6]]
+    return f"提示: 试试 {'、'.join(picks)}"
 
 
 def _entry_role(name: str, match_group: str | None) -> str:

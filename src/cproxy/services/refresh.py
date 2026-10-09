@@ -60,6 +60,8 @@ SUBSCRIPTION_STRIP_KEYS = {
 
 # 本地优先键：本地配置已存在时保留本地值；本地缺失时接受订阅提供的值
 LOCAL_PREFERRED_KEYS = {
+    "tun",
+    "dns",
     "mixed-port",
     "port",
     "mode",
@@ -73,6 +75,7 @@ LOCAL_PREFERRED_KEYS = {
     "ip-check-urls",
     "ai-chatgpt-url",
     "ai-openai-api-url",
+    "ai-gemini-api-url",
     "refresh-groups",
     "subscriptions",
     "profile",

@@ -11,6 +11,7 @@ from ...api import APIUnavailableError
 from ...backend.models import AIProbeResult
 from ...backend.runtime import (
     AI_AUTO_GROUP,
+    AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     AI_SG_GROUP,
     AI_US_GROUP,
@@ -44,8 +45,11 @@ class AIRouteScreen(Widget):
                         yield Label("模式", classes="label-key")
                         yield Label("─", id="ai-route-mode", classes="metric-value")
                     with Horizontal(classes="field-row"):
-                        yield Label("当前", classes="label-key")
+                        yield Label("通用", classes="label-key")
                         yield Label("─", id="ai-route-active", classes="metric-value")
+                    with Horizontal(classes="field-row"):
+                        yield Label("Gemini", classes="label-key")
+                        yield Label("─", id="ai-route-gemini", classes="metric-value")
                     with Horizontal(classes="field-row"):
                         yield Label("备用", classes="label-key")
                         yield Label("─", id="ai-route-standby", classes="metric-value")
@@ -88,6 +92,7 @@ class AIRouteScreen(Widget):
             label = "API 不可访问" if isinstance(error, APIUnavailableError) else f"错误: {error}"
             self.query_one("#ai-route-mode", Label).update(f"[#fb7185]{label}[/]")
             self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
+            self.query_one("#ai-route-gemini", Label).update("[#8b98aa]─[/]")
             self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
             self.query_one("#ai-route-chain", Label).update("[#8b98aa]─[/]")
             return
@@ -98,6 +103,7 @@ class AIRouteScreen(Widget):
             if manual is None or auto is None:
                 self.query_one("#ai-route-mode", Label).update("[#8b98aa]尚未配置[/]")
                 self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
+                self.query_one("#ai-route-gemini", Label).update("[#8b98aa]─[/]")
                 self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
                 self.query_one("#ai-route-chain", Label).update("[#8b98aa]请先生成运行配置[/]")
                 return
@@ -108,6 +114,7 @@ class AIRouteScreen(Widget):
 
             standby_name = ai_standby_peer(active_group_name)
             standby_group = groups.get(standby_name)
+            gemini_group = groups.get(AI_GEMINI_GROUP)
 
             mode_text = "[#f6c177]自动[/]" if auto_mode else f"[#f6c177]固定[/]（{manual.current}）"
             self.query_one("#ai-route-mode", Label).update(mode_text)
@@ -123,6 +130,19 @@ class AIRouteScreen(Widget):
                     f"{active_group_name} → {active_group.current} ({delay_str}) {alive_str}"
                 )
 
+            if gemini_group:
+                delay_str = f"{gemini_group.delay}ms" if gemini_group.delay else "─"
+                alive_str = (
+                    "[#a3e635]●[/]" if gemini_group.alive
+                    else "[#fb7185]○[/]" if gemini_group.alive is False
+                    else "[#8b98aa]?[/]"
+                )
+                self.query_one("#ai-route-gemini", Label).update(
+                    f"{AI_GEMINI_GROUP} → {gemini_group.current} ({delay_str}) {alive_str}"
+                )
+            else:
+                self.query_one("#ai-route-gemini", Label).update("[#8b98aa]─[/]")
+
             if standby_group:
                 delay_str = f"{standby_group.delay}ms" if standby_group.delay else "─"
                 alive_str = (
@@ -134,7 +154,7 @@ class AIRouteScreen(Widget):
                     f"{standby_name} → {standby_group.current} ({delay_str}) {alive_str}"
                 )
 
-            chain_lines = ["[#7dd3fc]AI-MANUAL[/]"]
+            chain_lines = ["[#7dd3fc]通用 AI-MANUAL[/]"]
             if auto_mode:
                 chain_lines.append("└─ [#f6c177]AI-AUTO[/]")
                 chain_lines.append(f"   └─ [#5eead4]{active_group_name}[/]")
@@ -144,6 +164,10 @@ class AIRouteScreen(Widget):
                 chain_lines.append(f"└─ [#5eead4]{active_group_name}[/]")
                 if active_group:
                     chain_lines.append(f"   └─ [#a3e635]{active_group.current}[/]")
+            if gemini_group:
+                chain_lines.append("")
+                chain_lines.append(f"[#7dd3fc]Gemini {AI_GEMINI_GROUP}[/]")
+                chain_lines.append(f"└─ [#a3e635]{gemini_group.current}[/]")
             self.query_one("#ai-route-chain", Label).update("\n".join(chain_lines))
 
         except Exception as e:

@@ -123,6 +123,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("init", "初始化用户配置目录"),
             ("bootstrap", "一键引导（无需参数）"),
             ("render", "由原始配置生成运行配置"),
+            ("tun", "配置 TUN 透明代理并查看内核状态"),
             ("start", "启动代理进程"),
             ("stop", "停止代理进程"),
             ("restart", "重启代理进程"),
@@ -320,7 +321,36 @@ def build_root_parser() -> ArgumentParser:
     migrate_parser.add_argument("legacy_root", help="旧仓库根目录")
 
     _add_command(subparsers, "render")
-    _add_command(subparsers, "snapshots", raw=True)
+    tun_parser = _add_command(subparsers, "tun", json_output=True)
+    tun_parser.add_argument(
+        "action", nargs="?", default="status", choices=("status", "on", "off"), help="查询状态或保存 TUN 开关"
+    )
+    tun_parser.add_argument(
+        "--apply", action="store_true", help="修改配置后立即生成并重启/热重载应用"
+    )
+    snapshots_parser = _add_command(subparsers, "snapshots", raw=True, json_output=True)
+    snapshots_parser.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=("list", "compact", "diff"),
+        help="快照操作：list（默认，列出快照）、diff（比对快照差异）或 compact（分级压缩清理快照）",
+    )
+    snapshots_parser.add_argument(
+        "target",
+        nargs="?",
+        help="与 diff 一起使用：指定要比对的快照文件名（默认取最新一份快照）",
+    )
+    snapshots_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="演练压缩清理，不实际删除文件",
+    )
+    snapshots_parser.add_argument(
+        "--kind",
+        choices=("runtime", "config"),
+        help="仅处理指定类型的快照（runtime 或 config）",
+    )
 
     rollback_parser = _add_command(subparsers, "rollback")
     rollback_parser.add_argument("name", nargs="?", help="快照文件名（默认取最近一份运行时快照）")

@@ -20,10 +20,14 @@ AI_MANUAL_GROUP = "AI-MANUAL"
 AI_AUTO_GROUP = "AI-AUTO"
 AI_US_GROUP = "AI-US"
 AI_SG_GROUP = "AI-SG"
+AI_GEMINI_GROUP = "AI-GEMINI"
 AI_REGION_JP = "🇯🇵 Japan"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
+# 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported）
+AI_GEMINI_REGION_ORDER = ("KR", "TW", "DE", "FR", "GB", "BR", "AE", "AU")
+AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP})
 CHINAMAX_RULE = "RULE-SET,ChinaMax,DIRECT"
 CHINAMAX_PROVIDER = {
     "type": "file",
@@ -56,8 +60,11 @@ AI_PROCESS_NAMES = frozenset(("agy",))
 
 
 def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
-    """订阅规则若把 AI 域名/关键字指向非 AI-MANUAL 组，则视为冲突需移除。
-    不限定订阅商组名（SSRDOG/PROXY/其它均可识别），避免换订阅后失效。"""
+    """订阅规则若把 AI 域名/关键字指向非 AI 策略组，则视为冲突需移除。
+
+    合法目标为 AI-MANUAL / AI-GEMINI。不限定订阅商组名（SSRDOG/PROXY/其它均可），
+    避免换订阅后失效。
+    """
     if not isinstance(rule, str):
         return False
     parts = [item.strip() for item in rule.split(",")]
@@ -74,7 +81,8 @@ def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
     else:
         return False
     # 末段为目标组（no-resolve 等修饰符位于中间）
-    return hit and parts[-1] != ai_group
+    allowed = AI_POLICY_GROUPS if ai_group in AI_POLICY_GROUPS else frozenset({ai_group})
+    return hit and parts[-1] not in allowed
 
 EMOJI_REGION_GROUPS = frozenset({AI_REGION_JP, AI_REGION_US, AI_REGION_SG})
 AI_REGION_CODE_BY_GROUP = {
@@ -107,6 +115,7 @@ RESERVED_MATCH_NAMES = frozenset(
         AI_AUTO_GROUP,
         AI_US_GROUP,
         AI_SG_GROUP,
+        AI_GEMINI_GROUP,
         AI_REGION_JP,
         AI_REGION_US,
         AI_REGION_SG,
@@ -229,6 +238,42 @@ def _collect_ai_region_nodes(
             add(code, str(member))
 
     return {code: _prefer_non_iepl_nodes(names) for code, names in buckets.items()}
+
+
+def _collect_gemini_nodes(
+    proxies: list | None,
+    group_map: dict[str, dict],
+    extra_names: list[str],
+) -> list[str]:
+    """收集 Gemini 专用出口：优先韩/台/欧/巴东等实测可用地区，1X 排 IEPL 前。"""
+    extra_set = set(extra_names)
+    buckets: dict[str, list[str]] = {code: [] for code in AI_GEMINI_REGION_ORDER}
+    seen: set[str] = set()
+
+    def add(code: str, name: str) -> None:
+        if (
+            code not in buckets
+            or not name
+            or name in seen
+            or is_panel_info_node(name)
+            or name in extra_set
+            or _is_extra_node(name, extra_names)
+            or name in group_map
+        ):
+            return
+        seen.add(name)
+        buckets[code].append(name)
+
+    for proxy in proxies or []:
+        if not isinstance(proxy, dict) or not proxy.get("name"):
+            continue
+        name = str(proxy["name"])
+        add(match_region(name), name)
+
+    ordered: list[str] = []
+    for code in AI_GEMINI_REGION_ORDER:
+        ordered.extend(_prefer_non_iepl_nodes(buckets[code]))
+    return ordered
 
 
 def _strip_panel_members(group: dict) -> None:
@@ -435,13 +480,16 @@ class RuntimeBackend:
         jp_proxies = region_nodes["JP"]
         if not us_proxies or not sg_proxies:
             raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
+        gemini_proxies = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names)
+        if not gemini_proxies:
+            # 订阅缺少韩/台/欧等优选区时，退回日美新，避免 render 直接失败
+            gemini_proxies = list(jp_proxies) + list(us_proxies) + list(sg_proxies)
 
         groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
 
         # 美国节点放首位：热重载/冷启动会把 selector 重置为第一项。
-        # 日本 IEPL 对 Cloud Code generate 仍 400；美国 1X 是实测能
-        # streamGenerateContent 的出口。热重载另会恢复重载前的选择器。
+        # ChatGPT/Claude 仍走 AI-MANUAL（美/日/新）；Gemini/Google 单独走 AI-GEMINI。
         # 不再挂 🇯🇵 Japan / 🇺🇸 United States：那些组和中文国家组重复。
         manual_candidates = list(us_proxies) + [AI_AUTO_GROUP] + list(jp_proxies) + list(sg_proxies)
 
@@ -450,9 +498,16 @@ class RuntimeBackend:
             {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_proxies, "url": TEST_URL, "interval": 300},
             {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 300},
             {"name": AI_MANUAL_GROUP, "type": "select", "proxies": manual_candidates},
+            {
+                "name": AI_GEMINI_GROUP,
+                "type": "fallback",
+                "proxies": gemini_proxies,
+                "url": TEST_URL,
+                "interval": 300,
+            },
         ]
 
-        managed_names = {AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP}
+        managed_names = {AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP, AI_GEMINI_GROUP}
         filtered_groups = [group for group in groups if not (isinstance(group, dict) and group.get("name") in managed_names)]
 
         insert_after = None
@@ -467,8 +522,20 @@ class RuntimeBackend:
             filtered_groups = filtered_groups[: insert_after + 1] + ai_groups + filtered_groups[insert_after + 1 :]
 
         ai_rules = [
-            # agy 所有出站（含 github / playwright CDN / Cloud Run）同一 AI 出口，
-            # 避免域名规则漏拦导致同一会话混用 CyberGuard 与 AI-MANUAL 的 IP。
+            # Google / Gemini / Antigravity —— 必须排在 PROCESS-NAME,agy 之前，
+            # 否则 agy 全部出站被 AI-MANUAL（美日新）吃掉，Gemini 仍 400。
+            # 精确子域不够：agy 实际打 daily-cloudcode-pa.googleapis.com、
+            # oauth2.googleapis.com、antigravity.google、antigravity-unleash.goog。
+            f"DOMAIN-SUFFIX,google.com,{AI_GEMINI_GROUP}",
+            f"DOMAIN-SUFFIX,googleapis.com,{AI_GEMINI_GROUP}",
+            f"DOMAIN-SUFFIX,googleusercontent.com,{AI_GEMINI_GROUP}",
+            f"DOMAIN-SUFFIX,gstatic.com,{AI_GEMINI_GROUP}",
+            f"DOMAIN-SUFFIX,google.dev,{AI_GEMINI_GROUP}",
+            f"DOMAIN-SUFFIX,appspot.com,{AI_GEMINI_GROUP}",
+            f"DOMAIN-KEYWORD,antigravity,{AI_GEMINI_GROUP}",
+            f"DOMAIN-KEYWORD,gemini,{AI_GEMINI_GROUP}",
+            f"DOMAIN-SUFFIX,goog,{AI_GEMINI_GROUP}",
+            # agy 非 Google 出站（github / playwright CDN 等）仍走通用 AI 出口
             f"PROCESS-NAME,agy,{AI_MANUAL_GROUP}",
             # OpenAI
             f"DOMAIN-SUFFIX,openai.com,{AI_MANUAL_GROUP}",
@@ -481,26 +548,12 @@ class RuntimeBackend:
             f"DOMAIN-SUFFIX,anthropic.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,claude.ai,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,claudeusercontent.com,{AI_MANUAL_GROUP}",
-            # Google / Gemini / Antigravity
-            # 精确子域不够：agy 实际打 daily-cloudcode-pa.googleapis.com、
-            # oauth2.googleapis.com、antigravity.google、antigravity-unleash.goog，
-            # 若只注入 gemini.google.com 会被订阅 DOMAIN-KEYWORD,google 送去 CyberGuard，
-            # 与 AI-MANUAL 出口 IP 混用。
-            f"DOMAIN-SUFFIX,google.com,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,googleapis.com,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,googleusercontent.com,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,gstatic.com,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,google.dev,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,appspot.com,{AI_MANUAL_GROUP}",
-            f"DOMAIN-KEYWORD,antigravity,{AI_MANUAL_GROUP}",
-            f"DOMAIN-KEYWORD,gemini,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,goog,{AI_MANUAL_GROUP}",
             # xAI / Azure OpenAI / GitHub Copilot
             f"DOMAIN-SUFFIX,x.ai,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,grok.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,openai.azure.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,githubcopilot.com,{AI_MANUAL_GROUP}",
-            # 人机验证与 AI 出口保持一致，避免出口 IP 混用触发风控
+            # 人机验证与通用 AI 出口保持一致
             f"DOMAIN-SUFFIX,challenges.cloudflare.com,{AI_MANUAL_GROUP}",
         ]
         # 大流量开发下载源直连，避免耗尽代理套餐流量

@@ -48,13 +48,15 @@ bash scripts/install-mihomo.sh --fetch-hash vX.Y.Z   # 升级前获取新版本�
 
 ## 快照、回滚与一键刷新
 
-`cproxy render` 和订阅更新会在覆盖配置前自动留快照（各保留最近 10 份，位于
+`cproxy render` 和订阅更新会在覆盖配置前自动留快照（具备内容 SHA256 智能去重与分级保留阶梯，位于
 `~/.local/state/cproxy/snapshots/`）：
 
 ```bash
-cproxy snapshots            # 列出快照
-cproxy rollback             # 回滚到上一份运行配置（运行中会自动重启）
-cproxy rollback <快照名>     # 恢复指定快照（含 config 类快照）
+cproxy snapshots                    # 列出快照
+cproxy snapshots compact --dry-run  # 演练分级压缩清理，查看拟清理快照
+cproxy snapshots compact            # 执行分级压缩清理（保留近期全量、中期按小时/天稀疏采样）
+cproxy rollback                     # 回滚到上一份运行配置（运行中会自动重启）
+cproxy rollback <快照名>             # 恢复指定快照（含 config 类快照）
 ```
 
 `cproxy refresh` 把日常维护串成一条命令：更新订阅（配置了
@@ -290,13 +292,14 @@ cproxy test-group "AI-AUTO" --raw
 
 - `current/list-groups/list-nodes`：API 优先，API 不可达时回退 `runtime.yaml`
 - `ai-status/test-group/switch`：只依赖 API
-- `ai-status` 默认还会通过本地代理探测 `chatgpt.com` 与 `api.openai.com/v1/models`，失败时会做最多 2 次轻量重试
+- `ai-status` 默认还会通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API，失败时会做最多 2 次轻量重试；摘要同时展示通用出口与 Gemini 出口
 
 如需覆盖探测地址：
 
 ```yaml
 ai-chatgpt-url: https://chatgpt.com
 ai-openai-api-url: https://api.openai.com/v1/models
+ai-gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models
 ai-probe-timeout: 8
 ```
 

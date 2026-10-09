@@ -35,6 +35,7 @@ DEFAULT_IP_CHECK_URLS = [
 DEFAULT_AI_PROBE_TARGETS = [
     ("ChatGPT Web", "https://chatgpt.com"),
     ("OpenAI API", "https://api.openai.com/v1/models"),
+    ("Gemini API", "https://generativelanguage.googleapis.com/v1beta/models"),
 ]
 DEFAULT_AI_PROBE_TIMEOUT = 8
 DEFAULT_AI_PROBE_RETRIES = 2
@@ -127,7 +128,10 @@ class DiagnosticsService:
         groups = self.api.get_groups()
         group = groups.get(group_name)
         if not group:
-            raise SystemExit(f"错误: 未找到代理组或节点: {group_name}")
+            from .switch_tree import suggest_groups_from_names
+
+            hint = suggest_groups_from_names(group_name, list(groups.keys()))
+            raise SystemExit(f"错误: 未找到代理组或节点: {group_name}\n{hint}")
 
         url = str(config.get("test-url", DEFAULT_TEST_URL))
         timeout = _config_int(config, "test-timeout", DEFAULT_TEST_TIMEOUT)
@@ -202,6 +206,7 @@ class DiagnosticsService:
         targets = [
             ("ChatGPT Web", _config_str(config, "ai-chatgpt-url", DEFAULT_AI_PROBE_TARGETS[0][1])),
             ("OpenAI API", _config_str(config, "ai-openai-api-url", DEFAULT_AI_PROBE_TARGETS[1][1])),
+            ("Gemini API", _config_str(config, "ai-gemini-api-url", DEFAULT_AI_PROBE_TARGETS[2][1])),
         ]
         opener = _proxy_opener(self.paths)
 

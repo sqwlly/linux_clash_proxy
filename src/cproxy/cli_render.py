@@ -4,7 +4,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,7 @@ from . import __version__
 from .api import APIUnavailableError
 from .backend.api import APIBackend
 from .backend.models import AIProbeReport, ProxyGroup
-from .backend.runtime import ai_standby_peer
+from .backend.runtime import AI_GEMINI_GROUP, ai_standby_peer
 from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
@@ -35,7 +35,17 @@ from .services.refresh import RefreshReport, update_source_from_subscription
 from .services.subscription_info import SubscriptionUsage, display_entries
 from .services.switch_tree import SwitchChoice, lookup_choice, resolve_group_query
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
-from .snapshots import list_snapshots, restore_snapshot, snapshot_kind, snapshots_dir
+from .snapshots import (
+    compact_snapshots,
+    format_relative_time,
+    list_snapshots,
+    parse_snapshot_time,
+    restore_snapshot,
+    snapshot_diff,
+    snapshot_kind,
+    snapshot_tier_label,
+    snapshots_dir,
+)
 from .structured_output import emit_json
 from .textwidth import display_width as _display_width
 from .textwidth import pad_left as _pad_left
@@ -43,6 +53,7 @@ from .textwidth import pad_right as _pad_right
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
 ANSI_BLUE = "\033[34m"
 ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
@@ -243,6 +254,47 @@ def _print_section(title: str) -> None:
     print(_section_rule())
 
 
+def _exit_summary(group_name: object, node: object, delay: object) -> str:
+    summary = f"{group_name} -> {normalize_name(node)}"
+    if isinstance(delay, int):
+        summary = f"{summary} ({delay}ms)"
+    return summary
+
+
+def _resolve_group_exit(groups: dict, group_name: str) -> dict[str, object]:
+    """解析某代理组当前叶子出口；组缺失时 present=False。"""
+    group = groups.get(group_name)
+    if group is None:
+        return {
+            "present": False,
+            "group": group_name,
+            "node": "-",
+            "delay": "-",
+            "alive": None,
+            "summary": "-",
+        }
+    node = _group_value(group, "now", "-")
+    delay = _group_value(group, "delay", "-")
+    alive = _group_value(group, "alive")
+    if (not isinstance(delay, int) or alive is None) and node and node != "-":
+        leaf = groups.get(str(node))
+        if leaf is not None:
+            if not isinstance(delay, int):
+                leaf_delay = _group_value(leaf, "delay", "-")
+                if isinstance(leaf_delay, int):
+                    delay = leaf_delay
+            if alive is None:
+                alive = _group_value(leaf, "alive")
+    return {
+        "present": True,
+        "group": group_name,
+        "node": node,
+        "delay": delay,
+        "alive": alive,
+        "summary": _exit_summary(group_name, node, delay),
+    }
+
+
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
     manual_target = _group_value(_get_group(groups, "AI-MANUAL"), "now", "-")
     auto_target = _group_value(_get_group(groups, "AI-AUTO"), "now", "-")
@@ -257,6 +309,7 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
     standby_node = _group_value(standby, "now", "-")
     standby_delay = _group_value(standby, "delay", "-")
     standby_alive = _group_value(standby, "alive")
+    gemini = _resolve_group_exit(groups, AI_GEMINI_GROUP)
 
     return {
         "auto_mode": auto_mode,
@@ -265,10 +318,17 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
         "active_node": active_node,
         "active_delay": active_delay,
         "active_alive": active_alive,
+        "active_summary": _exit_summary(active_group, active_node, active_delay),
         "standby_group": standby_group,
         "standby_node": standby_node,
         "standby_delay": standby_delay,
         "standby_alive": standby_alive,
+        "gemini_present": gemini["present"],
+        "gemini_group": gemini["group"],
+        "gemini_node": gemini["node"],
+        "gemini_delay": gemini["delay"],
+        "gemini_alive": gemini["alive"],
+        "gemini_summary": gemini["summary"],
     }
 
 
@@ -281,8 +341,24 @@ def _render_current(groups: dict, group_name: str, raw: bool, json_output: bool 
     elif raw:
         print(current)
     else:
+        group = _get_group(groups, group_name)
+        group_type = _group_value(group, "type")
+        candidates = _group_value(group, "all", [])
+        delay = _group_value(group, "delay")
+        alive = _group_value(group, "alive")
+
         _print_section("摘要")
         print(f"当前选择: {_accent(normalize_name(current))}")
+        print(f"代理组  : {group_name}")
+        if group_type:
+            print(f"组类型  : {group_type}")
+        if delay is not None and delay != "-":
+            print(f"延迟    : {_format_delay_label(delay)}")
+        if alive is not None and alive != "-":
+            status = "正常" if alive is True else "异常" if alive is False else "未知"
+            print(f"状态    : {_status_label(status)}")
+        if candidates:
+            print(f"候选数  : {len(candidates)}")
     return 0
 
 
@@ -345,7 +421,7 @@ def _render_switch_entries(tree, groups, *, heading: str) -> int:
     for entry in tree:
         group = groups_by_name.get(entry.key)
         current = normalize_name(_group_value(group, "now", "-")) if group else "-"
-        print(f"{_pad_right(entry.display, name_w)}  {_pad_right(entry.key, key_w)}  {current}")
+        print(f"{_pad_right(entry.display, name_w)}  {_pad_right(entry.key, key_w)}  {_accent(current)}")
     return 0
 
 
@@ -420,8 +496,12 @@ def _render_list_nodes(groups: dict, group_name: str | None, raw: bool, json_out
     print()
     _print_section("列表")
     for item in items:
-        label = "当前" if item == current or item in current_keys else "候选"
-        print(f"{label}  {labels.get(item, normalize_name(item))}")
+        is_curr = item == current or item in current_keys
+        label = "当前" if is_curr else "候选"
+        item_text = labels.get(item, normalize_name(item))
+        styled_label = _style(label, ANSI_BOLD, ANSI_GREEN) if is_curr else _style(label, ANSI_DIM)
+        styled_item = _accent(item_text) if is_curr else item_text
+        print(f"{styled_label}  {styled_item}")
     return 0
 
 
@@ -431,6 +511,7 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
         "AI-AUTO",
         "AI-US",
         "AI-SG",
+        "AI-GEMINI",
     )
     probe_report = run_ai_probe(default_paths())
     if json_output:
@@ -487,12 +568,22 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     standby_alive = route["standby_alive"]
     standby_status = "正常" if standby_alive is True else "异常" if standby_alive is False else "未知"
     active_status = "正常" if active_alive is True else "异常" if active_alive is False else "未知"
+    gemini_present = bool(route.get("gemini_present"))
+    gemini_alive = route.get("gemini_alive")
+    gemini_status = "正常" if gemini_alive is True else "异常" if gemini_alive is False else "未知"
 
     _print_section("摘要")
-    print(
-        f"AI 路由: {route['mode_label']}  当前出口={normalize_name(active_node)}  "
-        f"区域={active_group}  延迟={_format_delay_label(active_delay)}  状态={_status_label(active_status)}"
-    )
+    # 注意：这里**不**走 _render_kv_colon——避免 "AI 路由" 与冒号间补空格，
+    # 破坏测试断言中的 "AI 路由:" 子串。
+    print(f"AI 路由: {route['mode_label']}")
+    print(f"通用出口: {normalize_name(active_node)}")
+    print(f"区域: {active_group}")
+    print(f"延迟: {_format_delay_label(active_delay)}")
+    print(f"状态: {_status_label(active_status)}")
+    if gemini_present:
+        print(f"Gemini 出口: {normalize_name(route['gemini_node'])}")
+        print(f"Gemini 延迟: {_format_delay_label(route['gemini_delay'])}")
+        print(f"Gemini 状态: {_status_label(gemini_status)}")
     print(f"AI 探测: {_status_label(_probe_summary_status(probe_report))}")
     print()
     _print_section("连通性")
@@ -501,7 +592,7 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
         print(f"{label}  {item.name}  {item.url}")
     print()
     _print_section("链路")
-    print("AI-MANUAL")
+    print("通用  AI-MANUAL")
     if bool(route["auto_mode"]):
         print("└─ AI-AUTO")
         print(f"   └─ {active_group}")
@@ -509,17 +600,33 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     else:
         print(f"└─ {active_group}")
         print(f"   └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
+    if gemini_present:
+        print()
+        print(f"Gemini  {AI_GEMINI_GROUP}")
+        print(
+            f"└─ {normalize_name(route['gemini_node'])} "
+            f"({_format_delay_label(route['gemini_delay'])})"
+        )
     print()
     _print_section("备用")
-    print(
-        f"{standby_group} -> {normalize_name(standby_node)}"
-        f" ({_format_delay_label(standby_delay)}, {_status_label(standby_status)})"
+    _render_kv_colon(
+        [
+            (
+                standby_group,
+                f"{normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {_status_label(standby_status)})",
+            )
+        ]
     )
     print()
     _print_section("分组")
-    for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG"):
-        group = _get_group(groups, name)
-        print(f"{name:<10} {_group_value(group, 'type', '-'):<8} 当前: {normalize_name(_group_value(group, 'now', '-'))}")
+    present = [name for name in names if groups.get(name) is not None]
+    group_width = max((_display_width(name) for name in present), default=10)
+    for name in present:
+        group = groups[name]
+        print(
+            f"{_pad_right(name, group_width)} ({_group_value(group, 'type', '-')}) 当前: "
+            f"{normalize_name(_group_value(group, 'now', '-'))}"
+        )
     return 0
 
 
@@ -718,13 +825,14 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
         ai_mode = "-"
         ai_summary = "-"
 
+        gemini_summary = "-"
         try:
             route = _resolve_ai_route(QueryService(paths).get_ai_status_groups())
             api_text = "可访问"
             ai_mode = str(route["mode_label"])
-            ai_summary = f"{route['active_group']} -> {normalize_name(route['active_node'])}"
-            if isinstance(route["active_delay"], int):
-                ai_summary = f"{ai_summary} ({route['active_delay']}ms)"
+            ai_summary = str(route["active_summary"])
+            if route.get("gemini_present"):
+                gemini_summary = str(route["gemini_summary"])
         except APIUnavailableError:
             pass
 
@@ -765,6 +873,7 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
                 "api_available": api_text == "可访问",
                 "ai_mode": ai_mode,
                 "ai_route": ai_summary,
+                "ai_gemini_route": gemini_summary,
                 "metrics": {
                     "connections": _connection_count(paths) if api_text == "可访问" else None,
                     "uptime_seconds": metrics.uptime_seconds,
@@ -809,15 +918,16 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
     print(_section_rule())
 
     _print_section("摘要")
-    _render_kv(
-        [
-            ("状态", _status_label(status_text)),
-            ("API", _status_label(api_text)),
-            ("运行配置", _status_label(config_state)),
-            ("AI 路由", ai_mode),
-            ("当前出口", _accent(ai_summary)),
-        ]
-    )
+    summary_rows = [
+        ("状态", _status_label(status_text)),
+        ("API", _status_label(api_text)),
+        ("运行配置", _status_label(config_state)),
+        ("AI 路由", ai_mode),
+        ("通用出口", _accent(ai_summary)),
+    ]
+    if gemini_summary != "-":
+        summary_rows.append(("Gemini", _accent(gemini_summary)))
+    _render_kv(summary_rows)
 
     print()
     _print_section("资源")
@@ -909,11 +1019,13 @@ def _render_group_check(report: GroupCheckReport, raw: bool, json_output: bool =
     print(f"最慢: {worst.name} ({worst.delay}ms)" if worst else "最慢: -")
     print()
     _print_section("结果")
+    name_w = max((_display_width(item.name) for item in report.results), default=6)
     for item in report.results:
+        padded_name = _pad_right(item.name, name_w)
         if item.ok and item.delay is not None:
-            print(f"{_status_label('正常')}  {item.name}  {item.delay}ms")
+            print(f"{_status_label('正常')}  {padded_name}  {item.delay}ms")
         else:
-            print(f"{_status_label('失败')}  {item.name}  -")
+            print(f"{_status_label('失败')}  {padded_name}  -")
     return 0 if len(ok_items) == len(report.results) else 1
 
 
@@ -941,11 +1053,13 @@ def _render_connectivity_report(report: ConnectivityReport, json_output: bool = 
     print(f"出口 IP: {report.exit_ip or '-'}")
     print()
     _print_section("结果")
+    name_w = max((_display_width(item.name) for item in report.results), default=8)
     for item in report.results:
+        padded_name = _pad_right(item.name, name_w)
         if item.ok:
-            print(f"{_status_label('正常')}  {item.name}  {item.detail}")
+            print(f"{_status_label('正常')}  {padded_name}  {item.detail}")
         else:
-            print(f"{_status_label('失败')}  {item.name}  {item.detail}")
+            print(f"{_status_label('失败')}  {padded_name}  {item.detail}")
     if passed != len(report.results):
         print()
         _print_section("建议操作")
@@ -1042,59 +1156,295 @@ def _render_doctor(json_output: bool = False) -> int:
         )
         return 0 if report["ok"] else 1
 
+    checks = report["checks"]
+    failed = [item for item in checks if item["status"] == "失败"]
+    passed = [item for item in checks if item["status"] != "失败"]
+    summary_status = _status_label("正常" if not failed else "失败")
+
+    # 摘要先于体检结果：让一眼就能看出「6 项 / 1 失败」再决定要不要往下读，
+    # 否则直接进 体检结果 时，本应跳过的健康项会和失败项混在一起，反而被忽略。
+    _print_section("摘要")
+    _render_kv_colon(
+        [
+            ("状态", summary_status),
+            ("总项数", str(len(checks))),
+            ("通过", str(len(passed))),
+            ("失败", str(len(failed))),
+        ]
+    )
+    print()
     _print_section("体检结果")
+    name_w = max((_display_width(item["name"]) for item in checks), default=8)
     for item in report["checks"]:
-        print(f"{_status_label(item['status'])}  {item['name']}  {item['detail']}")
+        padded_name = _pad_right(item["name"], name_w)
+        print(f"{_status_label(item['status'])}  {padded_name}  {item['detail']}")
     if report["recommended_actions"]:
         print()
         _print_section("建议操作")
         for action in report["recommended_actions"]:
-            print(f"- {action}")
+            print(f"- {_accent(action)}")
     return 0 if report["ok"] else 1
 
 
 def _render_security_check(strict: bool) -> int:
     report = validate_controller_security(default_paths())
-    if report.issues:
-        for issue in report.issues:
-            print(f"{issue.severity.upper()}: {issue.code}: {issue.detail}")
+    errors = [i for i in report.issues if i.severity == "error"]
+    warnings = [i for i in report.issues if i.severity == "warning"]
+
+    _print_section("安全体检摘要")
+    if not report.issues:
+        status_label = _status_label("正常")
+        print(f"总体状态: {status_label} (安全校验通过)")
+    elif errors:
+        status_label = _status_label("失败")
+        print(f"总体状态: {status_label} (发现高危配置风险)")
     else:
-        print("OK: security configuration passed")
+        status_label = _status_label("部分异常")
+        print(f"总体状态: {status_label} (发现安全改进项)")
+
+    print(f"高危风险: {len(errors)}")
+    print(f"警告提示: {len(warnings)}")
+    print()
+
+    _print_section("检查项详情")
+    if not report.issues:
+        print("OK: security configuration passed (外部控制接口安全配置达标)")
+    else:
+        for issue in report.issues:
+            sev_label = _status_label("失败" if issue.severity == "error" else "部分异常")
+            print(f"{sev_label}  {issue.severity.upper()}: {issue.code}: {issue.detail}")
+
+    if errors or warnings:
+        print()
+        _print_section("修复建议")
+        for issue in report.issues:
+            if issue.code == "missing-controller-tls":
+                print(f"- [建议] 可在 config.yaml 开启 external-controller-tls 并配置证书保护控制端口")
+            elif issue.code == "non-loopback-controller":
+                print(f"- [修复] 请修改 config.yaml 中的 external-controller，绑定至 127.0.0.1 避免公网暴露")
+            else:
+                print(f"- [{issue.code}] 请检查对应安全项配置")
+
     if any(issue.severity == "error" or (strict and issue.severity == "warning") for issue in report.issues):
         return 1
     return 0
 
 
-def _render_snapshots(paths, raw: bool) -> int:
+def _render_snapshots(paths, raw: bool, as_json: bool = False) -> int:
     entries = list_snapshots(paths)
+    if as_json:
+        payload = [
+            {
+                "name": entry.name,
+                "kind": snapshot_kind(entry),
+                "size": entry.stat().st_size,
+                "relative_time": format_relative_time(parse_snapshot_time(entry)),
+                "tier": snapshot_tier_label(entry, idx),
+                "created_at": parse_snapshot_time(entry).isoformat() if parse_snapshot_time(entry) else None,
+            }
+            for idx, entry in enumerate(entries)
+        ]
+        emit_json("snapshots", {"snapshots": payload, "count": len(entries), "directory": str(snapshots_dir(paths))})
+        return 0
     if raw:
         for entry in entries:
             print(entry.name)
         return 0
 
     _print_section("摘要")
-    print(f"快照数: {len(entries)}")
-    print(f"快照目录: {snapshots_dir(paths)}")
+    _render_kv_colon(
+        [
+            ("快照数", str(len(entries))),
+            ("快照目录", str(snapshots_dir(paths))),
+        ]
+    )
     if entries:
         print()
         _print_section("列表")
-        for entry in entries:
-            size = entry.stat().st_size
-            print(f"{snapshot_kind(entry):<8} {entry.name}  {size}B")
+        rows = []
+        for idx, entry in enumerate(entries):
+            kind = snapshot_kind(entry)
+            name = entry.name
+            rel_time = format_relative_time(parse_snapshot_time(entry))
+            tier = snapshot_tier_label(entry, idx)
+            size = format_bytes(entry.stat().st_size)
+            rows.append((kind, name, rel_time, f"[{tier}]", size))
+
+        kind_width = max((_display_width(r[0]) for r in rows), default=4)
+        name_width = max((_display_width(r[1]) for r in rows), default=4)
+        time_width = max((_display_width(r[2]) for r in rows), default=6)
+        tier_width = max((_display_width(r[3]) for r in rows), default=6)
+        size_width = max((_display_width(r[4]) for r in rows), default=6)
+
+        kind_header = _pad_right("类型", kind_width)
+        name_header = _pad_right("快照文件名", name_width)
+        time_header = _pad_right("生成时间", time_width)
+        tier_header = _pad_right("保留阶梯", tier_width)
+        size_header = _pad_left("大小", size_width)
+        print(f"{kind_header}  {name_header}  {time_header}  {tier_header}  {size_header}")
+
+        for kind, name, rel_time, tier, size in rows:
+            p_kind = _pad_right(kind, kind_width)
+            p_name = _pad_right(name, name_width)
+            p_time = _pad_right(rel_time, time_width)
+            p_tier = _pad_right(tier, tier_width)
+            p_size = _pad_left(size, size_width)
+            print(f"{p_kind}  {p_name}  {p_time}  {p_tier}  {p_size}")
+    return 0
+
+
+def _render_colored_diff(diff_lines: Sequence[str], max_lines: int = 40) -> None:
+    count = 0
+    for line in diff_lines:
+        count += 1
+        if count > max_lines:
+            print(f"{ANSI_DIM}… (余下 {len(diff_lines) - max_lines} 行差异已折叠){ANSI_RESET}")
+            break
+        text = line.rstrip("\r\n")
+        if text.startswith("---") or text.startswith("+++"):
+            print(f"{ANSI_BOLD}{text}{ANSI_RESET}")
+        elif text.startswith("@@"):
+            print(f"\033[36m{text}{ANSI_RESET}")
+        elif text.startswith("+"):
+            print(f"\033[32m{text}{ANSI_RESET}")
+        elif text.startswith("-"):
+            print(f"\033[31m{text}{ANSI_RESET}")
+        else:
+            print(text)
+
+
+def _render_snapshot_diff(paths, target_name: str | None = None, raw: bool = False, as_json: bool = False) -> int:
+    if target_name:
+        candidate = snapshots_dir(paths) / Path(target_name).name
+        if not candidate.is_file():
+            raise RuntimeError(f"错误: 快照不存在: {target_name}")
+        snapshot = candidate
+    else:
+        snapshots = list_snapshots(paths)
+        if not snapshots:
+            raise RuntimeError("错误: 没有可供比对的快照")
+        snapshot = snapshots[0]
+
+    diff_lines = snapshot_diff(paths, snapshot)
+    if as_json:
+        emit_json(
+            "snapshots_diff",
+            {
+                "snapshot": snapshot.name,
+                "kind": snapshot_kind(snapshot),
+                "diff": diff_lines,
+                "has_diff": bool(diff_lines),
+            },
+        )
+        return 0
+    if raw:
+        for line in diff_lines:
+            print(line, end="")
+        return 0
+
+    _print_section(f"配置差异对比 ({snapshot.name})")
+    if not diff_lines:
+        print("快照内容与当前对应配置文件完全一致（无差异）。")
+    else:
+        _render_colored_diff(diff_lines)
+    return 0
+
+
+def _run_compact_snapshots(
+    paths,
+    kind: str | None = None,
+    dry_run: bool = False,
+    raw: bool = False,
+    as_json: bool = False,
+) -> int:
+    report = compact_snapshots(paths, kind=kind, dry_run=dry_run)
+    if as_json:
+        emit_json(
+            "snapshots_compact",
+            {
+                "dry_run": report.dry_run,
+                "total_before": report.total_before,
+                "total_after": report.total_after,
+                "kept_count": len(report.kept),
+                "pruned_count": len(report.pruned),
+                "bytes_reclaimed": report.bytes_reclaimed,
+                "kept": report.kept,
+                "pruned": report.pruned,
+            },
+        )
+        return 0
+    if raw:
+        for name in report.pruned:
+            print(name)
+        return 0
+
+    mode_label = "演练（Dry Run）" if report.dry_run else "已完成"
+    _print_section(f"快照压缩 - {mode_label}")
+    _render_kv_colon(
+        [
+            ("压缩前总数", str(report.total_before)),
+            ("保留快照数", str(report.total_after)),
+            ("清理快照数", str(len(report.pruned))),
+            ("释放空间", f"{report.bytes_reclaimed} 字节"),
+            ("模式", "演练（未实际删除文件）" if report.dry_run else "已实际删除"),
+        ]
+    )
+    if report.pruned:
+        print()
+        _print_section("已清理快照" if not report.dry_run else "拟清理快照")
+        for name in report.pruned:
+            print(f"- {name}")
     return 0
 
 
 def _run_rollback(paths, name: str | None) -> int:
+    from .interactive import interactive_supported, select_one
+
     if name:
         candidate = snapshots_dir(paths) / Path(name).name
         if not candidate.is_file():
             raise RuntimeError(f"错误: 快照不存在: {name}")
         snapshot = candidate
     else:
-        runtime_snapshots = list_snapshots(paths, "runtime")
-        if not runtime_snapshots:
-            raise RuntimeError("错误: 没有可用的运行配置快照")
-        snapshot = runtime_snapshots[0]
+        if interactive_supported():
+            all_snapshots = list_snapshots(paths)
+            if not all_snapshots:
+                raise RuntimeError("错误: 没有可用的快照")
+
+            # 构造带相对时间与阶梯标签的交互菜单
+            items = [s.name for s in all_snapshots]
+            annotations = {
+                s.name: f"{format_relative_time(parse_snapshot_time(s))} [{snapshot_tier_label(s, i)}]"
+                for i, s in enumerate(all_snapshots)
+            }
+            chosen = select_one("选择要回滚的快照（Esc / q 取消）", items, annotations=annotations)
+            if chosen is None:
+                print("已取消回滚。")
+                return 0
+            snapshot = snapshots_dir(paths) / chosen
+
+            # 展示差异预览
+            diff_lines = snapshot_diff(paths, snapshot)
+            print()
+            _print_section("差异预览")
+            if diff_lines:
+                _render_colored_diff(diff_lines, max_lines=30)
+            else:
+                print("提示: 快照内容与当前目标文件完全一致")
+
+            try:
+                reply = input("\n是否确认回滚到此快照？[Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n已取消回滚。")
+                return 0
+            if reply not in ("", "y", "yes"):
+                print("已取消回滚。")
+                return 0
+        else:
+            runtime_snapshots = list_snapshots(paths, "runtime")
+            if not runtime_snapshots:
+                raise RuntimeError("错误: 没有可用的运行配置快照")
+            snapshot = runtime_snapshots[0]
 
     target = restore_snapshot(paths, snapshot)
     kind = snapshot_kind(snapshot)
@@ -1141,24 +1491,28 @@ def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False)
         return 0
 
     _print_section("摘要")
+    # 旧版用裸 `f"订阅更新: ..."` 拼接，长 detail 时会撞列；
+    # 现在按最长 key 对齐，多字段也不会错位。
+    rows: list[tuple[str, str]] = []
     subscription_label = report.subscription
     if report.subscription_detail:
         subscription_label = f"{subscription_label}  {report.subscription_detail}"
-    print(f"订阅更新: {subscription_label}")
+    rows.append(("订阅更新", subscription_label))
     for extra in report.extra_subscriptions:
         extra_label = extra.status
         if extra.detail:
             extra_label = f"{extra_label}  {extra.detail}"
-        print(f"附加订阅 {extra.name}: {extra_label}")
-    print(f"运行配置: {report.runtime_path}")
+        rows.append((f"附加订阅 {extra.name}", extra_label))
+    rows.append(("运行配置", report.runtime_path))
     if report.restarted:
-        print("代理: 已重启应用新配置（连接已中断）")
+        rows.append(("代理", "已重启应用新配置（连接已中断）"))
     elif report.hot_reloaded:
-        print("代理: 已热重载应用新配置（连接不中断）")
+        rows.append(("代理", "已热重载应用新配置（连接不中断）"))
     elif report.was_running:
-        print("代理: 运行中")
+        rows.append(("代理", "运行中"))
     else:
-        print("代理: 未运行（跳过重启与探测）")
+        rows.append(("代理", "未运行（跳过重启与探测）"))
+    _render_kv_colon(rows)
     if report.groups:
         print()
         _print_section("分组探测")
@@ -1170,6 +1524,20 @@ def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False)
                 line += f"  {item.detail}"
             print(line)
     return 0
+
+
+def _format_history_time(ts_val: Any) -> str:
+    try:
+        ts = float(ts_val)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        local_dt = dt.astimezone()
+        local_str = local_dt.strftime("%Y-%m-%d %H:%M")
+        rel = format_relative_time(dt)
+        if any(keyword in rel for keyword in ("前", "昨天")):
+            return f"{local_str} ({rel})"
+        return local_str
+    except Exception:
+        return str(ts_val)
 
 
 def _render_shadow_history(paths, limit: int, raw: bool) -> int:
@@ -1189,17 +1557,31 @@ def _render_shadow_history(paths, limit: int, raw: bool) -> int:
     if not rows:
         print("-")
         return 0
+
     for item in rows:
-        print(
-            f"{item.get('ts', '-')}  "
-            f"{item.get('profile', '-')}  "
-            f"{item.get('strategy', '-')}  "
-            f"current={item.get('current', '-')}  "
-            f"best={item.get('best', '-')}  "
-            f"stable={item.get('stable', '-')}  "
-            f"switched={item.get('switched', '-')}  "
-            f"reason={item.get('skip_reason') or item.get('reason', '-')}"
-        )
+        time_label = _format_history_time(item.get("ts", "-"))
+        profile = item.get("profile", "-")
+        strategy = item.get("strategy", "-")
+        curr = normalize_name(item.get("current", "-"))
+        best = normalize_name(item.get("best", "-"))
+        switched = item.get("switched") is True
+        stable = item.get("stable") is True
+        reason = item.get("skip_reason") or item.get("reason", "-")
+
+        if switched:
+            tag = _style("[已自动切换]", ANSI_BOLD, ANSI_GREEN)
+        elif stable:
+            tag = _style("[稳定保持]", ANSI_CYAN)
+        else:
+            tag = _style("[未达标]", ANSI_YELLOW)
+
+        print(f"• {time_label}  {profile} ({strategy})  {tag}")
+        if best and best != "-" and best != "None":
+            print(f"  当前: {curr}  ->  推荐: {_accent(best)}")
+        else:
+            print(f"  当前: {curr}")
+        print(f"  原因: {reason}")
+        print()
     return 0
 
 
@@ -1211,12 +1593,24 @@ def _render_ai_connections(paths, raw: bool) -> int:
             print(f"AI_CONNECTION\t{conn.host}\tcount={conn.count}\troute={conn.route}")
         return 0
 
+    total_conns = sum(conn.count for conn in connections)
+    _print_section("摘要")
+    print(f"活动目标数: {len(connections)}")
+    print(f"活动连接数: {_accent(str(total_conns))}")
+    print()
+
     _print_section("AI 连接")
     if not connections:
         print("未发现 ChatGPT/Claude/Gemini/Antigravity/GitHub 相关活动连接")
         return 0
+
+    host_width = max((_display_width(conn.host) for conn in connections), default=12)
+    host_width = max(host_width, _display_width("目标域名"))
+    print(f"{_pad_right('目标域名', host_width)}  {'连接数':<10}  出口链路")
     for conn in connections:
-        print(f"{conn.host}  {conn.count} active  {conn.route}")
+        active_label = f"{conn.count} active"
+        styled_active = _style(f"{active_label:<10}", ANSI_GREEN)
+        print(f"{_pad_right(conn.host, host_width)}  {styled_active}  {conn.route}")
     return 0
 
 
@@ -1427,6 +1821,25 @@ def _render_kv(rows: list[tuple[str, str]]) -> None:
     width = max(_display_width(label) for label, _ in visible) + _KV_GUTTER
     for label, value in visible:
         print(f"{_pad_right(label, width)}{value}")
+
+
+def _render_kv_colon(rows: list[tuple[str, str]]) -> None:
+    """按东亚宽度对齐输出「key: value」行；空值行自动跳过。
+
+    与 :func:`_render_kv` 的区别：分隔符是 ``": "`` 而非多空格，
+    适合「目标组: AI-AUTO」「订阅更新: 已更新」这类人类可读的冒号场景，
+    也兼容外部断言（测试仍可命中 ``"AI 路由:"`` 等冒号子串）。
+
+    标签按 display width 对齐（CJK 字符 2 列宽），最长标签后**直接**接
+    ``": value"``，不会在冒号前补额外空白——保留 ``"目标组: AI-AUTO"``
+    这种紧凑格式比强行做列对齐更重要（后者会让冒号漂在奇怪的位置）。
+    """
+    visible = [(label, value) for label, value in rows if value]
+    if not visible:
+        return
+    width = max(_display_width(label) for label, _ in visible)
+    for label, value in visible:
+        print(f"{_pad_right(label, width)}: {value}")
 
 
 def _total_size_columns() -> list[tuple[str, Callable[[Any], str], str]]:

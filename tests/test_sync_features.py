@@ -150,6 +150,10 @@ def _render_config(tmp_path: Path, config_yaml: str) -> dict:
         return yaml.safe_load(fh)
 
 
+def _groups_by_name(data: dict) -> dict:
+    return {g["name"]: g for g in data["proxy-groups"]}
+
+
 BASE_CONFIG = """\
 mixed-port: 7890
 external-controller: 127.0.0.1:9090
@@ -262,10 +266,47 @@ def test_render_ssrdog_rules_removed(tmp_path: Path):
     data = _render_config(tmp_path, BASE_CONFIG)
     ssrdog = [r for r in data["rules"] if "SSRDOG" in str(r)]
     assert ssrdog == []
-    ai_rules = [r for r in data["rules"] if "AI-MANUAL" in str(r)]
-    assert len(ai_rules) == 24
-    # 注入规则需前移到订阅规则之前（首条规则即 AI 规则）
-    assert "AI-MANUAL" in str(data["rules"][0])
+    manual_rules = [r for r in data["rules"] if "AI-MANUAL" in str(r)]
+    gemini_rules = [r for r in data["rules"] if "AI-GEMINI" in str(r)]
+    assert len(manual_rules) == 15
+    assert len(gemini_rules) == 9
+    # Google / Gemini 规则前移到首条，且排在 PROCESS-NAME,agy 之前
+    assert "AI-GEMINI" in str(data["rules"][0])
+    groups = _groups_by_name(data)
+    assert groups["AI-GEMINI"]["type"] == "fallback"
+    # 无韩台欧节点时退回日美新
+    assert groups["AI-GEMINI"]["proxies"] == ["JP-01", "US-01", "SG-01"]
+
+
+def test_render_gemini_prefers_friendly_regions(tmp_path: Path):
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: 🇺🇸 US 01 | 1X
+  - name: 🇸🇬 SG 01 | 1X
+  - name: 🇯🇵 JP 01 | 1X
+  - name: 🇰🇷 KR 01 | IEPL
+  - name: 🇰🇷 KR 01 | 1X
+  - name: 🇹🇼 TW 01 | 1X
+  - name: 🇭🇰 HK 01 | 1X
+proxy-groups:
+  - name: Auto
+    type: fallback
+    proxies: [🇺🇸 US 01 | 1X]
+rules:
+  - MATCH,Auto
+"""
+    data = _render_config(tmp_path, config)
+    gemini = _groups_by_name(data)["AI-GEMINI"]["proxies"]
+    assert gemini[0] == "🇰🇷 KR 01 | 1X"
+    assert "🇹🇼 TW 01 | 1X" in gemini
+    assert "🇭🇰 HK 01 | 1X" not in gemini
+    assert "🇺🇸 US 01 | 1X" not in gemini
+    assert "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI" in data["rules"]
+    assert data["rules"].index("DOMAIN-SUFFIX,google.com,AI-GEMINI") < data["rules"].index(
+        "PROCESS-NAME,agy,AI-MANUAL"
+    )
 
 
 def test_render_atomic_write(tmp_path: Path):

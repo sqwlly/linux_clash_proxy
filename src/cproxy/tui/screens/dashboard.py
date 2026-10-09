@@ -51,8 +51,11 @@ class DashboardScreen(Widget):
                         yield Label("模式", classes="label-key")
                         yield Label("─", id="dash-ai-mode", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("当前", classes="label-key")
+                        yield Label("通用", classes="label-key")
                         yield Label("─", id="dash-ai-active", classes="metric-value")
+                    with Horizontal(classes="dashboard-row"):
+                        yield Label("Gemini", classes="label-key")
+                        yield Label("─", id="dash-ai-gemini", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("备用", classes="label-key")
                         yield Label("─", id="dash-ai-standby", classes="metric-value")
@@ -141,6 +144,7 @@ class DashboardScreen(Widget):
             self.query_one("#dash-api-status", Label).update("[#fb7185]○ 不可访问[/]")
             self.query_one("#dash-ai-mode", Label).update("[#8b98aa]─[/]")
             self.query_one("#dash-ai-active", Label).update("[#8b98aa]─[/]")
+            self.query_one("#dash-ai-gemini", Label).update("[#8b98aa]─[/]")
             self.query_one("#dash-ai-standby", Label).update("[#8b98aa]─[/]")
 
         traffic = result["traffic"]
@@ -175,6 +179,20 @@ class DashboardScreen(Widget):
                     self.query_one("#dash-ai-active", Label).update(
                         f"{active_group_name} → {active.current} ({delay_str}) {alive_str}"
                     )
+
+                gemini = groups.get("AI-GEMINI")
+                if gemini:
+                    delay_str = f"{gemini.delay}ms" if gemini.delay else "─"
+                    alive_str = (
+                        "[#a3e635]●[/]" if gemini.alive
+                        else "[#fb7185]○[/]" if gemini.alive is False
+                        else "[#8b98aa]?[/]"
+                    )
+                    self.query_one("#dash-ai-gemini", Label).update(
+                        f"AI-GEMINI → {gemini.current} ({delay_str}) {alive_str}"
+                    )
+                else:
+                    self.query_one("#dash-ai-gemini", Label).update("[#8b98aa]─[/]")
 
                 standby_name = ai_standby_peer(active_group_name)
                 standby = groups.get(standby_name)

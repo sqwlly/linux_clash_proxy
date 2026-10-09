@@ -7,6 +7,7 @@ from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ConnectionEntry, ProviderEntry, ProxyGroup, QueryContext
 from ..backend.runtime import (
     AI_AUTO_GROUP,
+    AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     AI_PROCESS_NAMES,
     AI_REGION_JP,
@@ -25,6 +26,7 @@ AI_SWITCH_DROP_GROUPS = frozenset(
         AI_AUTO_GROUP,
         AI_US_GROUP,
         AI_SG_GROUP,
+        AI_GEMINI_GROUP,
         AI_REGION_JP,
         AI_REGION_US,
         AI_REGION_SG,
@@ -194,7 +196,7 @@ class QueryService:
     def _connection_follows_ai_switch(item: dict[str, Any], group_name: str) -> bool:
         chains = item.get("chains") or []
         chain_names = {str(part) for part in chains} if isinstance(chains, list) else set()
-        if group_name in chain_names or AI_MANUAL_GROUP in chain_names:
+        if group_name in chain_names or AI_MANUAL_GROUP in chain_names or AI_GEMINI_GROUP in chain_names:
             return True
         raw_metadata = item.get("metadata")
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}

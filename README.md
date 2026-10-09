@@ -12,6 +12,7 @@
 - AI 路由状态查看与手动切换
 - 代理组、节点、延迟检查
 - 命令级代理环境注入
+- TUN 透明代理开关、状态与热重载
 - 运行配置自动快照与一键回滚
 - 一键刷新：订阅更新、重启、分组探测与失效自动切换
 - 从旧仓库目录迁移 `config.yaml`
@@ -143,6 +144,51 @@ cproxy bootstrap
 ```bash
 cproxy bootstrap --subscription-url 'https://example.invalid/subscription'
 ```
+
+## TUN 透明代理（Linux）
+
+TUN 在网络层接管流量，不要求应用设置 `HTTP_PROXY`，仍按现有 Mihomo 规则和
+代理组分流。命令级代理和 mixed-port 继续可用。
+
+```bash
+cproxy tun status          # 同时查看本地开关、内核开关和 Linux 前置条件
+cproxy tun status --json
+cproxy tun on              # 保存配置并 render，下次启动或 refresh 时应用
+cproxy tun on --apply      # 保存并热重载已运行的 Mihomo，立即改变本机路由
+cproxy tun off --apply     # 关闭并热重载，撤销 Mihomo 的 TUN 接管
+```
+
+本地 `tun`、`dns` 配置在订阅更新时优先保留。保存前创建配置快照，写入采用
+同目录原子替换；渲染失败会恢复原始配置。`--apply` 要求 cproxy 管理的 Mihomo
+已经运行且 controller 可用，复用现有热重载与 Selector 选择恢复流程。
+热重载失败会返回非零退出码，并保留已保存的配置；请按错误提示检查状态和日志。
+
+首次开启会补齐以下默认值，保留已有的自定义字段：
+
+```yaml
+tun:
+  enable: true
+  device: cproxy-tun
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack: [any:53, 'tcp://any:53']
+  auto-redirect: false
+  strict-route: false
+```
+
+同时启用内置 DNS；没有 DNS 模式或上游配置时补充 `fake-ip` 模式和数字 IP
+上游。`auto-redirect` 默认关闭，避免额外依赖 nftables；`strict-route` 默认
+关闭。需要自定义路由排除、协议栈或 DNS 时，编辑 `~/.config/cproxy/config.yaml`
+再应用。参数定义见 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
+
+Linux 需要可用的 `/dev/net/tun` 和 Mihomo 的 `CAP_NET_ADMIN`。容器还需宿主机
+允许对应设备和网络管理能力。普通用户的 systemd 服务不会凭空获得这些权限，
+尤其现有 unit 的 `NoNewPrivileges=yes` 会阻止通过文件 capability 新增权限。
+命令会检查可见的前置条件，不会自动提权或修改服务权限。配置开关与内核返回的
+开关也不能单独证明端到端接管成功；开启后应核对网卡、路由与不带代理环境变量的
+实际请求。远程服务器切换自动路由可能影响 SSH、容器网络或其他 VPN，应在有
+恢复通道时启用；可用 `cproxy tun off --apply` 关闭。
 
 ## 用户级目录
 
@@ -287,13 +333,15 @@ cproxy test-group "AI-AUTO" --raw
 
 - `render` 后、`start` 前，`current/list-groups/list-nodes` 仍然可用
 - `ai-status/switch/test-group` 仍要求 Mihomo API 可访问
-- `ai-status` 会额外通过本地代理探测 `chatgpt.com` 与 `api.openai.com/v1/models`，失败时会做最多 2 次轻量重试
+- `ai-status` 会额外通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API，失败时会做最多 2 次轻量重试
+- `status` / `ai-status` 分别展示通用出口（`AI-MANUAL`）与 Gemini 出口（`AI-GEMINI`）
 
 如需覆盖默认探测地址，可在 `config.yaml` 里配置：
 
 ```yaml
 ai-chatgpt-url: https://chatgpt.com
 ai-openai-api-url: https://api.openai.com/v1/models
+ai-gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models
 ai-probe-timeout: 8
 ```
 
@@ -304,21 +352,17 @@ ai-probe-timeout: 8
 - `AI-US`
 - `AI-SG`
 - `AI-AUTO`
-- `AI-MANUAL`
+- `AI-MANUAL`（ChatGPT / Claude / agy 非 Google 流量）
+- `AI-GEMINI`（Google / Gemini / Antigravity；fallback 优先韩台德法英巴东澳）
 
 默认 AI 规则覆盖：
 
-- `openai.com`
-- `chatgpt.com`
-- `oaistatic.com`
-- `oaiusercontent.com`
-- `anthropic.com`
-- `claude.ai`
-- `google.com` / `googleapis.com` / `googleusercontent.com` / `gstatic.com` / `google.dev` / `appspot.com`（含 Gemini、AI Studio）
-- `PROCESS-NAME,agy`：Antigravity CLI 全部出站走同一 AI 出口（含 github / playwright CDN 等域名规则盖不到的请求）
-- `antigravity` 关键字（`antigravity.google`、`antigravity-unleash.goog` 等）
+- `openai.com` / `chatgpt.com` / `oaistatic.com` / `oaiusercontent.com` → `AI-MANUAL`
+- `anthropic.com` / `claude.ai` → `AI-MANUAL`
+- `google.com` / `googleapis.com` / `googleusercontent.com` / `gstatic.com` / `google.dev` / `appspot.com` / `goog` / `gemini` / `antigravity` → `AI-GEMINI`（排在进程规则之前）
+- `PROCESS-NAME,agy` → `AI-MANUAL`：仅兜底非 Google 出站（github / playwright CDN 等）
 
-切换 `AI-MANUAL` / `AI-AUTO` / `AI-US` / `AI-SG` 时会立刻断开这些组上的旧连接（以及残留的 `agy` 连接），避免同一会话混用新旧出口 IP。Google Cloud Code 按请求 IP 做地区校验，换节点后需要新开 `agy` 对话。
+切换 `AI-MANUAL` / `AI-AUTO` / `AI-US` / `AI-SG` / `AI-GEMINI` 时会立刻断开相关旧连接（以及残留的 `agy` 连接），避免同一会话混用新旧出口 IP。Google Cloud Code 按请求 IP 做地区校验，换节点后需要新开 `agy` 对话。
 
 并且会在 `MATCH` 前补一条：
 
@@ -407,7 +451,7 @@ legacy 入口的子命令与 cproxy **绝大多数同名同义**——`status`�
    cproxy rollback [文件名]    # 省略文件名则回滚最近一份运行时快照
    ```
 
-   render 与订阅更新在覆盖配置前各留一份快照（各保留 10 份）；运行中回滚会自动重启。
+   render 与订阅更新在覆盖配置前各留一份快照（支持 SHA256 智能去重与 `cproxy snapshots compact` 分级压缩轮转）；运行中回滚会自动重启。
 
 每日订阅更新由用户级 `cproxy-subscription.timer` 触发（默认 04:00 + 随机延迟），
 `cproxy-refresh.timer` 作为周期性重渲染兜底，定义见

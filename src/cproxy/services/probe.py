@@ -285,7 +285,10 @@ class ProbeService:
 
         groups = self.api.get_groups()
         if group not in groups:
-            raise RuntimeError(f"错误: 未找到代理组或节点: {group}")
+            from .switch_tree import suggest_groups_from_names
+
+            hint = suggest_groups_from_names(group, list(groups.keys()))
+            raise RuntimeError(f"错误: 未找到代理组或节点: {group}\n{hint}")
 
         candidates, switch_paths = collect_leaf_candidates(groups, group)
         current = resolve_current_leaf(groups, group)

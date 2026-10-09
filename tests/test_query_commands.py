@@ -43,6 +43,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "all": ["🇸🇬 Singapore丨01"],
                 "history": [{"delay": 99}],
             },
+            "AI-GEMINI": {
+                "type": "Fallback",
+                "now": "🇰🇷 Korea丨01",
+                "alive": True,
+                "all": ["🇰🇷 Korea丨01"],
+                "history": [{"delay": 88}],
+            },
             "🇺🇸 United States": {
                 "type": "Selector",
                 "now": "🇺🇸 United States丨01",
@@ -90,6 +97,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "http://probe.local/openai-api":
             self._send(502, "bad gateway")
             return
+        if self.path == "http://probe.local/gemini":
+            self._send(403, "need key")
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -130,7 +140,8 @@ def test_query_commands_use_api_output(tmp_path: Path):
             f"external-controller: 127.0.0.1:{server.server_port}\n"
             f"mixed-port: {proxy_server.server_port}\n"
             "ai-chatgpt-url: http://probe.local/chatgpt\n"
-            "ai-openai-api-url: http://probe.local/openai-api\n",
+            "ai-openai-api-url: http://probe.local/openai-api\n"
+            "ai-gemini-api-url: http://probe.local/gemini\n",
             encoding="utf-8",
         )
 
@@ -178,15 +189,20 @@ def test_query_commands_use_api_output(tmp_path: Path):
         assert ai_status_result.returncode == 0
         assert "摘要" in ai_status_result.stdout
         assert "AI 路由:" in ai_status_result.stdout
+        assert "通用出口:" in ai_status_result.stdout
+        assert "Gemini 出口:" in ai_status_result.stdout
         assert "AI 探测: 部分异常" in ai_status_result.stdout
         assert "连通性" in ai_status_result.stdout
         assert "正常  ChatGPT Web  http://probe.local/chatgpt" in ai_status_result.stdout
         assert "失败  OpenAI API  http://probe.local/openai-api" in ai_status_result.stdout
+        assert "正常  Gemini API  http://probe.local/gemini" in ai_status_result.stdout
         assert "链路" in ai_status_result.stdout
+        assert "Gemini  AI-GEMINI" in ai_status_result.stdout
 
         ai_status_raw = _run(env, "ai-status", "--raw")
         assert ai_status_raw.returncode == 0
         assert "AI-MANUAL: type=Selector now=AI-AUTO" in ai_status_raw.stdout
+        assert "AI-GEMINI: type=Fallback now=🇰🇷 Korea丨01" in ai_status_raw.stdout
     finally:
         server.shutdown()
         thread.join()

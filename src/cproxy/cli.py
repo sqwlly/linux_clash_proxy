@@ -22,10 +22,12 @@ from .cli_render import (
     _render_refresh,
     _render_security_check,
     _render_shadow_history,
+    _render_snapshot_diff,
     _render_snapshots,
     _render_status,
     _render_traffic,
     _run_bootstrap,
+    _run_compact_snapshots,
     _run_rollback,
     _section_heading,
     _section_title,
@@ -52,6 +54,8 @@ from .services.switch_tree import (
     resolve_delay as _resolve_delay,
     resolve_group_query,
 )
+from .services.tun import TunService
+from .structured_output import emit_json
 from .support import build_support_bundle
 
 
@@ -87,8 +91,44 @@ def run(argv: list[str] | None = None) -> int:
             runtime_path = render_runtime(default_paths())
             print(f"已生成运行配置: {runtime_path}")
             return 0
+        if args.command == "tun":
+            if args.action == "status" and args.apply:
+                print_error("错误: --apply 只能与 tun on/off 一起使用")
+                return 1
+            tun_service = TunService(default_paths())
+            tun_report = (
+                tun_service.status() if args.action == "status"
+                else tun_service.configure(args.action == "on", apply=args.apply)
+            )
+            if args.json:
+                emit_json("tun", tun_report, warnings=tun_report.warnings)
+            else:
+                labels = {True: "开启", False: "关闭", None: "未知"}
+                print(f"配置 TUN: {labels[tun_report.configured_enabled]}")
+                print(f"内核 TUN: {labels[tun_report.kernel_enabled]}")
+                print(f"TUN 网卡: {tun_report.device or '未指定'}")
+                interface_label = {True: "是", False: "否", None: "未知"}[tun_report.interface_present]
+                print(f"网卡存在: {interface_label}")
+                for issue in tun_report.prerequisites + tun_report.warnings:
+                    print(f"提示: {issue}")
+            return 0
         if args.command == "snapshots":
-            return _render_snapshots(default_paths(), args.raw)
+            if getattr(args, "action", "list") == "compact":
+                return _run_compact_snapshots(
+                    default_paths(),
+                    kind=getattr(args, "kind", None),
+                    dry_run=getattr(args, "dry_run", False),
+                    raw=args.raw,
+                    as_json=args.json,
+                )
+            if getattr(args, "action", "list") == "diff":
+                return _render_snapshot_diff(
+                    default_paths(),
+                    target_name=getattr(args, "target", None),
+                    raw=args.raw,
+                    as_json=args.json,
+                )
+            return _render_snapshots(default_paths(), args.raw, as_json=args.json)
         if args.command == "rollback":
             return _run_rollback(default_paths(), args.name)
         if args.command == "refresh":
@@ -298,8 +338,11 @@ def _resolve_switch(service: QueryService, args: Namespace) -> list[tuple[str, s
         return [(args.group, args.target)]
 
     if args.group is not None:
-        print("cproxy switch: 错误: 缺少必需参数: target", file=sys.stderr)
-        print("用法: cproxy switch <代理组> <目标>", file=sys.stderr)
+        # 走 print_error 让整条上色，跟 run() 里 SystemExit(str) 的着色一致——
+        # 之前裸 print 出来的错误在 TTY 下是普通黑字，跟其它错误的红字混在一起
+        # 反而显得不严肃。
+        print_error("cproxy switch: 错误: 缺少必需参数: target")
+        print_error("用法: cproxy switch <代理组> <目标>")
         raise SystemExit(2)
 
     all_groups = service.list_groups()
@@ -312,7 +355,7 @@ def _resolve_switch(service: QueryService, args: Namespace) -> list[tuple[str, s
         delays=delays,
     )
     if not entries:
-        print("错误: 没有可手动切换的代理组", file=sys.stderr)
+        print_error("错误: 没有可手动切换的代理组")
         raise SystemExit(1)
 
     last_display: str | None = None
@@ -331,7 +374,7 @@ def _resolve_switch(service: QueryService, args: Namespace) -> list[tuple[str, s
             last_display = entry.display
             children = entry.children
             if not children:
-                print(f"错误: 代理组 [{entry.key}] 没有候选节点", file=sys.stderr)
+                print_error(f"错误: 代理组 [{entry.key}] 没有候选节点")
                 raise SystemExit(1)
             while True:
                 region_item = select_one(
@@ -399,11 +442,11 @@ def _switch_tree_for(service: QueryService):
 
 def _explain_switch_usage(entries) -> None:
     """非交互终端下的降级说明：给出用法与可选入口，退出码沿用用法错误的 2。"""
-    print("cproxy switch: 错误: 缺少参数，且当前不是交互终端", file=sys.stderr)
-    print("用法: cproxy switch <代理组> <目标>", file=sys.stderr)
-    print("可选入口:", file=sys.stderr)
+    print_error("cproxy switch: 错误: 缺少参数，且当前不是交互终端")
+    print_error("用法: cproxy switch <代理组> <目标>")
+    print_error("可选入口:")
     for entry in entries:
-        print(f"  {entry.display}  ({entry.key})", file=sys.stderr)
+        print_error(f"  {entry.display}  ({entry.key})")
 
 
 
