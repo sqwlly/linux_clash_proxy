@@ -246,6 +246,9 @@ def test_refresh_falls_back_to_restart_when_reload_fails(tmp_path: Path):
     service = RefreshService(paths)
     service.process = StubProcess()
     service._api_factory = lambda _paths: StubAPI()
+    # 重启后 refresh 会校验内核是否真的起来；stub 环境没有真实内核，
+    # 这里视为已就绪——本用例只关注"热重载失败回退重启"这一行为。
+    service._wait_for_api = lambda: None
     report = service.refresh()
 
     assert restarted == [True]
@@ -305,6 +308,8 @@ def test_refresh_stage_progress_reports_restart_fallback(tmp_path: Path):
     service = RefreshService(paths)
     service.process = StubProcess()
     service._api_factory = lambda _paths: StubAPI()
+    # 同上：stub 环境无真实内核，启动校验视为通过
+    service._wait_for_api = lambda: None
     service.refresh(on_stage=stages.append)
 
     assert stages == ["正在渲染运行配置…", "正在热重载代理配置…", "热重载不可用，正在重启代理…"]

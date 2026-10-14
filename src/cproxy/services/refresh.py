@@ -19,7 +19,7 @@ from ..backend.process import ProcessBackend
 from ..backend.runtime import TEST_URL, RuntimeBackend
 from ..config import AppPaths, config_file, read_config, runtime_file
 from ..redaction import redact_text
-from ..snapshots import snapshot_file
+from ..snapshots import list_snapshots, restore_snapshot, snapshot_file
 from .diagnostics import DiagnosticsService
 from .nodelist import (
     REGION_LABELS,
@@ -76,6 +76,7 @@ LOCAL_PREFERRED_KEYS = {
     "ai-chatgpt-url",
     "ai-openai-api-url",
     "ai-gemini-api-url",
+    "ai-gemini-prefer",
     "refresh-groups",
     "subscriptions",
     "profile",
@@ -109,6 +110,64 @@ class SubscriptionPreview:
     proxy_count: int
     group_count: int
     source: str
+
+
+def _dedupe_proxy_names(config: dict) -> list[tuple[str, str]]:
+    """把重名的节点改成唯一名，并同步 proxy-groups 内的引用。
+
+    机场订阅偶尔会给出同名不同 server 的节点（实测 CyberGuard 的
+    「🇯🇵日本 01 | 1X | 推荐」就是两条），而 mihomo 遇到重名会以
+    "duplicate name" 直接 fatal 退出——刷新因此把代理搞挂。这里对第 k(k>=2)
+    次出现的名字追加 " #k" 后缀，组内引用按出现顺序一一对应改写，既不丢节点
+    也不动其余配置。返回 [(原名, 新名)]，无重名时返回空列表。
+    """
+    proxies = config.get("proxies")
+    if not isinstance(proxies, list):
+        return []
+
+    reserved = {str(proxy.get("name")) for proxy in proxies if isinstance(proxy, dict)}
+    seen: dict[str, int] = {}
+    renames: list[tuple[str, str]] = []
+    suffix_map: dict[str, list[str]] = {}
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        name = proxy.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        if count == 1:
+            continue
+        # 新名还需避开订阅里本就存在的同名节点，否则制造出新的重名
+        new_name = f"{name} #{count}"
+        while new_name in reserved:
+            new_name += "_"
+        reserved.add(new_name)
+        suffix_map.setdefault(name, []).append(new_name)
+        proxy["name"] = new_name
+        renames.append((name, new_name))
+    if not renames:
+        return []
+
+    for group in config.get("proxy-groups") or []:
+        if not isinstance(group, dict):
+            continue
+        members = group.get("proxies")
+        if not isinstance(members, list):
+            continue
+        counter: dict[str, int] = {}
+        for index, member in enumerate(members):
+            if not isinstance(member, str):
+                continue
+            count = counter.get(member, 0) + 1
+            counter[member] = count
+            if count < 2:
+                continue
+            renamed = suffix_map.get(member) or []
+            if count - 2 < len(renamed):
+                members[index] = renamed[count - 2]
+    return renames
 
 
 def _rebuild_groups_with_new_nodes(local_groups: list, old_node_names: list[str], new_node_names: list[str]) -> list:
@@ -323,6 +382,8 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
             existing.get("proxy-groups") or [], old_node_names, new_node_names
         )
     merged["subscription-url"] = url
+    # 订阅可能自带重名节点；不处理会生成 mihomo 拒绝加载的配置
+    _dedupe_proxy_names(merged)
 
     snapshot_file(paths, path, "config")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -556,6 +617,8 @@ def apply_extra_subscriptions(
                     members.append(name)
     config["proxies"] = proxies
     config["proxy-groups"] = groups
+    # 附加订阅同样可能引入重名节点（见 _dedupe_proxy_names）
+    _dedupe_proxy_names(config)
 
     path = config_file(paths)
     snapshot_file(paths, path, "config")
@@ -644,6 +707,30 @@ class RefreshService:
                 self.process.restart()
                 report.restarted = True
 
+                # 重启才是危险路径。热重载被 mihomo 拒绝时（HTTP 4xx/5xx 会抛）
+                # 我们已确知配置有问题；但 restart 后 mihomo 解析失败发生在
+                # start() 的存活检测窗口之后——进程随即 fatal 退出，refresh 却
+                # 已回报成功，代理就此静默宕机。这里确认内核真的起来了，失败则
+                # 回滚上一版 runtime 并重启：宁可退回旧配置，也不留下挂掉的代理。
+                try:
+                    self._wait_for_api()
+                except Exception as exc:
+                    stage("新配置未能加载，正在回滚上一版运行配置…")
+                    rolled_back = self._rollback_runtime()
+                    if rolled_back is None:
+                        raise RuntimeError(f"错误: 新配置加载失败，且没有可回滚的运行配置: {exc}") from exc
+                    report.runtime_path = rolled_back
+                    self.process.restart()
+                    try:
+                        self._wait_for_api()
+                    except Exception as retry_exc:
+                        raise RuntimeError(
+                            f"错误: 新配置加载失败，回滚后代理仍未就绪: {retry_exc}"
+                        ) from retry_exc
+                    raise RuntimeError(
+                        f"错误: 新配置加载失败，已回滚到上一版运行配置并重启代理: {exc}"
+                    ) from exc
+
         config_applied = report.restarted or report.hot_reloaded
         if target_groups and config_applied:
             stage("正在等待 Mihomo API 就绪…")
@@ -676,6 +763,17 @@ class RefreshService:
                 self.process.restart()
                 report.restarted = True
         return report
+
+    def _rollback_runtime(self) -> Path | None:
+        """把 runtime.yaml 回滚到最近一份快照，返回目标路径。
+
+        render 覆盖 runtime.yaml 前会自动快照上一版（见 RuntimeBackend.render_runtime），
+        所以最新快照即"最近一次加载成功过的配置"。没有任何快照时返回 None。
+        """
+        snapshots = list_snapshots(self.paths, "runtime")
+        if not snapshots:
+            return None
+        return restore_snapshot(self.paths, snapshots[0])
 
     def _wait_for_api(self) -> None:
         deadline = time.monotonic() + API_READY_TIMEOUT

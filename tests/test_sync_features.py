@@ -442,3 +442,167 @@ rules:
     assert groups["AI-US"]["type"] == "fallback"
     assert groups["AI-SG"]["type"] == "fallback"
 
+
+# ---------------------------------------------------------------------------
+# 重名节点防护：机场订阅会给出同名不同 server 的节点，mihomo 遇重名直接
+# fatal 退出（"proxy X is the duplicate name"），刷新因此把代理搞挂。
+# ---------------------------------------------------------------------------
+
+def test_dedupe_proxy_names_renames_and_rewrites_group_refs():
+    from cproxy.services.refresh import _dedupe_proxy_names
+
+    config = {
+        "proxies": [
+            {"name": "JP 01", "server": "1.1.1.1"},
+            {"name": "US 01", "server": "2.2.2.2"},
+            {"name": "JP 01", "server": "3.3.3.3"},
+        ],
+        "proxy-groups": [{"name": "G", "proxies": ["JP 01", "US 01", "JP 01"]}],
+    }
+
+    renames = _dedupe_proxy_names(config)
+
+    assert renames == [("JP 01", "JP 01 #2")]
+    assert [p["name"] for p in config["proxies"]] == ["JP 01", "US 01", "JP 01 #2"]
+    # 组内引用按出现顺序同步改写，两个节点都还在
+    assert config["proxy-groups"][0]["proxies"] == ["JP 01", "US 01", "JP 01 #2"]
+
+
+def test_dedupe_proxy_names_noop_without_duplicates():
+    from cproxy.services.refresh import _dedupe_proxy_names
+
+    config = {
+        "proxies": [{"name": "A"}, {"name": "B"}],
+        "proxy-groups": [{"name": "G", "proxies": ["A", "B"]}],
+    }
+    before = json.dumps(config, sort_keys=True, ensure_ascii=False)
+
+    assert _dedupe_proxy_names(config) == []
+    assert json.dumps(config, sort_keys=True, ensure_ascii=False) == before
+
+
+def test_dedupe_proxy_names_avoids_collision_with_existing_name():
+    from cproxy.services.refresh import _dedupe_proxy_names
+
+    # 订阅里本就存在 "A #2"：生成的新名必须避让，否则又造出新的重名
+    config = {
+        "proxies": [{"name": "A"}, {"name": "A #2"}, {"name": "A"}],
+        "proxy-groups": [],
+    }
+
+    _dedupe_proxy_names(config)
+
+    names = [p["name"] for p in config["proxies"]]
+    assert len(set(names)) == len(names), names
+
+
+def test_update_source_from_subscription_dedupes_duplicate_nodes(tmp_path: Path, monkeypatch):
+    """端到端：订阅自带重名节点时，落盘的 config.yaml 必须已无重名。"""
+    import cproxy.services.refresh as refresh_mod
+
+    payload = {
+        "proxies": [
+            {"name": "JP 01", "type": "ss", "server": "1.1.1.1", "port": 1, "cipher": "aes-128-gcm", "password": "x"},
+            {"name": "JP 01", "type": "ss", "server": "2.2.2.2", "port": 1, "cipher": "aes-128-gcm", "password": "x"},
+        ],
+        "proxy-groups": [{"name": "G", "type": "select", "proxies": ["JP 01", "JP 01"]}],
+    }
+    raw = yaml.safe_dump(payload, allow_unicode=True).encode("utf-8")
+    monkeypatch.setattr(refresh_mod, "_download_subscription", lambda *a, **k: (raw, None))
+
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "config.yaml").write_text("proxies: []\nproxy-groups: []\n", encoding="utf-8")
+
+    out = refresh_mod.update_source_from_subscription(paths, "https://example.com/sub")
+    data = yaml.safe_load(out.read_text(encoding="utf-8"))
+
+    names = [proxy["name"] for proxy in data["proxies"]]
+    assert len(set(names)) == len(names), names
+    assert len(names) == 2  # 节点没被丢弃
+
+
+# ---------------------------------------------------------------------------
+# 刷新后的启动校验：配置被接受 ≠ 内核活着。新 runtime 加载失败时必须回滚，
+# 而不是让 refresh 回报成功却留下一个挂掉的代理。
+# ---------------------------------------------------------------------------
+
+def _make_paths(tmp_path: Path):
+    paths = default_paths(tmp_path)
+    for directory in (paths.config_dir, paths.data_dir, paths.state_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def test_rollback_runtime_restores_latest_snapshot(tmp_path: Path):
+    from cproxy.config import runtime_file
+    from cproxy.services.refresh import RefreshService
+    from cproxy.snapshots import snapshot_file
+
+    paths = _make_paths(tmp_path)
+    runtime = runtime_file(paths)
+    runtime.write_text("marker: good\n", encoding="utf-8")
+    snapshot_file(paths, runtime, "runtime")
+    runtime.write_text("marker: broken\n", encoding="utf-8")  # 模拟 render 写入的坏配置
+
+    restored = RefreshService(paths)._rollback_runtime()
+
+    assert restored == runtime
+    assert runtime.read_text(encoding="utf-8") == "marker: good\n"
+
+
+def test_rollback_runtime_returns_none_without_snapshot(tmp_path: Path):
+    from cproxy.services.refresh import RefreshService
+
+    assert RefreshService(_make_paths(tmp_path))._rollback_runtime() is None
+
+
+def test_refresh_rolls_back_and_restarts_when_new_config_fails(tmp_path: Path, monkeypatch):
+    import cproxy.services.refresh as refresh_mod
+    from cproxy.config import runtime_file
+    from cproxy.snapshots import snapshot_file
+
+    paths = _make_paths(tmp_path)
+    runtime = runtime_file(paths)
+    good = "marker: good\n"
+    runtime.write_text(good, encoding="utf-8")
+    snapshot_file(paths, runtime, "runtime")  # 上一版可用配置
+    (paths.config_dir / "config.yaml").write_text(
+        "proxies: []\nproxy-groups: []\nsubscription-url: https://example.com/sub\n", encoding="utf-8"
+    )
+
+    service = refresh_mod.RefreshService(paths)
+    monkeypatch.setattr(service.process, "is_running", lambda: True)
+    restarts = []
+    monkeypatch.setattr(service.process, "restart", lambda: restarts.append(1) or 42)
+    monkeypatch.setattr(refresh_mod, "update_source_from_subscription", lambda *a, **k: runtime)
+
+    def fake_render(self):
+        runtime.write_text("marker: broken\n", encoding="utf-8")  # 新配置(坏)
+        return runtime
+
+    monkeypatch.setattr(refresh_mod.RuntimeBackend, "render_runtime", fake_render)
+
+    # 强制走重启分支：热重载不可用
+    class _DeadAPI:
+        def reload_config(self, _path):
+            raise RuntimeError("hot reload unavailable")
+
+    monkeypatch.setattr(service, "_api_factory", lambda _paths: _DeadAPI())
+
+    waits = []
+
+    def fake_wait():
+        waits.append(1)
+        if len(waits) == 1:  # 新配置加载失败
+            raise RuntimeError("Mihomo API 未就绪")
+
+    monkeypatch.setattr(service, "_wait_for_api", fake_wait)
+
+    with pytest.raises(RuntimeError, match="已回滚"):
+        service.refresh()
+
+    assert len(waits) == 2, "回滚后应复检一次 API"
+    assert len(restarts) == 2, "重启应发生两次：应用新配置 + 回滚后恢复"
+    assert runtime.read_text(encoding="utf-8") == good, "runtime 必须已回滚到可用版本"
+

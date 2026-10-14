@@ -244,8 +244,14 @@ def _collect_gemini_nodes(
     proxies: list | None,
     group_map: dict[str, dict],
     extra_names: list[str],
+    prefer: list | None = None,
 ) -> list[str]:
-    """收集 Gemini 专用出口：优先韩/台/欧/巴东等实测可用地区，1X 排 IEPL 前。"""
+    """收集 Gemini 专用出口：优先韩/台/欧/巴东等实测可用地区，1X 排 IEPL 前。
+
+    prefer（config.yaml 的 ai-gemini-prefer）按给定顺序把已入选的节点提到最前，
+    用于把实测更稳的节点钉成 fallback 默认出口；未入选（改名/不在优选地区）
+    的名字静默忽略，不绕过地区筛选。
+    """
     extra_set = set(extra_names)
     buckets: dict[str, list[str]] = {code: [] for code in AI_GEMINI_REGION_ORDER}
     seen: set[str] = set()
@@ -273,6 +279,10 @@ def _collect_gemini_nodes(
     ordered: list[str] = []
     for code in AI_GEMINI_REGION_ORDER:
         ordered.extend(_prefer_non_iepl_nodes(buckets[code]))
+    for name in reversed([str(item) for item in prefer or []]):
+        if name in ordered:
+            ordered.remove(name)
+            ordered.insert(0, name)
     return ordered
 
 
@@ -480,7 +490,10 @@ class RuntimeBackend:
         jp_proxies = region_nodes["JP"]
         if not us_proxies or not sg_proxies:
             raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
-        gemini_proxies = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names)
+        gemini_prefer = data.get("ai-gemini-prefer")
+        if not isinstance(gemini_prefer, list):
+            gemini_prefer = []
+        gemini_proxies = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names, gemini_prefer)
         if not gemini_proxies:
             # 订阅缺少韩/台/欧等优选区时，退回日美新，避免 render 直接失败
             gemini_proxies = list(jp_proxies) + list(us_proxies) + list(sg_proxies)
