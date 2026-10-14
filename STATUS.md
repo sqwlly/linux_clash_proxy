@@ -1,6 +1,6 @@
 # 项目状态
 
-更新日期：2026-09-20
+更新日期：2026-10-15
 
 ## 当前阶段
 
@@ -15,6 +15,8 @@
 - 退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)
 
 ## 最近里程碑
+
+- 2026-10-15 **发布 v1.1.0**（tag `v1.1.0`；GA 产物 `dist/ga/cproxy-1.1.0-source.tar.gz` 已构建并通过 `verify-ga-artifacts.sh`；生产按系统级非 editable 重装，`cproxy --version` 报 1.1.0）：把 1.0.0 以来的累积内容归档为 1.1.0——Gemini 单独分流（`AI-GEMINI`）、配置快照阶梯管理与交互式回滚、TUI 中文化与 80 列布局、CLI 入口/错误路径重做、`doctor` 与 `--json` 信封、TUI 中文化等。本版另修一处**刷新订阅后代理静默宕机**：机场订阅会给出同名不同 server 的节点（实测 CyberGuard 的 `🇯🇵日本 01 | 1X | 推荐` 为两条），mihomo 遇重名直接以 `duplicate name` fatal 退出，而进程解析失败发生在 `start()` 那个仅 `sleep(0.1)` 的存活检测窗口**之后**（实测约 156ms），于是 `cproxy refresh` 回报「已重启应用新配置」时代理其实已经挂掉。现为三层防护：合并订阅时 `_dedupe_proxy_names` 对重名追加 `#k` 后缀并按出现顺序同步组引用（新名避让订阅里已存在的同名节点）、重启分支后校验内核是否真正就绪、失败回滚上一版 runtime 快照并重启。新增 `ai-gemini-prefer` 配置：把实测更稳的节点钉为 `AI-GEMINI`（fallback 组）首选出口——fallback 无法用 `cproxy switch` 手动指定，此前只能受 render 的硬编码排序支配（1X 恒在 IEPL 前）
 
 - 2026-09-20 体验与可恢复性收口：TUI 全面中文化并适配 80 列布局，耗时 API 操作移出 UI 主线程；配置编辑增加 YAML 校验、快照、原子写入与危险操作二次确认，代理环境页明确父 shell 边界并支持带备份的 rc 写入/移除；订阅页脱离 legacy 导入器，原生支持主订阅、附加订阅与挂载目标。CLI 新增 `doctor`、统一 `--json` 信封和可直接传订阅的 bootstrap；安装默认带 TUI 且 clean-host root 路径先补齐依赖，默认不再生成 legacy 日志轮转配置
 - 2026-09-20 `cproxy switch`：修画面残留与返回上一级；并去掉切组卡顿（config.yaml 重复 YAML 解析 + 多次 `/proxies`），选组/切节点应接近即时
