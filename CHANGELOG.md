@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.1.0] - 2026-10-15
 
 ### 改进
 
@@ -67,6 +67,7 @@
 - `cproxy traffic`：代理流量统计报表，按出口链路 / 命中规则 / 按目标主机与按日汇总（`--days`、`--by`、`--top`、`--raw`）
 - `cproxy traffic collect`：单次流量采集（对 Mihomo `/connections` 做连接级增量记账），数据落 `~/.local/state/cproxy/traffic.db`，跨重启累计，保留 90 天
 - `systemd/clash-proxy-traffic-collector.{service,timer}`：每分钟自动采集的定时单元，由 `systemd/install-systemd.sh` 一并安装启用
+- `ai-gemini-prefer` 配置项：按给定顺序把指定节点钉为 `AI-GEMINI`（fallback 组）的首选出口。fallback 组不可用 `cproxy switch` 手动指定，此前只能靠 render 的硬编码排序（1X 恒排在 IEPL 前）；该键让实测更稳的节点成为默认出口，未入选的名字静默忽略。已纳入 `LOCAL_PREFERRED_KEYS`，刷新订阅时不会被合并冲掉
 
 ### 修复
 
@@ -78,6 +79,7 @@
 - `runtime_metrics` 的 `/proc` 读取加 `errors="replace"`：`UnicodeDecodeError` 是 `ValueError` 子类，不被 `except OSError` 捕获，会穿透「绝不阻塞 status」的契约
 - `_traffic_bar` 对 0 字节行返回定宽空白占位（`pad=True` 时），否则该行标签左移一整个条形宽度、整表错位
 - `_shorten_path` 增加最终 clamp：末段自身超宽时（如极长可执行名）循环压不进 `width`，原先会返回超宽串突破列宽契约
+- **刷新订阅后代理静默宕机**：机场订阅会给出同名不同 server 的节点（实测 CyberGuard 的 `🇯🇵日本 01 | 1X | 推荐` 就是两条），mihomo 遇重名直接以 `duplicate name` fatal 退出。刷新是「订阅更新 → render → 重启」，进程解析失败发生在 `start()` 那个仅 `sleep(0.1)` 的存活检测窗口**之后**（实测约 156ms 才退出），于是 `cproxy refresh` 回报「已重启应用新配置」而代理其实已经挂掉。现有三层防护：合并订阅时 `_dedupe_proxy_names` 对重名追加 `#k` 后缀并按出现顺序同步组引用（生成的新名还会避让订阅里本就存在的同名节点）；重启分支后校验内核是否真正就绪，失败则回滚上一版 runtime 快照并重启；热重载成功即证明配置已被 mihomo 接受，无需重复校验
 
 ## [1.0.0] - 2026-07-18
 
@@ -101,4 +103,5 @@
 - 测试不再硬编码 `/root/clash_proxy`，CI 移除 sudo 符号链接步骤
 - `proxy.sh` 工作流冻结新功能，退役条件见 `docs/plans/2026-07-18-proxy-sh-retirement.md`
 
+[1.1.0]: https://github.com/sqwlly/linux_clash_proxy/releases/tag/v1.1.0
 [1.0.0]: https://github.com/sqwlly/linux_clash_proxy/releases/tag/v1.0.0
