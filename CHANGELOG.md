@@ -2,6 +2,18 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- `AI-MANUAL` 稳定性兜底：组类型由 `select` 改为 `fallback`（故障转移），手动固定的节点挂掉后 mihomo 自动切到下一个存活节点；候选列表按「`ai-manual-prefer` 钉选 → 实测稳定度序 → 静态地区」三级排序
+- `cproxy ai-rebalance`：多轮探测 `AI-MANUAL` 全部叶子，按 `rank_key`（成功↑/失败↓/最大延迟↓/平均延迟↓/抖动↓/历史惩罚↓）实测稳定度重排并持久化到 `ai-manual-order.json`，随后重渲染并热重载；配套 `cproxy-ai-rebalance.timer`（30 分钟周期）自动驱动
+
+### 改进
+
+- `cproxy switch` 放行 `fallback` 组手动指定：mihomo 尊重手动选择直到节点挂，`AI-MANUAL` 与 `AI-AUTO` 均可在 fallback 下切换（顺带修掉 TUI「切换美/新」在自动模式被类型守卫拦下的隐患）
+- TUI / `ai-status` 的 AI 出口「模式」标签由「固定」改为「兜底」，如实反映故障转移语义
+
 ## [1.1.0] - 2026-10-15
 
 ### 改进

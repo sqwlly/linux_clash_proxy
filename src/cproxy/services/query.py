@@ -115,7 +115,7 @@ class QueryService:
             raise SystemExit(f"错误: 未找到代理组: {group_name}")
 
         group_type = str(group.type).lower()
-        if group_type not in {"selector", "select"}:
+        if group_type not in {"selector", "select", "fallback"}:
             raise SystemExit(f"错误: 代理组 [{group_name}] 不是可手动切换的 Selector 类型")
         # 面板展示会经 normalize_name 剥掉 emoji 与 `丨`（`🇯🇵 Japan` → `Japan`），
         # 用户照屏幕上的名字输入是自然行为——按规范化名再解析一次候选，

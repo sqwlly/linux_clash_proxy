@@ -70,6 +70,11 @@ def subscription_info_file(paths: AppPaths) -> Path:
     return paths.state_dir / "subscription-info.json"
 
 
+def ai_manual_order_file(paths: AppPaths) -> Path:
+    """cproxy ai-rebalance 持久化的 AI-MANUAL 稳定度排序（state 文件，非用户配置）。"""
+    return paths.state_dir / "ai-manual-order.json"
+
+
 def load_yaml_file(path: Path) -> Any:
     """读 YAML。文件不存在返回 None。按路径 + 内容哈希缓存，写入后自动失效。"""
     try:

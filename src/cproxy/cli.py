@@ -45,6 +45,7 @@ from .runtime import render_runtime
 from .services.ops import guard
 from .services.probe import ProbeService, resolve_current_leaf
 from .services.query import QueryService
+from .services.rebalance import RebalanceService
 from .services.refresh import RefreshService
 from .services.switch_tree import (
     build_switch_tree,
@@ -263,6 +264,21 @@ def run(argv: list[str] | None = None) -> int:
             return exit_code
         if args.command == "shadow-history":
             return _render_shadow_history(default_paths(), args.limit, args.raw)
+        if args.command == "ai-rebalance":
+            try:
+                report = RebalanceService(default_paths()).rebalance(dry_run=args.dry_run)
+            except APIUnavailableError:
+                # 定时任务在代理未运行时无需报错：跳过本轮，下一轮再排
+                print("代理未运行，跳过稳定度重排")
+                return 0
+            print(_section_heading("结果"))
+            print(f"稳定度排序（{len(report.ordered)} 个节点）:")
+            for index, name in enumerate(report.ordered, start=1):
+                print(f"  {index}. {name}")
+            if report.rerendered:
+                print(f"已写入稳定度排序: {report.order_path}")
+                print("运行配置: " + ("已热重载" if report.hot_reloaded else "已渲染（代理未运行）"))
+            return 0
         if args.command == "guard":
             command = args.command_args
             if command and command[0] == "--":

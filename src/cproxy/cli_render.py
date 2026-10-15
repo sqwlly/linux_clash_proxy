@@ -313,7 +313,7 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
 
     return {
         "auto_mode": auto_mode,
-        "mode_label": "自动切换" if auto_mode else f"固定 {manual_target}",
+        "mode_label": "自动切换" if auto_mode else f"兜底 {manual_target}",
         "active_group": active_group,
         "active_node": active_node,
         "active_delay": active_delay,

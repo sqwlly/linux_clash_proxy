@@ -77,6 +77,7 @@ LOCAL_PREFERRED_KEYS = {
     "ai-openai-api-url",
     "ai-gemini-api-url",
     "ai-gemini-prefer",
+    "ai-manual-prefer",
     "refresh-groups",
     "subscriptions",
     "profile",

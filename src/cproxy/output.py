@@ -145,6 +145,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("probe-stable-node", "多轮探测并推荐更稳定的节点"),
             ("shadow-probe", "只探测并记录历史，不切换"),
             ("shadow-history", "查看最近稳定探测历史"),
+            ("ai-rebalance", "按实测稳定度重排 AI-MANUAL 出口并热重载"),
             ("guard", "先选稳定 AI 出口，再按需注入代理执行命令"),
             ("ai-connections", "查看 AI/GitHub 相关活动连接"),
             ("incident", "输出 AI 出口故障排查报告"),
@@ -422,6 +423,9 @@ def build_root_parser() -> ArgumentParser:
 
     shadow_history_parser = _add_command(subparsers, "shadow-history", raw=True)
     shadow_history_parser.add_argument("--limit", type=int, default=5, help="显示条数（默认 5）")
+
+    rebalance_parser = _add_command(subparsers, "ai-rebalance", raw=True)
+    rebalance_parser.add_argument("--dry-run", action="store_true", help="只探测排序，不写文件、不重渲染")
 
     guard_parser = _add_command(subparsers, "guard")
     guard_parser.add_argument(

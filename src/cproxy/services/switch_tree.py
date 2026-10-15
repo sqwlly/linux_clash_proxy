@@ -161,6 +161,10 @@ def build_switch_tree(
     extra = list(extra_names or [])
     delay_map = delays or {}
     selectable = {name for name, group in groups.items() if _is_selectable(group)}
+    # AI-MANUAL 已改为 fallback（故障转移）类型，但仍允许手动指定节点：
+    # mihomo fallback 尊重手动选择直到节点挂。放行以便 switch 树/交互选择继续列出它。
+    if AI_MANUAL_GROUP in groups:
+        selectable.add(AI_MANUAL_GROUP)
     skip = _entry_skip_names(extra)
     ordered: list[str] = []
     seen: set[str] = set()

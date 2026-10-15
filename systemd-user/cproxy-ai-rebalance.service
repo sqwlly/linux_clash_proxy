@@ -1,0 +1,8 @@
+[Unit]
+Description=Rebalance AI-MANUAL stability order
+After=network-online.target cproxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cproxy ai-rebalance

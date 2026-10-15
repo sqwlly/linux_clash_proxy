@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import yaml
 
-from ..config import AppPaths, config_file, runtime_file
-from ..snapshots import snapshot_file
+from ..config import AppPaths, ai_manual_order_file, config_file, runtime_file
 from ..services.nodelist import (
     SUBSCRIPTION_REGION_ORDER,
     SWITCH_REGION_LABELS,
     is_panel_info_node,
     match_region,
 )
+from ..snapshots import snapshot_file
 from .api import APIBackend
 from .models import ProxyGroup
 
@@ -286,6 +287,43 @@ def _collect_gemini_nodes(
     return ordered
 
 
+def _load_ai_manual_order(paths: AppPaths) -> list[str]:
+    """读取 rebalance 持久化的稳定度排序；缺失/损坏时返回空列表（回退静态序）。"""
+    try:
+        data = json.loads(ai_manual_order_file(paths).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data if item]
+
+
+def _order_manual_candidates(leaves: list[str], prefer: list | None, order: list | None) -> list[str]:
+    """按「用户钉选 → 实测稳定度序 → 静态地区兜底」排 AI-MANUAL 叶子候选。
+
+    AI-MANUAL 是 fallback：mihomo 按列表顺序找第一个存活节点，顺序即兜底优先级。
+    prefer 是 config 的 ai-manual-prefer（手动钉选），order 是 cproxy ai-rebalance
+    的实测稳定度序，静态兜底沿用美/日/新 + 非 IEPL 优先。
+    """
+    leaves_set = {str(name) for name in leaves}
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if not name or name in seen or name not in leaves_set:
+            return
+        seen.add(name)
+        ordered.append(name)
+
+    for name in [str(item) for item in prefer or []]:
+        add(name)
+    for name in [str(item) for item in order or []]:
+        add(name)
+    for name in leaves:
+        add(name)
+    return ordered
+
+
 def _strip_panel_members(group: dict) -> None:
     members = group.get("proxies") or []
     group["proxies"] = [member for member in members if not is_panel_info_node(str(member))]
@@ -501,16 +539,21 @@ class RuntimeBackend:
         groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
 
-        # 美国节点放首位：热重载/冷启动会把 selector 重置为第一项。
-        # ChatGPT/Claude 仍走 AI-MANUAL（美/日/新）；Gemini/Google 单独走 AI-GEMINI。
-        # 不再挂 🇯🇵 Japan / 🇺🇸 United States：那些组和中文国家组重复。
-        manual_candidates = list(us_proxies) + [AI_AUTO_GROUP] + list(jp_proxies) + list(sg_proxies)
+        # AI-MANUAL 是 fallback：固定节点挂掉后 mihomo 自动切到列表下一个存活节点，
+        # 列表顺序即兜底优先级——按「用户钉选 → 实测稳定度 → 静态地区」排。
+        # AI-AUTO 垫底作最终兜底；Gemini/Google 仍单独走 AI-GEMINI。
+        manual_prefer = data.get("ai-manual-prefer")
+        if not isinstance(manual_prefer, list):
+            manual_prefer = []
+        manual_order = _load_ai_manual_order(self.paths)
+        manual_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies)
+        manual_candidates = _order_manual_candidates(manual_leaves, manual_prefer, manual_order) + [AI_AUTO_GROUP]
 
         ai_groups = [
             {"name": AI_US_GROUP, "type": "fallback", "proxies": us_proxies, "url": TEST_URL, "interval": 300},
             {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_proxies, "url": TEST_URL, "interval": 300},
             {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 300},
-            {"name": AI_MANUAL_GROUP, "type": "select", "proxies": manual_candidates},
+            {"name": AI_MANUAL_GROUP, "type": "fallback", "proxies": manual_candidates, "url": TEST_URL, "interval": 300},
             {
                 "name": AI_GEMINI_GROUP,
                 "type": "fallback",

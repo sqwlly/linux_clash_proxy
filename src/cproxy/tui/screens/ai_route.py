@@ -116,7 +116,7 @@ class AIRouteScreen(Widget):
             standby_group = groups.get(standby_name)
             gemini_group = groups.get(AI_GEMINI_GROUP)
 
-            mode_text = "[#f6c177]自动[/]" if auto_mode else f"[#f6c177]固定[/]（{manual.current}）"
+            mode_text = "[#f6c177]自动[/]" if auto_mode else f"[#f6c177]兜底[/]（{manual.current}）"
             self.query_one("#ai-route-mode", Label).update(mode_text)
 
             if active_group:

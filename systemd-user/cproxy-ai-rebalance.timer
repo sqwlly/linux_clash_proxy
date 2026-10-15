@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically rebalance AI-MANUAL stability order
+
+[Timer]
+Unit=cproxy-ai-rebalance.service
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
