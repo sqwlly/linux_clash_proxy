@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from ..config import AppPaths, config_file, log_file, pid_file, process_meta_file, read_config, runtime_file
@@ -151,6 +152,29 @@ class ProcessBackend:
         if not owner or not owner.runtime_hash or not current_hash:
             return False
         return owner.runtime_hash != current_hash
+
+    def mark_runtime_applied(self, runtime_path: Path | str | None = None) -> bool:
+        """把“运行实例已加载该 runtime 内容”同步进进程元数据。
+
+        热重载（PUT /configs）在既有进程内替换配置，不经过 start()，因此不会像
+        启动那样重写进程元数据指纹。不同步的话 _runtime_is_stale 会把刚热重载过
+        的实例一直判为落后于最近一次 render，status/doctor 遂误报“配置时效: 失败”
+        ——而内核其实早已加载新配置。**每一处热重载成功后都必须调用本方法。**
+        返回是否真的写入了指纹；未运行时（无进程元数据）或指纹不可得时返回 False。
+        """
+        owner = self._read_process_owner()
+        if owner is None:
+            return False
+        path = Path(runtime_path) if runtime_path is not None else Path(owner.runtime)
+        fingerprint = self._file_fingerprint(path)
+        if not fingerprint:
+            return False
+        try:
+            self._write_process_owner(replace(owner, runtime_hash=fingerprint))
+        except OSError:
+            # 纯记账失败不该反过来影响已经生效的热重载
+            return False
+        return True
 
     def _cleanup_process_state(self) -> None:
         pid_file(self.paths).unlink(missing_ok=True)

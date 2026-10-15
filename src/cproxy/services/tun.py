@@ -157,6 +157,8 @@ class TunService:
                 self.api.reload_config(str(runtime))
             except APIUnavailableError as exc:
                 raise RuntimeError("TUN 配置已保存，但热重载失败；内核状态未知，请检查 cproxy tun status 和 cproxy logs") from exc
+            # 热重载不经过 start()：同步“已加载”指纹，否则 status/doctor 会误报配置陈旧
+            self.process.mark_runtime_applied(runtime)
         report = self.status()
         if apply and (report.kernel_enabled is not enabled or (enabled and report.interface_present is not True)):
             raise RuntimeError("TUN 配置已保存并提交热重载，但未确认生效；请检查 cproxy tun status 和 cproxy logs")

@@ -291,6 +291,46 @@ def test_runtime_staleness_requires_both_fingerprints():
     assert ProcessBackend._runtime_is_stale(legacy, "bbb") is False
 
 
+def test_mark_runtime_applied_clears_staleness(tmp_path):
+    """热重载（PUT /configs）不走 start()，须靠 mark_runtime_applied 同步指纹，
+    否则 status/doctor 会把已加载新配置的实例一直误报为“配置时效: 失败”。"""
+    from cproxy.backend.models import ProcessOwner
+    from cproxy.backend.process import ProcessBackend
+    from cproxy.config import default_paths, runtime_file
+
+    paths = default_paths(tmp_path)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    backend = ProcessBackend(paths)
+    runtime = runtime_file(paths)
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+
+    # 模拟 start()：记下当时的 runtime 内容指纹
+    runtime.write_text("proxies: []\n", encoding="utf-8")
+    backend._write_process_owner(
+        ProcessOwner(
+            pid=1,
+            program="mihomo",
+            runtime=str(runtime),
+            runtime_hash=backend._file_fingerprint(runtime),
+        )
+    )
+
+    # render 重写同一路径 → 内容变了 → 运行实例确实落后
+    runtime.write_text("proxies:\n- name: a\n", encoding="utf-8")
+    owner = backend._read_process_owner()
+    assert ProcessBackend._runtime_is_stale(owner, backend._file_fingerprint(runtime)) is True
+
+    # 热重载成功后同步 → 不再被判为陈旧
+    assert backend.mark_runtime_applied(runtime) is True
+    owner = backend._read_process_owner()
+    assert ProcessBackend._runtime_is_stale(owner, backend._file_fingerprint(runtime)) is False
+
+    # 未运行时（无进程元数据）不写入也不报错
+    idle = ProcessBackend(default_paths(tmp_path / "idle"))
+    idle.paths.state_dir.mkdir(parents=True, exist_ok=True)
+    assert idle.mark_runtime_applied() is False
+
+
 def test_render_kv_skips_empty_values(capsys):
     from cproxy.cli_render import _render_kv
 

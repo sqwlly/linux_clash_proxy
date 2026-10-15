@@ -202,6 +202,7 @@ def test_refresh_prefers_hot_reload_over_restart(tmp_path: Path):
     _write_config(paths, RENDERABLE_CONFIG)
 
     reload_calls = []
+    applied = []
 
     class StubProcess:
         def is_running(self):
@@ -209,6 +210,9 @@ def test_refresh_prefers_hot_reload_over_restart(tmp_path: Path):
 
         def restart(self):
             raise AssertionError("热重载可用时不应重启进程")
+
+        def mark_runtime_applied(self, runtime_path=None):
+            applied.append(runtime_path)
 
     class StubAPI:
         def reload_config(self, path):
@@ -221,6 +225,8 @@ def test_refresh_prefers_hot_reload_over_restart(tmp_path: Path):
     service.refresh()
 
     assert reload_calls == [str(runtime_file(paths))]
+    # 热重载成功后必须同步“已加载”指纹，否则 status/doctor 会误报“配置时效: 失败”
+    assert applied == [runtime_file(paths)]
 
 
 def test_refresh_falls_back_to_restart_when_reload_fails(tmp_path: Path):
@@ -270,6 +276,9 @@ def test_refresh_reports_stage_progress(tmp_path: Path):
 
         def restart(self):
             raise AssertionError("热重载可用时不应重启进程")
+
+        def mark_runtime_applied(self, runtime_path=None):
+            return True
 
     class StubAPI:
         def reload_config(self, path):

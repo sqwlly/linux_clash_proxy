@@ -731,6 +731,11 @@ class RefreshService:
                         f"错误: 新配置加载失败，已回滚到上一版运行配置并重启代理: {exc}"
                     ) from exc
 
+        if report.hot_reloaded:
+            # 热重载不经过 start()，须手动同步“已加载”指纹；否则 status/doctor
+            # 会一直误报“配置时效: 失败”（内核其实已加载新配置）
+            self.process.mark_runtime_applied(report.runtime_path)
+
         config_applied = report.restarted or report.hot_reloaded
         if target_groups and config_applied:
             stage("正在等待 Mihomo API 就绪…")
@@ -762,6 +767,9 @@ class RefreshService:
             except Exception:
                 self.process.restart()
                 report.restarted = True
+            if report.hot_reloaded:
+                # 同 refresh()：热重载后同步指纹，避免误报配置陈旧
+                self.process.mark_runtime_applied(report.runtime_path)
         return report
 
     def _rollback_runtime(self) -> Path | None:
