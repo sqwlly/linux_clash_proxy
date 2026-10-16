@@ -341,8 +341,9 @@ def _render_table(
 
         print(node("┌", "┬", "┐"))
         print(grid_line(cells_of([(header, (ANSI_BOLD,)) for header in headers])))
-        print(node("├", "┼", "┤"))
-        for row in rows:
+        # 逐行之间也画横线：只隔列不隔行时，相邻行的值容易连读成同一格
+        for index, row in enumerate(rows):
+            print(node("├", "┼", "┤"))
             print(grid_line(cells_of(row)))
         print(node("└", "┴", "┘"))
         return _table_grid_width(widths)
