@@ -19,6 +19,7 @@ from .backend.runtime import (
     AI_STATUS_GROUPS,
     ai_exit_metrics,
     delay_state,
+    resolve_ai_leaf,
     resolve_ai_route,
 )
 from .backend.runtime_metrics import collect_runtime_metrics
@@ -626,11 +627,15 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
 
     print()
     _print_section("候选池")
+    # 这一块只讲**拓扑**：有哪些池、各多少候选、当前指向谁。刻意不写延迟——
+    # 延迟属于「出口健康」，摘要的三条出口行已按各池组**自身的健康检查**给出
+    # （那正是 mihomo 做故障转移决策的依据）；若这里改按节点实测值再列一遍，
+    # 同一节点就会在摘要与候选池出现两个不同的数，读起来互相打架。
     present = [name for name in AI_STATUS_GROUPS if groups.get(name) is not None]
     group_width = max((_display_width(name) for name in present), default=10)
     for name in present:
         group = groups[name]
-        node, delay, _alive = _ai_exit(groups, name)
+        node = resolve_ai_leaf(groups, name)
         parts = [f"候选 {len(_group_value(group, 'all', []) or [])}"]
         if name == AI_AUTO_GROUP:
             # 自动池的 `now` 指向区域组（AI-US/AI-SG）而非真实出口——显式标出，
@@ -639,9 +644,6 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
             parts.append(f"自动池 {pointer} → {_accent(normalize_name(node))}")
         else:
             parts.append(f"当前 {_accent(normalize_name(node))}")
-        if isinstance(delay, int):
-            # 组的 history 为空时不写占位——`超时`/`未测得` 只在真有信号时出现
-            parts.append(_exit_delay_label(delay))
         print(f"{_pad_right(name, group_width)}  " + " · ".join(parts))
     return 0
 

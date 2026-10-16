@@ -259,13 +259,17 @@ def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_p
         )
 
     kr = "🇰🇷韩国 01 | IEPL 1.7X | CM"
+    kr2 = "🇰🇷韩国 02 | 1X"
     groups = {
         "AI-MANUAL": group("AI-MANUAL", kr, ["AI-AUTO", kr], delay=None),
         "AI-AUTO": group("AI-AUTO", "AI-US", ["AI-US"], delay=0),
+        # 备用：组自身健康检查连续超时（哨兵 5000）
         "AI-US": group("AI-US", "🇺🇸美国 01 | 1X", ["🇺🇸美国 01 | 1X"], delay=5000),
         "AI-SG": group("AI-SG", "🇸🇬新加坡 01 | 1X", ["🇸🇬新加坡 01 | 1X"], delay=0, alive=False),
-        "AI-GEMINI": group("AI-GEMINI", kr, [kr], delay=None),
+        # Gemini：组自身无 history，落到的出口节点本轮未测得（0）
+        "AI-GEMINI": group("AI-GEMINI", kr2, [kr2], delay=None),
         kr: ProxyGroup(name=kr, type="Vless", current="-", candidates=[], alive=True, delay=140),
+        kr2: ProxyGroup(name=kr2, type="Vless", current="-", candidates=[], alive=True, delay=0),
     }
     monkeypatch.setattr(
         cli_render,
@@ -281,15 +285,20 @@ def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_p
     # 非自动池的措辞：出口由 mihomo 在直连候选池里自动择优，「手动」是与行为不符的说法
     assert "模式      兜底 · 直连池" in out
     assert "兜底 · 手动" not in out
-    assert "超时" in out  # 备用 AI-US 的 5000 哨兵
-    assert "未测得" in out  # AI-AUTO / AI-SG 的 0
+    assert "备用      AI-US · 🇺🇸美国 01 1X · 超时" in out  # 5000 哨兵
+    assert "Gemini    🇰🇷韩国 02 1X · 未测得" in out  # 0 哨兵
     assert "5000ms" not in out  # 哨兵绝不能按毫秒展示
     assert "· 0ms" not in out
     # 非 ok 时不附健康标记：否则会读成「超时 · 正常」这种自相矛盾的组合
     assert "超时 · 正常" not in out
-    assert "未测得 · 异常" not in out
+    assert "未测得 · 正常" not in out
     # ok 的那条仍完整显示延迟与健康（出口从节点自身取到 140ms）
-    assert "140ms · 正常" in out
+    assert "出口      🇰🇷韩国 01 IEPL 1.7X CM · 140ms · 正常" in out
+    # 候选池只讲拓扑，不再列延迟——避免同一节点在摘要与候选池出现两个口径的数
+    assert "候选池" in out
+    assert "AI-MANUAL  候选 2 · 当前 🇰🇷韩国 01 IEPL 1.7X CM" in out
+    assert "AI-AUTO    候选 1 · 自动池 AI-US → 🇺🇸美国 01 1X" in out
+    assert "🇰🇷韩国 01 IEPL 1.7X CM · 140ms" not in out.split("候选池", 1)[1]
 
 
 def test_query_commands_fall_back_to_runtime_when_api_unavailable(tmp_path: Path):
