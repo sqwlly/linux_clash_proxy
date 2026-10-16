@@ -15,9 +15,8 @@ pipx install '/path/to/clash_proxy[tui]'
 ```
 
 `./scripts/install.sh` 会自动尝试一键部署（等价于 `cproxy bootstrap`）。
-它默认安装 Textual TUI；只需要 CLI 时可设置 `CPROXY_INSTALL_TUI=0`。默认不会安装或
-刷新已停用的 `clash-proxy` / `clash-proxy-update` legacy wrapper；只有明确回滚时才设置
-`CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`。脚本不会覆盖 pip 安装的 `cproxy` 真入口。
+它默认安装 Textual TUI；只需要 CLI 时可设置 `CPROXY_INSTALL_TUI=0`。它不安装也不刷新
+任何 legacy wrapper（相关脚本已随退役删除），也不会覆盖 pip 安装的 `cproxy` 真入口。
 
 默认以 editable 方式安装（开发便利，改动立即生效）。生产环境应使用非
 editable 安装，避免未提交的工作区改动直接影响生产命令：
@@ -73,19 +72,16 @@ controller、`allow-lan` 等）即使订阅携带也一律剔除，防止恶意�
 本地优先键（端口、模式等）保留本地已配置的值；订阅拉取失败不会阻断后续
 render 与探测。输出中的订阅地址会脱敏。
 
-## legacy 入口（已停用）
+## legacy 入口（已退役）
 
-`proxy.sh` 工作流已于 2026-09-11 停用，生产入口是 cproxy 用户级链路
-（见 [README 的生产入口识别](README.md#生产入口识别)）。本节内容保留仅供回滚对照。
+`proxy.sh` 工作流已于 2026-09-11 停用，并于 **2026-10-17 从仓库删除**（退役阶段 3，仓库侧）；
+生产入口是 cproxy 用户级链路（见 [README 的生产入口识别](README.md#生产入口识别)）。
+本节保留的对照表仅供**从旧入口迁移**时参考。
 
-如因回滚确需安装 root 级 wrapper：
-
-```bash
-sudo ./scripts/install-system-commands.sh --with-legacy
-```
-
-- `clash-proxy`：转发到仓库内 `proxy.sh`
-- `clash-proxy-update`：转发到仓库内 `update_config.sh`
+- 仓库内已无 legacy 代码：`proxy.sh`、`update_config.sh`、其 helper 脚本、
+  `scripts/install-system-commands.sh` 与 legacy systemd 单元均已删除
+- 系统侧仍残留 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与
+  `/usr/local/lib/clash-proxy/`（占位、不在运行路径上），不可逆删除留待第二阶段
 
 legacy 子命令与 cproxy **绝大多数同名同义**——`status`、`switch`、`list-nodes`、
 `probe-stable-node`、`ai-use`、`guard`、`ai-connections`、`incident` 等直接换成
@@ -96,8 +92,8 @@ legacy 子命令与 cproxy **绝大多数同名同义**——`status`、`switch`
 | `clash-proxy import-subscription <url>` | `cproxy refresh`（订阅更新→渲染→热重载→探测） |
 | `clash-proxy menu` | `cproxy tui` |
 
-> ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际转发到 legacy 的
-> `update_config.sh`——不要把它当成 cproxy 的一部分。
+> ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际是 legacy 残留——
+> 不要把它当成 cproxy 的一部分。
 
 若 `cproxy status` 显示 `运行配置    待刷新`，说明用户级 runtime 尚未初始化
 （它读 `~/.local/share/cproxy/runtime.yaml`），与 legacy 入口无关。

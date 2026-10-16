@@ -246,7 +246,8 @@ def _status_label(text: str) -> str:
 
 
 def _section_heading(title: str, *, icon: str = "▸") -> str:
-    """区块标题文本；图标随 `_icons_enabled()` 开关（与 proxy.sh 的 section_label 对齐）。
+    """区块标题文本；图标随 `_icons_enabled()` 开关（沿用历史 legacy `proxy.sh` 的
+    `section_label`，该脚本已于 2026-10-17 删除）。
 
     与 :func:`_section_title` 的分工：`_section_title` 只是“加粗蓝字”原语，也被
     通知类文本复用；本函数专用于**区块标题**，因此承载图标门控。

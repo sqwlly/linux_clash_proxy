@@ -250,9 +250,8 @@ cproxy render
 cproxy restart
 ```
 
-当前生产入口是 cproxy，root 级 `clash-proxy.service` 与
-`clash-proxy-refresh.path` 已停用。不要再用 legacy 的 `update_config.sh` 应用候选配置。
-修改用户级源配置后使用：
+当前生产入口是 cproxy；root 级 `clash-proxy.service` / `clash-proxy-refresh.path` 与
+legacy 的 `update_config.sh` 已随 2026-10-17 的退役阶段 3 删除。修改用户级源配置后使用：
 
 ```bash
 cproxy render

@@ -35,7 +35,7 @@
 | 日志 | `LogsScreen` tail 本地 `cproxy.log`，展示最近 500 行，追加时保留最近 1000 行，支持 pause/follow | 有本地日志观察面 |
 | 代理环境 | `SystemProxyScreen` 支持当前会话代理环境变量和 `.bashrc`/`.zshrc` 标记块写入 | 有用户级环境接入能力 |
 | 诊断 | `DiagnosticsService` 覆盖 GeoIP、外网连通性、出口 IP、ChatGPT/OpenAI 探测、组延迟测试 | 有基础连通性与 AI 路由验证 |
-| 安装与运维 | `scripts/install.sh` 支持 pipx 或 user pip 安装、GeoIP 安装、logrotate 配置、system command 安装；`scripts/install-system-commands.sh` 有 `--dry-run` | 有用户级安装和 root-level wrapper 刷新路径 |
+| 安装与运维 | `scripts/install.sh` 支持 pipx 或 user pip 安装、GeoIP 安装、logrotate 配置；`systemd/install-systemd.sh` 有 `--dry-run` 用于安装活跃的流量采集单元 | 有用户级安装路径；legacy wrapper 刷新已于 2026-10-17 随退役移除 |
 | 测试 | `tests/test_tui_app.py`、`tests/test_tui_proxies.py`、`tests/test_tui_subscriptions.py`、`tests/test_tui_logs.py`、`tests/test_runtime_and_process.py`、`tests/systemd_user_examples_test.sh` | 已有 Textual 交互、运行时、安装和 systemd 示例测试 |
 
 ## 企业缺口

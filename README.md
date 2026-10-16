@@ -2,7 +2,7 @@
 
 > 项目当前阶段、里程碑与下一步见 [STATUS.md](STATUS.md)。
 
-`cproxy` 是面向用户级安装的 Mihomo CLI，**已是本机生产入口**。旧的 `proxy.sh` 工作流已于 2026-09-11 停用（生产入口切换至 cproxy 用户级链路），遗留文件与 systemd unit 保留原地仅供回滚与对照——退役条件与进度见 [STATUS.md](STATUS.md) 与 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
+`cproxy` 是面向用户级安装的 Mihomo CLI，**已是本机唯一生产入口**。旧的 `proxy.sh` 工作流已于 2026-09-11 停用、2026-10-17 从仓库删除（退役阶段 3）——退役条件与进度见 [STATUS.md](STATUS.md) 与 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
 
 当前已经具备这些能力：
 
@@ -54,8 +54,8 @@ pipx install '/path/to/clash_proxy[tui]'
   `python3 -m pip install --user --editable`
 - 初始化用户级 `cproxy` 配置目录
 - 安装 GeoIP 数据到默认路径：优先复用已有用户级文件和仓库根目录遗留的 `Country.mmdb`（该文件已不入库），缺失时尝试从 meta-rules-dat 下载，仍失败则打印手动放置警告
-- 默认不安装或刷新任何 legacy wrapper；仅在明确回滚时设置
-  `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`。脚本不会覆盖 pip 安装的 `cproxy` 真入口
+- 不安装也不刷新任何 legacy wrapper——相关脚本已随退役删除；脚本同样不会覆盖 pip 安装的
+  `cproxy` 真入口
 
 安装脚本**不会中断正在运行的代理**：
 
@@ -371,8 +371,8 @@ ai-probe-timeout: 3   # 面板单次探测超时（留空则用默认 3 秒）
 
 ## 当前边界
 
-`proxy.sh` 工作流已于 2026-09-11 停用；其文件与 systemd unit 保留原地供回滚对照，
-退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
+`proxy.sh` 工作流已于 2026-09-11 停用、2026-10-17 从仓库删除（退役阶段 3，仓库侧）；
+条件、Gate 状态与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
 日常使用与排障只看 `cproxy` 即可。
 
 另外，`cproxy` 只管理自己启动的 mihomo 进程：
@@ -389,27 +389,22 @@ ai-probe-timeout: 3   # 面板单次探测超时（留空则用默认 3 秒）
 - 用户级路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
 - 定时任务：`cproxy-subscription.timer`（每日订阅更新）、`cproxy-refresh.timer`（周期性重渲染）、`cproxy-ai-watch.timer`（每 2 分钟语义探测 AI 出口，连续失败即切节点）、`cproxy-ai-rebalance.timer`（每 30 分钟按实测稳定度重排 `AI-MANUAL` 候选）
 
-legacy 侧（已停用，保留待退役，**不要**再作为入口使用）：
+legacy 侧（**已于 2026-10-17 退役**，不要再作为入口使用）：
 
-| 组件 | 位置 | 当前状态 |
-|---|---|---|
-| `clash-proxy.service` | `/etc/systemd/system/` | `inactive` + `disabled` |
-| `clash-proxy-refresh.path` / `.timer` / `.service` | `/etc/systemd/system/` | `inactive` + `disabled`（`.path` 的监听已于 2026-09-15 停掉） |
-| `clash-proxy-subscription.timer` / `.service` | `/etc/systemd/system/` | `inactive` + `disabled` |
-| `clash-proxy`、`clash-proxy-update` | `/usr/local/bin/` | wrapper 仍在 PATH，但其指向的 unit 已停用 |
-| `proxy.sh`、`update_config.sh` | 仓库根目录 | 保留对照，不再作为入口 |
-
-> ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际转发到 legacy 的
-> `update_config.sh`——不要把它当成 cproxy 的一部分。
+- 仓库内已无 legacy 代码：`proxy.sh`、`update_config.sh`、其 helper 脚本、legacy systemd 单元、
+  `scripts/install-system-commands.sh` 均已删除（详见 [退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)）
+- **系统侧仍残留** `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与
+  `/usr/local/lib/clash-proxy/`：它们只是占位、不在任何运行路径上，不可逆删除留待第二阶段
+- ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际是 legacy 残留——
+  不要把它当成 cproxy 的一部分
 
 只读确认：
 
 ```bash
 systemctl --user is-active cproxy.service    # 预期 active
-systemctl is-active clash-proxy.service      # 预期 inactive
 ```
 
-### legacy 命令对照
+### legacy 命令对照（历史，供从旧入口迁移时参考）
 
 legacy 入口的子命令与 cproxy **绝大多数同名同义**——`status`、`switch`、`list-groups`、
 `list-nodes`、`current`、`probe-stable-node`、`ai-use`、`shadow-probe`、`shadow-history`、
@@ -459,7 +454,7 @@ legacy 入口的子命令与 cproxy **绝大多数同名同义**——`status`�
 [systemd-user/](/root/clash_proxy/systemd-user/)。
 
 > legacy 侧原先由 `clash-proxy-refresh.path` 监听 `/root/clash_proxy/config.yaml`
-> 变化触发刷新，该监听已于 2026-09-15 停掉，对应 unit 全部 `disabled`。
+> 变化触发刷新；该监听 2026-09-15 停掉，对应 unit 已随 2026-10-17 的退役阶段 3 从仓库删除。
 
 ## Mihomo 热 reload
 

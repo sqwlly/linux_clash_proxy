@@ -27,11 +27,12 @@
 
 ## Legacy Retirement
 
-- `proxy.sh` 工作流已于 2026-09-11 停用，**完全冻结**——此前规则是「只接受安全修复」，现在连安全修复也不必做：legacy 侧已无任何运行组件，改它没有收益。新功能只进 `cproxy`。
-- 遗留入口（`/usr/local/bin/clash-proxy`、`clash-proxy-update`、`cproxy-update`）保留在 PATH 供回滚对照，调用时会向 stderr 打印弃用警告。**不要再为它们刷新安装副本**——原先的 "Installed Command Copy" 规则已随之作废（改 `proxy.sh` 后无需再同步 `/usr/local/lib/clash-proxy`）。
-- 安装脚本默认**不装** legacy：`scripts/install-system-commands.sh` 需显式 `--with-legacy`；`systemd/install-systemd.sh` 同理（`install.sh` 侧用 `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy` 触发）。
-- ⚠️ **不要按名字前缀判断归属**。`clash-proxy-` 横跨新旧两代：
+- **`proxy.sh` 工作流已退役**：2026-09-11 停用并完全冻结，**2026-10-17 执行退役阶段 3**——`proxy.sh`、`update_config.sh`、其 helper 脚本（`scripts/{import_subscription,update_subscription_prod,probe_stable_node,ai_tools,probe_history,progress}.py`）、legacy systemd 单元（`systemd/clash-proxy.{service}` / `clash-proxy-refresh.*` / `clash-proxy-subscription.*` / `clash-proxy-command.env.example` / `generate-proxied-service.sh` / `example-proxied-service.override.conf`）与 `scripts/install-system-commands.sh` 已全部**从仓库删除**。新功能只进 `cproxy`。
+- **仓库里已无 legacy 代码**：不要再找 `proxy.sh`，也不要再引入「改 legacy 同步副本」这类规则。`install-system-commands.sh` 已不存在（其非 legacy 能力 `--with-cproxy-alias` 一并移除）。
+- ⚠️ **不要按名字前缀判断归属**。`clash-proxy-` 横跨新旧两代，退役后仍有活着的同名物：
   - `clash-proxy-traffic-collector.{service,timer}` 名字带 legacy 前缀，实际 `ExecStart=/usr/local/bin/cproxy traffic collect --raw`，是**活跃的 cproxy 组件**，绝不能删；
-  - `/usr/local/bin/cproxy` 与 `cproxy-tui` 是 pip 装的**真入口**，不能被 `install-system-commands.sh --with-cproxy-alias` 覆盖（脚本已加保护并会拒绝）；
+  - `/usr/local/bin/cproxy` 与 `cproxy-tui` 是 pip 装的**真入口**，不改不覆盖；
   - 判断前先看 unit 的 `ExecStart`，或查 `systemctl is-active`。
-- 退役条件、Gate 当前状态与分阶段步骤见 `docs/plans/2026-07-18-proxy-sh-retirement.md`；项目状态见 `STATUS.md`。
+- **系统侧残留（待第二阶段）**：`/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与 `/usr/local/lib/clash-proxy/` 仍在（不可逆删除待单独确认）；它们仅占位、不在任何运行路径上。
+- **已知遗留项**：`src/cproxy/backend/process.py` 的 `SYSTEMD_SERVICE_NAME = "clash-proxy.service"` 指向已删的 legacy 服务名，其 `start()` 抢端口守卫与 `restart()` 的 systemd 分支现为空转。它当年正确（见 `2f0ee5d`、`1eb4304`），真实生产服务是**用户级** `cproxy.service`；修正需改常量并给 systemctl 加 `--user`，属行为变更，见 `STATUS.md` 的「已知遗留项」。
+- 退役条件、Gate 状态与分阶段步骤见 `docs/plans/2026-07-18-proxy-sh-retirement.md`；项目状态见 `STATUS.md`。

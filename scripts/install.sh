@@ -154,67 +154,6 @@ setup_logrotate() {
     add_logrotate_cron "${logrotate_conf}" "logrotate.*cproxy"
 }
 
-setup_legacy_logrotate() {
-    local logrotate_dir="${CPROXY_LOGROTATE_DIR:-/etc/logrotate.d}"
-    local logrotate_conf="${logrotate_dir}/clash_proxy"
-    local state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
-    local log_file="${state_home}/clash_proxy/clash.log"
-
-    if [ ! -d "${logrotate_dir}" ]; then
-        return 0
-    fi
-
-    if [ ! -w "${logrotate_dir}" ]; then
-        return 0
-    fi
-
-    cat > "${logrotate_conf}" << 'EOF'
-{{LOG_FILE}} {
-    daily
-    size 10M
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-
-    sed -i "s|{{LOG_FILE}}|${log_file}|g" "${logrotate_conf}"
-
-    add_logrotate_cron "${logrotate_conf}" "logrotate.*clash_proxy"
-}
-
-install_system_commands() {
-    local installer="${ROOT_DIR}/scripts/install-system-commands.sh"
-    local mode="${CPROXY_INSTALL_SYSTEM_COMMANDS:-1}"
-
-    if [ "$mode" = "0" ]; then
-        echo "系统命令安装: 已跳过"
-        return 0
-    fi
-
-    if [ ! -f "$installer" ]; then
-        echo "警告: 未找到系统命令安装脚本: ${installer}" >&2
-        return 0
-    fi
-
-    # legacy 入口（clash-proxy / clash-proxy-update / cproxy-update）已于 2026-09-11
-    # 停用，安装器默认只打印说明、不写任何东西。确需回滚时用 =legacy 触发实际安装。
-    if [ "$mode" = "legacy" ]; then
-        if "$installer" --with-legacy; then
-            echo "系统命令安装: 完成（legacy）"
-        else
-            echo "警告: 系统命令安装未完成，可稍后手动执行: ${installer} --with-legacy" >&2
-        fi
-        return 0
-    fi
-
-    "$installer" >/dev/null
-    echo "系统命令安装: 已跳过（legacy 入口已停用，不再默认安装；确需回滚用 CPROXY_INSTALL_SYSTEM_COMMANDS=legacy）"
-}
-
 main() {
     require_cmd python3
 
@@ -253,10 +192,6 @@ main() {
     ensure_geodata
 
     setup_logrotate
-    if [ "${CPROXY_INSTALL_SYSTEM_COMMANDS:-1}" = "legacy" ]; then
-        setup_legacy_logrotate
-    fi
-    install_system_commands
 
     if PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
         CPROXY_LEGACY_ROOT="${ROOT_DIR}" \

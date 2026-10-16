@@ -114,8 +114,9 @@ def _probe_table_lines(report: ProbeReport) -> list[str]:
 #   2. 各子命令自身 `--help` 的 description（注册时查 `_COMMAND_HELP`）
 # 新增命令只需在这里加一行。
 #
-# 分组名沿用 proxy.sh `usage()` 的既有词汇（配置与进程 / AI 路由控制 / 命令级代理 /
-# 诊断与排障），与 cproxy 面板复刻 proxy.sh 视觉的做法一致；后两组为 cproxy 独有命令。
+# 分组名沿用历史 legacy `proxy.sh` `usage()` 的词汇（配置与进程 / AI 路由控制 /
+# 命令级代理 / 诊断与排障）——当年的面板刻意与之对齐，便于从旧入口迁移；后两组为
+# cproxy 独有命令。该脚本已于 2026-10-17 退役删除，此处仅存历史缘由。
 _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "配置与进程",
@@ -210,8 +211,8 @@ _OVERVIEW_HINT = "提示: cproxy status 查看当前状态 · cproxy <命令> --
 def _command_list_lines() -> list[str]:
     """按分组渲染命令清单（分组标题 + `  命令名   - 描述`）。
 
-    格式对齐 proxy.sh `usage()` 的既有语言：分组标题带冒号、命令两空格缩进、
-    命令名与描述之间用 `-` 分隔。
+    格式沿用历史 legacy `proxy.sh` `usage()` 的语言（已删除，仅存历史缘由）：
+    分组标题带冒号、命令两空格缩进、命令名与描述之间用 `-` 分隔。
     """
     lines: list[str] = []
     for group, commands in _COMMAND_GROUPS:

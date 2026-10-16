@@ -158,13 +158,11 @@ exit 0
     assert f"GeoIP 数据: 已从 {ROOT_DIR}/Country.mmdb 安装到" in result.stdout
     assert str(country_mmdb) in result.stdout
     assert "未检测到 GeoIP 数据文件" not in result.stderr
-    # legacy 入口（clash-proxy / clash-proxy-update）已停用，安装脚本默认不再安装；
-    # 确需回滚时由 CPROXY_INSTALL_SYSTEM_COMMANDS=legacy 显式触发（该分支的安装逻辑
-    # 由 tests/system_command_installer_test.sh 覆盖）
+    # legacy 入口（clash-proxy / clash-proxy-update / cproxy-update）已于 2026-10-17
+    # 随退役阶段 3 删除；安装脚本不再有任何系统命令安装步骤
     assert not (tmp_path / "system-bin" / "clash-proxy").exists()
     assert not (tmp_path / "system-bin" / "cproxy").exists()
     assert not (tmp_path / "system-lib").exists()
-    assert "系统命令安装: 已跳过（legacy 入口已停用" in result.stdout
 
 
 def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path):
@@ -217,13 +215,11 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     assert f"GeoIP 数据: 已从 {ROOT_DIR}/Country.mmdb 安装到" in result.stdout
     assert str(country_mmdb) in result.stdout
     assert "未检测到 GeoIP 数据文件" not in result.stderr
-    # legacy 入口（clash-proxy / clash-proxy-update）已停用，安装脚本默认不再安装；
-    # 确需回滚时由 CPROXY_INSTALL_SYSTEM_COMMANDS=legacy 显式触发（该分支的安装逻辑
-    # 由 tests/system_command_installer_test.sh 覆盖）
+    # legacy 入口（clash-proxy / clash-proxy-update / cproxy-update）已于 2026-10-17
+    # 随退役阶段 3 删除；安装脚本不再有任何系统命令安装步骤
     assert not (tmp_path / "system-bin" / "clash-proxy").exists()
     assert not (tmp_path / "system-bin" / "cproxy").exists()
     assert not (tmp_path / "system-lib").exists()
-    assert "系统命令安装: 已跳过（legacy 入口已停用" in result.stdout
 
 
 def _install_env(tmp_path: Path, fake_bin: Path, logrotate_dir: Path) -> dict:

@@ -39,7 +39,7 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 |---|---|
 | 1. acceptance 通过 | ⚠️ 已复跑：静态审计 0 failure、TUI 39 passed、后端 22 passed、运维与安装 dry-run 6/6、GA 产物 build+verify、本地 smoke 均通过。唯一未过项 `security-check --strict`（返回 1）属「环境未达 GA 配置」——本机未配 `external-controller-tls`，acceptance.md 已声明此类失败不代表仓库测试失败 |
 | 2. 功能对账表 | ✅ 9 行全部填「已有等价」 |
-| 3. 4 周无 P0/P1 | ⏳ 起算 2026-09-11，至 2026-10-09 |
+| 3. 4 周无 P0/P1 | ✅ 窗口 2026-09-11 ~ 2026-10-09；2026-10-17 确认期内无 P0/P1 事故 |
 | 4. README / USAGE 改写 | ✅ 入口描述已以 cproxy 为准重写；legacy 侧保留为**带状态的对照表**而非使用说明 |
 
 另：`clash-proxy-refresh.path` 于 2026-09-15 停掉——它是阶段 2 的遗漏项（阶段 2 只
@@ -122,12 +122,33 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 - 保留回滚路径：legacy 文件与 unit 仅停用不删除，回滚 = 重新 enable 旧 unit
 - 开始 4 周观察期
 
-### 阶段 3：退役
+### 阶段 3：退役（**2026-10-17 已完成 · 仓库侧**）
 
-- `proxy.sh`、`update_config.sh` 入口打印 deprecation 警告，指向 cproxy 等价命令
-- `scripts/install-system-commands.sh` 停止安装 `/usr/local/bin/clash-proxy*`
-- 一个版本周期后删除 legacy 入口文件，更新 `AGENTS.md` 移除 "Installed Command Copy" 规则
-- README / USAGE 以 cproxy 为唯一入口重写相关段落
+- ✅ `proxy.sh`、`update_config.sh` 入口打印 deprecation 警告，指向 cproxy 等价命令（2026-09-11 完成）
+- ✅ `scripts/install-system-commands.sh` 停止安装 `/usr/local/bin/clash-proxy*`（2026-09-11 改为默认不装）
+- ✅ 一个版本周期后删除 legacy 入口文件，更新 `AGENTS.md` 移除 "Installed Command Copy" 规则
+  （2026-10-17 执行；实测删除清单见下）
+- ✅ README / USAGE 以 cproxy 为唯一入口重写相关段落
+
+**2026-10-17 实际删除清单（均在一个提交内，可 `git revert` 回滚）**
+
+- 入口与 helper（9）：`proxy.sh`、`update_config.sh`、`scripts/install-system-commands.sh`、
+  `scripts/{import_subscription,update_subscription_prod,probe_stable_node,ai_tools,probe_history,progress}.py`
+- legacy systemd（10）：`systemd/clash-proxy.service`、`clash-proxy-refresh.{service,timer,path}`、
+  `clash-proxy-subscription.{service,timer,sh}`、`clash-proxy-command.env.example`、
+  `example-proxied-service.override.conf`、`generate-proxied-service.sh`
+- 测试（20）
+
+**保留**：`systemd/clash-proxy-traffic-collector.{service,timer}`（活跃的 cproxy 组件）、
+`systemd-user/*`（cproxy 自己那一套）、`tests/{mihomo_installer,systemd_user_examples,systemd_user_helper_scripts}_test.sh`。
+
+**改写**：`systemd/install-systemd.sh`（去掉 `--with-legacy`）、`scripts/install.sh`（去掉
+`install_system_commands`/`setup_legacy_logrotate`）、collector 单元的悬空 `After=`、
+`systemd_helper_scripts_test.sh`（只留 collector 断言）、`tests/test_install_script.py`（去掉对已删输出的断言）。
+
+**未做（待第二阶段，不可逆）**：删系统侧 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}`
+与 `/usr/local/lib/clash-proxy/`。另见 `STATUS.md` 的「已知遗留项」——`process.py` 的 systemd 守卫
+仍指向已删的 legacy 服务名。
 
 ## 回滚
 

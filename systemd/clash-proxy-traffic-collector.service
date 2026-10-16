@@ -1,7 +1,7 @@
 [Unit]
 Description=Collect Clash Proxy traffic statistics (poll Mihomo connections API)
 Documentation=file:/root/clash_proxy/README.md
-After=network-online.target clash-proxy.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

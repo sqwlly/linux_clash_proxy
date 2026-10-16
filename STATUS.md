@@ -4,14 +4,14 @@
 
 ## 当前阶段
 
-**阶段 2：生产入口已切换到 cproxy 用户级链路；4 周观察期（2026-09-11 ~ 2026-10-09）已到期，待确认期内无 P0/P1 事故后即可执行阶段 3**
+**阶段 3（已完成 · 仓库侧）：4 周观察期（2026-09-11 ~ 2026-10-09）已到期、期内无 P0/P1 事故，legacy 入口与单元已从仓库删除**
 
-- `clash-proxy.service`（系统级，proxy.sh 编排）已 `disable --now`，仅停用未删除，回滚 = 重新 enable
+- `clash-proxy.service`（系统级，proxy.sh 编排）此前已 `disable --now`；**2026-10-17 随阶段 3 删除单元文件**（系统侧回滚入口见文末「已知遗留项」）
 - 2026-09-15 补齐阶段 2 的一处遗漏：`clash-proxy-refresh.path` 此前仍是 `active (waiting)`——它 9-10 启动，而阶段 2 只 `disable --now` 了 `clash-proxy.service`，没停这个独立 unit，导致它持续监听 `/root/clash_proxy/config.yaml`，一旦该文件变化就会拉起 legacy 刷新流程去操作已由 cproxy 接管的运行时。已 `stop`（未 disable、未删文件，回滚 = `systemctl start`）。**至此 legacy 侧全部 unit 为 `inactive` + `disabled`，系统内无任何 legacy 组件在运行**
 - 同批完成 README / USAGE 的入口描述改写：原文写「截至 2026-05-14……生产入口仍是 root 级 `clash-proxy.service`」，与 9-11 已切换的事实相反，会把排障带反方向；现以 cproxy 为唯一生产入口陈述，legacy 侧改为带状态的对照表（Gate 4 主体完成）
 - 同日完成 legacy 入口的**弃用警告与安装解耦**：三个 legacy wrapper（`clash-proxy` / `clash-proxy-update` / `cproxy-update`）调用时向 stderr 打印警告并指向 cproxy 等价命令，`./proxy.sh` 直接调用同样提示（经 wrapper 时去重）；`scripts/install-system-commands.sh` 与 `systemd/install-systemd.sh` 改为**默认不装** legacy（`--with-legacy` 才装，后者始终安装活跃的 `clash-proxy-traffic-collector`），`install.sh` 对应 `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`——防止将来重跑把已停用的入口装回 PATH。顺带修掉 `--with-cproxy-alias` 会覆盖 pip 版 `/usr/local/bin/cproxy` 的隐患（已加保护并拒绝）。`AGENTS.md` 移除已作废的 "Installed Command Copy" 规则，并修正「legacy mihomo 以 `/root/clash_proxy` 为 `-d`」的过时描述——实测 `-d` 是 `~/.local/share/cproxy`
 - cproxy 用户级 `cproxy.service` 接管代理（linger 已开启）；`cproxy-subscription.timer` 接管每日订阅更新（热重载应用新配置，不中断连接），`cproxy-refresh.timer` 定期重渲染；流量采集 timer（系统级）继续调用 `cproxy traffic collect`
-- legacy 文件（`proxy.sh`、`update_config.sh`、`/usr/local/bin/clash-proxy*`）保留原地，阶段 3 才移除
+- **2026-10-17 执行退役阶段 3（仓库侧）**：`proxy.sh`、`update_config.sh`、legacy helper 脚本（6 个）、legacy systemd 单元（10 个）、`scripts/install-system-commands.sh` 及其 19 个测试全部从仓库删除；两个安装脚本的 `--with-legacy` 分支一并移除。系统侧 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与 `/usr/local/lib/clash-proxy/` 仍在（不可逆删除另待确认），但它们不在任何运行路径上
 - 退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)
 
 ## 最近里程碑
@@ -35,9 +35,25 @@
 
 ## 下一步（按优先级）
 
-1. 确认观察期（2026-09-11 ~ 2026-10-09，**窗口已到期**）内 cproxy 链路无 P0/P1 事故——仓库内无可查的事故记录，此项需人工确认；确认通过后 Gate 3 即满足
+1. ~~确认观察期（2026-09-11 ~ 2026-10-09）内 cproxy 链路无 P0/P1 事故~~ 已于 2026-10-17 确认：期内无 P0/P1，Gate 3 满足
 2. ~~复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令~~ 已于 2026-09-15 复跑：静态审计 0 failure、TUI 回归 39 passed、后端与运行时 22 passed、运维示例与安装 dry-run 6/6、GA 产物 build+verify 通过、本地 smoke 通过。**唯一未过项**是 `security-check --strict`（本机未配 `external-controller-tls`，返回 1）——acceptance.md 已将这类失败归类为「环境未达 GA 配置，不表示仓库测试失败」
-3. 观察期满（**已到期**）后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper。弃用警告和默认停装已经完成；当前剩余风险是旧 wrapper 仍可被手工调用
+3. ~~观察期满后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper~~ 已于 2026-10-17 完成**仓库侧**（见上）；**系统侧** `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与 `/usr/local/lib/clash-proxy/` 的删除不可逆，待单独确认后执行
+
+## 已知遗留项
+
+- **`process.py` 的 systemd 守卫指向已删的 legacy 服务名**：`src/cproxy/backend/process.py:17`
+  `SYSTEMD_SERVICE_NAME = "clash-proxy.service"`，被 `:66`（`is-enabled`）、`:82`（`is-active`）、
+  `:269-271`（`start()` 抢端口守卫）、`:333`（`restart()` 的 systemd 分支）与
+  `services/ops.py:109`（incident 报告）使用。
+  - **它当年是正确的**：`2f0ee5d` 引入（"systemd awareness：service enabled 时用 systemctl restart"），
+    `1eb4304` 的标题就是 *"fix(cproxy): prevent port conflict with production clash-proxy.service"*
+    ——那时 `clash-proxy.service` 就是生产服务。
+  - **现在它过时了**：真实生产服务是**用户级** `cproxy.service`（`systemd-user/cproxy.service`），
+    这几处查的是系统级 legacy 名。legacy 单元删除后，`_production_service_active()` 恒为 False、
+    `restart()` 永不走 systemctl 分支——**空转**。
+  - **今天行为不变**（legacy 服务本就 `inactive`/`disabled`），故未随退役改动；修正需改常量
+    并给 systemctl 加 `--user`，属 `cproxy start` 守卫与 `cproxy restart` 路径的**行为变更**，
+    应单独一轮并自带测试。
 
 ## 发布
 

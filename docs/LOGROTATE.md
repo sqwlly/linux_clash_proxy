@@ -10,12 +10,9 @@ cproxy 自动配置日志轮转功能，防止日志文件无限增长占用磁�
 - **保留历史**: 7 个轮转文件
 - **检查频率**: 每 6 小时
 - **压缩**: 自动压缩旧日志
-- **cproxy 轮转方式**: 使用 `copytruncate`，兼容当前通过 `stdout/stderr` 重定向写日志的启动方式
-- **旧版 proxy.sh 轮转方式**: 使用 `copytruncate`，兼容当前通过 `stdout/stderr` 重定向写日志的启动方式
+- **轮转方式**: 使用 `copytruncate`，兼容当前通过 `stdout/stderr` 重定向写日志的启动方式
 
-## 支持的部署方式
-
-### 1. cproxy 用户级安装
+## 安装时自动配置
 
 使用 `./scripts/install.sh` 安装时，会自动配置：
 
@@ -23,20 +20,12 @@ cproxy 自动配置日志轮转功能，防止日志文件无限增长占用磁�
 - **日志路径**: `$HOME/.local/state/cproxy/cproxy.log`
 - **定时任务**: 自动添加到 crontab
 
-### 2. 旧版 proxy.sh 部署
-
-使用旧版 `proxy.sh` 时，会同时配置：
-
-- **配置文件**: `/etc/logrotate.d/clash_proxy`
-- **日志路径**: `$HOME/.local/state/clash_proxy/clash.log`
-- **PID 文件**: `/root/clash_proxy/mihomo.pid`
-- **定时任务**: 自动添加到 crontab
+> 旧版 `proxy.sh` 部署（`/etc/logrotate.d/clash_proxy` 与 `$HOME/.local/state/clash_proxy/clash.log`）
+> 已于 2026-10-17 随退役阶段 3 一并移除，本节不再覆盖。
 
 ## 手动配置
 
 如果自动配置失败，可以手动配置：
-
-### cproxy 用户级
 
 ```bash
 # 创建 logrotate 配置
@@ -57,37 +46,12 @@ EOF
 (crontab -l 2>/dev/null | grep -v "logrotate.*cproxy"; echo "0 */6 * * * /usr/sbin/logrotate /etc/logrotate.d/cproxy >/dev/null 2>&1") | crontab -
 ```
 
-### 旧版 proxy.sh
-
-```bash
-# 创建 logrotate 配置
-sudo tee /etc/logrotate.d/clash_proxy > /dev/null << 'EOF'
-/root/.local/state/clash_proxy/clash.log {
-    daily
-    size 10M
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-
-# 添加定时任务
-(crontab -l 2>/dev/null | grep -v "logrotate.*clash_proxy"; echo "0 */6 * * * /usr/sbin/logrotate /etc/logrotate.d/clash_proxy >/dev/null 2>&1") | crontab -
-```
-
 ## 验证配置
 
 ### 检查配置文件
 
 ```bash
-# cproxy
 cat /etc/logrotate.d/cproxy
-
-# 旧版
-cat /etc/logrotate.d/clash_proxy
 ```
 
 ### 检查定时任务
@@ -99,21 +63,13 @@ crontab -l | grep logrotate
 ### 手动测试轮转
 
 ```bash
-# cproxy
 sudo logrotate -f /etc/logrotate.d/cproxy
-
-# 旧版
-sudo logrotate -f /etc/logrotate.d/clash_proxy
 ```
 
 ### 查看日志文件
 
 ```bash
-# cproxy
 ls -lh ~/.local/state/cproxy/cproxy.log*
-
-# 旧版
-ls -lh ~/.local/state/clash_proxy/clash.log*
 ```
 
 ## 故障排除
@@ -131,11 +87,10 @@ ls -lh ~/.local/state/clash_proxy/clash.log*
 
 - `logrotate.conf.template`
 
-### 旧版 proxy.sh 轮转方式
+### 为什么用 copytruncate 而不是发信号
 
-`cproxy` 默认配置不依赖信号重开日志文件，而是使用 `copytruncate`。
-
-旧版 `proxy.sh` 也使用 `copytruncate`，因为它通过 shell 重定向把 `stdout/stderr` 写入日志文件，单纯向 mihomo 发送信号并不能可靠地让 shell 持有的文件描述符切到新文件。
+`cproxy` 通过 shell 重定向把 `stdout/stderr` 写入日志文件——单纯向 mihomo 发送信号并不能
+可靠地让 shell 持有的文件描述符切到新文件，所以采用 `copytruncate`。
 
 ## 自定义配置
 

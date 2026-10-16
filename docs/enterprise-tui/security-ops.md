@@ -24,7 +24,7 @@
 | 渲染运行配置 | `PYTHONPATH="src" python3 -m cproxy.cli render` | 从用户配置生成 runtime YAML |
 | 查看状态 | `PYTHONPATH="src" python3 -m cproxy.cli status` | 输出进程、端口、Controller 和 runtime 状态 |
 | 用户级 systemd 校验 | `bash "tests/systemd_user_examples_test.sh"` | 验证 service/override/env 示例没有漂移 |
-| root-level wrapper dry-run | `bash "scripts/install-system-commands.sh" --dry-run --bindir "/tmp/cproxy-enterprise-tui-audit/bin"` | legacy 已停用：默认只打印「不再默认安装」说明，不写 `/usr/local`（演练旧安装动作需显式 `--with-legacy`） |
+| root-level 单元安装 dry-run | `bash "systemd/install-systemd.sh" --dry-run` | 只打印将安装的 `clash-proxy-traffic-collector.{service,timer}`（活跃的 cproxy 组件），不写 `/etc/systemd/system`；legacy 安装能力已随退役移除 |
 | 文档/审计 gate | `bash "scripts/audit-enterprise-tui.sh"` | 静态校验当前企业 TUI 文档和项目事实是否一致 |
 
 ## 操作风险与处理
