@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from ..backend.api import APIBackend
+from ..backend.runtime import AI_STATUS_GROUPS, ai_exit_metrics
 from ..config import AppPaths
 from ..proxyenv import proxy_http_url
 from .probe import ProbeService
@@ -132,12 +133,18 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
     try:
         api = APIBackend(paths)
         groups = api.get_groups()
-        for name in ("AI-MANUAL", "AI-AUTO", "AI-US", "AI-SG", "AI-GEMINI"):
+        for name in AI_STATUS_GROUPS:
             group = groups.get(name)
-            if group:
-                ai_lines.append(f"{name}: type={group.type} now={group.current} alive={group.alive} delay={group.delay}")
-            else:
+            if group is None:
                 ai_lines.append(f"{name}: 缺失")
+                continue
+            # 延迟取出口节点的真实值：fixed fallback 组（AI-MANUAL/AI-GEMINI）自身
+            # history 恒空，直接读 group.delay 会打成 None
+            _node, delay, _alive = ai_exit_metrics(groups, name)
+            ai_lines.append(
+                f"{name}: type={group.type} now={group.current} alive={group.alive} "
+                f"delay={'-' if delay is None else delay}"
+            )
     except Exception as exc:
         ai_lines.append(f"API 不可访问: {exc}")
     sections.append(IncidentSection("ai-status", ai_lines))

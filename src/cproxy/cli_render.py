@@ -13,7 +13,14 @@ from . import __version__
 from .api import APIUnavailableError
 from .backend.api import APIBackend
 from .backend.models import AIProbeReport, ProxyGroup
-from .backend.runtime import AI_GEMINI_GROUP, ai_standby_peer
+from .backend.runtime import (
+    AI_AUTO_GROUP,
+    AI_GEMINI_GROUP,
+    AI_MANUAL_GROUP,
+    AI_STATUS_GROUPS,
+    ai_exit_metrics,
+    ai_standby_peer,
+)
 from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
@@ -261,74 +268,72 @@ def _exit_summary(group_name: object, node: object, delay: object) -> str:
     return summary
 
 
-def _resolve_group_exit(groups: dict, group_name: str) -> dict[str, object]:
-    """解析某代理组当前叶子出口；组缺失时 present=False。"""
-    group = groups.get(group_name)
-    if group is None:
-        return {
-            "present": False,
-            "group": group_name,
-            "node": "-",
-            "delay": "-",
-            "alive": None,
-            "summary": "-",
-        }
-    node = _group_value(group, "now", "-")
-    delay = _group_value(group, "delay", "-")
-    alive = _group_value(group, "alive")
-    if (not isinstance(delay, int) or alive is None) and node and node != "-":
-        leaf = groups.get(str(node))
-        if leaf is not None:
-            if not isinstance(delay, int):
-                leaf_delay = _group_value(leaf, "delay", "-")
-                if isinstance(leaf_delay, int):
-                    delay = leaf_delay
-            if alive is None:
-                alive = _group_value(leaf, "alive")
-    return {
-        "present": True,
-        "group": group_name,
-        "node": node,
-        "delay": delay,
-        "alive": alive,
-        "summary": _exit_summary(group_name, node, delay),
-    }
+def _alive_text(alive: object) -> str:
+    """三态健康值 → 文案；`None` 是「mihomo 未上报」，不等于「异常」。"""
+    if alive is True:
+        return "正常"
+    if alive is False:
+        return "异常"
+    return "未知"
+
+
+def _ai_exit(groups: dict, name: str) -> tuple[str, object, object]:
+    """`:func:`ai_exit_metrics` 的 CLI 侧包装：把「无延迟」统一渲染成 `"-"`。
+
+    拓扑解析本身在 `backend.runtime`——那里是 AI 组常量的所在地，services 层
+    （`incident` 面板）也要用，放在这里会让 services 反向依赖 CLI 契约层。
+    """
+    node, delay, alive = ai_exit_metrics(groups, name)
+    return node, ("-" if delay is None else delay), alive
 
 
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
-    manual_target = _group_value(_get_group(groups, "AI-MANUAL"), "now", "-")
-    auto_target = _group_value(_get_group(groups, "AI-AUTO"), "now", "-")
-    auto_mode = manual_target == "AI-AUTO"
-    active_group = auto_target if auto_mode else manual_target
-    active = _get_group(groups, active_group)
-    active_node = _group_value(active, "now", "-")
-    active_delay = _group_value(active, "delay", "-")
-    active_alive = _group_value(active, "alive")
-    standby_group = ai_standby_peer(str(active_group))
-    standby = _get_group(groups, standby_group)
-    standby_node = _group_value(standby, "now", "-")
-    standby_delay = _group_value(standby, "delay", "-")
-    standby_alive = _group_value(standby, "alive")
-    gemini = _resolve_group_exit(groups, AI_GEMINI_GROUP)
+    """解析 AI 出路的模式 / 出口 / 备用 / Gemini 四要素。
+
+    不变式：`active_summary` 的左操作数是**承载出口的池组名**（自动模式为 AI-AUTO
+    当前选中的区域组，手动模式为 AI-MANUAL）。`cproxy status` 的断言逐字锁定了
+    `"AI-US -> United States 01 (95ms)"` 这一形态，改动左操作数会直接打破它。
+
+    全程用 `groups.get` 而非 `_get_group`：组缺失时降级为占位值，不抛 SystemExit——
+    `_render_status` 只捕获 APIUnavailableError，SystemExit 会穿透并让 status 崩掉。
+    """
+    target = str(_group_value(groups.get(AI_MANUAL_GROUP), "now", "-"))
+    auto_mode = target == AI_AUTO_GROUP
+    # 池组 = 直接承载出口候选的那一层：自动模式是 AI-AUTO 选中的区域组，手动模式是 AI-MANUAL
+    pool = str(_group_value(groups.get(AI_AUTO_GROUP), "now", "-")) if auto_mode else AI_MANUAL_GROUP
+
+    active_node, active_delay, active_alive = _ai_exit(groups, pool)
+
+    standby_group = ai_standby_peer(pool)
+    standby_node, standby_delay, standby_alive = _ai_exit(groups, standby_group)
+
+    gemini_present = AI_GEMINI_GROUP in groups
+    if gemini_present:
+        gemini_node, gemini_delay, gemini_alive = _ai_exit(groups, AI_GEMINI_GROUP)
+    else:
+        gemini_node, gemini_delay, gemini_alive = "-", "-", None
 
     return {
         "auto_mode": auto_mode,
-        "mode_label": "自动切换" if auto_mode else f"兜底 {manual_target}",
-        "active_group": active_group,
+        # 手动模式的旧值是「兜底 <节点名>」——把节点当组名，语义错；改为固定文案
+        "mode_label": "自动切换" if auto_mode else "兜底 · 手动",
+        "active_group": pool,
         "active_node": active_node,
         "active_delay": active_delay,
         "active_alive": active_alive,
-        "active_summary": _exit_summary(active_group, active_node, active_delay),
+        "active_summary": _exit_summary(pool, active_node, active_delay),
         "standby_group": standby_group,
         "standby_node": standby_node,
         "standby_delay": standby_delay,
         "standby_alive": standby_alive,
-        "gemini_present": gemini["present"],
-        "gemini_group": gemini["group"],
-        "gemini_node": gemini["node"],
-        "gemini_delay": gemini["delay"],
-        "gemini_alive": gemini["alive"],
-        "gemini_summary": gemini["summary"],
+        "gemini_present": gemini_present,
+        "gemini_group": AI_GEMINI_GROUP,
+        "gemini_node": gemini_node,
+        "gemini_delay": gemini_delay,
+        "gemini_alive": gemini_alive,
+        "gemini_summary": (
+            _exit_summary(AI_GEMINI_GROUP, gemini_node, gemini_delay) if gemini_present else "-"
+        ),
     }
 
 
@@ -506,21 +511,20 @@ def _render_list_nodes(groups: dict, group_name: str | None, raw: bool, json_out
 
 
 def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int:
-    names = (
-        "AI-MANUAL",
-        "AI-AUTO",
-        "AI-US",
-        "AI-SG",
-        "AI-GEMINI",
-    )
-    probe_report = run_ai_probe(default_paths())
-    if json_output:
+    # 三个 HTTP 语义探测（含瞬时失败重试）是这条命令的主要耗时；与 status 面板一致，
+    # 用 Spinner 兜住，免得终端在探测期间看起来卡死
+    with Spinner("正在探测 AI 出口…", delay=0.4, enabled=not (raw or json_output)):
+        probe_report = run_ai_probe(default_paths())
         route = _resolve_ai_route(groups)
+    probe_ok = all(item.ok for item in probe_report.results)
+    probe_status = _probe_summary_status(probe_report)
+
+    if json_output:
         emit_json(
             "ai-status",
             {
                 "route": route,
-                "probe_status": _probe_summary_status(probe_report),
+                "probe_status": probe_status,
                 "probes": [
                     {"name": item.name, "url": item.url, "ok": item.ok, "detail": item.detail}
                     for item in probe_report.results
@@ -532,101 +536,103 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
                         "alive": _group_value(group, "alive"),
                         "delay": _group_value(group, "delay"),
                     }
-                    for name in names
+                    for name in AI_STATUS_GROUPS
                     if (group := groups.get(name)) is not None
                 },
             },
-            ok=all(item.ok for item in probe_report.results),
+            ok=probe_ok,
             warnings=[item.detail for item in probe_report.results if not item.ok],
-            recommended_actions=["cproxy incident"] if any(not item.ok for item in probe_report.results) else [],
+            recommended_actions=["cproxy incident"] if not probe_ok else [],
         )
-        return 0 if all(item.ok for item in probe_report.results) else 1
+        return 0 if probe_ok else 1
+
     if raw:
-        for name in names:
+        for name in AI_STATUS_GROUPS:
             group = groups.get(name)
-            if not group:
+            if group is None:
                 print(f"{name}: 缺失")
                 continue
-            delay = _group_value(group, "delay", "-")
+            # delay 取**出口节点**的真实延迟：fixed fallback 组自身 history 恒空，
+            # 直接读组会打出 None（旧实现即如此）
+            _node, exit_delay, _alive = _ai_exit(groups, name)
             print(
                 f"{name}: type={_group_value(group, 'type', '-')} now={_group_value(group, 'now', '-')} "
-                f"alive={_group_value(group, 'alive', '-')} last_delay={delay}"
+                f"alive={_group_value(group, 'alive', '-')} delay={exit_delay}"
             )
-        print(f"AI-PROBE: {_probe_summary_status(probe_report)}")
+        print(f"AI-MODE: {'auto' if route['auto_mode'] else 'manual'} 池={route['active_group']}")
+        print(
+            f"AI-EXIT: node={route['active_node']} delay={route['active_delay']} "
+            f"alive={route['active_alive']}"
+        )
+        print(
+            f"AI-STANDBY: group={route['standby_group']} node={route['standby_node']} "
+            f"delay={route['standby_delay']} alive={route['standby_alive']}"
+        )
+        print(f"AI-PROBE: {probe_status}")
         for item in probe_report.results:
             print(f"AI-PROBE-ITEM: name={item.name} ok={item.ok} detail={item.detail} url={item.url}")
         return 0
 
-    route = _resolve_ai_route(groups)
-    active_group = str(route["active_group"])
-    active_node = route["active_node"]
-    active_delay = route["active_delay"]
-    active_alive = route["active_alive"]
-    standby_group = str(route["standby_group"])
-    standby_node = route["standby_node"]
-    standby_delay = route["standby_delay"]
-    standby_alive = route["standby_alive"]
-    standby_status = "正常" if standby_alive is True else "异常" if standby_alive is False else "未知"
-    active_status = "正常" if active_alive is True else "异常" if active_alive is False else "未知"
-    gemini_present = bool(route.get("gemini_present"))
-    gemini_alive = route.get("gemini_alive")
-    gemini_status = "正常" if gemini_alive is True else "异常" if gemini_alive is False else "未知"
+    auto_mode = bool(route["auto_mode"])
+    mode_text = f"自动切换 · 池 {route['active_group']}" if auto_mode else str(route["mode_label"])
 
     _print_section("摘要")
-    # 注意：这里**不**走 _render_kv_colon——避免 "AI 路由" 与冒号间补空格，
-    # 破坏测试断言中的 "AI 路由:" 子串。
-    print(f"AI 路由: {route['mode_label']}")
-    print(f"通用出口: {normalize_name(active_node)}")
-    print(f"区域: {active_group}")
-    print(f"延迟: {_format_delay_label(active_delay)}")
-    print(f"状态: {_status_label(active_status)}")
-    if gemini_present:
-        print(f"Gemini 出口: {normalize_name(route['gemini_node'])}")
-        print(f"Gemini 延迟: {_format_delay_label(route['gemini_delay'])}")
-        print(f"Gemini 状态: {_status_label(gemini_status)}")
-    print(f"AI 探测: {_status_label(_probe_summary_status(probe_report))}")
+    summary_rows: list[tuple[str, str]] = [
+        ("模式", mode_text),
+        (
+            "出口",
+            f"{_accent(normalize_name(route['active_node']))}"
+            f"  {_status_label(_alive_text(route['active_alive']))}",
+        ),
+    ]
+    # 延迟只在真有测量值时才出现——fixed fallback 组没有 history，「-」是假信息
+    if isinstance(route["active_delay"], int):
+        summary_rows.append(("延迟", _format_delay_label(route["active_delay"])))
+    summary_rows.append(
+        (
+            "备用",
+            f"{route['standby_group']} · {normalize_name(route['standby_node'])}"
+            f" · {_format_delay_label(route['standby_delay'])}"
+            f" · {_status_label(_alive_text(route['standby_alive']))}",
+        )
+    )
+    if route["gemini_present"]:
+        summary_rows.append(
+            (
+                "Gemini",
+                f"{_accent(normalize_name(route['gemini_node']))}"
+                f"  {_format_delay_label(route['gemini_delay'])}"
+                f"  {_status_label(_alive_text(route['gemini_alive']))}",
+            )
+        )
+    summary_rows.append(("探测", _status_label(probe_status)))
+    _render_kv(summary_rows)
+
     print()
     _print_section("连通性")
     for item in probe_report.results:
         label = _status_label("正常" if item.ok else "失败")
-        print(f"{label}  {item.name}  {item.url}")
+        suffix = f"  {_style(item.detail, ANSI_DIM)}" if item.detail else ""
+        print(f"{label}  {item.name}  {item.url}{suffix}")
+
     print()
-    _print_section("链路")
-    print("通用  AI-MANUAL")
-    if bool(route["auto_mode"]):
-        print("└─ AI-AUTO")
-        print(f"   └─ {active_group}")
-        print(f"      └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
-    else:
-        print(f"└─ {active_group}")
-        print(f"   └─ {normalize_name(active_node)} ({_format_delay_label(active_delay)})")
-    if gemini_present:
-        print()
-        print(f"Gemini  {AI_GEMINI_GROUP}")
-        print(
-            f"└─ {normalize_name(route['gemini_node'])} "
-            f"({_format_delay_label(route['gemini_delay'])})"
-        )
-    print()
-    _print_section("备用")
-    _render_kv_colon(
-        [
-            (
-                standby_group,
-                f"{normalize_name(standby_node)} ({_format_delay_label(standby_delay)}, {_status_label(standby_status)})",
-            )
-        ]
-    )
-    print()
-    _print_section("分组")
-    present = [name for name in names if groups.get(name) is not None]
+    _print_section("候选池")
+    present = [name for name in AI_STATUS_GROUPS if groups.get(name) is not None]
     group_width = max((_display_width(name) for name in present), default=10)
     for name in present:
         group = groups[name]
-        print(
-            f"{_pad_right(name, group_width)} ({_group_value(group, 'type', '-')}) 当前: "
-            f"{normalize_name(_group_value(group, 'now', '-'))}"
-        )
+        node, delay, _alive = _ai_exit(groups, name)
+        parts = [f"候选 {len(_group_value(group, 'all', []) or [])}"]
+        if name == AI_AUTO_GROUP:
+            # 自动池的 `now` 指向区域组（AI-US/AI-SG）而非真实出口——显式标出，
+            # 免得「当前 AI-US」被误读成一个节点
+            pointer = normalize_name(_group_value(group, "now", "-"))
+            parts.append(f"自动池 {pointer} → {_accent(normalize_name(node))}")
+        else:
+            parts.append(f"当前 {_accent(normalize_name(node))}")
+        if isinstance(delay, int):
+            parts.append(_format_delay_label(delay))
+        print(f"{_pad_right(name, group_width)}  " + " · ".join(parts))
     return 0
 
 

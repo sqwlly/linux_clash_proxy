@@ -29,6 +29,9 @@ TEST_URL = "https://cp.cloudflare.com/generate_204"
 # 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported）
 AI_GEMINI_REGION_ORDER = ("KR", "TW", "DE", "FR", "GB", "BR", "AE", "AU")
 AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP})
+# AI 面板（`cproxy ai-status` / `cproxy incident`）要展示的组，及展示顺序。
+# 单一来源：此前 cli_render 与 services.ops 各硬编码了一份同样的 5 元组。
+AI_STATUS_GROUPS = (AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP, AI_GEMINI_GROUP)
 CHINAMAX_RULE = "RULE-SET,ChinaMax,DIRECT"
 CHINAMAX_PROVIDER = {
     "type": "file",
@@ -144,6 +147,52 @@ def ai_standby_peer(active_name: str) -> str:
     if code == "SG":
         return AI_US_GROUP
     return AI_US_GROUP
+
+
+# AI 组下钻的深度上限（AI-MANUAL → AI-AUTO → AI-US → 叶子，共 3 跳）。
+# 上限只是防御性兜底；真正的环守卫是 resolve_ai_leaf 的 seen 集。
+_AI_LEAF_MAX_DEPTH = 8
+
+
+def resolve_ai_leaf(groups: dict[str, ProxyGroup], name: str, seen: frozenset[str] = frozenset()) -> str:
+    """沿 `now` 逐层下钻，返回最终的真实节点名。
+
+    兜底组的 `now` 既可能是**嵌套组**（AI-AUTO）也可能是**真实节点**（手动钉住的某个
+    节点）。按「一定是组名」的假设去查表会拿到「节点条目」（无 `now`）从而打出空出口，
+    这是本函数要消除的核心失真。
+
+    判据：真实节点条目在 /proxies 里恒无候选（见 api._to_proxy_group），所以
+    「候选非空 ⇒ 是组」可靠。`seen` 集防自指组（某组 `now` 指回祖先）无限下钻。
+    """
+    if not name or name == "-" or name in seen or len(seen) >= _AI_LEAF_MAX_DEPTH:
+        return name
+    group = groups.get(name)
+    if group is None or not group.candidates:
+        return name
+    nxt = str(group.current or "")
+    if not nxt or nxt == "-":
+        return name
+    return resolve_ai_leaf(groups, nxt, seen | {name})
+
+
+def ai_exit_metrics(groups: dict[str, ProxyGroup], name: str) -> tuple[str, int | None, bool | None]:
+    """某组的出口三要素 `(node, delay, alive)`。
+
+    `node` 沿 `now` 下钻到真实节点（兜底组与自动池都适用）。延迟/健康优先取该组自身的
+    history——AI-AUTO/AI-US/AI-SG 这类会被 mihomo 健康检查的组有值；AI-MANUAL/AI-GEMINI
+    是 fixed fallback，mihomo 不检查它们（`history` 恒空 ⇒ 组自身 delay 为 None），这时
+    回退到出口节点自身的 history，避免展示成空。
+    """
+    group = groups.get(name)
+    node = resolve_ai_leaf(groups, name)
+    delay = group.delay if group is not None else None
+    alive = group.alive if group is not None else None
+    leaf = groups.get(node)
+    if delay is None and leaf is not None:
+        delay = leaf.delay
+    if alive is None and leaf is not None:
+        alive = leaf.alive
+    return node, delay, alive
 
 
 def ai_manual_toggle_target(candidates: list[str], active_name: str) -> str | None:

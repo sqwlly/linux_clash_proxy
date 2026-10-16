@@ -188,21 +188,52 @@ def test_query_commands_use_api_output(tmp_path: Path):
         ai_status_result = _run(env, "ai-status")
         assert ai_status_result.returncode == 0
         assert "摘要" in ai_status_result.stdout
-        assert "AI 路由:" in ai_status_result.stdout
-        assert "通用出口:" in ai_status_result.stdout
-        assert "Gemini 出口:" in ai_status_result.stdout
-        assert "AI 探测: 部分异常" in ai_status_result.stdout
+        # 出口必须是解析后的**真实节点**：旧实现在 AI-MANUAL 直接钉住节点时会退化成 "-"
+        assert "出口      United States 01" in ai_status_result.stdout
+        assert "自动切换 · 池 AI-US" in ai_status_result.stdout
+        assert "延迟      95ms" in ai_status_result.stdout
+        assert "备用      AI-SG · Singapore 01 · 99ms · " in ai_status_result.stdout
+        assert "Gemini    Korea 01" in ai_status_result.stdout
         assert "连通性" in ai_status_result.stdout
         assert "正常  ChatGPT Web  http://probe.local/chatgpt" in ai_status_result.stdout
         assert "失败  OpenAI API  http://probe.local/openai-api" in ai_status_result.stdout
         assert "正常  Gemini API  http://probe.local/gemini" in ai_status_result.stdout
-        assert "链路" in ai_status_result.stdout
-        assert "Gemini  AI-GEMINI" in ai_status_result.stdout
+        assert "部分异常" in ai_status_result.stdout
+        # 旧「链路」区块已移除，链路信息并入「模式」(池) 与「出口」两行
+        assert "链路" not in ai_status_result.stdout
+        # 「候选池」取代旧「分组」：自动池要标出它的当前项是区域组指针、不是真实出口
+        assert "候选池" in ai_status_result.stdout
+        assert "自动池 AI-US → United States 01" in ai_status_result.stdout
 
         ai_status_raw = _run(env, "ai-status", "--raw")
         assert ai_status_raw.returncode == 0
         assert "AI-MANUAL: type=Selector now=AI-AUTO" in ai_status_raw.stdout
         assert "AI-GEMINI: type=Fallback now=🇰🇷 Korea丨01" in ai_status_raw.stdout
+        # delay 取出口节点的真实延迟：fixed fallback 组自身 history 为空，旧实现打成 None
+        assert "delay=88" in ai_status_raw.stdout
+        assert "AI-MODE: auto 池=AI-US" in ai_status_raw.stdout
+        assert "AI-EXIT: node=🇺🇸 United States丨01 delay=95 alive=True" in ai_status_raw.stdout
+        assert "AI-STANDBY: group=AI-SG node=🇸🇬 Singapore丨01 delay=99 alive=True" in ai_status_raw.stdout
+        assert "AI-PROBE: 部分异常" in ai_status_raw.stdout
+
+        ai_status_json = _run(env, "ai-status", "--json")
+        # 夹具里有一个探测失败 ⇒ 机器可读模式以退出码 1 + ok=false 上报（人类面板恒返回 0）
+        assert ai_status_json.returncode == 1
+        payload = json.loads(ai_status_json.stdout)
+        assert payload["schema_version"] == 1
+        assert payload["ok"] is False
+        assert payload["recommended_actions"] == ["cproxy incident"]
+        route = payload["data"]["route"]
+        assert route["auto_mode"] is True
+        assert route["mode_label"] == "自动切换"
+        assert route["active_group"] == "AI-US"
+        assert route["active_node"] == "🇺🇸 United States丨01"
+        assert route["active_delay"] == 95
+        assert route["standby_group"] == "AI-SG"
+        assert route["gemini_present"] is True
+        assert route["gemini_node"] == "🇰🇷 Korea丨01"
+        assert route["gemini_delay"] == 88
+        assert payload["data"]["probe_status"] == "部分异常"
     finally:
         server.shutdown()
         thread.join()
