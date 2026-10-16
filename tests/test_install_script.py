@@ -1,3 +1,4 @@
+import contextlib
 import os
 import subprocess
 import sys
@@ -6,6 +7,28 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
+
+
+@contextlib.contextmanager
+def _repo_bundled_geodata():
+    """确保仓库根存在 `Country.mmdb`——它是 install.sh 的**离线回退**数据源。
+
+    该文件按设计不入库（`.gitignore` 有一条 `Country.mmdb`），所以 CI 的 checkout 里
+    没有它，安装脚本会转而联网下载，而下面的断言期望「已从仓库副本安装」→ 在 CI 上
+    必然失败（本地因留有历史副本而通过）。这里在缺失时放一个占位文件（install.sh 的
+    仓库副本分支只做 `cp`、不校验内容，大小检查只作用于下载分支），用完删除，
+    让这条回退路径在任何环境下都被确定性覆盖。
+    """
+    bundled = ROOT_DIR / "Country.mmdb"
+    created = False
+    if not bundled.is_file():
+        bundled.write_bytes(b"placeholder\n")
+        created = True
+    try:
+        yield bundled
+    finally:
+        if created:
+            bundled.unlink()
 
 
 def _write_fake_python(fake_python: Path, python_log: Path, bootstrap_message: str = "一键部署: 完成") -> None:
@@ -106,14 +129,17 @@ exit 0
     env["BINDIR"] = str(tmp_path / "system-bin")
     env["LIBDIR"] = str(tmp_path / "system-lib")
     env["DEFAULT_TMPDIR"] = str(tmp_path / "system-tmp")
+    # 禁联网：回退分支由测试自备的仓库副本提供，断言与网络可达性解耦
+    env["CPROXY_GEODATA_DOWNLOAD"] = "0"
 
-    result = subprocess.run(
-        ["/bin/bash", str(ROOT_DIR / "scripts" / "install.sh")],
-        capture_output=True,
-        text=True,
-        cwd=ROOT_DIR,
-        env=env,
-    )
+    with _repo_bundled_geodata():
+        result = subprocess.run(
+            ["/bin/bash", str(ROOT_DIR / "scripts" / "install.sh")],
+            capture_output=True,
+            text=True,
+            cwd=ROOT_DIR,
+            env=env,
+        )
 
     config_file = tmp_path / ".config" / "cproxy" / "config.yaml"
     assert result.returncode == 0
@@ -164,14 +190,17 @@ def test_install_script_falls_back_to_user_pip_when_pipx_missing(tmp_path: Path)
     env["BINDIR"] = str(tmp_path / "system-bin")
     env["LIBDIR"] = str(tmp_path / "system-lib")
     env["DEFAULT_TMPDIR"] = str(tmp_path / "system-tmp")
+    # 禁联网：回退分支由测试自备的仓库副本提供，断言与网络可达性解耦
+    env["CPROXY_GEODATA_DOWNLOAD"] = "0"
 
-    result = subprocess.run(
-        ["/bin/bash", str(ROOT_DIR / "scripts" / "install.sh")],
-        capture_output=True,
-        text=True,
-        cwd=ROOT_DIR,
-        env=env,
-    )
+    with _repo_bundled_geodata():
+        result = subprocess.run(
+            ["/bin/bash", str(ROOT_DIR / "scripts" / "install.sh")],
+            capture_output=True,
+            text=True,
+            cwd=ROOT_DIR,
+            env=env,
+        )
 
     config_file = tmp_path / ".config" / "cproxy" / "config.yaml"
     assert result.returncode == 0
