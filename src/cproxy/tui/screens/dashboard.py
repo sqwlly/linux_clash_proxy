@@ -9,11 +9,12 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Label
 
-from ...backend.runtime import ai_standby_peer
+from ...backend.runtime import resolve_ai_route
 from ...config import AppPaths
 from ...process import get_status
 from ...services.query import QueryService
 from ...services.speed import RateMeter, format_rate
+from ..ai_status import exit_line_or_idle, mode_markup
 
 
 class DashboardScreen(Widget):
@@ -179,49 +180,15 @@ class DashboardScreen(Widget):
         try:
             self.query_one("#dash-api-status", Label).update("[#a3e635]● 已连接[/]")
 
-            manual = groups.get("AI-MANUAL")
-            auto = groups.get("AI-AUTO")
-            if manual and auto:
-                auto_mode = manual.current == "AI-AUTO"
-                active_group_name = auto.current if auto_mode else manual.current
-                active = groups.get(active_group_name)
+            route = resolve_ai_route(groups)
+            if not route.present:
+                # 组未配置时保持占位符，不拼半截数据
+                return
 
-                mode_text = "自动" if auto_mode else f"固定（{manual.current}）"
-                self.query_one("#dash-ai-mode", Label).update(f"[#f6c177]{mode_text}[/]")
-
-                if active:
-                    delay_str = f"{active.delay}ms" if active.delay else "─"
-                    alive_str = "[#a3e635]●[/]" if active.alive else "[#fb7185]○[/]" if active.alive is False else "[#8b98aa]?[/]"
-                    self.query_one("#dash-ai-active", Label).update(
-                        f"{active_group_name} → {active.current} ({delay_str}) {alive_str}"
-                    )
-
-                gemini = groups.get("AI-GEMINI")
-                if gemini:
-                    delay_str = f"{gemini.delay}ms" if gemini.delay else "─"
-                    alive_str = (
-                        "[#a3e635]●[/]" if gemini.alive
-                        else "[#fb7185]○[/]" if gemini.alive is False
-                        else "[#8b98aa]?[/]"
-                    )
-                    self.query_one("#dash-ai-gemini", Label).update(
-                        f"AI-GEMINI → {gemini.current} ({delay_str}) {alive_str}"
-                    )
-                else:
-                    self.query_one("#dash-ai-gemini", Label).update("[#8b98aa]─[/]")
-
-                standby_name = ai_standby_peer(active_group_name)
-                standby = groups.get(standby_name)
-                if standby:
-                    delay_str = f"{standby.delay}ms" if standby.delay else "─"
-                    alive_str = (
-                        "[#a3e635]●[/]" if standby.alive
-                        else "[#fb7185]○[/]" if standby.alive is False
-                        else "[#8b98aa]?[/]"
-                    )
-                    self.query_one("#dash-ai-standby", Label).update(
-                        f"{standby_name} → {standby.current} ({delay_str}) {alive_str}"
-                    )
+            self.query_one("#dash-ai-mode", Label).update(mode_markup(route))
+            self.query_one("#dash-ai-active", Label).update(exit_line_or_idle(route.active, groups))
+            self.query_one("#dash-ai-gemini", Label).update(exit_line_or_idle(route.gemini, groups))
+            self.query_one("#dash-ai-standby", Label).update(exit_line_or_idle(route.standby, groups))
 
         except Exception:
             pass

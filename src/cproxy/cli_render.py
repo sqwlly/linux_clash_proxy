@@ -16,10 +16,9 @@ from .backend.models import AIProbeReport, ProxyGroup
 from .backend.runtime import (
     AI_AUTO_GROUP,
     AI_GEMINI_GROUP,
-    AI_MANUAL_GROUP,
     AI_STATUS_GROUPS,
     ai_exit_metrics,
-    ai_standby_peer,
+    resolve_ai_route,
 )
 from .backend.runtime_metrics import collect_runtime_metrics
 from .config import default_paths, log_file, read_config
@@ -277,62 +276,50 @@ def _alive_text(alive: object) -> str:
     return "未知"
 
 
+def _delay_cell(delay: object) -> object:
+    """CLI 契约里「无延迟」是字符串 `"-"`（`--raw`/`--json` 的下游按字符串解析）。"""
+    return "-" if delay is None else delay
+
+
 def _ai_exit(groups: dict, name: str) -> tuple[str, object, object]:
-    """`:func:`ai_exit_metrics` 的 CLI 侧包装：把「无延迟」统一渲染成 `"-"`。
+    """`:func:`ai_exit_metrics` 的 CLI 侧包装：套上 `_delay_cell` 的缺省值约定。
 
     拓扑解析本身在 `backend.runtime`——那里是 AI 组常量的所在地，services 层
     （`incident` 面板）也要用，放在这里会让 services 反向依赖 CLI 契约层。
     """
     node, delay, alive = ai_exit_metrics(groups, name)
-    return node, ("-" if delay is None else delay), alive
+    return node, _delay_cell(delay), alive
 
 
 def _resolve_ai_route(groups: dict) -> dict[str, object]:
-    """解析 AI 出路的模式 / 出口 / 备用 / Gemini 四要素。
+    """`:func:`backend.runtime.resolve_ai_route` 的 CLI 侧适配：展平成 17 键字典。
 
-    不变式：`active_summary` 的左操作数是**承载出口的池组名**（自动模式为 AI-AUTO
-    当前选中的区域组，手动模式为 AI-MANUAL）。`cproxy status` 的断言逐字锁定了
-    `"AI-US -> United States 01 (95ms)"` 这一形态，改动左操作数会直接打破它。
-
-    全程用 `groups.get` 而非 `_get_group`：组缺失时降级为占位值，不抛 SystemExit——
-    `_render_status` 只捕获 APIUnavailableError，SystemExit 会穿透并让 status 崩掉。
+    键名与含义是 `ai-status --json` 与 `cproxy status` 的既有契约（`schema_version` 1），
+    改键名会破坏下游解析，所以这里只做展平——出口/备用/Gemini 的解析口径由运行时侧
+    的单一实现负责，CLI 与 TUI 不会各算一套。
     """
-    target = str(_group_value(groups.get(AI_MANUAL_GROUP), "now", "-"))
-    auto_mode = target == AI_AUTO_GROUP
-    # 池组 = 直接承载出口候选的那一层：自动模式是 AI-AUTO 选中的区域组，手动模式是 AI-MANUAL
-    pool = str(_group_value(groups.get(AI_AUTO_GROUP), "now", "-")) if auto_mode else AI_MANUAL_GROUP
-
-    active_node, active_delay, active_alive = _ai_exit(groups, pool)
-
-    standby_group = ai_standby_peer(pool)
-    standby_node, standby_delay, standby_alive = _ai_exit(groups, standby_group)
-
-    gemini_present = AI_GEMINI_GROUP in groups
-    if gemini_present:
-        gemini_node, gemini_delay, gemini_alive = _ai_exit(groups, AI_GEMINI_GROUP)
-    else:
-        gemini_node, gemini_delay, gemini_alive = "-", "-", None
-
+    route = resolve_ai_route(groups)
+    active, standby, gemini = route.active, route.standby, route.gemini
     return {
-        "auto_mode": auto_mode,
+        "auto_mode": route.auto_mode,
         # 手动模式的旧值是「兜底 <节点名>」——把节点当组名，语义错；改为固定文案
-        "mode_label": "自动切换" if auto_mode else "兜底 · 手动",
-        "active_group": pool,
-        "active_node": active_node,
-        "active_delay": active_delay,
-        "active_alive": active_alive,
-        "active_summary": _exit_summary(pool, active_node, active_delay),
-        "standby_group": standby_group,
-        "standby_node": standby_node,
-        "standby_delay": standby_delay,
-        "standby_alive": standby_alive,
-        "gemini_present": gemini_present,
+        "mode_label": "自动切换" if route.auto_mode else "兜底 · 手动",
+        "active_group": active.group,
+        "active_node": active.node,
+        "active_delay": _delay_cell(active.delay),
+        "active_alive": active.alive,
+        "active_summary": _exit_summary(active.group, active.node, active.delay),
+        "standby_group": standby.group,
+        "standby_node": standby.node,
+        "standby_delay": _delay_cell(standby.delay),
+        "standby_alive": standby.alive,
+        "gemini_present": gemini is not None,
         "gemini_group": AI_GEMINI_GROUP,
-        "gemini_node": gemini_node,
-        "gemini_delay": gemini_delay,
-        "gemini_alive": gemini_alive,
+        "gemini_node": gemini.node if gemini is not None else "-",
+        "gemini_delay": _delay_cell(gemini.delay) if gemini is not None else "-",
+        "gemini_alive": gemini.alive if gemini is not None else None,
         "gemini_summary": (
-            _exit_summary(AI_GEMINI_GROUP, gemini_node, gemini_delay) if gemini_present else "-"
+            _exit_summary(AI_GEMINI_GROUP, gemini.node, gemini.delay) if gemini is not None else "-"
         ),
     }
 

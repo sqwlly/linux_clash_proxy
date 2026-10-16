@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -193,6 +194,66 @@ def ai_exit_metrics(groups: dict[str, ProxyGroup], name: str) -> tuple[str, int 
     if alive is None and leaf is not None:
         alive = leaf.alive
     return node, delay, alive
+
+
+@dataclass(frozen=True)
+class AIExit:
+    """单个 AI 出口：承载它的组 + 下钻后的真实节点 + 延迟/健康。"""
+
+    group: str
+    node: str
+    delay: int | None
+    alive: bool | None
+
+
+@dataclass(frozen=True)
+class AIRoute:
+    """AI 出口的统一解析结果——`ai-status` 面板、`--raw`/`--json` 与 TUI 共用同一份。
+
+    `pool` 是直接承载通用出口候选的那一层：自动模式为 AI-AUTO 当前选中的区域组，
+    手动模式为 AI-MANUAL。
+    """
+
+    present: bool
+    auto_mode: bool
+    pool: str
+    active: AIExit
+    standby: AIExit
+    gemini: AIExit | None
+
+
+def resolve_ai_route(groups: dict[str, ProxyGroup]) -> AIRoute:
+    """解析 AI 出口（备用/Gemini 一并），供 CLI 与 TUI 共用。
+
+    这是「AI-MANUAL 的 now 可能是嵌套组、也可能是真实节点」这一不变式的单一定义点。
+    备用组的映射分两种口径（见 `ai_standby_peer`）：自动模式按**池组**取显式成对
+    （AI-US↔AI-SG）；手动模式按**出口节点的地区**映射到另一侧，否则钉在美国节点时
+    会把「备用」算成它自己所在的 AI-US。
+    """
+    manual = groups.get(AI_MANUAL_GROUP)
+    auto = groups.get(AI_AUTO_GROUP)
+    target = str(manual.current) if manual is not None else "-"
+    auto_mode = target == AI_AUTO_GROUP
+    pool = str(auto.current) if auto_mode and auto is not None else AI_MANUAL_GROUP
+
+    active_node, active_delay, active_alive = ai_exit_metrics(groups, pool)
+
+    standby_group = ai_standby_peer(pool if auto_mode else active_node)
+    standby_node, standby_delay, standby_alive = ai_exit_metrics(groups, standby_group)
+
+    gemini: AIExit | None = None
+    if AI_GEMINI_GROUP in groups:
+        gemini_node, gemini_delay, gemini_alive = ai_exit_metrics(groups, AI_GEMINI_GROUP)
+        gemini = AIExit(AI_GEMINI_GROUP, gemini_node, gemini_delay, gemini_alive)
+
+    return AIRoute(
+        present=manual is not None and auto is not None,
+        auto_mode=auto_mode,
+        pool=pool,
+        active=AIExit(pool, active_node, active_delay, active_alive),
+        standby=AIExit(standby_group, standby_node, standby_delay, standby_alive),
+        gemini=gemini,
+    )
 
 
 def ai_manual_toggle_target(candidates: list[str], active_name: str) -> str | None:

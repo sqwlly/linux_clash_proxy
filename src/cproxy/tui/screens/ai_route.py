@@ -11,16 +11,16 @@ from ...api import APIUnavailableError
 from ...backend.models import AIProbeResult
 from ...backend.runtime import (
     AI_AUTO_GROUP,
-    AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     AI_SG_GROUP,
     AI_US_GROUP,
     ai_manual_toggle_target,
-    ai_standby_peer,
+    resolve_ai_route,
 )
 from ...config import AppPaths
 from ...services.diagnostics import DiagnosticsService
 from ...services.query import QueryService
+from ..ai_status import IDLE, chain_markup, exit_line_or_idle, mode_markup
 from ..widgets import NavigationDataTable as DataTable
 
 
@@ -87,89 +87,40 @@ class AIRouteScreen(Widget):
         except Exception as exc:
             self.app.call_from_thread(self._apply_route, None, exc)
 
+    def _paint_route(self, *, mode: str, active: str, gemini: str, standby: str, chain: str) -> None:
+        """一次写完五个标签——三条分支（报错/未配置/正常）都要整屏刷新。"""
+        for widget_id, text in (
+            ("#ai-route-mode", mode),
+            ("#ai-route-active", active),
+            ("#ai-route-gemini", gemini),
+            ("#ai-route-standby", standby),
+            ("#ai-route-chain", chain),
+        ):
+            self.query_one(widget_id, Label).update(text)
+
     def _apply_route(self, groups: dict | None, error: Exception | None) -> None:
         if error is not None or groups is None:
             label = "API 不可访问" if isinstance(error, APIUnavailableError) else f"错误: {error}"
-            self.query_one("#ai-route-mode", Label).update(f"[#fb7185]{label}[/]")
-            self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
-            self.query_one("#ai-route-gemini", Label).update("[#8b98aa]─[/]")
-            self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
-            self.query_one("#ai-route-chain", Label).update("[#8b98aa]─[/]")
+            self._paint_route(mode=f"[#fb7185]{label}[/]", active=IDLE, gemini=IDLE, standby=IDLE, chain=IDLE)
             return
         try:
-            manual = groups.get("AI-MANUAL")
-            auto = groups.get("AI-AUTO")
-
-            if manual is None or auto is None:
-                self.query_one("#ai-route-mode", Label).update("[#8b98aa]尚未配置[/]")
-                self.query_one("#ai-route-active", Label).update("[#8b98aa]─[/]")
-                self.query_one("#ai-route-gemini", Label).update("[#8b98aa]─[/]")
-                self.query_one("#ai-route-standby", Label).update("[#8b98aa]─[/]")
-                self.query_one("#ai-route-chain", Label).update("[#8b98aa]请先生成运行配置[/]")
+            route = resolve_ai_route(groups)
+            if not route.present:
+                self._paint_route(
+                    mode="[#8b98aa]尚未配置[/]",
+                    active=IDLE,
+                    gemini=IDLE,
+                    standby=IDLE,
+                    chain="[#8b98aa]请先生成运行配置[/]",
+                )
                 return
-
-            auto_mode = manual.current == "AI-AUTO"
-            active_group_name = auto.current if auto_mode else manual.current
-            active_group = groups.get(active_group_name)
-
-            standby_name = ai_standby_peer(active_group_name)
-            standby_group = groups.get(standby_name)
-            gemini_group = groups.get(AI_GEMINI_GROUP)
-
-            mode_text = "[#f6c177]自动[/]" if auto_mode else f"[#f6c177]兜底[/]（{manual.current}）"
-            self.query_one("#ai-route-mode", Label).update(mode_text)
-
-            if active_group:
-                delay_str = f"{active_group.delay}ms" if active_group.delay else "─"
-                alive_str = (
-                    "[#a3e635]●[/]" if active_group.alive
-                    else "[#fb7185]○[/]" if active_group.alive is False
-                    else "[#8b98aa]?[/]"
-                )
-                self.query_one("#ai-route-active", Label).update(
-                    f"{active_group_name} → {active_group.current} ({delay_str}) {alive_str}"
-                )
-
-            if gemini_group:
-                delay_str = f"{gemini_group.delay}ms" if gemini_group.delay else "─"
-                alive_str = (
-                    "[#a3e635]●[/]" if gemini_group.alive
-                    else "[#fb7185]○[/]" if gemini_group.alive is False
-                    else "[#8b98aa]?[/]"
-                )
-                self.query_one("#ai-route-gemini", Label).update(
-                    f"{AI_GEMINI_GROUP} → {gemini_group.current} ({delay_str}) {alive_str}"
-                )
-            else:
-                self.query_one("#ai-route-gemini", Label).update("[#8b98aa]─[/]")
-
-            if standby_group:
-                delay_str = f"{standby_group.delay}ms" if standby_group.delay else "─"
-                alive_str = (
-                    "[#a3e635]●[/]" if standby_group.alive
-                    else "[#fb7185]○[/]" if standby_group.alive is False
-                    else "[#8b98aa]?[/]"
-                )
-                self.query_one("#ai-route-standby", Label).update(
-                    f"{standby_name} → {standby_group.current} ({delay_str}) {alive_str}"
-                )
-
-            chain_lines = ["[#7dd3fc]通用 AI-MANUAL[/]"]
-            if auto_mode:
-                chain_lines.append("└─ [#f6c177]AI-AUTO[/]")
-                chain_lines.append(f"   └─ [#5eead4]{active_group_name}[/]")
-                if active_group:
-                    chain_lines.append(f"      └─ [#a3e635]{active_group.current}[/]")
-            else:
-                chain_lines.append(f"└─ [#5eead4]{active_group_name}[/]")
-                if active_group:
-                    chain_lines.append(f"   └─ [#a3e635]{active_group.current}[/]")
-            if gemini_group:
-                chain_lines.append("")
-                chain_lines.append(f"[#7dd3fc]Gemini {AI_GEMINI_GROUP}[/]")
-                chain_lines.append(f"└─ [#a3e635]{gemini_group.current}[/]")
-            self.query_one("#ai-route-chain", Label).update("\n".join(chain_lines))
-
+            self._paint_route(
+                mode=mode_markup(route),
+                active=exit_line_or_idle(route.active, groups),
+                gemini=exit_line_or_idle(route.gemini, groups),
+                standby=exit_line_or_idle(route.standby, groups),
+                chain=chain_markup(route),
+            )
         except Exception as e:
             self.query_one("#ai-route-mode", Label).update(f"[#fb7185]错误: {e}[/]")
 
