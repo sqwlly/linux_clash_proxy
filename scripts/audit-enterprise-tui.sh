@@ -153,7 +153,10 @@ check_file "docs/enterprise-tui/security-ops.md" "enterprise TUI security and op
 
 check_contains "pyproject.toml" '^requires-python = ">=3\.11"$' "Python runtime stays >=3.11"
 check_contains "pyproject.toml" '^tui = \["textual>=5\.0"\]$' "Textual optional dependency is declared"
-check_contains "pyproject.toml" '^cproxy-tui = "cproxy\.tui\.app:run_tui"$' "cproxy-tui entry point is declared"
+check_contains "pyproject.toml" '^cproxy-tui = "cproxy\.tui_launcher:main"$' "cproxy-tui entry point is declared"
+# 入口刻意走 tui_launcher 而不是直连 tui.app：Textual 是可选依赖，缺依赖时要出友好提示
+# 而不是 ModuleNotFoundError 回溯。上面声明与下面实现必须成对，否则就是又一次静默漂移。
+check_contains "src/cproxy/tui_launcher.py" '^def main\(\) -> None:$' "cproxy-tui launcher entry point exists"
 
 check_contains "docs/enterprise-tui/overview.md" '不做 Go/Bubble Tea 重写' "overview states no Go/Bubble Tea rewrite"
 check_contains "docs/enterprise-tui/overview.md" 'Python 3\.11 \+ Textual' "overview states Python 3.11 + Textual"

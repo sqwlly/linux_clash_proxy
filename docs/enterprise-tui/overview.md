@@ -2,7 +2,7 @@
 
 ## 决策
 
-**Direct Evidence:** 当前仓库是 Python 项目，不做 Go/Bubble Tea 重写。`pyproject.toml` 声明 `requires-python = ">=3.11"`，可选 TUI 依赖为 `textual>=5.0`，命令入口为 `cproxy-tui = "cproxy.tui.app:run_tui"`。
+**Direct Evidence:** 当前仓库是 Python 项目，不做 Go/Bubble Tea 重写。`pyproject.toml` 声明 `requires-python = ">=3.11"`，可选 TUI 依赖为 `textual>=5.0`，命令入口为 `cproxy-tui = "cproxy.tui_launcher:main"`（经 launcher 转发，未安装 Textual 时给出安装提示而不是回溯）。
 
 **Direct Evidence:** `deep-research-report.md` 给出的 Go/Bubble Tea/Lip Gloss 方案是通用企业 TUI 蓝图，不是本仓库迁移要求。本仓库落地方式是把报告中的架构、测试、安全、运维和验收要求翻译到现有 **Python 3.11 + Textual + Mihomo External Controller** 项目。
 
