@@ -8,6 +8,7 @@
 
 - `AI-MANUAL` 稳定性兜底：组类型由 `select` 改为 `fallback`（故障转移），手动固定的节点挂掉后 mihomo 自动切到下一个存活节点；候选列表按「`ai-manual-prefer` 钉选 → 实测稳定度序 → 静态地区」三级排序
 - `cproxy ai-rebalance`：多轮探测 `AI-MANUAL` 全部叶子，按 `rank_key`（成功↑/失败↓/最大延迟↓/平均延迟↓/抖动↓/历史惩罚↓）实测稳定度重排并持久化到 `ai-manual-order.json`，随后重渲染并热重载；配套 `cproxy-ai-rebalance.timer`（30 分钟周期）自动驱动
+- 实时网速监控：TUI 仪表盘「实时流量」卡片升级为「实时网速」（下载/上传显示瞬时速率，新增累计量行，连接数不变），并新增 `cproxy speed` 命令（一次性测速 + `--watch` 持续刷新 + `--interval` + `--raw`）；复用 mihomo `/connections` 全局累计计数器做差分，重启归零自动钳位
 
 ### 改进
 

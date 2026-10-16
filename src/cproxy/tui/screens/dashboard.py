@@ -13,6 +13,7 @@ from ...backend.runtime import ai_standby_peer
 from ...config import AppPaths
 from ...process import get_status
 from ...services.query import QueryService
+from ...services.speed import RateMeter, format_rate
 
 
 class DashboardScreen(Widget):
@@ -21,6 +22,7 @@ class DashboardScreen(Widget):
         self.paths = paths
         self._refresh_timer: Timer | None = None
         self._timer_paused = False
+        self._rate_meter = RateMeter()
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -61,13 +63,16 @@ class DashboardScreen(Widget):
                         yield Label("─", id="dash-ai-standby", classes="metric-value")
 
                 with Vertical(classes="status-card traffic-card"):
-                    yield Label("实时流量", classes="status-card-title")
+                    yield Label("实时网速", classes="status-card-title")
+                    with Horizontal(classes="dashboard-row"):
+                        yield Label("下载", classes="label-key")
+                        yield Label("─", id="dash-download", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("上传", classes="label-key")
                         yield Label("─", id="dash-upload", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
-                        yield Label("下载", classes="label-key")
-                        yield Label("─", id="dash-download", classes="metric-value")
+                        yield Label("累计", classes="label-key")
+                        yield Label("─", id="dash-total", classes="metric-value")
                     with Horizontal(classes="dashboard-row"):
                         yield Label("连接", classes="label-key")
                         yield Label("─", id="dash-connections", classes="metric-value")
@@ -117,9 +122,12 @@ class DashboardScreen(Widget):
             result["api_error"] = str(exc)
         try:
             data = service.api.request("GET", "/connections")
+            upload = int(data.get("uploadTotal") or 0)
+            download = int(data.get("downloadTotal") or 0)
             result["traffic"] = {
-                "upload": data.get("uploadTotal", 0),
-                "download": data.get("downloadTotal", 0),
+                "upload": upload,
+                "download": download,
+                "rate": self._rate_meter.sample(upload, download),
                 "connections": len(data.get("connections", [])),
             }
         except Exception:
@@ -149,11 +157,19 @@ class DashboardScreen(Widget):
 
         traffic = result["traffic"]
         if traffic is None:
-            for selector in ("#dash-upload", "#dash-download", "#dash-connections"):
+            for selector in ("#dash-download", "#dash-upload", "#dash-total", "#dash-connections"):
                 self.query_one(selector, Label).update("[#8b98aa]─[/]")
         else:
-            self.query_one("#dash-upload", Label).update(f"[#5eead4]{self._format_bytes(traffic['upload'])}[/]")
-            self.query_one("#dash-download", Label).update(f"[#5eead4]{self._format_bytes(traffic['download'])}[/]")
+            rate = traffic.get("rate")
+            if rate is None:
+                self.query_one("#dash-download", Label).update("[#8b98aa]等待采样[/]")
+                self.query_one("#dash-upload", Label).update("[#8b98aa]等待采样[/]")
+            else:
+                self.query_one("#dash-download", Label).update(f"[#5eead4]↓ {format_rate(rate.download_bps)}[/]")
+                self.query_one("#dash-upload", Label).update(f"[#5eead4]↑ {format_rate(rate.upload_bps)}[/]")
+            self.query_one("#dash-total", Label).update(
+                f"[#8b98aa]{self._format_bytes(traffic['upload'] + traffic['download'])}[/]"
+            )
             self.query_one("#dash-connections", Label).update(f"[#5eead4]{traffic['connections']}[/]")
         self.query_one("#dash-refresh-status", Label).update(
             f"[#8b98aa]最后刷新 {datetime.now():%H:%M:%S} · F5 手动刷新[/]"

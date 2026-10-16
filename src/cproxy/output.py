@@ -173,6 +173,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "流量与维护",
         (
             ("traffic", "流量统计报表或采集一次样本"),
+            ("speed", "显示实时上下行网速"),
             ("refresh", "更新订阅、渲染、重启并探测分组"),
             ("snapshots", "列出运行时/配置快照"),
             ("rollback", "回滚到历史快照"),
@@ -445,6 +446,12 @@ def build_root_parser() -> ArgumentParser:
         "profile", nargs="?", default="codex", choices=PROFILE_CHOICES, help="AI 场景（默认 codex）"
     )
     ai_use_parser.add_argument("--group", default="AI-MANUAL", help="代理组名（默认 AI-MANUAL）")
+
+    speed_parser = _add_command(subparsers, "speed", raw=True)
+    speed_parser.add_argument("--watch", action="store_true", help="持续刷新（Ctrl-C 退出）")
+    speed_parser.add_argument(
+        "--interval", type=float, default=2.0, help="watch 刷新间隔秒数（默认 2）"
+    )
 
     traffic_parser = _add_command(subparsers, "traffic", raw=True, json_output=True)
     traffic_parser.add_argument(

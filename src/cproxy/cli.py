@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import sys
+import time
 from argparse import Namespace
 from pathlib import Path
 
 from . import __version__
-from .api import APIUnavailableError
+from .api import APIBackend, APIUnavailableError
 from .cli_render import (
     _accent,
     _render_ai_connections,
@@ -47,6 +48,7 @@ from .services.probe import ProbeService, resolve_current_leaf
 from .services.query import QueryService
 from .services.rebalance import RebalanceService
 from .services.refresh import RefreshService
+from .services.speed import RateMeter, fetch_total_traffic, format_rate, measure_once
 from .services.switch_tree import (
     build_switch_tree,
     delay_label as _delay_label,
@@ -58,6 +60,51 @@ from .services.switch_tree import (
 from .services.tun import TunService
 from .structured_output import emit_json
 from .support import build_support_bundle
+
+
+def _run_speed(args: Namespace) -> int:
+    """实时网速：一次性测速，或 `--watch` 持续刷新。"""
+    api = APIBackend(default_paths())
+    if not args.watch:
+        try:
+            rate = measure_once(api, window=1.0)
+        except APIUnavailableError:
+            print_error("错误: 无法连接 Mihomo API（代理可能未运行）")
+            return 1
+        if rate is None:
+            print_error("错误: 采样失败")
+            return 1
+        if args.raw:
+            print(f"{rate.download_bps:.1f} {rate.upload_bps:.1f}")
+        else:
+            print(_section_heading("实时网速"))
+            print(f"↓ 下载  {format_rate(rate.download_bps)}")
+            print(f"↑ 上传  {format_rate(rate.upload_bps)}")
+        return 0
+
+    meter = RateMeter()
+    interval = max(0.5, float(args.interval))
+    try:
+        while True:
+            try:
+                up, down = fetch_total_traffic(api)
+            except APIUnavailableError:
+                up, down = 0, 0
+            rate = meter.sample(up, down)
+            if rate is not None:
+                if args.raw:
+                    print(f"{rate.download_bps:.1f} {rate.upload_bps:.1f}", flush=True)
+                else:
+                    print(
+                        f"\r↓ {format_rate(rate.download_bps)}   ↑ {format_rate(rate.upload_bps)}  ",
+                        end="",
+                        flush=True,
+                    )
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        if not args.raw:
+            print()
+        return 0
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -298,6 +345,8 @@ def run(argv: list[str] | None = None) -> int:
             output_lines, exit_code = build_probe_output(probe_report, args.raw, _section_heading)
             print("\n".join(output_lines))
             return exit_code
+        if args.command == "speed":
+            return _run_speed(args)
         if args.command == "traffic":
             return _render_traffic(
                 default_paths(),
