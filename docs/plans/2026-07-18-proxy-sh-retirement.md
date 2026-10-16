@@ -146,8 +146,11 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 `install_system_commands`/`setup_legacy_logrotate`）、collector 单元的悬空 `After=`、
 `systemd_helper_scripts_test.sh`（只留 collector 断言）、`tests/test_install_script.py`（去掉对已删输出的断言）。
 
-**未做（待第二阶段，不可逆）**：删系统侧 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}`
-与 `/usr/local/lib/clash-proxy/`。
+**第二阶段（系统侧，同日完成）**：删 `/etc/systemd/system/` 的 6 个 legacy 单元、
+`/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}`、`/usr/local/lib/clash-proxy/` payload、
+`/etc/default/clash-proxy-command*`、`/etc/logrotate.d/clash_proxy` 及其 cron 行；`systemctl daemon-reload`。
+删前逐个复核 `is-active`（6 个 legacy 均 inactive，唯一 active 的 `traffic-collector.timer` 予以保留），
+并打包到 `/root/legacy-system-backup-20261017.tar.gz`（回滚：`tar xzf … -C /`）。
 
 **同批修掉的连带遗留**：`process.py` 的 systemd 守卫曾指向 legacy 服务名（当年正确、退役后空转），
 已改查**用户级** `cproxy.service` 并带 `--user`；`restart()` 刻意不调 systemd（它是该单元的

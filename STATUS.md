@@ -11,7 +11,7 @@
 - 同批完成 README / USAGE 的入口描述改写：原文写「截至 2026-05-14……生产入口仍是 root 级 `clash-proxy.service`」，与 9-11 已切换的事实相反，会把排障带反方向；现以 cproxy 为唯一生产入口陈述，legacy 侧改为带状态的对照表（Gate 4 主体完成）
 - 同日完成 legacy 入口的**弃用警告与安装解耦**：三个 legacy wrapper（`clash-proxy` / `clash-proxy-update` / `cproxy-update`）调用时向 stderr 打印警告并指向 cproxy 等价命令，`./proxy.sh` 直接调用同样提示（经 wrapper 时去重）；`scripts/install-system-commands.sh` 与 `systemd/install-systemd.sh` 改为**默认不装** legacy（`--with-legacy` 才装，后者始终安装活跃的 `clash-proxy-traffic-collector`），`install.sh` 对应 `CPROXY_INSTALL_SYSTEM_COMMANDS=legacy`——防止将来重跑把已停用的入口装回 PATH。顺带修掉 `--with-cproxy-alias` 会覆盖 pip 版 `/usr/local/bin/cproxy` 的隐患（已加保护并拒绝）。`AGENTS.md` 移除已作废的 "Installed Command Copy" 规则，并修正「legacy mihomo 以 `/root/clash_proxy` 为 `-d`」的过时描述——实测 `-d` 是 `~/.local/share/cproxy`
 - cproxy 用户级 `cproxy.service` 接管代理（linger 已开启）；`cproxy-subscription.timer` 接管每日订阅更新（热重载应用新配置，不中断连接），`cproxy-refresh.timer` 定期重渲染；流量采集 timer（系统级）继续调用 `cproxy traffic collect`
-- **2026-10-17 执行退役阶段 3（仓库侧）**：`proxy.sh`、`update_config.sh`、legacy helper 脚本（6 个）、legacy systemd 单元（10 个）、`scripts/install-system-commands.sh` 及其 19 个测试全部从仓库删除；两个安装脚本的 `--with-legacy` 分支一并移除。系统侧 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与 `/usr/local/lib/clash-proxy/` 仍在（不可逆删除另待确认），但它们不在任何运行路径上
+- **2026-10-17 执行退役阶段 3（仓库侧）**：`proxy.sh`、`update_config.sh`、legacy helper 脚本（6 个）、legacy systemd 单元（10 个）、`scripts/install-system-commands.sh` 及其 19 个测试全部从仓库删除；两个安装脚本的 `--with-legacy` 分支一并移除。**系统侧同日清完**：6 个 legacy 单元、三个 PATH wrapper、`/usr/local/lib/clash-proxy/` payload、`/etc/default/clash-proxy-command*`、`/etc/logrotate.d/clash_proxy` 及其 cron 行全部删除（回滚路径 `/root/legacy-system-backup-20261017.tar.gz`）；保留活跃的 `clash-proxy-traffic-collector.{service,timer}` 与 `/etc/logrotate.d/cproxy`
 - 退役条件与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)
 
 ## 最近里程碑
@@ -37,7 +37,7 @@
 
 1. ~~确认观察期（2026-09-11 ~ 2026-10-09）内 cproxy 链路无 P0/P1 事故~~ 已于 2026-10-17 确认：期内无 P0/P1，Gate 3 满足
 2. ~~复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令~~ 已于 2026-09-15 复跑：静态审计 0 failure、TUI 回归 39 passed、后端与运行时 22 passed、运维示例与安装 dry-run 6/6、GA 产物 build+verify 通过、本地 smoke 通过。**唯一未过项**是 `security-check --strict`（本机未配 `external-controller-tls`，返回 1）——acceptance.md 已将这类失败归类为「环境未达 GA 配置，不表示仓库测试失败」
-3. ~~观察期满后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper~~ 已于 2026-10-17 完成**仓库侧**（见上）；**系统侧** `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与 `/usr/local/lib/clash-proxy/` 的删除不可逆，待单独确认后执行
+3. ~~观察期满后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper~~ 已于 2026-10-17 完成：**仓库侧**与**系统侧**均已清理（见上）
 
 ## 已知遗留项
 

@@ -80,8 +80,9 @@ render 与探测。输出中的订阅地址会脱敏。
 
 - 仓库内已无 legacy 代码：`proxy.sh`、`update_config.sh`、其 helper 脚本、
   `scripts/install-system-commands.sh` 与 legacy systemd 单元均已删除
-- 系统侧仍残留 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与
-  `/usr/local/lib/clash-proxy/`（占位、不在运行路径上），不可逆删除留待第二阶段
+- **系统侧也已清完**（2026-10-17）：legacy 单元、三个 PATH wrapper、`/usr/local/lib/clash-proxy/`
+  payload、`/etc/default/clash-proxy-command*` 与 legacy logrotate 配置均已删除
+  （回滚路径 `/root/legacy-system-backup-20261017.tar.gz`）
 
 legacy 子命令与 cproxy **绝大多数同名同义**——`status`、`switch`、`list-nodes`、
 `probe-stable-node`、`ai-use`、`guard`、`ai-connections`、`incident` 等直接换成

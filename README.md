@@ -393,10 +393,11 @@ legacy 侧（**已于 2026-10-17 退役**，不要再作为入口使用）：
 
 - 仓库内已无 legacy 代码：`proxy.sh`、`update_config.sh`、其 helper 脚本、legacy systemd 单元、
   `scripts/install-system-commands.sh` 均已删除（详见 [退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)）
-- **系统侧仍残留** `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与
-  `/usr/local/lib/clash-proxy/`：它们只是占位、不在任何运行路径上，不可逆删除留待第二阶段
-- ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际是 legacy 残留——
-  不要把它当成 cproxy 的一部分
+- **系统侧也已清完**（2026-10-17）：`/etc/systemd/system/` 的 legacy 单元、三个 PATH wrapper
+  （`clash-proxy` / `clash-proxy-update` / `cproxy-update`）、`/usr/local/lib/clash-proxy/` payload、
+  `/etc/default/clash-proxy-command*`、`/etc/logrotate.d/clash_proxy` 及其 cron 行均已删除。
+  回滚路径 = `/root/legacy-system-backup-20261017.tar.gz`
+- 若机器上仍能看到 `clash-proxy` 之类命令，说明是更早的安装残留，可安全忽略或按上述备份方式清理
 
 只读确认：
 

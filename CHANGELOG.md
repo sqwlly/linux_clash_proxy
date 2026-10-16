@@ -11,6 +11,10 @@
 - 实时网速监控：TUI 仪表盘「实时流量」卡片升级为「实时网速」（下载/上传显示瞬时速率，新增累计量行，连接数不变），并新增 `cproxy speed` 命令（一次性测速 + `--watch` 持续刷新 + `--interval` + `--raw`）；复用 mihomo `/connections` 全局累计计数器做差分，重启归零自动钳位
 - AI 出口快速自愈看门狗：新增 `cproxy ai-watch`（配套 `cproxy-ai-watch.timer`，2 分钟周期），对当前 codex/Gemini 出口做**语义探测**——识别 Gemini 的「location not supported」地区门禁（此前 4xx 一律判 ok，测不出「节点通但 AI 用不了」）——连续 2 次语义失败即切到下一个好节点，10 分钟冷却期抗抖，状态持久化到 `ai-watch.json`
 
+### 移除
+
+- **legacy `proxy.sh` 工作流退役（breaking）**：4 周观察期已到期且无 P0/P1，执行退役阶段 3。仓库侧删除 `proxy.sh`、`update_config.sh`、`scripts/install-system-commands.sh`、6 个 legacy helper 脚本、10 个 legacy systemd 文件与 19 个测试；`systemd/install-systemd.sh` 与 `scripts/install.sh` 的 `--with-legacy` 分支一并移除（其非 legacy 能力 `--with-cproxy-alias` 随之失去）。系统侧同步清理：6 个已安装单元、`clash-proxy`/`clash-proxy-update`/`cproxy-update` 三个 PATH wrapper、`/usr/local/lib/clash-proxy/` payload、`/etc/default/clash-proxy-command*` 与 legacy logrotate 配置及其 cron 行（备份 `/root/legacy-system-backup-20261017.tar.gz`）。**不受影响**：活跃的 `clash-proxy-traffic-collector.{service,timer}`、`/etc/logrotate.d/cproxy`、`systemd-user/*` 与全部 cproxy 命令
+
 ### 改进
 
 - CI 的 Lint 步骤从 `ruff check src/` 扩到 `src/ tests/`，并清掉 `tests/` 下积压的 42 项（6 条超长行、4 处 `l` 歧义变量名、import 顺序与未用导入等）；`tests/*` 整体豁免 E402——测试必须在 `import cproxy` 之前把仓库 `src/` 插进 `sys.path`，那几个 import 不在文件顶部是结构使然
