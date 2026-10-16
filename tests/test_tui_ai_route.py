@@ -25,6 +25,17 @@ def _labels(screen: AIRouteScreen) -> dict[str, str]:
     }
 
 
+def test_tui_delay_text_uses_the_same_sentinel_semantics_as_cli():
+    """TUI 与 CLI 共用 `backend.runtime.delay_state` 的判定，措辞也必须一致：
+    5000 是探测超时哨兵、0 是未测得，都不能按毫秒展示。"""
+    from cproxy.tui.ai_status import delay_text
+
+    assert delay_text(140) == "140ms"
+    assert delay_text(5000) == "超时"
+    assert delay_text(0) == "未测得"
+    assert delay_text(None) == "未测得"
+
+
 def test_ai_route_panel_renders_resolved_exit_for_pinned_node(ai_route_groups, tmp_path):
     """兜底模式钉住真实节点时，出口要显示该节点与**真实延迟**，而不是旧实现的空 `-`。"""
     paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")

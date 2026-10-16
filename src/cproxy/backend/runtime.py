@@ -206,6 +206,24 @@ class AIExit:
     alive: bool | None
 
 
+# mihomo 健康检查的超时哨兵值：探测未在 `timeout` 内返回时，`history` 里记的就是它。
+# 本项目生成的组配置不设 `timeout`，故取 mihomo 默认的 5000ms；`0` 表示「未测得」。
+# 两者都不是真实延迟——直接按毫秒展示会把「探测超时」渲染成「很快」。
+HEALTH_CHECK_TIMEOUT_MS = 5000
+
+
+def delay_state(delay: int | None) -> str:
+    """延迟的三态：`ok` / `timeout` / `unknown`。
+
+    后端只给状态，具体措辞由各前端（CLI 面板 / TUI）决定，避免 UI 文案下沉到运行时。
+    """
+    if delay is None or delay <= 0:
+        return "unknown"
+    if delay >= HEALTH_CHECK_TIMEOUT_MS:
+        return "timeout"
+    return "ok"
+
+
 @dataclass(frozen=True)
 class AIRoute:
     """AI 出口的统一解析结果——`ai-status` 面板、`--raw`/`--json` 与 TUI 共用同一份。

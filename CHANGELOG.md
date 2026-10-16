@@ -22,6 +22,8 @@
 
 ### 修复
 
+- `ai-status` / TUI 的延迟不再把 mihomo 的**哨兵值**当真实延迟展示：`history` 里的 `5000` 是探测**超时**（本项目组配置不设 `timeout`，取 mihomo 默认 5000ms），`0` 是**未测得**。此前按毫秒渲染，会把「备用节点其实在超时」显示成 `5000ms · 正常`——读起来又快又健康，是比旧版显示 `─` 更糟的错误信息（生产实测 AI-US 的 history 为 `[5000, 861, 5000, 267]`）。现按三态渲染 `NNNms` / `超时` / `未测得`，且非 ok 时不再并排显示健康标记（避免「超时 · 正常」这种自相矛盾）；`--raw` / `--json` 仍保留原始数值供机器解析
+- `ai-status` 的连通性明细只在探测失败时显示：成功时的 `HTTP 401/403` 是「可达但需鉴权」，摆在「正常」后面会被读成故障码
 - `cproxy snapshot compact` / `snapshots --json` 遇文件名时间戳不可解析的快照（如手工拷入的 `runtime-backup.yaml`）会直接 `TypeError` 崩溃：回退取文件 mtime 时把关键字写成了 `tzinfo=`，而 `datetime.fromtimestamp` 的参数名是 `tz`。真实快照名都合规，所以该分支一直未被触发；已修并补回归测试
 - 清掉 `ruff check src/` 与 `mypy src/` 的全部历史报错（8 + 35 项），CI 的这两个步骤此前长期失败。这些多为类型不安全而非线上崩溃（运行时都有 `if`/`dict.get` 兜底）：TUI 表格同步把可能为 `None` 的 `RowKey.value` 当作字典键、`ai-status` 列表渲染依赖中间布尔量传递 `choice is not None` 的收窄、`cli.py` 用一个变量名承载三种不同的 Report 类型、`feedback.py` 的流对象被注解为 `object`。另修掉 `snapshots.py` 中 `weekly_seen` 的注解与实参元数不符、表格同步函数参数过窄（`list`/`dict` 改为 `Sequence`/`Mapping`）等
 

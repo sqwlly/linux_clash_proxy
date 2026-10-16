@@ -188,17 +188,19 @@ def test_query_commands_use_api_output(tmp_path: Path):
         ai_status_result = _run(env, "ai-status")
         assert ai_status_result.returncode == 0
         assert "摘要" in ai_status_result.stdout
-        # 出口必须是解析后的**真实节点**：旧实现在 AI-MANUAL 直接钉住节点时会退化成 "-"
-        assert "出口      United States 01" in ai_status_result.stdout
+        # 出口三条行同构：`<节点> · <延迟> · <健康>`；
+        # 出口必须是解析后的**真实节点**（旧实现在 AI-MANUAL 直接钉住节点时会退化成 "-"）
+        assert "出口      United States 01 · 95ms · 正常" in ai_status_result.stdout
         assert "自动切换 · 池 AI-US" in ai_status_result.stdout
-        assert "延迟      95ms" in ai_status_result.stdout
-        assert "备用      AI-SG · Singapore 01 · 99ms · " in ai_status_result.stdout
-        assert "Gemini    Korea 01" in ai_status_result.stdout
+        assert "备用      AI-SG · Singapore 01 · 99ms · 正常" in ai_status_result.stdout
+        assert "Gemini    Korea 01 · 88ms · 正常" in ai_status_result.stdout
         assert "连通性" in ai_status_result.stdout
         assert "正常  ChatGPT Web  http://probe.local/chatgpt" in ai_status_result.stdout
         assert "失败  OpenAI API  http://probe.local/openai-api" in ai_status_result.stdout
         assert "正常  Gemini API  http://probe.local/gemini" in ai_status_result.stdout
         assert "部分异常" in ai_status_result.stdout
+        # 探测成功时不显示 detail：HTTP 401/403 是「可达但需鉴权」，摆在「正常」后像故障码
+        assert "正常  ChatGPT Web  http://probe.local/chatgpt  " not in ai_status_result.stdout
         # 旧「链路」区块已移除，链路信息并入「模式」(池) 与「出口」两行
         assert "链路" not in ai_status_result.stdout
         # 「候选池」取代旧「分组」：自动池要标出它的当前项是区域组指针、不是真实出口
@@ -239,6 +241,52 @@ def test_query_commands_use_api_output(tmp_path: Path):
         thread.join()
         proxy_server.shutdown()
         proxy_thread.join()
+
+
+def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_path, capsys):
+    """延迟的哨兵值必须如实标注：
+
+    生产实测 AI-US 组的 history 是 `[5000, 861, 5000, 267]`、AI-SG 是 `[644, 641, 0, 0]`。
+    `5000` 是 mihomo 的探测**超时**哨兵、`0` 是**未测得**——都不是真实延迟。此前按毫秒
+    展示，会把「备用节点其实在超时」渲染成「5000ms · 正常」，读起来像又快又健康。
+    """
+    from cproxy import cli_render
+    from cproxy.backend.models import AIProbeReport, AIProbeResult, ProxyGroup
+
+    def group(name, now, candidates=(), delay=None, alive=True):
+        return ProxyGroup(
+            name=name, type="Fallback", current=now, candidates=list(candidates), alive=alive, delay=delay
+        )
+
+    kr = "🇰🇷韩国 01 | IEPL 1.7X | CM"
+    groups = {
+        "AI-MANUAL": group("AI-MANUAL", kr, ["AI-AUTO", kr], delay=None),
+        "AI-AUTO": group("AI-AUTO", "AI-US", ["AI-US"], delay=0),
+        "AI-US": group("AI-US", "🇺🇸美国 01 | 1X", ["🇺🇸美国 01 | 1X"], delay=5000),
+        "AI-SG": group("AI-SG", "🇸🇬新加坡 01 | 1X", ["🇸🇬新加坡 01 | 1X"], delay=0, alive=False),
+        "AI-GEMINI": group("AI-GEMINI", kr, [kr], delay=None),
+        kr: ProxyGroup(name=kr, type="Vless", current="-", candidates=[], alive=True, delay=140),
+    }
+    monkeypatch.setattr(
+        cli_render,
+        "run_ai_probe",
+        lambda paths: AIProbeReport(
+            results=[AIProbeResult("ChatGPT Web", "https://chatgpt.com", True, "HTTP 200")]
+        ),
+    )
+
+    assert cli_render._render_ai_status(groups, raw=False) == 0
+    out = capsys.readouterr().out
+
+    assert "超时" in out  # 备用 AI-US 的 5000 哨兵
+    assert "未测得" in out  # AI-AUTO / AI-SG 的 0
+    assert "5000ms" not in out  # 哨兵绝不能按毫秒展示
+    assert "· 0ms" not in out
+    # 非 ok 时不附健康标记：否则会读成「超时 · 正常」这种自相矛盾的组合
+    assert "超时 · 正常" not in out
+    assert "未测得 · 异常" not in out
+    # ok 的那条仍完整显示延迟与健康（出口从节点自身取到 140ms）
+    assert "140ms · 正常" in out
 
 
 def test_query_commands_fall_back_to_runtime_when_api_unavailable(tmp_path: Path):

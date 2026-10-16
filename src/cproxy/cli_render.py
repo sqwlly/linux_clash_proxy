@@ -18,6 +18,7 @@ from .backend.runtime import (
     AI_GEMINI_GROUP,
     AI_STATUS_GROUPS,
     ai_exit_metrics,
+    delay_state,
     resolve_ai_route,
 )
 from .backend.runtime_metrics import collect_runtime_metrics
@@ -263,8 +264,31 @@ def _print_section(title: str) -> None:
 def _exit_summary(group_name: object, node: object, delay: object) -> str:
     summary = f"{group_name} -> {normalize_name(node)}"
     if isinstance(delay, int):
-        summary = f"{summary} ({delay}ms)"
+        summary = f"{summary} ({_exit_delay_label(delay)})"
     return summary
+
+
+def _exit_delay_label(delay: object) -> str:
+    """AI 出口延迟的三态文案。
+
+    `history` 里的 5000 是探测**超时**哨兵、0 是**未测得**——都不是真实延迟。
+    照毫秒展示会把「超时」说成「很快」，所以这里如实标注。
+    """
+    if not isinstance(delay, int):
+        return "未测得"
+    return {"ok": f"{delay}ms", "timeout": "超时", "unknown": "未测得"}[delay_state(delay)]
+
+
+def _exit_cell(delay: object, alive: object) -> str:
+    """`<延迟> · <健康>`；延迟不是 ok 时不附健康标记。
+
+    两者并排会读成「超时 · 正常」这种自相矛盾的组合——mihomo 的 alive 标记在单次
+    探测超时后未必翻转，而「超时」本身已经是更准确的结论。
+    """
+    parts = [_exit_delay_label(delay)]
+    if isinstance(delay, int) and delay_state(delay) == "ok":
+        parts.append(_status_label(_alive_text(alive)))
+    return " · ".join(parts)
 
 
 def _alive_text(alive: object) -> str:
@@ -565,32 +589,24 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     mode_text = f"自动切换 · 池 {route['active_group']}" if auto_mode else str(route["mode_label"])
 
     _print_section("摘要")
+    # 三条出口行同构：`<节点> · <延迟> · <健康>`，延迟语义由 _exit_cell 统一裁定
     summary_rows: list[tuple[str, str]] = [
         ("模式", mode_text),
         (
             "出口",
-            f"{_accent(normalize_name(route['active_node']))}"
-            f"  {_status_label(_alive_text(route['active_alive']))}",
+            f"{_accent(normalize_name(route['active_node']))} · {_exit_cell(route['active_delay'], route['active_alive'])}",
         ),
-    ]
-    # 延迟只在真有测量值时才出现——fixed fallback 组没有 history，「-」是假信息
-    if isinstance(route["active_delay"], int):
-        summary_rows.append(("延迟", _format_delay_label(route["active_delay"])))
-    summary_rows.append(
         (
             "备用",
             f"{route['standby_group']} · {normalize_name(route['standby_node'])}"
-            f" · {_format_delay_label(route['standby_delay'])}"
-            f" · {_status_label(_alive_text(route['standby_alive']))}",
-        )
-    )
+            f" · {_exit_cell(route['standby_delay'], route['standby_alive'])}",
+        ),
+    ]
     if route["gemini_present"]:
         summary_rows.append(
             (
                 "Gemini",
-                f"{_accent(normalize_name(route['gemini_node']))}"
-                f"  {_format_delay_label(route['gemini_delay'])}"
-                f"  {_status_label(_alive_text(route['gemini_alive']))}",
+                f"{_accent(normalize_name(route['gemini_node']))} · {_exit_cell(route['gemini_delay'], route['gemini_alive'])}",
             )
         )
     summary_rows.append(("探测", _status_label(probe_status)))
@@ -600,7 +616,9 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     _print_section("连通性")
     for item in probe_report.results:
         label = _status_label("正常" if item.ok else "失败")
-        suffix = f"  {_style(item.detail, ANSI_DIM)}" if item.detail else ""
+        # detail 只在失败时显示：成功时的 HTTP 401/403 是「可达但需鉴权」，摆在
+        # 「正常」后面会被读成故障码
+        suffix = f"  {_style(item.detail, ANSI_DIM)}" if not item.ok and item.detail else ""
         print(f"{label}  {item.name}  {item.url}{suffix}")
 
     print()
@@ -619,7 +637,8 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
         else:
             parts.append(f"当前 {_accent(normalize_name(node))}")
         if isinstance(delay, int):
-            parts.append(_format_delay_label(delay))
+            # 组的 history 为空时不写占位——`超时`/`未测得` 只在真有信号时出现
+            parts.append(_exit_delay_label(delay))
         print(f"{_pad_right(name, group_width)}  " + " · ".join(parts))
     return 0
 

@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from ..backend.runtime import AI_GEMINI_GROUP, AIExit, AIRoute
+from ..backend.runtime import AI_GEMINI_GROUP, AIExit, AIRoute, delay_state
 from ..names import normalize_name
 
 _ACCENT = "#f6c177"
@@ -35,16 +35,25 @@ def alive_markup(alive: bool | None) -> str:
 
 
 def delay_text(delay: int | None) -> str:
-    """无测量值时给 `─`，不伪造 `0ms`。"""
-    return f"{delay}ms" if isinstance(delay, int) else "─"
+    """延迟三态：`NNNms` / `超时` / `未测得`。
+
+    `history` 里的 5000 是探测超时哨兵、0 是未测得，都不是真实延迟——照毫秒展示会把
+    「超时」渲染成「很快」（CLI 面板用同一套判定，见 `backend.runtime.delay_state`）。
+    """
+    if not isinstance(delay, int):
+        return "未测得"
+    return {"ok": f"{delay}ms", "timeout": "超时", "unknown": "未测得"}[delay_state(delay)]
 
 
 def exit_line(exit_: AIExit) -> str:
-    """`<组> → <节点> (<延迟>) <健康>`；节点名与 CLI 面板同样走 `normalize_name`。"""
-    return (
-        f"{exit_.group} → {normalize_name(exit_.node)} "
-        f"({delay_text(exit_.delay)}) {alive_markup(exit_.alive)}"
-    )
+    """`<组> → <节点> (<延迟>) <健康>`；节点名与 CLI 面板同样走 `normalize_name`。
+
+    延迟不是 ok 时不附健康标记：`超时 · 正常` 这种组合自相矛盾。
+    """
+    parts = [f"{exit_.group} → {normalize_name(exit_.node)} ({delay_text(exit_.delay)})"]
+    if isinstance(exit_.delay, int) and delay_state(exit_.delay) == "ok":
+        parts.append(alive_markup(exit_.alive))
+    return " ".join(parts)
 
 
 def exit_line_or_idle(exit_: AIExit | None, groups: dict) -> str:

@@ -9,7 +9,7 @@
 """
 
 from cproxy.backend.models import ProxyGroup
-from cproxy.backend.runtime import resolve_ai_leaf, resolve_ai_route
+from cproxy.backend.runtime import delay_state, resolve_ai_leaf, resolve_ai_route
 
 KR_NODE = "🇰🇷韩国 01 | IEPL 1.7X | CM"
 US_NODE = "🇺🇸美国 01 | IEPL 1.7X | CM"
@@ -119,3 +119,18 @@ def test_leaf_of_name_absent_from_snapshot_is_the_name():
 
     assert resolve_ai_leaf(groups, "AI-US") == "AI-US"
     assert resolve_ai_leaf(groups, "还没进快照的节点") == "还没进快照的节点"
+
+
+# --- 延迟的哨兵值 ---------------------------------------------------------
+
+
+def test_delay_state_classifies_timeout_sentinel_and_unmeasured():
+    """生产实测 AI-US 的 history 是 [5000, 861, 5000, 267]：5000 是探测**超时**哨兵，
+    不是「5000 毫秒的延迟」。把它按毫秒展示会把「不可用」说成「很慢但可用」。"""
+    assert delay_state(140) == "ok"
+    assert delay_state(4999) == "ok"
+    assert delay_state(5000) == "timeout"
+    assert delay_state(6000) == "timeout"
+    # 0 表示该轮未测得（AI-SG 实测 history 尾部就是 [0, 0]）
+    assert delay_state(0) == "unknown"
+    assert delay_state(None) == "unknown"
