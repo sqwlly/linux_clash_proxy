@@ -20,6 +20,11 @@
 - `AI-MANUAL` 的 codex 候选池扩展韩/英：实测 `🇰🇷韩国 01 IEPL` 与 `🇬🇧英国 01 IEPL` 对 codex 稳定（5/5），纳入后 `ai-rebalance` 的 codex 稳定度排序随之覆盖，日本 TE 挂掉后可自动落到韩国 IEPL（仅进 codex 池，不污染 `AI-US`/`AI-SG` 自动池）
 - `ai-rebalance` 排序加重历史失败惩罚权重，平滑单轮 codex 探测噪声（削弱「一轮 5/5、下一轮 1/5」的名次翻转）
 
+### 修复
+
+- `cproxy snapshot compact` / `snapshots --json` 遇文件名时间戳不可解析的快照（如手工拷入的 `runtime-backup.yaml`）会直接 `TypeError` 崩溃：回退取文件 mtime 时把关键字写成了 `tzinfo=`，而 `datetime.fromtimestamp` 的参数名是 `tz`。真实快照名都合规，所以该分支一直未被触发；已修并补回归测试
+- 清掉 `ruff check src/` 与 `mypy src/` 的全部历史报错（8 + 35 项），CI 的这两个步骤此前长期失败。这些多为类型不安全而非线上崩溃（运行时都有 `if`/`dict.get` 兜底）：TUI 表格同步把可能为 `None` 的 `RowKey.value` 当作字典键、`ai-status` 列表渲染依赖中间布尔量传递 `choice is not None` 的收窄、`cli.py` 用一个变量名承载三种不同的 Report 类型、`feedback.py` 的流对象被注解为 `object`。另修掉 `snapshots.py` 中 `weekly_seen` 的注解与实参元数不符、表格同步函数参数过窄（`list`/`dict` 改为 `Sequence`/`Mapping`）等
+
 ## [1.1.0] - 2026-10-15
 
 ### 改进
