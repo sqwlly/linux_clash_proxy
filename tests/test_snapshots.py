@@ -188,6 +188,30 @@ def test_snapshot_deduplication(tmp_path: Path):
     assert len(list_snapshots(paths, "config")) == 2
 
 
+def test_compact_snapshots_tolerates_unparseable_snapshot_name(tmp_path: Path):
+    """文件名时间戳不可解析时（如手工拷入的 `runtime-backup.yaml`）应回退到文件 mtime。
+
+    这条回退分支曾写成 `datetime.fromtimestamp(ts, tzinfo=...)`，而 `fromtimestamp`
+    的关键字是 `tz`——只要目录里出现一个非常规命名的快照，`snapshot compact` 与
+    `snapshots --json` 就会直接 TypeError（真实快照名都合规，所以一直没暴露）。
+    """
+    from datetime import datetime, timezone
+
+    from cproxy.config import default_paths
+    from cproxy.snapshots import compact_snapshots, snapshots_dir
+
+    paths = default_paths(tmp_path)
+    s_dir = snapshots_dir(paths)
+    s_dir.mkdir(parents=True, exist_ok=True)
+    (s_dir / "runtime-backup.yaml").write_text("port: 7890\n")
+
+    report = compact_snapshots(paths, kind="runtime", dry_run=True, now=datetime.now(timezone.utc))
+
+    # 能跑完即达标：该文件按 mtime 判为「近期」，保留而非报错
+    assert report.total_before == 1
+    assert report.pruned == []
+
+
 def test_compact_snapshots_tiered_ladder(tmp_path: Path):
     from datetime import datetime, timedelta, timezone
 

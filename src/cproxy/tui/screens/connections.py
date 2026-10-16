@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -32,7 +34,7 @@ def _cursor_row_key(table: DataTable) -> str | None:
         return None
 
 
-def _sync_table_rows(table: DataTable, column_keys, desired: list[tuple[str, tuple[str, ...]]]) -> None:
+def _sync_table_rows(table: DataTable, column_keys, desired: Sequence[tuple[str, tuple[str, ...]]]) -> None:
     """按 row key 增量同步表格：更新变化单元格、增删行，避免 clear+重建造成的闪烁与光标丢失。"""
     desired_keys = {key for key, _ in desired}
     for row_key in list(table.rows.keys()):
@@ -156,10 +158,14 @@ class ConnectionsScreen(Widget):
         _sync_table_rows(table, self._table_columns, desired)
 
         # 表格保持插入序（增量同步只追加新行），_visible_connections 按表格行序对齐，
-        # 保证 cursor_row 索引映射不变
-        self._visible_connections = [
-            connection for row_key in table.rows if (connection := by_key.get(row_key.value)) is not None
-        ]
+        # 保证 cursor_row 索引映射不变。RowKey.value 可能是 None，取不到就跳过该行。
+        visible: list[ConnectionEntry] = []
+        for row_key in table.rows:
+            row_value = row_key.value
+            entry = by_key.get(row_value) if isinstance(row_value, str) else None
+            if entry is not None:
+                visible.append(entry)
+        self._visible_connections = visible
         self._restore_connection_cursor(previous_key)
         self._update_connection_detail(self._selected_connection())
 

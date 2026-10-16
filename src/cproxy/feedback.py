@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+from typing import TextIO
 
 from .textwidth import display_width
 
@@ -83,10 +84,10 @@ class Spinner:
         *,
         enabled: bool = True,
         delay: float = 0.0,
-        stream: object | None = None,
+        stream: TextIO | None = None,
     ) -> None:
         self._message = message
-        self._stream = stream if stream is not None else sys.stderr
+        self._stream: TextIO = stream if stream is not None else sys.stderr
         self._live = bool(enabled and _live_capable(self._stream))
         self._delay = max(0.0, delay)
         self._color = _stderr_color_enabled()
@@ -144,8 +145,8 @@ class ProgressLine:
     「探测 | …」「筛选 | …」静态行行为完全一致，journal/测试不受影响。
     """
 
-    def __init__(self, *, enabled: bool = True, stream: object | None = None) -> None:
-        self._stream = stream if stream is not None else sys.stderr
+    def __init__(self, *, enabled: bool = True, stream: TextIO | None = None) -> None:
+        self._stream: TextIO = stream if stream is not None else sys.stderr
         self.live = bool(enabled and _live_capable(self._stream))
         self._color = _stderr_color_enabled()
 

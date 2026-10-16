@@ -137,13 +137,14 @@ def _evaluate_tier_retention(
     # - 超过 30 天：淘汰清理
     hourly_seen: set[tuple[int, int, int, int]] = set()
     daily_seen: set[tuple[int, int, int]] = set()
-    weekly_seen: set[tuple[int, int, int]] = set()
+    # 周桶是 (ISO 年, ISO 周数) 两元组——原先注解写成三元组，与 add 的实参不符
+    weekly_seen: set[tuple[int, int]] = set()
 
     for idx, item in enumerate(deduped_candidates):
         item_time = parse_snapshot_time(item)
         if item_time is None:
             try:
-                item_time = datetime.fromtimestamp(item.stat().st_mtime, tzinfo=timezone.utc)
+                item_time = datetime.fromtimestamp(item.stat().st_mtime, tz=timezone.utc)
             except OSError:
                 item_time = current_time
 

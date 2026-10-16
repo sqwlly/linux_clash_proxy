@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -39,7 +39,7 @@ from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
 from .services.refresh import RefreshReport, update_source_from_subscription
 from .services.subscription_info import SubscriptionUsage, display_entries
-from .services.switch_tree import SwitchChoice, lookup_choice, resolve_group_query
+from .services.switch_tree import lookup_choice, resolve_group_query
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import (
     compact_snapshots,
@@ -442,17 +442,14 @@ def _render_list_nodes(groups: dict, group_name: str | None, raw: bool, json_out
 
     group = groups.get(resolved) if resolved else None
     current = _group_value(group, "now", "") if group else ""
-    use_tree = bool(
-        choice is not None
-        and choice.children
-        and not raw
-        and not json_output
-        and group_name not in groups
-    )
+    # 先取出子项列表再判定：把 `choice is not None` 的收窄留在同一处，
+    # 否则 use_tree 这个中间布尔量会让收窄失效（mypy 看不到它蕴含非空）
+    children = choice.children if choice is not None else []
+    use_tree = bool(children and not raw and not json_output and group_name not in groups)
     if use_tree:
-        items = [child.key for child in choice.children]
-        labels = {child.key: child.display for child in choice.children}
-        current_keys = {child.key for child in choice.children if child.current}
+        items = [child.key for child in children]
+        labels = {child.key: child.display for child in children}
+        current_keys = {child.key for child in children if child.current}
     else:
         raw_items = list(_group_value(group, "all", []) or [])
         items = raw_items if raw or json_output else [item for item in raw_items if not is_panel_info_node(item)]
@@ -466,7 +463,11 @@ def _render_list_nodes(groups: dict, group_name: str | None, raw: bool, json_out
                 "group": resolved or group_name,
                 "current": current,
                 "nodes": [
-                    {"name": str(item), "display_name": labels.get(item, normalize_name(item)), "current": item == current or item in current_keys}
+                    {
+                        "name": str(item),
+                        "display_name": labels.get(item, normalize_name(item)),
+                        "current": item == current or item in current_keys,
+                    }
                     for item in items
                 ],
             },
@@ -1212,9 +1213,9 @@ def _render_security_check(strict: bool) -> int:
         _print_section("修复建议")
         for issue in report.issues:
             if issue.code == "missing-controller-tls":
-                print(f"- [建议] 可在 config.yaml 开启 external-controller-tls 并配置证书保护控制端口")
+                print("- [建议] 可在 config.yaml 开启 external-controller-tls 并配置证书保护控制端口")
             elif issue.code == "non-loopback-controller":
-                print(f"- [修复] 请修改 config.yaml 中的 external-controller，绑定至 127.0.0.1 避免公网暴露")
+                print("- [修复] 请修改 config.yaml 中的 external-controller，绑定至 127.0.0.1 避免公网暴露")
             else:
                 print(f"- [{issue.code}] 请检查对应安全项配置")
 
@@ -1226,17 +1227,20 @@ def _render_security_check(strict: bool) -> int:
 def _render_snapshots(paths, raw: bool, as_json: bool = False) -> int:
     entries = list_snapshots(paths)
     if as_json:
-        payload = [
-            {
-                "name": entry.name,
-                "kind": snapshot_kind(entry),
-                "size": entry.stat().st_size,
-                "relative_time": format_relative_time(parse_snapshot_time(entry)),
-                "tier": snapshot_tier_label(entry, idx),
-                "created_at": parse_snapshot_time(entry).isoformat() if parse_snapshot_time(entry) else None,
-            }
-            for idx, entry in enumerate(entries)
-        ]
+        # 逐个解析时间：既让 `created_at` 的 Optional 收窄成立，也避免同一项被解析三次
+        payload = []
+        for idx, entry in enumerate(entries):
+            created = parse_snapshot_time(entry)
+            payload.append(
+                {
+                    "name": entry.name,
+                    "kind": snapshot_kind(entry),
+                    "size": entry.stat().st_size,
+                    "relative_time": format_relative_time(created),
+                    "tier": snapshot_tier_label(entry, idx),
+                    "created_at": created.isoformat() if created else None,
+                }
+            )
         emit_json("snapshots", {"snapshots": payload, "count": len(entries), "directory": str(snapshots_dir(paths))})
         return 0
     if raw:
@@ -1496,7 +1500,9 @@ def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False)
         if extra.detail:
             extra_label = f"{extra_label}  {extra.detail}"
         rows.append((f"附加订阅 {extra.name}", extra_label))
-    rows.append(("运行配置", report.runtime_path))
+    # runtime_path 是 Path | None；空值时整行略去（_render_kv_colon 本就会跳过空值行）
+    if report.runtime_path:
+        rows.append(("运行配置", str(report.runtime_path)))
     if report.restarted:
         rows.append(("代理", "已重启应用新配置（连接已中断）"))
     elif report.hot_reloaded:

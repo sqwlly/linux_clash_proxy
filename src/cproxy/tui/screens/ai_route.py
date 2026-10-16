@@ -230,6 +230,8 @@ class AIRouteScreen(Widget):
             auto_mode = manual.current == AI_AUTO_GROUP
             active_group_name = auto.current if auto_mode else manual.current
 
+            # 手动分支的目标可能取不到（无可切的美/新节点），先声明为 Optional
+            target: str | None
             if auto_mode:
                 target = AI_SG_GROUP if active_group_name == AI_US_GROUP else AI_US_GROUP
                 service.switch_group(AI_AUTO_GROUP, target)

@@ -97,11 +97,16 @@ class ProvidersScreen(Widget):
         ]
         _sync_table_rows(table, self._table_columns, desired)
 
-        # 表格保持插入序，_providers 按表格行序对齐，保证 cursor_row 索引映射不变
+        # 表格保持插入序，_providers 按表格行序对齐，保证 cursor_row 索引映射不变。
+        # RowKey.value 可能是 None，取不到就跳过该行。
         by_key = {provider.name: provider for provider in self._providers}
-        self._providers = [
-            provider for row_key in table.rows if (provider := by_key.get(row_key.value)) is not None
-        ]
+        visible: list[ProviderEntry] = []
+        for row_key in table.rows:
+            key = row_key.value
+            provider = by_key.get(key) if isinstance(key, str) else None
+            if provider is not None:
+                visible.append(provider)
+        self._providers = visible
         self._restore_provider_cursor(previous_key)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

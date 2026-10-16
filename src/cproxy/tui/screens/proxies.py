@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -21,7 +23,7 @@ _PLACEHOLDER_KEY = "__placeholder__"
 _ERROR_KEY = "__error__"
 
 
-def _sync_table_rows(table: DataTable, rows: dict[str, tuple[str, ...]]) -> None:
+def _sync_table_rows(table: DataTable, rows: Mapping[str, tuple[str, ...]]) -> None:
     """按 row key 增量同步表格内容：更新变化单元格、补充新行、移除消失行。
 
     相比 clear() 后整表重建，光标位置、滚动偏移与选择状态都得以保留。

@@ -43,20 +43,24 @@ from .output import build_probe_output, build_root_parser, normalize_name, rende
 from .process import ProcessOwnershipError, restart_process, start_process, stop_process
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .runtime import render_runtime
+from .services.ai_watch import VERDICT_LABELS, AIWatchService
 from .services.ops import guard
 from .services.probe import ProbeService, resolve_current_leaf
 from .services.query import QueryService
-from .services.ai_watch import AIWatchService, VERDICT_LABELS
 from .services.rebalance import RebalanceService
 from .services.refresh import RefreshService
 from .services.speed import RateMeter, fetch_total_traffic, format_rate, measure_once
 from .services.switch_tree import (
     build_switch_tree,
-    delay_label as _delay_label,
     extra_subscription_names,
     level_title,
-    resolve_delay as _resolve_delay,
     resolve_group_query,
+)
+from .services.switch_tree import (
+    delay_label as _delay_label,
+)
+from .services.switch_tree import (
+    resolve_delay as _resolve_delay,
 )
 from .services.tun import TunService
 from .structured_output import emit_json
@@ -317,26 +321,27 @@ def run(argv: list[str] | None = None) -> int:
             return _render_shadow_history(default_paths(), args.limit, args.raw)
         if args.command == "ai-rebalance":
             try:
-                report = RebalanceService(default_paths()).rebalance(dry_run=args.dry_run)
+                # 各自独立的变量名：三种 report 类型不同，共用一个名字会让类型互相污染
+                rebalance_report = RebalanceService(default_paths()).rebalance(dry_run=args.dry_run)
             except APIUnavailableError:
                 # 定时任务在代理未运行时无需报错：跳过本轮，下一轮再排
                 print("代理未运行，跳过稳定度重排")
                 return 0
             print(_section_heading("结果"))
-            print(f"稳定度排序（{len(report.ordered)} 个节点）:")
-            for index, name in enumerate(report.ordered, start=1):
+            print(f"稳定度排序（{len(rebalance_report.ordered)} 个节点）:")
+            for index, name in enumerate(rebalance_report.ordered, start=1):
                 print(f"  {index}. {name}")
-            if report.rerendered:
-                print(f"已写入稳定度排序: {report.order_path}")
-                print("运行配置: " + ("已热重载" if report.hot_reloaded else "已渲染（代理未运行）"))
+            if rebalance_report.rerendered:
+                print(f"已写入稳定度排序: {rebalance_report.order_path}")
+                print("运行配置: " + ("已热重载" if rebalance_report.hot_reloaded else "已渲染（代理未运行）"))
             return 0
         if args.command == "ai-watch":
-            report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)
-            if not report.results:
+            watch_report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)
+            if not watch_report.results:
                 print("代理未运行，跳过 AI 出口看护")
                 return 0
             print(_section_heading("AI 出口看护"))
-            for item in report.results:
+            for item in watch_report.results:
                 verdict = VERDICT_LABELS.get(item.verdict, item.verdict)
                 line = f"{item.group}: {verdict}"
                 if item.current:

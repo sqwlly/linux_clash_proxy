@@ -30,7 +30,6 @@ from .screens.proxies import ProxiesScreen
 from .screens.subscriptions import SubscriptionsScreen
 from .screens.system_proxy import SystemProxyScreen
 
-
 # 主题令牌（与 styles.tcss 的 $primary/$warning/... 同源）。
 # 这些颜色会被 Textual 的 TCSS 变量系统使用：CSS 里写 ``$primary`` 就会自动
 # 解析为当前主题的 primary 字段。改这里 = 改全套 widget 默认色。

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlparse
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 import yaml
 
