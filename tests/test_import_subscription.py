@@ -1,6 +1,5 @@
-import importlib.util
 import base64
-import subprocess
+import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -90,7 +89,11 @@ def test_rejects_node_uri_list_without_full_yaml(monkeypatch, tmp_path, capsys):
     update_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
     monkeypatch.setattr(module, "urlopen", lambda request, timeout: _FakeResponse(b"ss://example"))
-    monkeypatch.setattr(module, "download_subscription_with_curl", lambda url, max_bytes, timeout: (_ for _ in ()).throw(RuntimeError("no fallback")))
+
+    def _no_fallback(url, max_bytes, timeout):
+        raise RuntimeError("no fallback")
+
+    monkeypatch.setattr(module, "download_subscription_with_curl", _no_fallback)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -110,7 +113,9 @@ def test_base64_vless_subscription_converts_to_minimal_yaml(monkeypatch, tmp_pat
     decoded = "\n".join(
         [
             "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test&fp=chrome&host=edge.example.test&path=%2Fws#Node%201",
-            "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test&fp=chrome&host=edge.example.test&path=%2Fws#剩余流量：100 GB",
+            # 超长 URL 用隐式拼接拆行，值本身不变（含末尾的中文节点名）
+            "vless://uuid@example.test:443?type=ws&security=tls&sni=edge.example.test"
+            "&fp=chrome&host=edge.example.test&path=%2Fws#剩余流量：100 GB",
             "vless://uuid2@reality.example.test:8443?type=tcp&security=reality&sni=updates.example.test&fp=chrome&flow=xtls-rprx-vision&pbk=public-key&sid=abcd#Reality%201",
         ]
     )

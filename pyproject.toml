@@ -34,6 +34,11 @@ line-length = 130
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 
+[tool.ruff.lint.per-file-ignores]
+# 测试要在 `import cproxy` 之前把仓库 src/ 插进 sys.path（见 tests/conftest.py），
+# 所以那几个 import 必然不在文件顶部——结构使然，不是疏漏，整体豁免 E402。
+"tests/*" = ["E402"]
+
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true

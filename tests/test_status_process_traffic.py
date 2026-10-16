@@ -123,7 +123,7 @@ def test_chain_traffic_bar_splits_by_proxy_ratio(monkeypatch):
     """双色流量条：条宽按总量、绿段长度按代理占比，0 字节保持占位契约。"""
     import re
 
-    from cproxy.cli_render import ANSI_GREEN, ANSI_RESET, ANSI_YELLOW, _TRAFFIC_BAR_WIDTH, _chain_traffic_bar
+    from cproxy.cli_render import _TRAFFIC_BAR_WIDTH, ANSI_GREEN, ANSI_RESET, ANSI_YELLOW, _chain_traffic_bar
 
     monkeypatch.setenv("CPROXY_COLOR", "always")
     # total=max → 满宽条；proxy:direct=3:1 → 绿 15 格、黄 5 格

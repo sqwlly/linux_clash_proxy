@@ -107,7 +107,7 @@ def test_load_tolerates_missing_or_broken_state(tmp_path):
 
 
 def test_display_entries_orders_and_filters(tmp_path):
-    from cproxy.services.subscription_info import record_subscription_info, display_entries
+    from cproxy.services.subscription_info import display_entries, record_subscription_info
 
     paths = make_paths(tmp_path)
     write_config(
@@ -227,8 +227,20 @@ def test_status_shows_subscription_block(tmp_path):
     _write_state_home(
         tmp_path,
         {
-            "main": {"upload": 0, "download": 100_000_000_000, "total": 1_000_000_000_000, "expire": expire, "updated_at": datetime.now().isoformat()},
-            "Mitce": {"upload": 0, "download": 3_000_000_000, "total": 0, "expire": None, "updated_at": datetime.now().isoformat()},
+            "main": {
+                "upload": 0,
+                "download": 100_000_000_000,
+                "total": 1_000_000_000_000,
+                "expire": expire,
+                "updated_at": datetime.now().isoformat(),
+            },
+            "Mitce": {
+                "upload": 0,
+                "download": 3_000_000_000,
+                "total": 0,
+                "expire": None,
+                "updated_at": datetime.now().isoformat(),
+            },
         },
     )
 
@@ -255,7 +267,9 @@ def test_update_source_records_main_usage(tmp_path, monkeypatch):
 
     paths = make_paths(tmp_path)
     write_config(paths, {"mixed-port": 7890, "rules": ["MATCH,PROXY"]})
-    payload = yaml.safe_dump({"proxies": [{"name": "N1", "type": "ss", "server": "1.1.1.1", "port": 1, "cipher": "x", "password": "y"}]})
+    payload = yaml.safe_dump(
+        {"proxies": [{"name": "N1", "type": "ss", "server": "1.1.1.1", "port": 1, "cipher": "x", "password": "y"}]}
+    )
     monkeypatch.setattr(
         refresh_module,
         "_download_subscription",

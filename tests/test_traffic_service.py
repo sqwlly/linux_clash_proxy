@@ -33,7 +33,12 @@ def make_service(tmp_path, snapshots: list[dict]) -> TrafficService:
 def connection(conn_id: str, host: str, rule: str, chain: list[str], download: int, upload: int, process: str = "") -> dict:
     return {
         "id": conn_id,
-        "metadata": {"host": host, "destinationIP": "1.2.3.4", "process": process, "processPath": f"/usr/bin/{process}" if process else ""},
+        "metadata": {
+            "host": host,
+            "destinationIP": "1.2.3.4",
+            "process": process,
+            "processPath": f"/usr/bin/{process}" if process else "",
+        },
         "rule": rule,
         "rulePayload": "",
         "chains": list(chain),

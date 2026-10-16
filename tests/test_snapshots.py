@@ -331,6 +331,7 @@ def test_cli_snapshots_compact(tmp_path: Path):
 
 def test_interactive_rollback_preview_and_confirm(tmp_path: Path, monkeypatch):
     import io
+
     from cproxy.backend.runtime import RuntimeBackend
     from cproxy.cli_render import _run_rollback
     from cproxy.config import default_paths, runtime_file

@@ -268,8 +268,8 @@ def test_cli_raw_compat(tmp_path, monkeypatch, capsys):
     assert run(["probe-stable-node", "G"] + ARGS3 + ["--raw"]) == 0
     lines = capsys.readouterr().out.strip().split("\n")
     kv: dict[str, list] = {}
-    for l in lines:
-        p = l.split("\t")
+    for line in lines:
+        p = line.split("\t")
         kv.setdefault(p[0], []).append(p)
     # CURRENT_STABLE / STABLE: true/false + reason
     assert kv["CURRENT_STABLE"][0][1] in ("true", "false") and len(kv["CURRENT_STABLE"][0]) >= 3
@@ -288,16 +288,16 @@ def test_cli_raw_switch_and_skip(tmp_path, monkeypatch, capsys):
     assert run(["probe-stable-node", "G"] + ARGS3 + ["--switch", "--raw"]) == 0
     out = capsys.readouterr().out
     assert "SWITCH\tG\tfast" in out
-    assert not any(l.startswith("SKIP_SWITCH\t") for l in out.strip().split("\n"))
+    assert not any(line.startswith("SKIP_SWITCH\t") for line in out.strip().split("\n"))
     # debounce → SKIP_SWITCH with group + reason
     run2 = _cli(tmp_path, monkeypatch, {"G": _g("G", "Selector", "cur", ["cur", "new"])}, {"cur": 100, "new": 90})
     assert run2(["probe-stable-node", "G"] + ARGS3 + ["--switch", "--raw"]) == 0
     out2 = capsys.readouterr().out
-    skips = [l for l in out2.strip().split("\n") if l.startswith("SKIP_SWITCH\t")]
+    skips = [line for line in out2.strip().split("\n") if line.startswith("SKIP_SWITCH\t")]
     assert len(skips) == 1
     parts = skips[0].split("\t")
     assert parts[1] == "G" and "防抖" in parts[2]
-    assert not any(l.startswith("SWITCH\t") for l in out2.strip().split("\n"))
+    assert not any(line.startswith("SWITCH\t") for line in out2.strip().split("\n"))
 
 def test_cli_human_preview(tmp_path, monkeypatch, capsys):
     # debounce → 不会切换 + reason

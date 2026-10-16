@@ -18,7 +18,6 @@ from cproxy.services import rebalance as rebalance_mod
 from cproxy.services.probe import ProbeSummary
 from cproxy.services.rebalance import RebalanceService
 
-
 # --- _order_manual_candidates ---
 
 def test_order_prefer_first_then_order_then_static():

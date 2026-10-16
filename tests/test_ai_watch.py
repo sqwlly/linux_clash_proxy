@@ -17,7 +17,6 @@ from cproxy.services import ai_watch as ai_watch_mod
 from cproxy.services.ai_watch import AIWatchService
 from cproxy.services.diagnostics import PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, _probe_target
 
-
 # --- 语义分类 ---
 
 class _FakeResponse:

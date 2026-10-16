@@ -883,7 +883,7 @@ def test_download_subscription_direct_retries_until_success(tmp_path: Path, monk
     """直连 TLS 握手可能被间歇重置：直连失败应重试多次，成功即返回。"""
     import cproxy.services.refresh as refresh_module
     from cproxy.config import default_paths
-    from cproxy.services.refresh import SUBSCRIPTION_DIRECT_ATTEMPTS, _download_subscription
+    from cproxy.services.refresh import _download_subscription
 
     paths = default_paths(tmp_path)
     _write_config(paths, LOCAL_CONFIG)
