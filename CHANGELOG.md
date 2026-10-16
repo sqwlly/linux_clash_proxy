@@ -14,6 +14,7 @@
 
 - `cproxy switch` 放行 `fallback` 组手动指定：mihomo 尊重手动选择直到节点挂，`AI-MANUAL` 与 `AI-AUTO` 均可在 fallback 下切换（顺带修掉 TUI「切换美/新」在自动模式被类型守卫拦下的隐患）
 - TUI / `ai-status` 的 AI 出口「模式」标签由「固定」改为「兜底」，如实反映故障转移语义
+- `AI-MANUAL` 的 codex 候选池扩展韩/英：实测 `🇰🇷韩国 01 IEPL` 与 `🇬🇧英国 01 IEPL` 对 codex 稳定（5/5），纳入后 `ai-rebalance` 的 codex 稳定度排序随之覆盖，日本 TE 挂掉后可自动落到韩国 IEPL（仅进 codex 池，不污染 `AI-US`/`AI-SG` 自动池）
 
 ## [1.1.0] - 2026-10-15
 

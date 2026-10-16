@@ -205,9 +205,13 @@ def _collect_ai_region_nodes(
     group_map: dict[str, dict],
     extra_names: list[str],
 ) -> dict[str, list[str]]:
-    """收集 AI 用的日/美/新节点；不创建第二套国家 selector。"""
+    """收集 AI 用的日/美/新 + 韩/英节点；不创建第二套国家 selector。
+
+    韩/英仅进 AI-MANUAL 的 codex 候选池（实测 KR/GB 的 IEPL 对 codex 稳定），
+    AI-US / AI-SG / AI-AUTO 仍只用美/新，避免污染自动池的地区语义。
+    """
     extra_set = set(extra_names)
-    buckets: dict[str, list[str]] = {"JP": [], "US": [], "SG": []}
+    buckets: dict[str, list[str]] = {"JP": [], "US": [], "SG": [], "KR": [], "GB": []}
     seen: dict[str, set[str]] = {code: set() for code in buckets}
 
     def add(code: str, name: str) -> None:
@@ -526,6 +530,8 @@ class RuntimeBackend:
         us_proxies = region_nodes["US"]
         sg_proxies = region_nodes["SG"]
         jp_proxies = region_nodes["JP"]
+        kr_proxies = region_nodes["KR"]
+        gb_proxies = region_nodes["GB"]
         if not us_proxies or not sg_proxies:
             raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
         gemini_prefer = data.get("ai-gemini-prefer")
@@ -546,7 +552,7 @@ class RuntimeBackend:
         if not isinstance(manual_prefer, list):
             manual_prefer = []
         manual_order = _load_ai_manual_order(self.paths)
-        manual_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies)
+        manual_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies) + list(kr_proxies) + list(gb_proxies)
         manual_candidates = _order_manual_candidates(manual_leaves, manual_prefer, manual_order) + [AI_AUTO_GROUP]
 
         ai_groups = [

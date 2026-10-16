@@ -115,6 +115,38 @@ def test_render_manual_respects_prefer_and_order(tmp_path):
     assert manual["proxies"][:3] == ["SG-01", "JP-01", "US-01"]
 
 
+def test_render_manual_includes_kr_gb(tmp_path):
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: US-01
+  - name: SG-01
+  - name: JP-01
+  - name: 🇰🇷韩国 01 | IEPL 1.7X | CM
+  - name: 🇬🇧英国 01 | IEPL 1.7X | CM
+proxy-groups:
+  - name: Auto
+    type: fallback
+    proxies: [US-01, SG-01]
+rules:
+  - MATCH,Auto
+"""
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "config.yaml").write_text(config, encoding="utf-8")
+    RuntimeBackend(paths).render_runtime()
+    data = yaml.safe_load((paths.data_dir / "runtime.yaml").read_text(encoding="utf-8"))
+    groups = {group["name"]: group for group in data["proxy-groups"]}
+
+    manual = groups["AI-MANUAL"]
+    assert "🇰🇷韩国 01 | IEPL 1.7X | CM" in manual["proxies"]
+    assert "🇬🇧英国 01 | IEPL 1.7X | CM" in manual["proxies"]
+    # 韩/英只进 codex 池，不污染 AI-US / AI-SG 自动池
+    assert "🇰🇷韩国 01 | IEPL 1.7X | CM" not in groups["AI-US"]["proxies"]
+    assert "🇬🇧英国 01 | IEPL 1.7X | CM" not in groups["AI-SG"]["proxies"]
+
+
 # --- RebalanceService ---
 
 def _summary(name: str, delays: tuple[int, ...], failures: int = 0) -> ProbeSummary:
