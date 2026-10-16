@@ -90,7 +90,10 @@ def _run_speed(args: Namespace) -> int:
             try:
                 up, down = fetch_total_traffic(api)
             except APIUnavailableError:
-                up, down = 0, 0
+                # API 暂不可用：跳过这一帧，不把 (0,0) 喂给 RateMeter，
+                # 否则会污染速率基线、恢复后算出「累计流量÷几秒」的假尖峰
+                time.sleep(interval)
+                continue
             rate = meter.sample(up, down)
             if rate is not None:
                 if args.raw:

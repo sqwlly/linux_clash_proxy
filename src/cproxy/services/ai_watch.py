@@ -12,10 +12,10 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from ..backend.runtime import AI_GEMINI_GROUP, AI_MANUAL_GROUP
-from ..config import AppPaths, ai_watch_state_file
+from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP
+from ..config import AppPaths, ai_watch_state_file, read_config
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
-from .probe import PROFILES, resolve_current_leaf
+from .probe import resolve_current_leaf
 from .query import QueryService
 
 CONSECUTIVE_FAILURE_THRESHOLD = 2
@@ -43,11 +43,16 @@ class WatchReport:
     results: list[WatchGroupResult] = field(default_factory=list)
 
 
-def _watch_url(group: str) -> str:
-    """AI-MANUAL 用 codex 场景 URL，AI-GEMINI 用 Gemini API URL。"""
+def _watch_url(paths: AppPaths, group: str) -> str:
+    """AI-MANUAL 用 ChatGPT Web URL，AI-GEMINI 用 Gemini API URL（均可被 config 覆盖）。
+
+    codex 无干净可测的语义失败信号，改用 chatgpt.com 首页（返回 200）做可达性判定，
+    而非 codex 的 POST 端点（GET 必返 4xx，会被语义分类永远判 ok，看门狗形同虚设）。
+    """
+    config = read_config(paths)
     if group == AI_GEMINI_GROUP:
-        return DEFAULT_AI_PROBE_TARGETS[2][1]
-    return str(PROFILES["codex"]["url"])
+        return str(config.get("ai-gemini-api-url") or DEFAULT_AI_PROBE_TARGETS[2][1])
+    return str(config.get("ai-chatgpt-url") or DEFAULT_AI_PROBE_TARGETS[0][1])
 
 
 def _load_state(paths: AppPaths) -> dict:
@@ -109,7 +114,7 @@ class AIWatchService:
         group_obj = groups.get(group)
         current = resolve_current_leaf(groups, group) if group_obj else None
         try:
-            verdict = ai_target_verdict(self.paths, _watch_url(group))
+            verdict = ai_target_verdict(self.paths, _watch_url(self.paths, group))
         except Exception as exc:
             verdict, detail = PROBE_DEAD, str(exc)
         else:
@@ -117,6 +122,11 @@ class AIWatchService:
 
         result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
         gs = _group_state(state, group)
+
+        # 自动模式（AI-MANUAL 当前是 AI-AUTO）由自动池自身 fallback 兜底，看门狗不手动切，
+        # 否则会把用户手动选的自动模式静默踢成固定叶子且无返回路径
+        if group == AI_MANUAL_GROUP and group_obj is not None and group_obj.current == AI_AUTO_GROUP:
+            return result
 
         if verdict == PROBE_OK:
             gs["fail_node"] = None
@@ -133,7 +143,11 @@ class AIWatchService:
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
-                self.query.switch_group(group, target)
+                try:
+                    self.query.switch_group(group, target)
+                except Exception:
+                    # 切换失败（API 抖动等）：保留失败计数，下一轮重试，不让异常中断循环、丢状态
+                    return result
                 cooldown = gs.setdefault("cooldown", {})
                 if current:
                     cooldown[current] = now

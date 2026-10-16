@@ -290,6 +290,33 @@ def test_restore_selectors_maps_legacy_japan_group_to_node(tmp_path, monkeypatch
     assert restored["AI-MANUAL"] == "JP-01"
 
 
+def test_restore_selectors_includes_fallback(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("external-controller: 127.0.0.1:9\n", encoding="utf-8")
+    backend = APIBackend(default_paths(tmp_path))
+    groups = {
+        "AI-MANUAL": ProxyGroup(
+            name="AI-MANUAL",
+            type="fallback",
+            current="US-01",
+            candidates=["US-01", "JP-01", "AI-AUTO"],
+        ),
+    }
+    switches: list[tuple[str, str]] = []
+    monkeypatch.setattr(backend, "get_groups", lambda: groups)
+    monkeypatch.setattr(backend, "switch_group", lambda name, target: switches.append((name, target)))
+    monkeypatch.setattr(backend, "_drop_connections_using_groups", lambda names: 0)
+
+    # fallback 组（AI-MANUAL 改 fallback 后）也应被快照与恢复
+    assert backend.selector_now() == {"AI-MANUAL": "US-01"}
+    restored = backend.restore_selectors({"AI-MANUAL": "JP-01"})
+    assert switches == [("AI-MANUAL", "JP-01")]
+    assert restored["AI-MANUAL"] == "JP-01"
+
+
 def test_restore_selectors_maps_leaf_into_country_group(tmp_path, monkeypatch):
     from cproxy.backend.models import ProxyGroup
 

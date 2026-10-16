@@ -244,10 +244,10 @@ class APIBackend:
         return self.request("PATCH", "/configs", patch)
 
     def selector_now(self) -> dict[str, str]:
-        """当前 Selector 组的选中项，供热重载后原样写回。"""
+        """当前 Selector/fallback 组的选中项，供热重载后原样写回。"""
         snapshot: dict[str, str] = {}
         for name, group in self.get_groups().items():
-            if str(group.type).lower() not in {"select", "selector"}:
+            if str(group.type).lower() not in {"select", "selector", "fallback"}:
                 continue
             current = str(group.current or "").strip()
             if current and current != "-":
@@ -266,7 +266,7 @@ class APIBackend:
         groups = self.get_groups()
         for name, wanted in snapshot.items():
             group = groups.get(name)
-            if group is None or str(group.type).lower() not in {"select", "selector"}:
+            if group is None or str(group.type).lower() not in {"select", "selector", "fallback"}:
                 continue
             parent_target, child_target = _restore_selector_targets(name, wanted, groups, snapshot)
             if parent_target is None:

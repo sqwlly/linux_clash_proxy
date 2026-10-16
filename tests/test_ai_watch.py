@@ -1,6 +1,7 @@
 """AI 出口看门狗：语义判定、连续失败切换、冷却期与状态持久化。"""
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -165,3 +166,51 @@ def test_state_persists_across_instances(tmp_path, monkeypatch):
     report = svc2.watch()  # 读到 fail_count=1 → 变 2 → 切换
     assert any(r.switched for r in report.results)
     assert fake_q2.switches
+
+
+def test_watch_skips_auto_mode(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    groups = {
+        "AI-MANUAL": _group("AI-MANUAL", ["US-01", "JP-01", "AI-AUTO"], "AI-AUTO"),
+        "AI-GEMINI": _group("AI-GEMINI", ["KR-01", "GB-01"], "KR-01"),
+        "AI-AUTO": _group("AI-AUTO", ["AI-US", "AI-SG"], "AI-US"),
+        "AI-US": _group("AI-US", ["US-01"], "US-01"),
+        "AI-SG": _group("AI-SG", ["SG-01"], "SG-01"),
+    }
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_GEO_BLOCKED)
+    svc = AIWatchService(paths)
+    fake_q = _FakeQuery(groups)
+    svc.query = fake_q
+
+    svc.watch()
+    report = svc.watch()  # 连续两轮失败，但 AI-MANUAL 在自动模式 → 不应被切走
+    manual = next(r for r in report.results if r.group == "AI-MANUAL")
+    assert not manual.switched
+    assert not any(sw[0] == "AI-MANUAL" for sw in fake_q.switches)
+
+
+class _FailingQuery:
+    def __init__(self, groups):
+        self.api = type("_API", (), {"get_groups": lambda self: groups})()
+
+    def switch_group(self, group, target):
+        raise RuntimeError("switch boom")
+
+
+def test_watch_switch_failure_preserves_state(tmp_path, monkeypatch):
+    from cproxy.config import ai_watch_state_file
+
+    paths = _paths(tmp_path)
+    groups = _groups()
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_DEAD)
+
+    svc = AIWatchService(paths)
+    svc.query = _FailingQuery(groups)
+    svc.watch()  # fail_count=1
+
+    svc2 = AIWatchService(paths)
+    svc2.query = _FailingQuery(groups)
+    report = svc2.watch()  # 触发切换但 switch_group 抛异常 → 不崩溃，计数保留
+    assert not any(r.switched for r in report.results)
+    state = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
+    assert state["AI-MANUAL"]["fail_count"] == 2  # 保留计数，下一轮重试
