@@ -13,6 +13,7 @@
 
 ### 改进
 
+- AI 出口解析收敛为单一实现（`backend.runtime.resolve_ai_route`），CLI 与 TUI 共用：TUI 仪表盘与 AI 路由面板此前各有一份独立解析、且都直读**组自身**的 `delay`/`alive`，而 `AI-MANUAL`/`AI-GEMINI` 是 fixed fallback（mihomo 不做健康检查、`history` 恒空），于是延迟永远显示 `─`、健康永远 `?`；现在与 CLI 面板同样下钻到出口节点取真实值，节点名也统一走 `normalize_name`。顺带修掉手动模式下「备用」的映射口径——它应按**出口节点地区**取另一侧，此前 CLI 传池组名，钉在美国节点时会把备用算成它自己所在的 `AI-US`
 - `cproxy ai-status` 输出重构：修掉兜底模式下「出口显示为 `-`」的解析失真——旧实现假定 `AI-MANUAL` 的 `now` 一定是 AI-* 组名，而它现在是一个**真实节点**，于是拿节点名去查组表、取到无 `now` 的节点条目、打出空出口与空叶子。现统一沿 `now` 下钻到真实出口节点（解析逻辑下沉到 `backend.runtime`，与 `incident` 共用），fixed fallback 组（`AI-MANUAL`/`AI-GEMINI`）的延迟回退到出口节点自身 history，`--raw` 不再打出 `delay=None`；版面按「出口」重组为「摘要 / 连通性 / 候选池」三区块，节点名统一走 `normalize_name`（消除同一节点两种写法），「候选池」明确标注 `AI-AUTO` 是自动池指针而非真实出口；`--json` 契约不变（`schema_version` 1、17 键全保留）
 - `cproxy switch` 放行 `fallback` 组手动指定：mihomo 尊重手动选择直到节点挂，`AI-MANUAL` 与 `AI-AUTO` 均可在 fallback 下切换（顺带修掉 TUI「切换美/新」在自动模式被类型守卫拦下的隐患）
 - TUI / `ai-status` 的 AI 出口「模式」标签由「固定」改为「兜底」，如实反映故障转移语义
