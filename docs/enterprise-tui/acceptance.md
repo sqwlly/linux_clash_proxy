@@ -14,7 +14,7 @@ bash "scripts/audit-enterprise-tui.sh"
 |---|---|
 | 技术栈 | `pyproject.toml` 保持 Python `>=3.11`、Textual optional dependency、`cproxy-tui` 入口 |
 | 重写防线 | 仓库根目录没有 `go.mod`，源码中没有 Bubble Tea runtime 依赖 |
-| 文档落地 | `docs/enterprise-tui/overview.md`、`acceptance.md`、`security-ops.md` 均存在并声明“不做 Go/Bubble Tea 重写，当前项目采用 Python 3.11 + Textual” |
+| 文档落地 | `docs/enterprise-tui/overview.md` 声明“不做 Go/Bubble Tea 重写，当前项目采用 Python 3.11 + Textual”；`acceptance.md` 与 `security-ops.md` 存在（后者聚焦安全与运维，不含重写声明） |
 | 变更范围 | 输出当前 `src`、`tests`、`pyproject.toml`、`README.md`、`USAGE.md` 的 worktree 变更清单，便于最终验收对账 |
 | 企业安全入口 | `external-controller-tls`、`external-controller-unix` 风险处理、secret provider、结构化审计和供应链 CI 均有仓库证据 |
 | GA readiness | `security-check`、`support-bundle`、GA artifact build/verify、80/120 布局和 5000 connections 压力 smoke 均有测试或脚本 |
@@ -77,10 +77,10 @@ bash "scripts/verify-ga-artifacts.sh" "/tmp/cproxy-ga"
 
 | 命令 | 通过条件 |
 |---|---|
-| `systemd_user_examples_test.sh` | 用户级 service/override/env 示例仍指向 `%h/.local/bin/cproxy` 和用户环境文件 |
+| `systemd_user_examples_test.sh` | 用户级 service/override/env 示例仍指向 `/usr/local/bin/cproxy` 和用户环境文件 |
 | `systemd-analyze verify` | systemd 能解析仓库内 user service；如果输出其他系统 unit 的 warning，只要返回码为 0 且没有指向 `systemd-user/cproxy.service` 的 error 即可 |
 | `system_command_installer_test.sh` | wrapper 安装 dry-run 不创建 bindir，真实测试只写临时目录 |
-| `install-system-commands.sh --dry-run` | 只打印将安装的 `clash-proxy`、`clash-proxy-update` 和 payload，不写 `/usr/local` |
+| `install-system-commands.sh --dry-run` | legacy 已停用：默认只打印「不再默认安装」说明并 `exit 0`，不写 `/usr/local`；确需演练旧安装动作要显式加 `--with-legacy` |
 | `build-ga-artifacts.sh` / `verify-ga-artifacts.sh` | 生成 source tarball、`SHA256SUMS` 和 `provenance.json`，并能校验 checksum 与 provenance 字段 |
 
 ## 目标环境 GA smoke

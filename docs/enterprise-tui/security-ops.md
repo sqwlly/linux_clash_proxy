@@ -8,7 +8,7 @@
 | Controller secret | `APIBackend.api_secret()` 按 `secret-systemd-credential`、`secret-file`、`secret-keyring-service`、`secret` 顺序读取，请求时写 `Authorization: Bearer ...` | 支持 systemd credential/file/keyring/YAML 回退 | YAML secret 仅作为兼容回退 |
 | Controller TLS | `APIBackend.controller_url()` 优先使用 `external-controller-tls` 并默认 `https://` | TLS controller 已有入口 | 仍需真实 TLS controller 集成测试 |
 | Unix socket | `APIBackend.controller_url()` 遇到 `external-controller-unix` 直接拒绝 | 避免使用不会校验 secret 的控制面 | 如果未来支持，必须单独 ADR |
-| TUI 权限 | `default_paths()` 使用 XDG 用户目录；`systemd-user/cproxy.service` 使用 `%h/.local/bin/cproxy` | TUI 可以用户级运行 | 仍需文档禁止用 root 长期运行 TUI |
+| TUI 权限 | `default_paths()` 使用 XDG 用户目录；`systemd-user/cproxy.service` 使用 `/usr/local/bin/cproxy`（硬编码绝对路径） | TUI 可以用户级运行 | 仍需文档禁止用 root 长期运行 TUI |
 | 进程所有权 | `ProcessBackend` 校验 `cproxy-process.json`、PID、program、runtime 后才 stop | stale pidfile 不应误杀外部进程 | 需要继续保留 `test_stop_does_not_kill_unowned_process_from_stale_pidfile` |
 | 日志 | `LogsScreen` tail `cproxy.log`；安装脚本可写 logrotate 配置 | 本地日志可查看和轮转 | 生产仍需配置日志保留周期 |
 | 操作审计 | `write_audit_event()` 写 `cproxy-audit.jsonl`，`audit-journald: true` 时写 `systemd-cat` | selector 切换、连接断开、Provider 更新和配置重启有审计记录 | 目标环境需用 `journalctl` 回放确认 |
@@ -24,7 +24,7 @@
 | 渲染运行配置 | `PYTHONPATH="src" python3 -m cproxy.cli render` | 从用户配置生成 runtime YAML |
 | 查看状态 | `PYTHONPATH="src" python3 -m cproxy.cli status` | 输出进程、端口、Controller 和 runtime 状态 |
 | 用户级 systemd 校验 | `bash "tests/systemd_user_examples_test.sh"` | 验证 service/override/env 示例没有漂移 |
-| root-level wrapper dry-run | `bash "scripts/install-system-commands.sh" --dry-run --bindir "/tmp/cproxy-enterprise-tui-audit/bin"` | 只打印安装动作，不写 `/usr/local` |
+| root-level wrapper dry-run | `bash "scripts/install-system-commands.sh" --dry-run --bindir "/tmp/cproxy-enterprise-tui-audit/bin"` | legacy 已停用：默认只打印「不再默认安装」说明，不写 `/usr/local`（演练旧安装动作需显式 `--with-legacy`） |
 | 文档/审计 gate | `bash "scripts/audit-enterprise-tui.sh"` | 静态校验当前企业 TUI 文档和项目事实是否一致 |
 
 ## 操作风险与处理

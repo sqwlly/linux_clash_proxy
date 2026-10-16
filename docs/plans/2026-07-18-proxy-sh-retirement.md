@@ -15,6 +15,11 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 
 ## 维护规则（即日起生效）
 
+> **2026-10-17 更新：本节已被 `AGENTS.md` 的 "Legacy Retirement" 取代。** `proxy.sh` 工作流
+> 自 2026-09-11 起**完全冻结**（连安全修复也不必做——legacy 侧已无任何运行组件，改它没有
+> 收益）；原先的 "Installed Command Copy" 规则随之作废，legacy 入口仅供回滚对照，**不再
+> 刷新安装副本**。下述三条保留为当时的决策记录。
+
 - `proxy.sh` 及其 helper 脚本只接受安全修复和 blocking bug 修复，不再添加新功能
 - 新功能只进 `cproxy`
 - 在阶段 3 完成前，`AGENTS.md` 的 "Installed Command Copy" 规则继续有效
@@ -41,6 +46,19 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 `disable --now` 了 `clash-proxy.service`，未停这个独立 unit），此前持续监听
 `/root/clash_proxy/config.yaml` 并会在该文件变化时拉起 legacy 刷新流程。至此 legacy
 侧全部 unit 为 `inactive` + `disabled`，系统内无任何 legacy 组件在运行。
+
+### 2026-10-17 复核
+
+- **Gate 3 的窗口已到期**：起算 2026-09-11、至 2026-10-09 的 4 周已过完，但上表仍标 ⏳。
+  仓库内没有可查的事故记录，这 4 周有无 P0/P1 需人工确认；确认后本项才能判定。
+- **Gate 1 的可核验部分仍是绿的**：CI 六个步骤全绿（Lint 现为 `ruff check src/ tests/`）、
+  本地 `ruff`/`mypy` 干净、pytest 460 passed、`scripts/audit-enterprise-tui.sh` 0 failure。
+  其中 `security-check --strict` 的未过项仍是「本机未配 `external-controller-tls`」这一环境问题。
+- **legacy 侧现状未变**（本次实测）：`clash-proxy.service` / `clash-proxy-refresh.path` /
+  `clash-proxy-update.timer` 均为 `inactive`，三个回滚入口仍在 PATH。注意
+  `clash-proxy-traffic-collector.timer` 是**活跃的 cproxy 组件**（`ExecStart` 指向
+  `cproxy traffic collect --raw`），名字带 legacy 前缀属历史遗留，与退役无关。
+- **修正一处与 `AGENTS.md` 的矛盾**：上节「维护规则」的三条已被 AGENTS.md 取代，已加注。
 
 ## 功能对账表
 

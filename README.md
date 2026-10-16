@@ -43,8 +43,9 @@ pipx install '/path/to/clash_proxy[tui]'
 
 安装脚本会：
 
-- **root 下一律装到系统级 `/usr/local`**（先补齐声明的运行依赖，再以
-  `pip install --force-reinstall --no-deps` 替换项目本体），
+- **root 下一律装到系统级 `/usr/local`**（先补齐声明的运行依赖，再替换项目本体：
+  默认以 `pip install --no-deps --editable` 装成可编辑模式，设 `CPROXY_EDITABLE=0`
+  时改为 `pip install --force-reinstall --no-deps` 装成正式副本——生产安装用后者），
   刻意不用 `--user`：`systemd-user/cproxy.service` 硬编码 `/usr/local/bin/cproxy`，
   而 PATH 里 `~/.local/bin` 排在它前面——同时存在两份副本时，交互命令与 systemd
   服务会跑不同版本的代码
@@ -263,14 +264,14 @@ cproxy completion bash --install
 
 分组名与 `cproxy --help` 保持一致；完整命令清单见 `cproxy` 或 `cproxy --help`，shell 补全见 [USAGE.md](USAGE.md#shell-补全)。
 
-TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖概览、节点、Provider、连接、AI 路由、订阅、配置、代理环境和日志；耗时 API 操作在后台执行，连接全部断开、配置重启、丢弃未保存配置和 shell rc 写入/移除均需要二次确认。代理环境页只生成供父 shell 执行的 `export` / `unset`，不会伪装成已经修改当前终端。
+TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖概览、节点、提供方、连接、AI 路由、订阅、配置、代理环境和日志；耗时 API 操作在后台执行，连接全部断开、配置重启、丢弃未保存配置和 shell rc 写入/移除均需要二次确认。代理环境页只生成供父 shell 执行的 `export` / `unset`，不会伪装成已经修改当前终端。
 
 ## 输出策略
 
 默认输出面向人类阅读：
 
 - `status`：`摘要 + 资源 + 流量 + 路径`
-- `ai-status`：`摘要 + 连通性 + 链路 + 备用 + 分组`
+- `ai-status`：三张表——`AI 出口`（通用 / 备用 / Gemini）、`连通性`、`候选池`
 - `list-groups`：`摘要 + 列表`
 - `list-nodes`：`摘要 + 列表`
 - `test-group`：`摘要 + 结果`
@@ -279,7 +280,7 @@ TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前
 统一规则：
 
 - 默认输出优先给结论，再给明细
-- 区块标题统一使用 `摘要 / 资源 / 流量 / 路径 / 连通性 / 链路 / 备用 / 分组 / 列表 / 结果`，
+- 区块标题统一使用 `摘要 / 资源 / 流量 / 路径 / 连通性 / AI 出口 / 候选池 / 列表 / 结果` 等固定词表（完整清单以各命令实际输出为准），
   开启图标时（`CPROXY_ICONS=1` 或配置 `output-icons: true`）每个标题带 `▸` 前缀，
   `status` 顶部另有一行 `◆ cproxy` 主标题。`status` 的流量区块带统计窗口限定词，
   实际渲染为 `流量 (今日)`
@@ -333,8 +334,8 @@ cproxy test-group "AI-AUTO" --raw
 
 - `render` 后、`start` 前，`current/list-groups/list-nodes` 仍然可用
 - `ai-status/switch/test-group` 仍要求 Mihomo API 可访问
-- `ai-status` 会额外通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API，失败时会做最多 2 次轻量重试
-- `status` / `ai-status` 分别展示通用出口（`AI-MANUAL`）与 Gemini 出口（`AI-GEMINI`）
+- `ai-status` 会额外通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API，失败只做 1 次轻量重试（单次 3 秒）；看门狗另用更宽的预算（8 秒 × 2 次），因为它误判会触发真实切换
+- `ai-status` 的三张表与 `status` 的摘要区都会展示通用出口（`AI-MANUAL`）与 Gemini 出口（`AI-GEMINI`）
 
 如需覆盖默认探测地址，可在 `config.yaml` 里配置：
 
@@ -342,7 +343,7 @@ cproxy test-group "AI-AUTO" --raw
 ai-chatgpt-url: https://chatgpt.com
 ai-openai-api-url: https://api.openai.com/v1/models
 ai-gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models
-ai-probe-timeout: 8
+ai-probe-timeout: 3   # 面板单次探测超时（留空则用默认 3 秒）
 ```
 
 ## AI 路由设计
@@ -386,7 +387,7 @@ ai-probe-timeout: 8
 
 - 用户级服务：`systemd-user/cproxy.service`
 - 用户级路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
-- 定时任务：`cproxy-subscription.timer`（每日订阅更新）、`cproxy-refresh.timer`（周期性重渲染）
+- 定时任务：`cproxy-subscription.timer`（每日订阅更新）、`cproxy-refresh.timer`（周期性重渲染）、`cproxy-ai-watch.timer`（每 2 分钟语义探测 AI 出口，连续失败即切节点）、`cproxy-ai-rebalance.timer`（每 30 分钟按实测稳定度重排 `AI-MANUAL` 候选）
 
 legacy 侧（已停用，保留待退役，**不要**再作为入口使用）：
 

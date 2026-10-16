@@ -12,14 +12,14 @@
 
 | 层 | 当前拥有者 | Direct Evidence | 说明 |
 |---|---|---|---|
-| TUI shell | `src/cproxy/tui/app.py` | `CProxyApp` 使用 `TabbedContent` 组合 Overview、Nodes、Providers、Connections、AI Route、Subs、Config、Proxy、Logs | Textual 应用壳和跨页快捷键在这里 |
+| TUI shell | `src/cproxy/tui/app.py` | `CProxyApp` 使用 `TabbedContent` 组合 9 个页签：概览 / 节点 / 提供方 / 连接 / AI 路由 / 订阅 / 配置 / 代理环境 / 日志 | Textual 应用壳和跨页快捷键在这里 |
 | 页面组件 | `src/cproxy/tui/screens/*.py` | `DashboardScreen`、`ProxiesScreen`、`SubscriptionsScreen`、`ConfigEditorScreen`、`LogsScreen`、`SystemProxyScreen` | 每个页面只处理本页面交互和状态展示 |
 | 服务层 | `src/cproxy/services/*.py` | `QueryService` 优先读取 API，API 不可用时回退 runtime；`DiagnosticsService` 封装连通性和 AI 探测 | TUI 与后端 IO 的窄接口 |
 | Controller client | `src/cproxy/backend/api.py` | `APIBackend` 读取 `external-controller`，对有 `secret` 的请求加 `Authorization: Bearer ...`，覆盖 `/proxies`、`/configs`、`/connections`、`/providers/*` | 当前是同步 REST 客户端 |
 | Runtime config | `src/cproxy/backend/runtime.py` | `RuntimeBackend.render_runtime()` 读取用户 YAML，注入 AI 路由组和规则后写入 runtime YAML | 配置渲染与业务规则在后端层 |
 | Process owner | `src/cproxy/backend/process.py` | `ProcessBackend` 写 `cproxy-process.json`，停止前校验 PID、program 和 runtime | 防止 stale pidfile 误杀非 cproxy 进程 |
 | XDG paths | `src/cproxy/config.py` | `default_paths()` 使用 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME` | 支持用户级配置、数据和状态隔离 |
-| systemd/user | `systemd-user/*.service` | `cproxy.service` 使用 `%h/.local/bin/cproxy render/start/stop/restart` | 当前运维集成以用户级 systemd 为主 |
+| systemd/user | `systemd-user/*.service` | `cproxy.service` 使用 `/usr/local/bin/cproxy render/start/stop/restart`（硬编码绝对路径，刻意不用 `%h/.local/bin`，避免 PATH 里靠前的用户级副本与服务分叉） | 当前运维集成以用户级 systemd 为主 |
 
 ## 已有能力
 

@@ -19,9 +19,9 @@ cproxy logs --lines 50
 - `status` 是否显示 `AI 路由` 与 `当前出口`
 - `status` 的 `资源` 区块是否给出 `连接数 / 运行时间 / 内存 / 日志`
 - `status` 的 `流量 (今日)` 区块「按进程」是否按链路拆出 `代理↓ / 代理↑ / 直连↓ / 直连↑` 四列
-- `ai-status` 是否显示 `AI 探测: 正常 / 部分异常 / 失败`
-- `ai-status` 是否按 `摘要 / 连通性 / 链路 / 备用 / 分组` 展示
-- `ai-status` 是否能看出 `AI-MANUAL -> AI-AUTO -> AI-US/AI-SG` 的当前链路
+- `ai-status` 的 `连通性` 表标题是否带探测汇总（`连通性（探测 正常 / 部分异常 / 失败）`）
+- `ai-status` 是否按 `AI 出口 / 连通性 / 候选池` 三张表展示
+- `ai-status` 的 `AI 出口` 表能否看出通用出口解析到哪个真实节点（`AI-MANUAL` 现在是 fallback，直接挂节点，不再指向 `AI-AUTO`）；`候选池` 表则给出各池的候选数与当前指向，其中 `AI-AUTO` 标为 `自动池`、其当前指向是区域组（`AI-US`/`AI-SG`）而非节点
 - `test-group "AI-AUTO"` 是否能测出至少一个可用区域
 
 ## 2. 命令不存在或安装后找不到 `cproxy`
@@ -104,8 +104,7 @@ cproxy test-group "AI-AUTO"
 
 期望结果：
 
-- `AI-MANUAL` 默认指向 `AI-AUTO`
-- `AI-AUTO` 当前指向 `AI-US` 或 `AI-SG`
+- `AI-MANUAL`（fallback）当前指向它的某一个直连节点；`AI-AUTO`（自动池）当前指向 `AI-US` 或 `AI-SG` 区域组
 - `ai-status` 里的 `ChatGPT Web` 与 `OpenAI API` 至少应有一项正常
 - `test-group "AI-AUTO"` 能测出延迟
 

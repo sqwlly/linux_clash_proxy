@@ -1,10 +1,10 @@
 # 项目状态
 
-更新日期：2026-10-15
+更新日期：2026-10-17
 
 ## 当前阶段
 
-**阶段 2：生产入口已切换到 cproxy 用户级链路，4 周观察期进行中（起算 2026-09-11）**
+**阶段 2：生产入口已切换到 cproxy 用户级链路；4 周观察期（2026-09-11 ~ 2026-10-09）已到期，待确认期内无 P0/P1 事故后即可执行阶段 3**
 
 - `clash-proxy.service`（系统级，proxy.sh 编排）已 `disable --now`，仅停用未删除，回滚 = 重新 enable
 - 2026-09-15 补齐阶段 2 的一处遗漏：`clash-proxy-refresh.path` 此前仍是 `active (waiting)`——它 9-10 启动，而阶段 2 只 `disable --now` 了 `clash-proxy.service`，没停这个独立 unit，导致它持续监听 `/root/clash_proxy/config.yaml`，一旦该文件变化就会拉起 legacy 刷新流程去操作已由 cproxy 接管的运行时。已 `stop`（未 disable、未删文件，回滚 = `systemctl start`）。**至此 legacy 侧全部 unit 为 `inactive` + `disabled`，系统内无任何 legacy 组件在运行**
@@ -35,9 +35,9 @@
 
 ## 下一步（按优先级）
 
-1. 观察期（至 2026-10-09）内确认 cproxy 链路无 P0/P1 事故
+1. 确认观察期（2026-09-11 ~ 2026-10-09，**窗口已到期**）内 cproxy 链路无 P0/P1 事故——仓库内无可查的事故记录，此项需人工确认；确认通过后 Gate 3 即满足
 2. ~~复跑 `docs/enterprise-tui/acceptance.md` 全部验收命令~~ 已于 2026-09-15 复跑：静态审计 0 failure、TUI 回归 39 passed、后端与运行时 22 passed、运维示例与安装 dry-run 6/6、GA 产物 build+verify 通过、本地 smoke 通过。**唯一未过项**是 `security-check --strict`（本机未配 `external-controller-tls`，返回 1）——acceptance.md 已将这类失败归类为「环境未达 GA 配置，不表示仓库测试失败」
-3. 观察期满后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper。弃用警告和默认停装已经完成；当前剩余风险是旧 wrapper 仍可被手工调用
+3. 观察期满（**已到期**）后执行阶段 3：删除仍保留作回滚对照的 legacy 文件与 PATH wrapper。弃用警告和默认停装已经完成；当前剩余风险是旧 wrapper 仍可被手工调用
 
 ## 发布
 

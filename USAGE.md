@@ -171,7 +171,7 @@ cproxy tui
 cproxy-tui
 ```
 
-TUI 是当前 Python/Textual `cproxy` 的用户级控制台，使用 `~/.config/cproxy`、`~/.local/share/cproxy` 和 `~/.local/state/cproxy`。页签包括概览、节点、Provider、连接、AI 路由、订阅、配置、代理环境和日志。耗时请求在后台执行；破坏性操作要求二次确认并在可恢复场景创建备份。代理环境页显示供父 shell 执行的命令，TUI 本身不能修改父进程环境。
+TUI 是当前 Python/Textual `cproxy` 的用户级控制台，使用 `~/.config/cproxy`、`~/.local/share/cproxy` 和 `~/.local/state/cproxy`。页签包括概览、节点、提供方、连接、AI 路由、订阅、配置、代理环境和日志。耗时请求在后台执行；破坏性操作要求二次确认并在可恢复场景创建备份。代理环境页显示供父 shell 执行的命令，TUI 本身不能修改父进程环境。
 
 ## 机器可读输出
 
@@ -292,15 +292,15 @@ cproxy test-group "AI-AUTO" --raw
 
 - `current/list-groups/list-nodes`：API 优先，API 不可达时回退 `runtime.yaml`
 - `ai-status/test-group/switch`：只依赖 API
-- `ai-status` 默认还会通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API，失败时会做最多 2 次轻量重试；摘要同时展示通用出口与 Gemini 出口
+- `ai-status` 默认还会通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API。面板以三张表给出：**AI 出口**（通用 / 备用 / Gemini 的节点、延迟、状态）、**连通性**、**候选池**（各池的候选数与当前指向，只讲拓扑不列延迟）。探测失败只做 1 次重试（单次 3 秒）——看门狗另用更宽的预算（8 秒 × 2 次），因为误判会触发真实切换
 
-如需覆盖探测地址：
+如需覆盖探测地址或调整面板的探测预算：
 
 ```yaml
 ai-chatgpt-url: https://chatgpt.com
 ai-openai-api-url: https://api.openai.com/v1/models
 ai-gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models
-ai-probe-timeout: 8
+ai-probe-timeout: 3   # 面板单次探测超时（留空则用默认 3 秒）；看门狗的预算不受此项影响
 ```
 
 ## 稳定性探测
