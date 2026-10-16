@@ -116,6 +116,20 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         return
 
 
+def _table_cells(out: str) -> list[list[str]]:
+    """把表格行还原成「单元格文本」列表。
+
+    表格带行列分隔线、列宽由内容决定，直接断言整行会写死空格与边框字形；
+    这里只取单元格值，既精确（能断言空单元格、列值）又不受排版微调影响。
+    """
+    rows = []
+    for line in out.splitlines():
+        if "│" not in line:
+            continue
+        rows.append([cell.strip() for cell in line.strip().strip("│").split("│")])
+    return rows
+
+
 def _run(env, *args):
     return subprocess.run(
         [sys.executable, "-m", "cproxy.cli", *args],
@@ -189,29 +203,28 @@ def test_query_commands_use_api_output(tmp_path: Path):
         ai_status_result = _run(env, "ai-status")
         assert ai_status_result.returncode == 0
         out = ai_status_result.stdout
-        # 三张表：出口 / 连通性 / 候选池。列间距由内容决定，故用 `\s+` 断言列序与内容，
-        # 既不写死空格数，又仍锁住「哪一列放什么」。
+        rows = _table_cells(out)
+        # 三张表：出口 / 连通性 / 候选池（表头即契约）
         assert "AI 出口（自动切换）" in out
-        assert re.search(r"角色\s+池\s+当前节点\s+延迟\s+状态", out)
+        assert ["角色", "池", "当前节点", "延迟", "状态"] in rows
         # 出口必须是解析后的**真实节点**（旧实现在 AI-MANUAL 直接钉住节点时会退化成 "-"）
-        assert re.search(r"通用\s+AI-US\s+United States 01\s+95ms\s+正常", out)
-        assert re.search(r"备用\s+AI-SG\s+Singapore 01\s+99ms\s+正常", out)
-        assert re.search(r"Gemini\s+AI-GEMINI\s+Korea 01\s+88ms\s+正常", out)
+        assert ["通用", "AI-US", "United States 01", "95ms", "正常"] in rows
+        assert ["备用", "AI-SG", "Singapore 01", "99ms", "正常"] in rows
+        assert ["Gemini", "AI-GEMINI", "Korea 01", "88ms", "正常"] in rows
         assert "连通性（探测 部分异常）" in out
-        assert re.search(r"状态\s+目标\s+地址\s+详情", out)
-        assert re.search(r"正常\s+ChatGPT Web\s+http://probe\.local/chatgpt", out)
-        assert re.search(r"失败\s+OpenAI API\s+http://probe\.local/openai-api\s+HTTP 502", out)
-        assert re.search(r"正常\s+Gemini API\s+http://probe\.local/gemini", out)
-        # 探测成功时不显示 detail：HTTP 401/403 是「可达但需鉴权」，会被读成故障码
-        assert "probe.local/chatgpt  HTTP" not in out
+        assert ["状态", "目标", "地址", "详情"] in rows
+        # 探测成功时不带 detail：HTTP 401/403 是「可达但需鉴权」，会被读成故障码
+        assert ["正常", "ChatGPT Web", "http://probe.local/chatgpt", ""] in rows
+        assert ["正常", "Gemini API", "http://probe.local/gemini", ""] in rows
+        # 失败行才带 detail
+        assert ["失败", "OpenAI API", "http://probe.local/openai-api", "HTTP 502"] in rows
         # 旧「链路」区块已移除，链路信息并入「AI 出口」表
         assert "链路" not in out
         # 候选池取代旧「分组」：只讲拓扑（无延迟列），自动池要标出当前项是区域组指针
-        assert re.search(r"池\s+类型\s+候选\s+当前指向", out)
-        assert re.search(r"AI-AUTO\s+自动池\s+2\s+AI-US → United States 01", out)
-        assert re.search(r"AI-MANUAL\s+直连池\s+5\s+United States 01", out)
-        pool_block = out.split("候选池", 1)[1]
-        assert "ms" not in pool_block  # 候选池不列延迟——避免同一节点两个口径的数
+        assert ["池", "类型", "候选", "当前指向"] in rows
+        assert ["AI-AUTO", "自动池", "2", "AI-US → United States 01"] in rows
+        assert ["AI-MANUAL", "直连池", "5", "United States 01"] in rows
+        assert "ms" not in out.split("候选池", 1)[1]  # 候选池不列延迟
 
         ai_status_raw = _run(env, "ai-status", "--raw")
         assert ai_status_raw.returncode == 0
@@ -287,24 +300,23 @@ def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_p
 
     assert cli_render._render_ai_status(groups, raw=False) == 0
     out = capsys.readouterr().out
+    rows = _table_cells(out)
 
     # 非自动池的措辞：出口由 mihomo 在直连候选池里自动择优，「手动」是与行为不符的说法
     assert "AI 出口（兜底 · 直连池）" in out
     assert "兜底 · 手动" not in out
-    # 哨兵如实标注：5000 → 超时、0 → 未测得，都不能按毫秒展示
-    assert re.search(r"备用\s+AI-US\s+🇺🇸美国 01 1X\s+超时", out)
-    assert re.search(r"Gemini\s+AI-GEMINI\s+🇰🇷韩国 02 1X\s+未测得", out)
+    # 哨兵如实标注：5000 → 超时、0 → 未测得，都不能按毫秒展示。
+    # 状态列为**空**——延迟非 ok 时再并排一个健康标记会读成「超时 · 正常」。
+    assert ["备用", "AI-US", "🇺🇸美国 01 1X", "超时", ""] in rows
+    assert ["Gemini", "AI-GEMINI", "🇰🇷韩国 02 1X", "未测得", ""] in rows
     assert "5000ms" not in out
     # 注意用边界：`140ms` 里也含 `0ms` 子串，要的是「独立成值的 0ms」
     assert re.search(r"(?<!\d)0ms", out) is None
-    # 延迟非 ok 时状态列留空：否则会读成「超时 · 正常」这种自相矛盾的组合
-    assert re.search(r"超时\s*正常", out) is None
-    assert re.search(r"未测得\s*正常", out) is None
     # ok 的那条仍完整显示延迟与健康（出口从节点自身取到 140ms）
-    assert re.search(r"通用\s+AI-MANUAL\s+🇰🇷韩国 01 IEPL 1.7X CM\s+140ms\s+正常", out)
+    assert ["通用", "AI-MANUAL", "🇰🇷韩国 01 IEPL 1.7X CM", "140ms", "正常"] in rows
     # 候选池只讲拓扑，不列延迟——避免同一节点在出口表与候选池出现两个口径的数
-    assert re.search(r"AI-MANUAL\s+直连池\s+2\s+🇰🇷韩国 01 IEPL 1.7X CM", out)
-    assert re.search(r"AI-AUTO\s+自动池\s+1\s+AI-US → 🇺🇸美国 01 1X", out)
+    assert ["AI-MANUAL", "直连池", "2", "🇰🇷韩国 01 IEPL 1.7X CM"] in rows
+    assert ["AI-AUTO", "自动池", "1", "AI-US → 🇺🇸美国 01 1X"] in rows
     assert "ms" not in out.split("候选池", 1)[1]
 
 

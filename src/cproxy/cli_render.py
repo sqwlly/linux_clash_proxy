@@ -268,9 +268,10 @@ def _section_rule(width: int | None = None) -> str:
     return _style("─" * (width if width else _SECTION_RULE_WIDTH), ANSI_BLUE)
 
 
-def _print_section(title: str, *, rule_width: int | None = None) -> None:
+def _print_section(title: str, *, rule_width: int | None = None, rule: bool = True) -> None:
     print(_section_heading(title))
-    print(_section_rule(rule_width))
+    if rule:
+        print(_section_rule(rule_width))
 
 
 #: 表格列间距
@@ -293,18 +294,27 @@ def _table_rule_width(widths: list[int]) -> int:
     return sum(widths) + _display_width(_TABLE_GUTTER) * (len(widths) - 1)
 
 
+def _table_grid_width(widths: list[int]) -> int:
+    """带行列分隔线时的表格宽度：每列两侧各一空格，列间/两端各一条竖线。"""
+    return sum(widths) + 2 * len(widths) + (len(widths) + 1)
+
+
 def _render_table(
     headers: list[str],
     rows: list[list[TableCell]],
     *,
     aligns: list[str] | None = None,
     widths: list[int] | None = None,
+    grid: bool = False,
 ) -> int:
     """渲染列对齐的表格，返回其显示宽度（供分隔线对齐）。
 
     单元格传**未着色文本 + 上色码**，pad 到列宽之后再上色——与
     `_render_traffic_table` 同一心法，ANSI 转义不会掺进宽度计算（CJK 走
     `display_width`）。`aligns` 逐列给 `"l"`/`"r"`，缺省全左；表头加粗。
+
+    `grid=True` 时画出完整的行列分隔线（`│` 竖线 + 表头下与各行间的 `─` 横线，
+    浅色），表宽相应变宽；缺省只用列间距，留给不需要视觉重量表的调用方。
 
     列宽完全由内容决定，不感知终端宽度：过窄的终端会折行，但不会丢信息。
     `widths` 可由调用方预先算好（它要先拿宽度去定分隔线长度）。
@@ -314,16 +324,35 @@ def _render_table(
     aligns = aligns or ["l"] * len(headers)
     widths = widths if widths is not None else _table_widths(headers, rows)
 
-    def line(cells: list[TableCell]) -> str:
+    def cells_of(row: list[TableCell]) -> list[str]:
         out = []
-        for (text, codes), width, align in zip(cells, widths, aligns):
+        for (text, codes), width, align in zip(row, widths, aligns):
             padded = _pad_left(text, width) if align == "r" else _pad_right(text, width)
             out.append(_style(padded, *codes))
-        return _TABLE_GUTTER.join(out).rstrip()
+        return out
 
-    print(line([(header, (ANSI_BOLD,)) for header in headers]))
+    if grid:
+        # 每列左右各留一空格，边框用浅色以免压过内容
+        def grid_line(cells: list[str]) -> str:
+            return _style("│ ", ANSI_DIM) + _style(" │ ", ANSI_DIM).join(cells) + _style(" │", ANSI_DIM)
+
+        def node(left: str, mid: str, right: str) -> str:
+            return _style(left + mid.join("─" * (width + 2) for width in widths) + right, ANSI_DIM)
+
+        print(node("┌", "┬", "┐"))
+        print(grid_line(cells_of([(header, (ANSI_BOLD,)) for header in headers])))
+        print(node("├", "┼", "┤"))
+        for row in rows:
+            print(grid_line(cells_of(row)))
+        print(node("└", "┴", "┘"))
+        return _table_grid_width(widths)
+
+    def plain_line(cells: list[str]) -> str:
+        return _TABLE_GUTTER.join(cells).rstrip()
+
+    print(plain_line(cells_of([(header, (ANSI_BOLD,)) for header in headers])))
     for row in rows:
-        print(line(row))
+        print(plain_line(cells_of(row)))
     return _table_rule_width(widths)
 
 
@@ -690,9 +719,10 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     exit_headers = ["角色", "池", "当前节点", "延迟", "状态"]
     exit_aligns = ["l", "l", "l", "r", "l"]
     exit_widths = _table_widths(exit_headers, exit_rows)
-    # 模式放在区块标题里（它对三行都一样，不该占一列）
-    _print_section(f"AI 出口（{route['mode_label']}）", rule_width=_table_rule_width(exit_widths))
-    _render_table(exit_headers, exit_rows, aligns=exit_aligns, widths=exit_widths)
+    # 模式放在区块标题里（它对三行都一样，不该占一列）。
+    # 表格自带边框，区块标题下不再叠一条分隔线。
+    _print_section(f"AI 出口（{route['mode_label']}）", rule=False)
+    _render_table(exit_headers, exit_rows, aligns=exit_aligns, widths=exit_widths, grid=True)
 
     # ── 连通性 ────────────────────────────────────────────────
     # 详情列按需出现：全通过时它是空的，白占宽度还多一个无信息的表头。
@@ -711,8 +741,8 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     ]
     probe_widths = _table_widths(probe_headers, probe_rows)
     print()
-    _print_section(f"连通性（探测 {probe_status}）", rule_width=_table_rule_width(probe_widths))
-    _render_table(probe_headers, probe_rows, widths=probe_widths)
+    _print_section(f"连通性（探测 {probe_status}）", rule=False)
+    _render_table(probe_headers, probe_rows, widths=probe_widths, grid=True)
 
     # ── 候选池（只讲拓扑）──────────────────────────────────────
     # 刻意不列延迟：延迟属于「出口健康」，上面三条出口行已按各池组**自身的健康检查**
@@ -738,8 +768,8 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     pool_aligns = ["l", "l", "r", "l"]
     pool_widths = _table_widths(pool_headers, pool_rows)
     print()
-    _print_section("候选池", rule_width=_table_rule_width(pool_widths))
-    _render_table(pool_headers, pool_rows, aligns=pool_aligns, widths=pool_widths)
+    _print_section("候选池", rule=False)
+    _render_table(pool_headers, pool_rows, aligns=pool_aligns, widths=pool_widths, grid=True)
     return 0
 
 
