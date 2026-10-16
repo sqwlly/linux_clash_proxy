@@ -326,8 +326,11 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
     active, standby, gemini = route.active, route.standby, route.gemini
     return {
         "auto_mode": route.auto_mode,
-        # 手动模式的旧值是「兜底 <节点名>」——把节点当组名，语义错；改为固定文案
-        "mode_label": "自动切换" if route.auto_mode else "兜底 · 手动",
+        # 非自动池这一支的旧值先后是「兜底 <节点名>」（把节点当组名）与「兜底 · 手动」
+        # （暗示用户钉住了节点）。两者都不准：出口由 mihomo 在 AI-MANUAL 的**直连候选池**
+        # 里按列表顺序取第一个存活节点，池内顺序才是用户意图（`ai-rebalance` 维护），
+        # 节点本身并未被钉死——实测出现过韩国节点挂掉后自动落到新加坡。
+        "mode_label": "自动切换" if route.auto_mode else "兜底 · 直连池",
         "active_group": active.group,
         "active_node": active.node,
         "active_delay": _delay_cell(active.delay),

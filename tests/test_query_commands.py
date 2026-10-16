@@ -278,6 +278,9 @@ def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_p
     assert cli_render._render_ai_status(groups, raw=False) == 0
     out = capsys.readouterr().out
 
+    # 非自动池的措辞：出口由 mihomo 在直连候选池里自动择优，「手动」是与行为不符的说法
+    assert "模式      兜底 · 直连池" in out
+    assert "兜底 · 手动" not in out
     assert "超时" in out  # 备用 AI-US 的 5000 哨兵
     assert "未测得" in out  # AI-AUTO / AI-SG 的 0
     assert "5000ms" not in out  # 哨兵绝不能按毫秒展示
