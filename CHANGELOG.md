@@ -9,12 +9,14 @@
 - `AI-MANUAL` 稳定性兜底：组类型由 `select` 改为 `fallback`（故障转移），手动固定的节点挂掉后 mihomo 自动切到下一个存活节点；候选列表按「`ai-manual-prefer` 钉选 → 实测稳定度序 → 静态地区」三级排序
 - `cproxy ai-rebalance`：多轮探测 `AI-MANUAL` 全部叶子，按 `rank_key`（成功↑/失败↓/最大延迟↓/平均延迟↓/抖动↓/历史惩罚↓）实测稳定度重排并持久化到 `ai-manual-order.json`，随后重渲染并热重载；配套 `cproxy-ai-rebalance.timer`（30 分钟周期）自动驱动
 - 实时网速监控：TUI 仪表盘「实时流量」卡片升级为「实时网速」（下载/上传显示瞬时速率，新增累计量行，连接数不变），并新增 `cproxy speed` 命令（一次性测速 + `--watch` 持续刷新 + `--interval` + `--raw`）；复用 mihomo `/connections` 全局累计计数器做差分，重启归零自动钳位
+- AI 出口快速自愈看门狗：新增 `cproxy ai-watch`（配套 `cproxy-ai-watch.timer`，2 分钟周期），对当前 codex/Gemini 出口做**语义探测**——识别 Gemini 的「location not supported」地区门禁（此前 4xx 一律判 ok，测不出「节点通但 AI 用不了」）——连续 2 次语义失败即切到下一个好节点，10 分钟冷却期抗抖，状态持久化到 `ai-watch.json`
 
 ### 改进
 
 - `cproxy switch` 放行 `fallback` 组手动指定：mihomo 尊重手动选择直到节点挂，`AI-MANUAL` 与 `AI-AUTO` 均可在 fallback 下切换（顺带修掉 TUI「切换美/新」在自动模式被类型守卫拦下的隐患）
 - TUI / `ai-status` 的 AI 出口「模式」标签由「固定」改为「兜底」，如实反映故障转移语义
 - `AI-MANUAL` 的 codex 候选池扩展韩/英：实测 `🇰🇷韩国 01 IEPL` 与 `🇬🇧英国 01 IEPL` 对 codex 稳定（5/5），纳入后 `ai-rebalance` 的 codex 稳定度排序随之覆盖，日本 TE 挂掉后可自动落到韩国 IEPL（仅进 codex 池，不污染 `AI-US`/`AI-SG` 自动池）
+- `ai-rebalance` 排序加重历史失败惩罚权重，平滑单轮 codex 探测噪声（削弱「一轮 5/5、下一轮 1/5」的名次翻转）
 
 ## [1.1.0] - 2026-10-15
 

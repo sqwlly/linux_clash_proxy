@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically watch AI egress health
+
+[Timer]
+Unit=cproxy-ai-watch.service
+OnBootSec=3min
+OnUnitActiveSec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

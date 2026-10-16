@@ -46,6 +46,7 @@ from .runtime import render_runtime
 from .services.ops import guard
 from .services.probe import ProbeService, resolve_current_leaf
 from .services.query import QueryService
+from .services.ai_watch import AIWatchService, VERDICT_LABELS
 from .services.rebalance import RebalanceService
 from .services.refresh import RefreshService
 from .services.speed import RateMeter, fetch_total_traffic, format_rate, measure_once
@@ -325,6 +326,21 @@ def run(argv: list[str] | None = None) -> int:
             if report.rerendered:
                 print(f"已写入稳定度排序: {report.order_path}")
                 print("运行配置: " + ("已热重载" if report.hot_reloaded else "已渲染（代理未运行）"))
+            return 0
+        if args.command == "ai-watch":
+            report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)
+            if not report.results:
+                print("代理未运行，跳过 AI 出口看护")
+                return 0
+            print(_section_heading("AI 出口看护"))
+            for item in report.results:
+                verdict = VERDICT_LABELS.get(item.verdict, item.verdict)
+                line = f"{item.group}: {verdict}"
+                if item.current:
+                    line += f"（{item.current}）"
+                if item.switched and item.target:
+                    line += f" → 已切换 {item.target}"
+                print(line)
             return 0
         if args.command == "guard":
             command = args.command_args

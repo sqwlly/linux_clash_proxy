@@ -75,6 +75,11 @@ def ai_manual_order_file(paths: AppPaths) -> Path:
     return paths.state_dir / "ai-manual-order.json"
 
 
+def ai_watch_state_file(paths: AppPaths) -> Path:
+    """cproxy ai-watch 的看护状态（连续失败计数与冷却期，state 文件）。"""
+    return paths.state_dir / "ai-watch.json"
+
+
 def load_yaml_file(path: Path) -> Any:
     """读 YAML。文件不存在返回 None。按路径 + 内容哈希缓存，写入后自动失效。"""
     try:

@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch AI egress and switch on semantic failure
+After=network-online.target cproxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cproxy ai-watch

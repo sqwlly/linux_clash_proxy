@@ -13,9 +13,30 @@ from ..backend.api import APIBackend
 from ..backend.process import ProcessBackend
 from ..backend.runtime import AI_MANUAL_GROUP, RuntimeBackend
 from ..config import AppPaths, ai_manual_order_file
-from .probe import ProbeService
+from .probe import ProbeService, ProbeSummary
 
 REBALANCE_PROFILE = "codex"
+# 排序时对历史失败惩罚的加权倍数：跨多次探测的惩罚自然平滑单轮噪声，
+# 削弱「一轮 5/5、下一轮 1/5」的名次翻转。
+HISTORY_PENALTY_WEIGHT = 2.0
+
+
+def _smooth_rank_key(summary: ProbeSummary):
+    """`rank_key` 基础上加重历史惩罚权重。
+
+    rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
+    这里把已叠加的惩罚还原成裸延迟，再按权重重新叠加，得到更稳的排序。
+    """
+    neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
+    weighted = penalty * HISTORY_PENALTY_WEIGHT
+    return (
+        neg_success,
+        failures,
+        max_plus_p - penalty + weighted,
+        avg_plus_p - penalty + weighted,
+        penalty,
+        name,
+    )
 
 
 @dataclass(frozen=True)
@@ -37,7 +58,7 @@ class RebalanceService:
             profile=REBALANCE_PROFILE,
             record_history=True,
         )
-        ordered = [summary.name for summary in sorted(report.summaries, key=lambda s: s.rank_key())]
+        ordered = [summary.name for summary in sorted(report.summaries, key=_smooth_rank_key)]
         order_path = ai_manual_order_file(self.paths)
 
         if dry_run:

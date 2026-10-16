@@ -15,6 +15,8 @@ install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-subscription.service" "${HOME
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-subscription.timer" "${HOME}/.config/systemd/user/cproxy-subscription.timer"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-ai-rebalance.service" "${HOME}/.config/systemd/user/cproxy-ai-rebalance.service"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-ai-rebalance.timer" "${HOME}/.config/systemd/user/cproxy-ai-rebalance.timer"
+install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-ai-watch.service" "${HOME}/.config/systemd/user/cproxy-ai-watch.service"
+install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-ai-watch.timer" "${HOME}/.config/systemd/user/cproxy-ai-watch.timer"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-command.env.example" "${HOME}/.config/cproxy/cproxy-command.env.example"
 
 if [ ! -f "${HOME}/.config/cproxy/cproxy-command.env" ]; then
@@ -23,7 +25,7 @@ fi
 
 systemctl --user daemon-reload
 systemctl --user enable --now cproxy.service
-systemctl --user enable --now cproxy-refresh.timer cproxy-subscription.timer cproxy-ai-rebalance.timer
+systemctl --user enable --now cproxy-refresh.timer cproxy-subscription.timer cproxy-ai-rebalance.timer cproxy-ai-watch.timer
 
 cat <<EOF
 用户级 systemd 安装完成:
@@ -34,6 +36,8 @@ cat <<EOF
 - ${HOME}/.config/systemd/user/cproxy-subscription.timer
 - ${HOME}/.config/systemd/user/cproxy-ai-rebalance.service
 - ${HOME}/.config/systemd/user/cproxy-ai-rebalance.timer
+- ${HOME}/.config/systemd/user/cproxy-ai-watch.service
+- ${HOME}/.config/systemd/user/cproxy-ai-watch.timer
 - ${HOME}/.config/cproxy/cproxy-command.env.example
 - ${HOME}/.config/cproxy/cproxy-command.env
 

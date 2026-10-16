@@ -41,6 +41,21 @@ DEFAULT_AI_PROBE_TIMEOUT = 8
 DEFAULT_AI_PROBE_RETRIES = 2
 DEFAULT_AI_PROBE_BACKOFFS = (0.2, 0.5)
 
+# 语义探测判定结果：ok=可达且可用，geo_blocked=可达但被地区门禁（Gemini 常见），dead=不可达
+PROBE_OK = "ok"
+PROBE_GEO_BLOCKED = "geo_blocked"
+PROBE_DEAD = "dead"
+
+# Gemini/Google 地区门禁的错误标记（响应体小写后做子串匹配）
+GEO_BLOCK_MARKERS = (
+    "location is not supported",
+    "location not supported",
+    "not supported for the api use",
+    "available in your country",
+)
+
+_ERROR_BODY_MAX_BYTES = 4096
+
 
 def _config_list(config: dict, key: str, defaults: Iterable[str]) -> list[str]:
     value = config.get(key)
@@ -86,24 +101,49 @@ def _probe_failure_detail(exc: Exception) -> str:
     return "连接失败"
 
 
-def _probe_target(opener, url: str, timeout: int) -> tuple[bool, str]:
+def _read_error_body(exc: HTTPError) -> str:
+    """有界读取 HTTP 错误响应体；读取失败返回空串（宁可当作可达，也不误报 geo-block）。"""
+    try:
+        return exc.read(_ERROR_BODY_MAX_BYTES).decode("utf-8", errors="replace").lower()
+    except Exception:
+        return ""
+
+
+def _is_geo_blocked(body: str) -> bool:
+    return any(marker in body for marker in GEO_BLOCK_MARKERS)
+
+
+def _probe_target(opener, url: str, timeout: int) -> tuple[str, str]:
+    """探测一个 AI 目标，返回 (判定, 详情)。判定 ∈ {ok, geo_blocked, dead}。
+
+    4xx 不再一律算「可达」：读响应体识别 Gemini 的地区门禁（location not
+    supported）；其余 4xx（401 缺 key / 405 等）仍算可达。5xx/超时/连接失败算 dead。
+    """
     for attempt in range(DEFAULT_AI_PROBE_RETRIES + 1):
         request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
         try:
             with opener.open(request, timeout=timeout) as response:
                 status = getattr(response, "status", response.getcode())
-            return True, f"HTTP {status}" if status else "成功"
+            return PROBE_OK, f"HTTP {status}" if status else "成功"
         except HTTPError as exc:
-            ok = 400 <= exc.code < 500
-            if ok or attempt == DEFAULT_AI_PROBE_RETRIES:
-                return ok, f"HTTP {exc.code}"
+            if 400 <= exc.code < 500:
+                if _is_geo_blocked(_read_error_body(exc)):
+                    return PROBE_GEO_BLOCKED, "位置不支持（地区门禁）"
+                return PROBE_OK, f"HTTP {exc.code}"
+            if attempt == DEFAULT_AI_PROBE_RETRIES:
+                return PROBE_DEAD, f"HTTP {exc.code}"
             time.sleep(DEFAULT_AI_PROBE_BACKOFFS[attempt])
         except (URLError, OSError) as exc:
             if attempt == DEFAULT_AI_PROBE_RETRIES:
-                return False, _probe_failure_detail(exc)
+                return PROBE_DEAD, _probe_failure_detail(exc)
             time.sleep(DEFAULT_AI_PROBE_BACKOFFS[attempt])
 
-    return False, "连接失败"
+    return PROBE_DEAD, "连接失败"
+
+
+def ai_target_verdict(paths: AppPaths, url: str, timeout: int = DEFAULT_AI_PROBE_TIMEOUT) -> str:
+    """经本机代理探测某 AI 目标，返回语义判定（ok/geo_blocked/dead）。供看门狗复用。"""
+    return _probe_target(_proxy_opener(paths), url, timeout)[0]
 
 
 class DiagnosticsService:
@@ -212,8 +252,8 @@ class DiagnosticsService:
 
         results: list[AIProbeResult] = []
         for name, url in targets:
-            ok, detail = _probe_target(opener, url, timeout)
-            result = AIProbeResult(name=name, url=url, ok=ok, detail=detail)
+            verdict, detail = _probe_target(opener, url, timeout)
+            result = AIProbeResult(name=name, url=url, ok=(verdict == PROBE_OK), detail=detail)
             results.append(result)
             if on_result is not None:
                 on_result(result)
