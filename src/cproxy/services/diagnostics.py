@@ -37,9 +37,19 @@ DEFAULT_AI_PROBE_TARGETS = [
     ("OpenAI API", "https://api.openai.com/v1/models"),
     ("Gemini API", "https://generativelanguage.googleapis.com/v1beta/models"),
 ]
-DEFAULT_AI_PROBE_TIMEOUT = 8
-DEFAULT_AI_PROBE_RETRIES = 2
-DEFAULT_AI_PROBE_BACKOFFS = (0.2, 0.5)
+# 探测预算分两档，因为两者的代价完全不对称：
+# - 面板（`ai-status` / TUI 的即时探测）只是给人看的快照，宁可快：最坏耗时从
+#   `8×(2+1)+退避 ≈ 26s` 降到 `3×(1+1)+退避 ≈ 6.2s`。实测健康目标约 0.75s，慢是
+#   因为某个目标此刻真的不通（要把预算烧完才确认「超时」）；保留 1 次重试以免把
+#   瞬时抖动报成失败。
+# - 看门狗判的是「这个节点该不该被换掉」，一次误判会触发真实切换，代价远高于多等几秒，
+#   所以维持原有耐心——提速只落在面板上。
+PANEL_AI_PROBE_TIMEOUT = 3
+PANEL_AI_PROBE_RETRIES = 1
+WATCH_AI_PROBE_TIMEOUT = 8
+WATCH_AI_PROBE_RETRIES = 2
+# 重试退避（秒），按第几次重试取用；超出长度时取最后一项
+AI_PROBE_BACKOFFS = (0.2, 0.5)
 
 # 语义探测判定结果：ok=可达且可用，geo_blocked=可达但被地区门禁（Gemini 常见），dead=不可达
 PROBE_OK = "ok"
@@ -113,13 +123,16 @@ def _is_geo_blocked(body: str) -> bool:
     return any(marker in body for marker in GEO_BLOCK_MARKERS)
 
 
-def _probe_target(opener, url: str, timeout: int) -> tuple[str, str]:
+def _probe_target(opener, url: str, timeout: int, retries: int) -> tuple[str, str]:
     """探测一个 AI 目标，返回 (判定, 详情)。判定 ∈ {ok, geo_blocked, dead}。
 
     4xx 不再一律算「可达」：读响应体识别 Gemini 的地区门禁（location not
     supported）；其余 4xx（401 缺 key / 405 等）仍算可达。5xx/超时/连接失败算 dead。
+
+    `retries` 与 `timeout` 由调用方按场景决定：面板用紧预算（快），看门狗用宽预算
+    （避免把慢节点误判成坏节点）。最坏耗时 ≈ `timeout × (retries+1) + Σ退避`。
     """
-    for attempt in range(DEFAULT_AI_PROBE_RETRIES + 1):
+    for attempt in range(retries + 1):
         request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -130,20 +143,33 @@ def _probe_target(opener, url: str, timeout: int) -> tuple[str, str]:
                 if _is_geo_blocked(_read_error_body(exc)):
                     return PROBE_GEO_BLOCKED, "位置不支持（地区门禁）"
                 return PROBE_OK, f"HTTP {exc.code}"
-            if attempt == DEFAULT_AI_PROBE_RETRIES:
+            if attempt == retries:
                 return PROBE_DEAD, f"HTTP {exc.code}"
-            time.sleep(DEFAULT_AI_PROBE_BACKOFFS[attempt])
+            time.sleep(_probe_backoff(attempt))
         except (URLError, OSError) as exc:
-            if attempt == DEFAULT_AI_PROBE_RETRIES:
+            if attempt == retries:
                 return PROBE_DEAD, _probe_failure_detail(exc)
-            time.sleep(DEFAULT_AI_PROBE_BACKOFFS[attempt])
+            time.sleep(_probe_backoff(attempt))
 
     return PROBE_DEAD, "连接失败"
 
 
-def ai_target_verdict(paths: AppPaths, url: str, timeout: int = DEFAULT_AI_PROBE_TIMEOUT) -> str:
-    """经本机代理探测某 AI 目标，返回语义判定（ok/geo_blocked/dead）。供看门狗复用。"""
-    return _probe_target(_proxy_opener(paths), url, timeout)[0]
+def _probe_backoff(attempt: int) -> float:
+    return AI_PROBE_BACKOFFS[min(attempt, len(AI_PROBE_BACKOFFS) - 1)]
+
+
+def ai_target_verdict(paths: AppPaths, url: str, timeout: int | None = None, retries: int | None = None) -> str:
+    """经本机代理探测某 AI 目标，返回语义判定（ok/geo_blocked/dead）。供看门狗复用。
+
+    默认取**看门狗**那档宽预算（判「该不该换节点」要耐心）。两个预算都在调用时读取
+    模块常量而非绑成默认参数——默认参数在 import 时求值，测试就无法改写它。
+    """
+    return _probe_target(
+        _proxy_opener(paths),
+        url,
+        WATCH_AI_PROBE_TIMEOUT if timeout is None else timeout,
+        WATCH_AI_PROBE_RETRIES if retries is None else retries,
+    )[0]
 
 
 class DiagnosticsService:
@@ -238,10 +264,11 @@ class DiagnosticsService:
         回调在调用方线程内同步执行。默认 `None` 时行为与输出和历史版本完全一致。
         """
         config = read_config(self.paths)
+        # 面板这一档用紧预算；用户在 config 里显式写了 ai-probe-timeout 则以其为准
         timeout = _config_int(
             config,
             "ai-probe-timeout",
-            _config_int(config, "connectivity-timeout", DEFAULT_AI_PROBE_TIMEOUT),
+            _config_int(config, "connectivity-timeout", PANEL_AI_PROBE_TIMEOUT),
         )
         targets = [
             ("ChatGPT Web", _config_str(config, "ai-chatgpt-url", DEFAULT_AI_PROBE_TARGETS[0][1])),
@@ -252,7 +279,7 @@ class DiagnosticsService:
 
         results: list[AIProbeResult] = []
         for name, url in targets:
-            verdict, detail = _probe_target(opener, url, timeout)
+            verdict, detail = _probe_target(opener, url, timeout, PANEL_AI_PROBE_RETRIES)
             result = AIProbeResult(name=name, url=url, ok=(verdict == PROBE_OK), detail=detail)
             results.append(result)
             if on_result is not None:

@@ -58,13 +58,11 @@ class _FakeOpener:
         raise AssertionError(f"unknown behavior {self._behavior}")
 
 
-def test_probe_target_classifies(monkeypatch):
-    from cproxy.services import diagnostics as diag
-
-    monkeypatch.setattr(diag, "DEFAULT_AI_PROBE_RETRIES", 0)
-    assert _probe_target(_FakeOpener("ok"), "http://x", 5)[0] == PROBE_OK
-    assert _probe_target(_FakeOpener("geo"), "http://x", 5)[0] == PROBE_GEO_BLOCKED
-    assert _probe_target(_FakeOpener("dead"), "http://x", 5)[0] == PROBE_DEAD
+def test_probe_target_classifies():
+    """retries 显式传 0：直接表达「不重试」，不必再 monkeypatch 模块常量。"""
+    assert _probe_target(_FakeOpener("ok"), "http://x", 5, 0)[0] == PROBE_OK
+    assert _probe_target(_FakeOpener("geo"), "http://x", 5, 0)[0] == PROBE_GEO_BLOCKED
+    assert _probe_target(_FakeOpener("dead"), "http://x", 5, 0)[0] == PROBE_DEAD
 
 
 # --- 看门狗 ---

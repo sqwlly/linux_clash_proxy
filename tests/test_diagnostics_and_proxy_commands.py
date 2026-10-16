@@ -281,7 +281,9 @@ ip-check-urls:
         proxy_thread.join()
 
 
-def test_ai_probe_uses_8_second_timeout_by_default(tmp_path: Path, monkeypatch):
+def test_ai_probe_uses_panel_timeout_by_default(tmp_path: Path, monkeypatch):
+    """面板块走**紧**预算（3s）：它只是给人看的快照，宁可快。看门狗那档见
+    `test_watchdog_probe_keeps_patient_budget`——两档刻意不同，别把面板的提速搬过去。"""
     config_dir = tmp_path / ".config" / "cproxy"
     config_dir.mkdir(parents=True)
     (config_dir / "config.yaml").write_text(
@@ -313,7 +315,7 @@ def test_ai_probe_uses_8_second_timeout_by_default(tmp_path: Path, monkeypatch):
     report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
 
     assert len(report.results) == 3
-    assert captured == [8, 8, 8]
+    assert captured == [3, 3, 3]
 
 
 def test_ai_probe_retries_transient_failures(tmp_path: Path, monkeypatch):
@@ -424,8 +426,48 @@ def test_ai_probe_waits_between_retries(tmp_path: Path, monkeypatch):
 
     report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
 
-    assert report.results[0].ok is True
-    assert attempts["http://probe.local/chatgpt"] == 3
+    # 面板只给 1 次重试：前两次失败即判失败，不再等第三次
+    assert report.results[0].ok is False
+    assert attempts["http://probe.local/chatgpt"] == 2
+    assert sleeps == [0.2]
+
+
+def test_watchdog_probe_keeps_patient_budget(tmp_path, monkeypatch):
+    """看门狗判「该不该换节点」要耐心：同一次失败它会给到 2 次重试、退避 [0.2, 0.5]。
+    面板提速（3s/1 次）刻意不落在这里——误判成 dead 会触发一次真实切换。"""
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("mixed-port: 7890\n", encoding="utf-8")
+
+    sleeps: list[float] = []
+    attempts = {"http://probe.local/watch": 0}
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self):
+            return self.status
+
+    class _Opener:
+        def open(self, request, timeout):
+            attempts[request.full_url] += 1
+            if attempts[request.full_url] < 3:
+                raise OSError("temporary failure")
+            return _Response()
+
+    monkeypatch.setattr("cproxy.services.diagnostics._proxy_opener", lambda paths: _Opener())
+    monkeypatch.setattr(diagnostics_module, "time", SimpleNamespace(sleep=sleeps.append), raising=False)
+
+    verdict = diagnostics_module.ai_target_verdict(default_paths(tmp_path), "http://probe.local/watch")
+
+    assert verdict == diagnostics_module.PROBE_OK
+    assert attempts["http://probe.local/watch"] == 3
     assert sleeps == [0.2, 0.5]
 
 

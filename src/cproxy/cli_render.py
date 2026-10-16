@@ -16,7 +16,9 @@ from .backend.models import AIProbeReport, ProxyGroup
 from .backend.runtime import (
     AI_AUTO_GROUP,
     AI_GEMINI_GROUP,
+    AI_SG_GROUP,
     AI_STATUS_GROUPS,
+    AI_US_GROUP,
     ai_exit_metrics,
     delay_state,
     resolve_ai_leaf,
@@ -217,25 +219,30 @@ def _accent(text: object) -> str:
     return _style(text, ANSI_CYAN)
 
 
-def _status_color(text: str) -> str:
+def _status_cell(text: str) -> tuple[str, tuple[str, ...]]:
+    """状态文案 → 「带图标的文本 + 上色码」。
+
+    文本与色码**分开**返回：表格要先把文本 pad 到列宽、再上色（见 `_render_table`），
+    否则 ANSI 转义会掺进宽度计算。图标受 `_icons_enabled()` 门控（`NO_COLOR` 下
+    同时关掉颜色与图标）。
+
+    注：图标现在与文本同色（此前图标是无色、文本有色），属刻意的外观统一。
+    """
     if text in POSITIVE_STATUSES:
-        return _style(text, ANSI_GREEN)
-    if text in WARNING_STATUSES:
-        return _style(text, ANSI_YELLOW)
-    if text in NEGATIVE_STATUSES:
-        return _style(text, ANSI_RED)
-    return text
+        codes: tuple[str, ...] = (ANSI_GREEN,)
+    elif text in WARNING_STATUSES:
+        codes = (ANSI_YELLOW,)
+    elif text in NEGATIVE_STATUSES:
+        codes = (ANSI_RED,)
+    else:
+        codes = ()
+    icon = STATUS_ICONS.get(text) if _icons_enabled() else None
+    return (f"{icon} {text}" if icon else text), codes
 
 
 def _status_label(text: str) -> str:
-    label = _status_color(text)
-    if not _icons_enabled():
-        return label
-
-    icon = STATUS_ICONS.get(text)
-    if not icon:
-        return label
-    return f"{icon} {label}"
+    label, codes = _status_cell(text)
+    return _style(label, *codes)
 
 
 def _section_heading(title: str, *, icon: str = "▸") -> str:
@@ -252,14 +259,72 @@ def _section_heading(title: str, *, icon: str = "▸") -> str:
 _SECTION_RULE_WIDTH = 36
 
 
-def _section_rule() -> str:
-    """标题下的细分隔线；配色与标题一致，NO_COLOR 下为普通横线。"""
-    return _style("─" * _SECTION_RULE_WIDTH, ANSI_BLUE)
+def _section_rule(width: int | None = None) -> str:
+    """标题下的细分隔线；配色与标题一致，NO_COLOR 下为普通横线。
+
+    `width` 让表格化的区块把分隔线拉齐到表宽（`cproxy ai-status` 用），
+    缺省仍是定长的 `_SECTION_RULE_WIDTH`。
+    """
+    return _style("─" * (width if width else _SECTION_RULE_WIDTH), ANSI_BLUE)
 
 
-def _print_section(title: str) -> None:
+def _print_section(title: str, *, rule_width: int | None = None) -> None:
     print(_section_heading(title))
-    print(_section_rule())
+    print(_section_rule(rule_width))
+
+
+#: 表格列间距
+_TABLE_GUTTER = "  "
+
+#: 表格单元格：`(未着色文本, 上色码)`
+TableCell = tuple[str, tuple[str, ...]]
+
+
+def _table_widths(headers: list[str], rows: list[list[TableCell]]) -> list[int]:
+    """逐列宽度（取表头与所有单元格文本的最大显示宽度）。"""
+    return [
+        max(_display_width(headers[i]), *(_display_width(row[i][0]) for row in rows))
+        for i in range(len(headers))
+    ]
+
+
+def _table_rule_width(widths: list[int]) -> int:
+    """表格实际占用的显示宽度，供分隔线拉齐。"""
+    return sum(widths) + _display_width(_TABLE_GUTTER) * (len(widths) - 1)
+
+
+def _render_table(
+    headers: list[str],
+    rows: list[list[TableCell]],
+    *,
+    aligns: list[str] | None = None,
+    widths: list[int] | None = None,
+) -> int:
+    """渲染列对齐的表格，返回其显示宽度（供分隔线对齐）。
+
+    单元格传**未着色文本 + 上色码**，pad 到列宽之后再上色——与
+    `_render_traffic_table` 同一心法，ANSI 转义不会掺进宽度计算（CJK 走
+    `display_width`）。`aligns` 逐列给 `"l"`/`"r"`，缺省全左；表头加粗。
+
+    列宽完全由内容决定，不感知终端宽度：过窄的终端会折行，但不会丢信息。
+    `widths` 可由调用方预先算好（它要先拿宽度去定分隔线长度）。
+    """
+    if not rows:
+        return 0
+    aligns = aligns or ["l"] * len(headers)
+    widths = widths if widths is not None else _table_widths(headers, rows)
+
+    def line(cells: list[TableCell]) -> str:
+        out = []
+        for (text, codes), width, align in zip(cells, widths, aligns):
+            padded = _pad_left(text, width) if align == "r" else _pad_right(text, width)
+            out.append(_style(padded, *codes))
+        return _TABLE_GUTTER.join(out).rstrip()
+
+    print(line([(header, (ANSI_BOLD,)) for header in headers]))
+    for row in rows:
+        print(line(row))
+    return _table_rule_width(widths)
 
 
 def _exit_summary(group_name: object, node: object, delay: object) -> str:
@@ -280,16 +345,24 @@ def _exit_delay_label(delay: object) -> str:
     return {"ok": f"{delay}ms", "timeout": "超时", "unknown": "未测得"}[delay_state(delay)]
 
 
-def _exit_cell(delay: object, alive: object) -> str:
-    """`<延迟> · <健康>`；延迟不是 ok 时不附健康标记。
-
-    两者并排会读成「超时 · 正常」这种自相矛盾的组合——mihomo 的 alive 标记在单次
-    探测超时后未必翻转，而「超时」本身已经是更准确的结论。
-    """
-    parts = [_exit_delay_label(delay)]
+def _exit_delay_cell(delay: object) -> TableCell:
+    """延迟单元格：有测量值时无色（数字本身不是告警），`超时`/`未测得` 用色标出。"""
+    label = _exit_delay_label(delay)
     if isinstance(delay, int) and delay_state(delay) == "ok":
-        parts.append(_status_label(_alive_text(alive)))
-    return " · ".join(parts)
+        return label, ()
+    codes: tuple[str, ...] = (ANSI_YELLOW,) if label == "超时" else (ANSI_DIM,)
+    return label, codes
+
+
+def _exit_state_cell(delay: object, alive: object) -> TableCell:
+    """状态单元格；延迟不是 ok 时**留空**。
+
+    `超时` 已在延迟列说清，再并排一个 mihomo 的健康标记会读成「超时 · 正常」这种
+    自相矛盾的组合——mihomo 的 alive 在单次探测超时后未必翻转。
+    """
+    if isinstance(delay, int) and delay_state(delay) == "ok":
+        return _status_cell(_alive_text(alive))
+    return "", ()
 
 
 def _alive_text(alive: object) -> str:
@@ -589,62 +662,84 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
             print(f"AI-PROBE-ITEM: name={item.name} ok={item.ok} detail={item.detail} url={item.url}")
         return 0
 
-    auto_mode = bool(route["auto_mode"])
-    mode_text = f"自动切换 · 池 {route['active_group']}" if auto_mode else str(route["mode_label"])
-
-    _print_section("摘要")
-    # 三条出口行同构：`<节点> · <延迟> · <健康>`，延迟语义由 _exit_cell 统一裁定
-    summary_rows: list[tuple[str, str]] = [
-        ("模式", mode_text),
-        (
-            "出口",
-            f"{_accent(normalize_name(route['active_node']))} · {_exit_cell(route['active_delay'], route['active_alive'])}",
-        ),
+    # ── AI 出口（三条出口合成一张表）────────────────────────────
+    exits = [
+        ("通用", str(route["active_group"]), route["active_node"], route["active_delay"], route["active_alive"]),
         (
             "备用",
-            f"{route['standby_group']} · {normalize_name(route['standby_node'])}"
-            f" · {_exit_cell(route['standby_delay'], route['standby_alive'])}",
+            str(route["standby_group"]),
+            route["standby_node"],
+            route["standby_delay"],
+            route["standby_alive"],
         ),
     ]
     if route["gemini_present"]:
-        summary_rows.append(
-            (
-                "Gemini",
-                f"{_accent(normalize_name(route['gemini_node']))} · {_exit_cell(route['gemini_delay'], route['gemini_alive'])}",
-            )
+        exits.append(
+            ("Gemini", AI_GEMINI_GROUP, route["gemini_node"], route["gemini_delay"], route["gemini_alive"])
         )
-    summary_rows.append(("探测", _status_label(probe_status)))
-    _render_kv(summary_rows)
+    exit_rows: list[list[TableCell]] = [
+        [
+            (role, ()),
+            (group, ()),
+            (normalize_name(node), (ANSI_CYAN,)),
+            _exit_delay_cell(delay),
+            _exit_state_cell(delay, alive),
+        ]
+        for role, group, node, delay, alive in exits
+    ]
+    exit_headers = ["角色", "池", "当前节点", "延迟", "状态"]
+    exit_aligns = ["l", "l", "l", "r", "l"]
+    exit_widths = _table_widths(exit_headers, exit_rows)
+    # 模式放在区块标题里（它对三行都一样，不该占一列）
+    _print_section(f"AI 出口（{route['mode_label']}）", rule_width=_table_rule_width(exit_widths))
+    _render_table(exit_headers, exit_rows, aligns=exit_aligns, widths=exit_widths)
 
+    # ── 连通性 ────────────────────────────────────────────────
+    # 详情列按需出现：全通过时它是空的，白占宽度还多一个无信息的表头。
+    # 另外 detail 只在失败时给出——成功时的 HTTP 401/403 是「可达但需鉴权」，
+    # 摆在「正常」旁边会被读成故障码。
+    show_detail = any(not item.ok and item.detail for item in probe_report.results)
+    probe_headers = ["状态", "目标", "地址", *(["详情"] if show_detail else [])]
+    probe_rows: list[list[TableCell]] = [
+        [
+            _status_cell("正常" if item.ok else "失败"),
+            (item.name, ()),
+            (item.url, (ANSI_DIM,)),
+            *([(item.detail if not item.ok else "", ())] if show_detail else []),
+        ]
+        for item in probe_report.results
+    ]
+    probe_widths = _table_widths(probe_headers, probe_rows)
     print()
-    _print_section("连通性")
-    for item in probe_report.results:
-        label = _status_label("正常" if item.ok else "失败")
-        # detail 只在失败时显示：成功时的 HTTP 401/403 是「可达但需鉴权」，摆在
-        # 「正常」后面会被读成故障码
-        suffix = f"  {_style(item.detail, ANSI_DIM)}" if not item.ok and item.detail else ""
-        print(f"{label}  {item.name}  {item.url}{suffix}")
+    _print_section(f"连通性（探测 {probe_status}）", rule_width=_table_rule_width(probe_widths))
+    _render_table(probe_headers, probe_rows, widths=probe_widths)
 
-    print()
-    _print_section("候选池")
-    # 这一块只讲**拓扑**：有哪些池、各多少候选、当前指向谁。刻意不写延迟——
-    # 延迟属于「出口健康」，摘要的三条出口行已按各池组**自身的健康检查**给出
-    # （那正是 mihomo 做故障转移决策的依据）；若这里改按节点实测值再列一遍，
-    # 同一节点就会在摘要与候选池出现两个不同的数，读起来互相打架。
+    # ── 候选池（只讲拓扑）──────────────────────────────────────
+    # 刻意不列延迟：延迟属于「出口健康」，上面三条出口行已按各池组**自身的健康检查**
+    # 给出（那正是 mihomo 做故障转移决策的依据）；这里若另按节点实测值列一遍，
+    # 同一节点就会在同一屏出现两个口径的数，读起来互相打架。
     present = [name for name in AI_STATUS_GROUPS if groups.get(name) is not None]
-    group_width = max((_display_width(name) for name in present), default=10)
+    pool_rows: list[list[TableCell]] = []
     for name in present:
         group = groups[name]
         node = resolve_ai_leaf(groups, name)
-        parts = [f"候选 {len(_group_value(group, 'all', []) or [])}"]
+        candidates = len(_group_value(group, "all", []) or [])
         if name == AI_AUTO_GROUP:
             # 自动池的 `now` 指向区域组（AI-US/AI-SG）而非真实出口——显式标出，
             # 免得「当前 AI-US」被误读成一个节点
             pointer = normalize_name(_group_value(group, "now", "-"))
-            parts.append(f"自动池 {pointer} → {_accent(normalize_name(node))}")
+            kind, target = "自动池", f"{pointer} → {normalize_name(node)}"
         else:
-            parts.append(f"当前 {_accent(normalize_name(node))}")
-        print(f"{_pad_right(name, group_width)}  " + " · ".join(parts))
+            # AI-US/AI-SG 是自动池的两个区域臂（被 AI-AUTO 引用），其余组直接挂节点
+            kind = "区域组" if name in {AI_US_GROUP, AI_SG_GROUP} else "直连池"
+            target = normalize_name(node)
+        pool_rows.append([(name, ()), (kind, ()), (str(candidates), ()), (target, (ANSI_CYAN,))])
+    pool_headers = ["池", "类型", "候选", "当前指向"]
+    pool_aligns = ["l", "l", "r", "l"]
+    pool_widths = _table_widths(pool_headers, pool_rows)
+    print()
+    _print_section("候选池", rule_width=_table_rule_width(pool_widths))
+    _render_table(pool_headers, pool_rows, aligns=pool_aligns, widths=pool_widths)
     return 0
 
 
