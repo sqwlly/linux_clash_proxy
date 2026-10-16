@@ -147,8 +147,11 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 `systemd_helper_scripts_test.sh`（只留 collector 断言）、`tests/test_install_script.py`（去掉对已删输出的断言）。
 
 **未做（待第二阶段，不可逆）**：删系统侧 `/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}`
-与 `/usr/local/lib/clash-proxy/`。另见 `STATUS.md` 的「已知遗留项」——`process.py` 的 systemd 守卫
-仍指向已删的 legacy 服务名。
+与 `/usr/local/lib/clash-proxy/`。
+
+**同批修掉的连带遗留**：`process.py` 的 systemd 守卫曾指向 legacy 服务名（当年正确、退役后空转），
+已改查**用户级** `cproxy.service` 并带 `--user`；`restart()` 刻意不调 systemd（它是该单元的
+`ExecReload`，会自我递归）。详见 `STATUS.md` 的「已知遗留项」。
 
 ## 回滚
 

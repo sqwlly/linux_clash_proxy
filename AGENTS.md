@@ -34,5 +34,5 @@
   - `/usr/local/bin/cproxy` 与 `cproxy-tui` 是 pip 装的**真入口**，不改不覆盖；
   - 判断前先看 unit 的 `ExecStart`，或查 `systemctl is-active`。
 - **系统侧残留（待第二阶段）**：`/usr/local/bin/{clash-proxy,clash-proxy-update,cproxy-update}` 与 `/usr/local/lib/clash-proxy/` 仍在（不可逆删除待单独确认）；它们仅占位、不在任何运行路径上。
-- **已知遗留项**：`src/cproxy/backend/process.py` 的 `SYSTEMD_SERVICE_NAME = "clash-proxy.service"` 指向已删的 legacy 服务名，其 `start()` 抢端口守卫与 `restart()` 的 systemd 分支现为空转。它当年正确（见 `2f0ee5d`、`1eb4304`），真实生产服务是**用户级** `cproxy.service`；修正需改常量并给 systemctl 加 `--user`，属行为变更，见 `STATUS.md` 的「已知遗留项」。
+- **systemd 守卫已改指真实生产单元**（2026-10-17）：`src/cproxy/backend/process.py` 的 `SYSTEMD_SERVICE_NAME = "cproxy.service"`，所有 systemctl 调用带 `--user`（生产单元是**用户级** `systemd-user/cproxy.service`）。⚠️ `restart()` **刻意不**调 `systemctl --user restart cproxy.service`——它本身就是该单元的 `ExecReload`，再回头调 systemd 会自我递归；整单元重启用 `systemctl --user restart cproxy.service`。
 - 退役条件、Gate 状态与分阶段步骤见 `docs/plans/2026-07-18-proxy-sh-retirement.md`；项目状态见 `STATUS.md`。

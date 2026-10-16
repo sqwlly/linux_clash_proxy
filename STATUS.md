@@ -41,19 +41,17 @@
 
 ## 已知遗留项
 
-- **`process.py` 的 systemd 守卫指向已删的 legacy 服务名**：`src/cproxy/backend/process.py:17`
-  `SYSTEMD_SERVICE_NAME = "clash-proxy.service"`，被 `:66`（`is-enabled`）、`:82`（`is-active`）、
-  `:269-271`（`start()` 抢端口守卫）、`:333`（`restart()` 的 systemd 分支）与
-  `services/ops.py:109`（incident 报告）使用。
-  - **它当年是正确的**：`2f0ee5d` 引入（"systemd awareness：service enabled 时用 systemctl restart"），
-    `1eb4304` 的标题就是 *"fix(cproxy): prevent port conflict with production clash-proxy.service"*
-    ——那时 `clash-proxy.service` 就是生产服务。
-  - **现在它过时了**：真实生产服务是**用户级** `cproxy.service`（`systemd-user/cproxy.service`），
-    这几处查的是系统级 legacy 名。legacy 单元删除后，`_production_service_active()` 恒为 False、
-    `restart()` 永不走 systemctl 分支——**空转**。
-  - **今天行为不变**（legacy 服务本就 `inactive`/`disabled`），故未随退役改动；修正需改常量
-    并给 systemctl 加 `--user`，属 `cproxy start` 守卫与 `cproxy restart` 路径的**行为变更**，
-    应单独一轮并自带测试。
+- ~~`process.py` 的 systemd 守卫指向已删的 legacy 服务名~~ **已于 2026-10-17 修正**。
+  修正后：`SYSTEMD_SERVICE_NAME = "cproxy.service"`（真实生产单元是**用户级**
+  `systemd-user/cproxy.service`），`_production_service_active()` 改查
+  `systemctl --user is-active cproxy.service`，两处守卫文案与 `incident` 报告（`ops.py`）
+  也一并改指用户级单元。
+  - 刻意**没有**让 `restart()` 去调 `systemctl --user restart cproxy.service`：`restart()`
+    本身就是该单元的 `ExecReload`（`systemctl --user reload` → `cproxy restart`），
+    再回头调 systemd 会**自我递归**。整单元重启请直接用 `systemctl --user restart cproxy.service`。
+  - 实测：该守卫现在能真正检出用户级服务在运行（此前恒为 False、属空转）；
+    服务 active 时 `cproxy start` 仍幂等返回原 pid（`is_running()` 先短路），线上进程未受影响。
+  - 这是**行为变更**，需部署后才在生产生效；已补 3 条测试（单元名与 `--user` 参数、inactive 时不误判、`restart()` 不 shell out）。
 
 ## 发布
 

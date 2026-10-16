@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from ..backend.api import APIBackend
+from ..backend.process import SYSTEMD_SERVICE_NAME
 from ..backend.runtime import AI_STATUS_GROUPS, ai_exit_metrics
 from ..config import AppPaths
 from ..proxyenv import proxy_http_url
@@ -106,7 +107,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
     service_lines: list[str] = []
     try:
         result = subprocess.run(
-            ["systemctl", "show", "clash-proxy.service",
+            ["systemctl", "--user", "show", SYSTEMD_SERVICE_NAME,
              "--property=ActiveState,SubState,MainPID,NRestarts", "--no-pager"],
             capture_output=True, text=True, timeout=5,
         )
