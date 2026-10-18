@@ -433,8 +433,9 @@ def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_p
     now_ts = time.time()
     ts_str = datetime.fromtimestamp(now_ts - 5).strftime("%m%d %H:%M:%S")
     older_session_log = tmp_path / "cli-20261018_181938.log"
+    # attempt 1/2 的普通单次 EOF 由 agy 自身 4s 重试消化，不触发切流雪崩
     older_session_log.write_text(
-        f"I{ts_str}.100000 12345 run.go:395] Run: attempt 2 failed "
+        f"I{ts_str}.100000 12345 run.go:395] Run: attempt 1 failed "
         '(Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), '
         "retrying in 2s...\n",
         encoding="utf-8",
@@ -447,6 +448,20 @@ def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_p
     os.utime(older_session_log, (now_ts - 5, now_ts - 5))
     os.utime(newer_idle_log, (now_ts - 1, now_ts - 1))
 
+    hit_1, _, _ = detect_recent_agy_retry_failure(
+        older_session_log.parent,
+        now=now_ts,
+        window_seconds=60.0,
+    )
+    assert hit_1 is False
+
+    # 连续失败达到 attempt 3（或出现 tls: bad record MAC）时立即触发自愈
+    older_session_log.write_text(
+        f"I{ts_str}.100000 12345 run.go:395] Run: attempt 3 failed "
+        '(Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), '
+        "retrying in 12s...\n",
+        encoding="utf-8",
+    )
     hit, event_ts, reason = detect_recent_agy_retry_failure(
         older_session_log.parent,
         now=now_ts,
@@ -454,8 +469,9 @@ def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_p
     )
     assert hit is True
     assert event_ts > 0
-    assert "attempt 2" in reason
+    assert "attempt 3" in reason
     assert "EOF" in reason
+
 
 
 

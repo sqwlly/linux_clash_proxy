@@ -152,6 +152,24 @@ class RebalanceService:
             gemini_report = None
             gemini_ordered = []
 
+        if ordered and not self._should_switch_current(report, ordered[0], AI_MANUAL_GROUP):
+            cur_manual = getattr(report, "current", None)
+            if cur_manual and getattr(report, "current_verdict", None) is not None and cur_manual in ordered:
+                ordered = [cur_manual] + [n for n in ordered if n != cur_manual]
+
+        if (
+            gemini_ordered
+            and gemini_report is not None
+            and not self._should_switch_current(gemini_report, gemini_ordered[0], AI_GEMINI_GROUP)
+        ):
+            cur_gemini = getattr(gemini_report, "current", None)
+            if (
+                cur_gemini
+                and getattr(gemini_report, "current_verdict", None) is not None
+                and cur_gemini in gemini_ordered
+            ):
+                gemini_ordered = [cur_gemini] + [n for n in gemini_ordered if n != cur_gemini]
+
         if dry_run:
             return RebalanceReport(
                 ordered=tuple(ordered),
@@ -273,7 +291,10 @@ class RebalanceService:
             if not next_candidate:
                 break
             try:
-                query.switch_group(AI_GEMINI_GROUP, next_candidate)
+                try:
+                    query.switch_group(AI_GEMINI_GROUP, next_candidate, drop_connections=False)
+                except TypeError:
+                    query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
             except Exception:
@@ -287,6 +308,38 @@ class RebalanceService:
                 pass
         return ordered, switched_to
 
+    @staticmethod
+    def _should_switch_current(
+        report,
+        best_candidate: str,
+        group_name: str = AI_MANUAL_GROUP,
+    ) -> bool:
+        current_verdict = getattr(report, "current_verdict", None)
+        best_verdict = getattr(report, "verdict", None)
+        if current_verdict is None or best_verdict is None:
+            return False
+        if not best_verdict.stable:
+            return False
+        current_node = getattr(report, "current", None)
+        if not best_candidate or best_candidate == current_node:
+            return False
+        summaries = getattr(report, "summaries", ()) or ()
+        best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
+        if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
+            return False
+        cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
+        migrating_gemini_off_iepl = (
+            group_name == AI_GEMINI_GROUP
+            and is_iepl_node(current_node)
+            and is_healthy_non_iepl_summary(best_summary)
+        )
+        if current_verdict.stable and not migrating_gemini_off_iepl:
+            cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
+            best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
+            if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:
+                return False
+        return True
+
     def _switch_if_current_unstable(
         self,
         report,
@@ -299,30 +352,8 @@ class RebalanceService:
         抖动不达标」的裂化节点，热重载还会保留原选中项。此处在非自动模式下主动切到
         实测稳定的榜首叶子，闭合「探测出劣化 → 切走」回路。
         """
-        current_verdict = getattr(report, "current_verdict", None)
-        best_verdict = getattr(report, "verdict", None)
-        if current_verdict is None or best_verdict is None:
+        if not self._should_switch_current(report, best_candidate, group_name):
             return None
-        if not best_verdict.stable:
-            return None
-        current_node = getattr(report, "current", None)
-        if not best_candidate or best_candidate == current_node:
-            return None
-        summaries = getattr(report, "summaries", ()) or ()
-        best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
-        if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
-            return None
-        cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
-        migrating_gemini_off_iepl = (
-            group_name == AI_GEMINI_GROUP
-            and is_iepl_node(current_node)
-            and is_healthy_non_iepl_summary(best_summary)
-        )
-        if current_verdict.stable and not migrating_gemini_off_iepl:
-            cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
-            best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
-            if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:
-                return None
         try:
             query = QueryService(self.paths)
             group_obj = query.api.get_groups().get(group_name)
@@ -330,7 +361,10 @@ class RebalanceService:
                 return None
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
-            query.switch_group(group_name, best_candidate)
+            try:
+                query.switch_group(group_name, best_candidate, drop_connections=(group_name != AI_GEMINI_GROUP))
+            except TypeError:
+                query.switch_group(group_name, best_candidate)
             return best_candidate
         except Exception:
             return None

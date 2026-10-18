@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
-from ..config import AppPaths, ai_watch_state_file, read_config
+from ..config import AppPaths, ai_gemini_order_file, ai_watch_state_file, read_config
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
 from .probe import is_iepl_node, resolve_current_leaf
 from .query import QueryService
@@ -274,6 +274,11 @@ def detect_recent_agy_retry_failure(
             if not m:
                 continue
             month, day, hour, minute, sec, usec, attempt, reason = m.groups()
+            # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
+            # 若在 attempt 1/2 时就强行切换节点，反而会打断正在重试的流造成正反馈雪崩；
+            # 仅当连续失败达到 attempt >= 3，或出现 xtls-rprx-vision 致命协议损坏（bad record MAC）时才介入。
+            if int(attempt) < 3 and "bad record mac" not in reason.lower():
+                continue
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
                 year -= 1
@@ -297,6 +302,22 @@ def detect_recent_agy_retry_failure(
     if found:
         return True, newest_ts, newest_reason
     return False, since_ts, ""
+
+
+def _promote_gemini_order_head(paths: AppPaths, target: str) -> None:
+    """将刚切中的 AI-GEMINI 目标节点同步提升到 ai-gemini-order.json 首位，
+    防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
+    order_path = ai_gemini_order_file(paths)
+    if not order_path.exists():
+        return
+    try:
+        data = json.loads(order_path.read_text(encoding="utf-8"))
+        if not isinstance(data, list) or not data or data[0] == target:
+            return
+        updated = [target] + [str(item) for item in data if item and str(item) != target]
+        order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
 
 
 class AIWatchService:
@@ -354,9 +375,9 @@ class AIWatchService:
         previous_active = gs.get("last_active")
         log_triggered = False
         if group == AI_GEMINI_GROUP:
-            # 若节点已由外部切换或自动优选变更，旧节点上的重试报错不应归咎于新节点
+            # 若节点已由外部切换或自动优选变更，设 90s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
             if previous_active and current and previous_active != current:
-                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now)
+                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 90.0)
             since_ts = float(gs.get("last_log_fail_ts") or 0.0)
             log_failed, log_ts, log_reason = detect_recent_agy_retry_failure(
                 self.agy_log_dir, now=now, since_ts=since_ts
@@ -375,12 +396,6 @@ class AIWatchService:
         passive_dead_switch = False
         if current:
             if not dry_run and previous_active and previous_active != current:
-                drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
-                if callable(drop_fn):
-                    try:
-                        drop_fn(group, keep_leaf=current)
-                    except TypeError:
-                        drop_fn(group)
                 prev_entry = groups.get(previous_active)
                 if (
                     prev_entry is not None
@@ -389,6 +404,14 @@ class AIWatchService:
                 ):
                     gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True
+                # AI-GEMINI 候选池均在支持地区：若旧节点并非彻底断死，不强杀其它会话正在流式传输的连接
+                if group != AI_GEMINI_GROUP or passive_dead_switch:
+                    drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
+                    if callable(drop_fn):
+                        try:
+                            drop_fn(group, keep_leaf=current)
+                        except TypeError:
+                            drop_fn(group)
             gs["last_active"] = current
 
         # 自动模式（AI-MANUAL 当前是 AI-AUTO）由自动池自身 fallback 兜底，看门狗不手动切，
@@ -421,8 +444,14 @@ class AIWatchService:
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
+                # AI-GEMINI 仅在地区门禁 (geo_blocked) 时强制掐旧连接；普通抖动采取平滑切流，
+                # 让新建/重试连接走新节点，绝不掐断其它终端正在正常流式输出的 SSE 连接。
+                should_drop = group != AI_GEMINI_GROUP or verdict == PROBE_GEO_BLOCKED
                 try:
-                    self.query.switch_group(group, target)
+                    try:
+                        self.query.switch_group(group, target, drop_connections=should_drop)
+                    except TypeError:
+                        self.query.switch_group(group, target)
                 except Exception:
                     # 切换失败（API 抖动等）：保留失败计数，下一轮重试，不让异常中断循环、丢状态
                     return result
@@ -430,13 +459,13 @@ class AIWatchService:
                 if current:
                     cooldown[current] = now
                 if group == AI_GEMINI_GROUP:
-                    # 切换节点会主动掐断旧叶子长连接，客户端可能立刻打一条旧连接的 EOF 重试日志；
-                    # 推進 last_log_fail_ts 跳过切流瞬间的残余日志，避免下一轮误杀新节点。
+                    # 设 90s 切流静默保护窗，并同步更新 ai-gemini-order.json 首位防 render 重置
                     gs["last_log_fail_ts"] = max(
                         float(gs.get("last_log_fail_ts") or 0.0),
-                        now + 2.0,
-                        time.time() + 2.0,
+                        now + 90.0,
+                        time.time() + 90.0,
                     )
+                    _promote_gemini_order_head(self.paths, target)
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
                 gs["last_active"] = target

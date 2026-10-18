@@ -107,7 +107,7 @@ class QueryService:
     def get_ai_status_groups(self) -> dict[str, ProxyGroup]:
         return self.load_context(require_api=True).groups
 
-    def switch_group(self, group_name: str, target_name: str) -> ProxyGroup:
+    def switch_group(self, group_name: str, target_name: str, *, drop_connections: bool = True) -> ProxyGroup:
         groups = self.api.get_groups()
         self.groups_snapshot = groups
         group = groups.get(group_name)
@@ -144,7 +144,7 @@ class QueryService:
             self.groups_snapshot = updated_groups
             updated = updated_groups[group_name]
             keep = target_name if target_name != AI_AUTO_GROUP else None
-            dropped = self._drop_stale_ai_connections(group_name, keep_leaf=keep)
+            dropped = self._drop_stale_ai_connections(group_name, keep_leaf=keep) if drop_connections else 0
         except Exception as exc:
             write_audit_event(
                 self.paths,
