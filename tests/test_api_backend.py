@@ -359,3 +359,40 @@ def test_restore_selectors_maps_leaf_into_country_group(tmp_path, monkeypatch):
     assert switches == [("CyberGuard", "香港"), ("香港", "HK-1")]
     assert restored["CyberGuard"] == "香港"
     assert restored["香港"] == "HK-1"
+
+
+def test_restore_selectors_keeps_connections_already_on_restored_target(tmp_path, monkeypatch):
+    """热重载后 restore_selectors 把组切回原选中项时，已经走在该目标节点上的活跃连接不应被误杀；
+    仅当某连接走在该组但落到了其它节点（如重载窗口期误落首项）时才断开。"""
+    from cproxy.backend.models import ProxyGroup
+
+    config_dir = tmp_path / ".config" / "cproxy"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("external-controller: 127.0.0.1:9\n", encoding="utf-8")
+    backend = APIBackend(default_paths(tmp_path))
+    groups = {
+        "AI-MANUAL": ProxyGroup(
+            name="AI-MANUAL",
+            type="fallback",
+            current="US-01",
+            candidates=["US-01", "SG-01", "AI-AUTO"],
+        ),
+    }
+    connections = {
+        "connections": [
+            # 重载前建立、本就走在目标节点 SG-01 上的活跃长连接 -> 必须保留
+            {"id": "keep-1", "chains": ["SG-01", "AI-MANUAL"]},
+            # 重载窗口期误落到首项 US-01 的连接 -> 应当断开
+            {"id": "drop-1", "chains": ["US-01", "AI-MANUAL"]},
+        ]
+    }
+    closed: list[str] = []
+    monkeypatch.setattr(backend, "get_groups", lambda: groups)
+    monkeypatch.setattr(backend, "switch_group", lambda name, target: None)
+    monkeypatch.setattr(backend, "get_connections", lambda: connections)
+    monkeypatch.setattr(backend, "close_connection", lambda cid: closed.append(cid))
+
+    restored = backend.restore_selectors({"AI-MANUAL": "SG-01"})
+    assert restored == {"AI-MANUAL": "SG-01"}
+    assert closed == ["drop-1"]
+

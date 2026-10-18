@@ -225,3 +225,50 @@ def test_update_source_keeps_local_extra_proxy(tmp_path):
     cyber = merged["proxy-groups"][0]
     assert "🇯🇵日本 Vultr-Reality" in cyber["proxies"]
     assert merged["subscription-url"] == "https://example.com/sub"
+
+
+def test_preserve_drops_retired_subscription_nodes_with_same_account_credential():
+    """主订阅下线或改名的旧节点与新节点共用同一订阅账号 uuid/password，刷新时必须清理，
+    同时保留真正的手写自建节点（不同凭证）与本地附加订阅组的成员节点。"""
+    sub_uuid = "49a58700-f54d-4a72-9e18-5451e675c9ba"
+    merged = {
+        "proxies": [
+            {"name": "🇯🇵日本 01 | IEPL", "type": "ss", "server": "jp1.example.com", "port": 1001, "uuid": sub_uuid},
+            {"name": "官網: www.cyberguard.best", "type": "ss", "server": "127.0.0.1", "port": 1002, "uuid": sub_uuid},
+            {"name": "距离下次重置剩余：9 天", "type": "ss", "server": "127.0.0.1", "port": 1003, "uuid": sub_uuid},
+        ],
+        "proxy-groups": [
+            {"name": "CyberGuard", "type": "select", "proxies": ["🇯🇵日本 01 | IEPL"]},
+        ],
+    }
+    existing = {
+        "proxies": [
+            {"name": "🇯🇵日本 01 | IEPL", "type": "ss", "server": "jp1.example.com", "port": 1001, "uuid": sub_uuid},
+            # 已从上游订阅下线的同账号死节点
+            {"name": "🇯🇵日本 05 | 1X | 推荐", "type": "ss", "server": "old.example.com", "port": 1005, "uuid": sub_uuid},
+            {"name": "🇰🇷韩国 02 | 1X", "type": "ss", "server": "kr2.example.com", "port": 1006, "uuid": sub_uuid},
+            # 旧面板信息节点（繁体官網/重置剩余）
+            {"name": "官網: old.cyberguard.best", "type": "ss", "server": "127.0.0.1", "port": 1002, "uuid": "other-id"},
+            {"name": "距离下次重置剩余：10 天", "type": "ss", "server": "127.0.0.1", "port": 1003, "uuid": "other-id"},
+            # 真正的手写自建节点（独立 uuid）
+            VULTR_PROXY,
+        ],
+        "proxy-groups": [
+            {
+                "name": "CyberGuard",
+                "type": "select",
+                "proxies": ["🇯🇵日本 01 | IEPL", "🇯🇵日本 05 | 1X | 推荐", "🇰🇷韩国 02 | 1X", "🇯🇵日本 Vultr-Reality"],
+            },
+        ],
+    }
+
+    _preserve_local_extra_proxies(merged, existing)
+
+    names = [p["name"] for p in merged["proxies"]]
+    assert "🇯🇵日本 05 | 1X | 推荐" not in names
+    assert "🇰🇷韩国 02 | 1X" not in names
+    assert "官網: old.cyberguard.best" not in names
+    assert "距离下次重置剩余：10 天" not in names
+    assert "🇯🇵日本 Vultr-Reality" in names
+    assert merged["proxy-groups"][0]["proxies"] == ["🇯🇵日本 01 | IEPL", "🇯🇵日本 Vultr-Reality"]
+

@@ -296,10 +296,15 @@ class APIBackend:
                     self.switch_group(parent_target, child_target)
                     restored[parent_target] = child_target
         if restored:
-            self._drop_connections_using_groups(set(restored))
+            self._drop_connections_using_groups(restored)
         return restored
 
-    def _drop_connections_using_groups(self, group_names: set[str]) -> int:
+    def _drop_connections_using_groups(self, group_names: set[str] | dict[str, str]) -> int:
+        """关闭受组切换影响的旧连接。
+
+        若传入 `dict[group, target]`（例如 `restore_selectors`），仅当连接链包含 `group`
+        且**尚未**走 `target` 时才断开——避免热重载把原本就在该节点上的活跃长连接误杀。
+        """
         if not group_names:
             return 0
         try:
@@ -313,8 +318,16 @@ class APIBackend:
         for item in connections:
             if not isinstance(item, dict):
                 continue
-            chains = item.get("chains") or []
-            if not any(str(part) in group_names for part in chains):
+            chains = [str(part) for part in (item.get("chains") or [])]
+            chain_set = set(chains)
+            if isinstance(group_names, dict):
+                should_drop = any(
+                    grp in chain_set and target not in chain_set
+                    for grp, target in group_names.items()
+                )
+            else:
+                should_drop = any(part in group_names for part in chain_set)
+            if not should_drop:
                 continue
             conn_id = str(item.get("id") or "")
             if not conn_id:

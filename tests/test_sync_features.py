@@ -471,6 +471,49 @@ rules:
     assert groups["AI-SG"]["type"] == "fallback"
 
 
+def test_render_upgrades_http_auto_group_url_and_adds_ip_cidr_no_resolve(tmp_path: Path):
+    """自动测速/故障转移组的明文 http:// 测速地址应升级为 HTTPS TEST_URL 并剔除繁体面板伪节点；
+    裸 3 段 IP-CIDR / IP-CIDR6 规则应自动补齐 `,no-resolve`。"""
+    from cproxy.backend.runtime import TEST_URL
+
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: 🇺🇸美国 01
+  - name: 🇸🇬新加坡 01
+  - name: "官網: www.cyberguard.best"
+  - name: 距离下次重置剩余：9 天
+proxy-groups:
+  - name: CyberGuard
+    type: select
+    proxies: [自动选择, 故障转移, 🇺🇸美国 01, 🇸🇬新加坡 01, "官網: www.cyberguard.best", 距离下次重置剩余：9 天]
+  - name: 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    proxies: ["官網: www.cyberguard.best", 距离下次重置剩余：9 天, 🇺🇸美国 01, 🇸🇬新加坡 01]
+  - name: 故障转移
+    type: fallback
+    url: http://www.gstatic.com/generate_204
+    proxies: ["官網: www.cyberguard.best", 🇺🇸美国 01, 🇸🇬新加坡 01]
+rules:
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR6,fe80::/10,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - MATCH,CyberGuard
+"""
+    data = _render_config(tmp_path, config)
+    groups = {g["name"]: g for g in data["proxy-groups"]}
+    assert "其他" not in groups
+    for gname in ("自动选择", "故障转移"):
+        assert groups[gname]["url"] == TEST_URL
+        assert "官網: www.cyberguard.best" not in groups[gname]["proxies"]
+        assert "距离下次重置剩余：9 天" not in groups[gname]["proxies"]
+    assert "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve" in data["rules"]
+    assert "IP-CIDR6,fe80::/10,DIRECT,no-resolve" in data["rules"]
+    assert "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve" in data["rules"]
+
+
 # ---------------------------------------------------------------------------
 # 重名节点防护：机场订阅会给出同名不同 server 的节点，mihomo 遇重名直接
 # fatal 退出（"proxy X is the duplicate name"），刷新因此把代理搞挂。

@@ -356,3 +356,52 @@ def test_watch_dual_endpoint_catches_cloudcode_failure_and_passive_fallback_drop
     assert ("AI-GEMINI", "GB-01") in q2.switches
     # 被动切换的 AI-MANUAL 触发了旧叶子连接清理（keep_leaf="JP-01"）
     assert dropped_calls == [("AI-MANUAL", "JP-01")]
+
+
+def test_watch_passive_fallback_from_dead_node_updates_fixed_and_cools_down(tmp_path, monkeypatch):
+    """当被 fixed 钉住的旧节点被 mihomo 健康检查判死（alive=False）而被动回退到新节点时，
+    看门狗必须把旧节点记入 cooldown 并调 api.switch_group 把 fixed 更新到新节点，
+    防止旧节点 5 分钟后偶发回包即被 mihomo fallback 瞬间弹回。"""
+    from cproxy.config import ai_watch_state_file
+
+    paths = _paths(tmp_path)
+    groups = {
+        "AI-MANUAL": _group("AI-MANUAL", ["US-01", "SG-01", "AI-AUTO"], "SG-01"),
+        "AI-GEMINI": _group("AI-GEMINI", ["KR-01", "DE-01"], "KR-01"),
+        "US-01": ProxyGroup(name="US-01", type="Shadowsocks", current="-", candidates=[], delay=120, alive=True),
+        "SG-01": ProxyGroup(name="SG-01", type="Shadowsocks", current="-", candidates=[], delay=90, alive=True),
+        "KR-01": ProxyGroup(name="KR-01", type="Shadowsocks", current="-", candidates=[], delay=80, alive=True),
+        "DE-01": ProxyGroup(name="DE-01", type="Shadowsocks", current="-", candidates=[], delay=150, alive=True),
+    }
+    api_switches: list[tuple[str, str]] = []
+
+    class _PinTrackingQuery(_FakeQuery):
+        def __init__(self, g):
+            super().__init__(g)
+            self.api = type(
+                "_API",
+                (),
+                {
+                    "get_groups": lambda _self: g,
+                    "switch_group": lambda _self, grp, target: api_switches.append((grp, target)),
+                },
+            )()
+
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_OK)
+
+    svc1 = AIWatchService(paths)
+    svc1.query = _PinTrackingQuery(groups)
+    svc1.watch()  # 记录 last_active = SG-01
+
+    # 模拟 SG-01 彻底断流 (alive=False, delay=0)，mihomo fallback 被动回退到候选首项 US-01
+    groups["SG-01"] = ProxyGroup(name="SG-01", type="Shadowsocks", current="-", candidates=[], delay=0, alive=False)
+    groups["AI-MANUAL"] = _group("AI-MANUAL", ["US-01", "SG-01", "AI-AUTO"], "US-01")
+
+    svc2 = AIWatchService(paths)
+    svc2.query = _PinTrackingQuery(groups)
+    svc2.watch()
+
+    assert api_switches == [("AI-MANUAL", "US-01")]
+    state = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
+    assert "SG-01" in state["AI-MANUAL"]["cooldown"]
+

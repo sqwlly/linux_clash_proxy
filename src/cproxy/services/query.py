@@ -134,7 +134,8 @@ class QueryService:
             updated_groups = self.api.get_groups()
             self.groups_snapshot = updated_groups
             updated = updated_groups[group_name]
-            dropped = self._drop_stale_ai_connections(group_name)
+            keep = target_name if target_name != AI_AUTO_GROUP else None
+            dropped = self._drop_stale_ai_connections(group_name, keep_leaf=keep)
         except Exception as exc:
             write_audit_event(
                 self.paths,

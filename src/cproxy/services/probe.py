@@ -366,6 +366,15 @@ class ProbeService:
                     raise RuntimeError(f"错误: 未找到推荐节点的切换路径: {best.name}")
                 for grp, target in reversed(path):
                     self.api.switch_group(grp, target)
+                try:
+                    from .query import QueryService
+
+                    query = QueryService(self.paths)
+                    query.api = self.api
+                    for grp, _target in reversed(path):
+                        query._drop_stale_ai_connections(grp, keep_leaf=best.name)
+                except Exception:
+                    pass
                 switched = True
 
         if record_history or switch:

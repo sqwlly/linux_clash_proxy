@@ -198,10 +198,12 @@ class RebalanceService:
         current_node = getattr(report, "current", None)
         if not best_candidate or best_candidate == current_node:
             return None
+        summaries = getattr(report, "summaries", ()) or ()
+        best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
+        if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
+            return None
         if current_verdict.stable:
-            summaries = getattr(report, "summaries", ()) or ()
             cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
-            best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
             cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
             best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
             if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:

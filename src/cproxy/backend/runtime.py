@@ -470,6 +470,41 @@ def _strip_panel_members(group: dict) -> None:
     group["proxies"] = [member for member in members if not is_panel_info_node(str(member))]
 
 
+def _sanitize_auto_groups(groups: list) -> None:
+    """清理自动测速/故障转移组：剔除面板伪节点，并将易被劫持的明文 http:// 测速地址升级为 HTTPS。
+
+    unified-delay 开启时 mihomo 会对测速 URL 连发两次 HEAD；部分机场在第一次明文 HTTP
+    返回 204 后截断第二次请求（`failed to get the second response ... context deadline exceeded`），
+    把存活的 1X 节点写死为 `alive=False, delay=0`。统一升级到 HTTPS `TEST_URL` 可彻底规避。
+    """
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("name") or "")
+        gtype = str(group.get("type") or "").lower()
+        if name not in AUTO_POLICY_NAMES and gtype not in AUTO_GROUP_TYPES:
+            continue
+        _strip_panel_members(group)
+        url = group.get("url")
+        if isinstance(url, str) and url.strip().lower().startswith("http://"):
+            group["url"] = TEST_URL
+
+
+def _normalize_ip_cidr_rule(rule: object) -> object:
+    """为裸 3 段 IP-CIDR / IP-CIDR6 规则补齐 `,no-resolve`。
+
+    订阅规则常在 GEOIP,CN,DIRECT,no-resolve 之前放一串裸 `IP-CIDR,192.168.0.0/16,DIRECT` 等，
+    缺省 `no-resolve` 会迫使 mihomo 在匹配到该条时先对域名发起本地 DNS 解析，既拖慢首包又使
+    后续 `no-resolve` 失效。
+    """
+    if not isinstance(rule, str):
+        return rule
+    parts = [item.strip() for item in rule.split(",")]
+    if len(parts) == 3 and parts[0].upper() in {"IP-CIDR", "IP-CIDR6"}:
+        return f"{parts[0]},{parts[1]},{parts[2]},no-resolve"
+    return rule
+
+
 def _collect_match_nodes(
     match_group: dict,
     group_map: dict[str, dict],
@@ -695,12 +730,14 @@ class RuntimeBackend:
         if not isinstance(manual_prefer, list):
             manual_prefer = []
         manual_order = _load_ai_manual_order(self.paths)
+        us_ordered = _order_manual_candidates(us_proxies, manual_prefer, manual_order)
+        sg_ordered = _order_manual_candidates(sg_proxies, manual_prefer, manual_order)
         manual_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies) + list(kr_proxies) + list(gb_proxies)
         manual_candidates = _order_manual_candidates(manual_leaves, manual_prefer, manual_order) + [AI_AUTO_GROUP]
 
         ai_groups = [
-            {"name": AI_US_GROUP, "type": "fallback", "proxies": us_proxies, "url": TEST_URL, "interval": 300},
-            {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_proxies, "url": TEST_URL, "interval": 300},
+            {"name": AI_US_GROUP, "type": "fallback", "proxies": us_ordered, "url": TEST_URL, "interval": 300},
+            {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_ordered, "url": TEST_URL, "interval": 300},
             {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 300},
             {"name": AI_MANUAL_GROUP, "type": "fallback", "proxies": manual_candidates, "url": TEST_URL, "interval": 300},
             {
@@ -786,7 +823,7 @@ class RuntimeBackend:
         }
 
         clean_rules = [
-            rule
+            _normalize_ip_cidr_rule(rule)
             for rule in rules
             if rule not in ai_rules
             and rule not in bulk_download_direct
@@ -818,6 +855,7 @@ class RuntimeBackend:
             if isinstance(group, dict) and group.get("name")
         }
         _reshape_match_country_groups(data, filtered_groups, group_map)
+        _sanitize_auto_groups(filtered_groups)
 
         data["proxy-groups"] = filtered_groups
         data["rules"] = clean_rules

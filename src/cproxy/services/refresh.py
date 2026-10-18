@@ -210,6 +210,36 @@ def _is_dedupe_artifact(name: str, merged_names: set[str]) -> bool:
     return bool(match and match.group(1) in merged_names)
 
 
+def _proxy_credential(proxy: dict) -> str:
+    for key in ("uuid", "password"):
+        val = proxy.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _subscription_account_credentials(proxies: list) -> set[str]:
+    """识别主订阅共享的账户凭证（uuid/password）。
+
+    机场订阅中所有节点（及面板信息节点）共享同一账户 uuid/password；当某凭证在订阅节点中
+    出现 >=2 次或出现在面板信息节点上时，本地旧配置里持同一凭证却已不在新订阅中的节点
+    必为机场下架/改名的退役节点，而非用户手写的自建节点。
+    """
+    counts: dict[str, int] = {}
+    panel_creds: set[str] = set()
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        cred = _proxy_credential(proxy)
+        if not cred:
+            continue
+        counts[cred] = counts.get(cred, 0) + 1
+        name = str(proxy.get("name") or "")
+        if name and is_panel_info_node(name):
+            panel_creds.add(cred)
+    return {cred for cred, count in counts.items() if count >= 2} | panel_creds
+
+
 def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加内容：
     - 附加节点：追加进 merged["proxies"]，并在同名组中按本地原有位置插回，
@@ -217,12 +247,34 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     - 附加分组：本地存在而订阅未提供的分组（自建分组、多订阅机场分组）
       整体追加到组列表末尾，其名称同样按本地位置插回同名组，保证主订阅
       组里挂的附加机场入口（如 "Mitce"）不随订阅更新丢失。
-    面板信息节点（名字随流量/到期日变化）与历史重名去重副本（`#2`/`#2_`）
-    不视为自建节点，任其随订阅更替。"""
+    面板信息节点（名字随流量/到期日变化）、历史重名去重副本（`#2`/`#2_`）与
+    持主订阅共享账户凭证但已下架的僵尸节点不视为自建节点，任其随订阅更替。"""
     local_proxies = [proxy for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
-    merged_names = {
-        str(proxy.get("name")) for proxy in merged.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+    merged_proxies = [proxy for proxy in merged.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
+    merged_names = {str(proxy["name"]) for proxy in merged_proxies}
+
+    merged_group_names = {
+        str(group.get("name"))
+        for group in merged.get("proxy-groups") or []
+        if isinstance(group, dict) and isinstance(group.get("name"), str)
     }
+    extra_group_names: set[str] = set()
+    extra_groups: list = []
+    extra_group_member_names: set[str] = set()
+    for group in existing.get("proxy-groups") or []:
+        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
+            continue
+        if group["name"] not in merged_group_names:
+            extra_groups.append(group)
+            extra_group_names.add(group["name"])
+            for member in group.get("proxies") or []:
+                if isinstance(member, str) and member:
+                    extra_group_member_names.add(member)
+
+    sub_credentials = _subscription_account_credentials(merged_proxies) | _subscription_account_credentials(
+        [proxy for proxy in local_proxies if is_panel_info_node(str(proxy.get("name") or ""))]
+    )
+
     extra_names: set[str] = set()
     extra_proxies: list = []
     for proxy in local_proxies:
@@ -232,22 +284,11 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
             and not is_panel_info_node(name)
             and not _is_dedupe_artifact(name, merged_names)
         ):
+            cred = _proxy_credential(proxy)
+            if cred and cred in sub_credentials and name not in extra_group_member_names:
+                continue
             extra_proxies.append(proxy)
             extra_names.add(name)
-
-    merged_group_names = {
-        str(group.get("name"))
-        for group in merged.get("proxy-groups") or []
-        if isinstance(group, dict) and isinstance(group.get("name"), str)
-    }
-    extra_group_names: set[str] = set()
-    extra_groups: list = []
-    for group in existing.get("proxy-groups") or []:
-        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
-            continue
-        if group["name"] not in merged_group_names:
-            extra_groups.append(group)
-            extra_group_names.add(group["name"])
 
     if not extra_proxies and not extra_groups:
         return

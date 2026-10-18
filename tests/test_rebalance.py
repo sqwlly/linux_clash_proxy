@@ -107,11 +107,14 @@ def test_render_manual_respects_prefer_and_order(tmp_path):
     paths = default_paths(tmp_path)
     order_file = ai_manual_order_file(paths)
     order_file.parent.mkdir(parents=True, exist_ok=True)
-    order_file.write_text(json.dumps(["JP-01", "SG-01"]), encoding="utf-8")
+    order_file.write_text(json.dumps(["JP-01", "US-02", "SG-01"]), encoding="utf-8")
 
-    manual = _manual_group(_render(tmp_path, extra_config="\nai-manual-prefer: [SG-01]\n"))
+    rendered = _render(tmp_path, extra_config="\nai-manual-prefer: [SG-01]\n")
+    manual = _manual_group(rendered)
     # prefer 置前，order 居中（跳过已 pin 的 SG-01），静态 remainder 垫尾
-    assert manual["proxies"][:3] == ["SG-01", "JP-01", "US-01"]
+    assert manual["proxies"][:4] == ["SG-01", "JP-01", "US-02", "US-01"]
+    ai_us = next(group for group in rendered["proxy-groups"] if group["name"] == "AI-US")
+    assert ai_us["proxies"] == ["US-02", "US-01"]
 
 
 def test_render_manual_includes_kr_gb(tmp_path):

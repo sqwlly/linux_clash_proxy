@@ -265,8 +265,10 @@ class AIWatchService:
         gs = _group_state(state, group)
 
         # 若 mihomo fallback 被动切换了出口叶子，清理仍滞留在旧叶子上的陈旧长连接，
-        # 避免同一会话混用新旧出口 IP。
+        # 避免同一会话混用新旧出口 IP；若旧叶子已被健康检查标死/超时，同步写入冷却期并把
+        # fallback 的 `fixed` 指针更新到新叶子，防止旧叶子短暂回包后 mihomo 瞬间跳回造成乒乓抖动。
         previous_active = gs.get("last_active")
+        passive_dead_switch = False
         if current:
             if not dry_run and previous_active and previous_active != current:
                 drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
@@ -275,6 +277,14 @@ class AIWatchService:
                         drop_fn(group, keep_leaf=current)
                     except TypeError:
                         drop_fn(group)
+                prev_entry = groups.get(previous_active)
+                if (
+                    prev_entry is not None
+                    and not prev_entry.candidates
+                    and (prev_entry.alive is False or delay_state(prev_entry.delay) == "timeout")
+                ):
+                    gs.setdefault("cooldown", {})[previous_active] = now
+                    passive_dead_switch = True
             gs["last_active"] = current
 
         # 自动模式（AI-MANUAL 当前是 AI-AUTO）由自动池自身 fallback 兜底，看门狗不手动切，
@@ -283,6 +293,13 @@ class AIWatchService:
             return result
 
         if verdict == PROBE_OK:
+            if passive_dead_switch and not dry_run and group_obj is not None and current in group_obj.candidates:
+                api_switch = getattr(self.query.api, "switch_group", None)
+                if callable(api_switch):
+                    try:
+                        api_switch(group, current)
+                    except Exception:
+                        pass
             gs["fail_node"] = None
             gs["fail_count"] = 0
             return result
