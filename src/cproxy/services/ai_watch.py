@@ -216,11 +216,96 @@ def _group_state(state: dict, group: str) -> dict:
     return item
 
 
+_AGY_RETRY_FAIL_RE = re.compile(
+    r"^I(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+\d+\s+run\.go:\d+\]\s+"
+    r"Run:\s+attempt\s+(\d+)\s+failed\s+\((.+?)\),\s+retrying\s+in\b"
+)
+AGY_LOG_WINDOW_SECONDS = 180.0
+
+
+def default_agy_log_dir(paths: AppPaths) -> Path:
+    return paths.state_dir.parent.parent / ".gemini" / "antigravity-cli" / "log"
+
+
+def detect_recent_agy_retry_failure(
+    log_dir: Path | None,
+    *,
+    now: float | None = None,
+    window_seconds: float = AGY_LOG_WINDOW_SECONDS,
+    since_ts: float = 0.0,
+) -> tuple[bool, float, str]:
+    """扫描所有近期活跃的 agy `cli-*.log` 尾部，检测 `run.go` 是否刚出现流式重试失败。
+
+    当同一台机器同时开启多个 agy 终端会话时，后台遥测（如 `listExperiments`）会不断刷新各
+    日志文件的 mtime；若只看 `logs[-1]` 会漏掉另一会话里正在发生的连续 EOF 重试。
+    这里扫描全部近期更新过的 `cli-*.log`（最多取最近 10 个），返回最新的一次失败事件。
+    """
+    if log_dir is None or not log_dir.is_dir():
+        return False, since_ts, ""
+    ts_now = time.time() if now is None else now
+    try:
+        logs = sorted(log_dir.glob("cli-*.log"), key=lambda p: (p.stat().st_mtime, p.name))
+    except OSError:
+        return False, since_ts, ""
+    if not logs:
+        return False, since_ts, ""
+
+    local_now = time.localtime(ts_now)
+    newest_ts = since_ts
+    newest_reason = ""
+    found = False
+
+    for log_path in reversed(logs[-10:]):
+        try:
+            with log_path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 65536), os.SEEK_SET)
+                tail = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+
+        for line in reversed(tail.splitlines()):
+            m = _AGY_RETRY_FAIL_RE.match(line.strip())
+            if not m:
+                continue
+            month, day, hour, minute, sec, usec, attempt, reason = m.groups()
+            year = local_now.tm_year
+            if int(month) == 12 and local_now.tm_mon == 1:
+                year -= 1
+            try:
+                struct_t = time.strptime(
+                    f"{year:04d}-{int(month):02d}-{int(day):02d} {int(hour):02d}:{int(minute):02d}:{int(sec):02d}",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
+            except ValueError:
+                continue
+            if event_ts <= newest_ts:
+                break
+            age = ts_now - event_ts
+            if -5.0 <= age <= window_seconds:
+                newest_ts = event_ts
+                newest_reason = f"attempt {attempt}: {reason}"
+                found = True
+            break
+
+    if found:
+        return True, newest_ts, newest_reason
+    return False, since_ts, ""
+
+
 class AIWatchService:
-    def __init__(self, paths: AppPaths, proc_root: Path = Path("/proc")):
+    def __init__(
+        self,
+        paths: AppPaths,
+        proc_root: Path = Path("/proc"),
+        agy_log_dir: Path | None = None,
+    ):
         self.paths = paths
         self.query = QueryService(paths)
         self.proc_root = proc_root
+        self.agy_log_dir = default_agy_log_dir(paths) if agy_log_dir is None else agy_log_dir
 
     def watch(self, dry_run: bool = False) -> WatchReport:
         report = WatchReport()
@@ -261,8 +346,20 @@ class AIWatchService:
         current = resolve_current_leaf(groups, group) if group_obj else None
         verdict, detail = self._probe_group_verdict(group)
 
-        result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
         gs = _group_state(state, group)
+        log_triggered = False
+        if group == AI_GEMINI_GROUP:
+            since_ts = float(gs.get("last_log_fail_ts") or 0.0)
+            log_failed, log_ts, log_reason = detect_recent_agy_retry_failure(
+                self.agy_log_dir, now=now, since_ts=since_ts
+            )
+            if log_failed:
+                gs["last_log_fail_ts"] = log_ts
+                verdict = PROBE_DEAD
+                detail = f"agy_log_retry ({log_reason})"
+                log_triggered = True
+
+        result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
 
         # 若 mihomo fallback 被动切换了出口叶子，清理仍滞留在旧叶子上的陈旧长连接，
         # 避免同一会话混用新旧出口 IP；若旧叶子已被健康检查标死/超时，同步写入冷却期并把
@@ -304,8 +401,11 @@ class AIWatchService:
             gs["fail_count"] = 0
             return result
 
-        # 语义失败：记录连续失败计数
-        if gs.get("fail_node") == current:
+        # 语义失败：记录连续失败计数；若由客户端真实重试日志触发，则直接达到切换阈值立即自愈
+        if log_triggered:
+            gs["fail_node"] = current
+            gs["fail_count"] = max(int(gs.get("fail_count", 0)) + 1, CONSECUTIVE_FAILURE_THRESHOLD)
+        elif gs.get("fail_node") == current:
             gs["fail_count"] = int(gs.get("fail_count", 0)) + 1
         else:
             gs["fail_node"] = current
@@ -327,19 +427,35 @@ class AIWatchService:
                 gs["last_active"] = target
                 result.switched = True
                 result.target = target
+                try:
+                    from .notify import send_notification
+
+                    send_notification(
+                        self.paths,
+                        "cproxy AI 出口自动切换",
+                        f"{group}: {current or '-'} → {target}（原因: {detail}）",
+                        event="ai_watch_switch",
+                    )
+                except Exception:
+                    pass
         return result
 
     def _pick_next(self, groups: dict, group, current: str | None, cooldown: dict, now: float) -> str | None:
-        """从组候选里挑下一个可切叶子：跳过当前节点、冷却期节点与嵌套组（AI-AUTO 等）。
+        """从组候选里挑下一个可切叶子：跳过当前节点、屏蔽节点、冷却期节点与嵌套组（AI-AUTO 等）。
 
         mihomo `/proxies` 对每个叶子节点也返回一条 `candidates=[]` 的条目，因此必须用
         `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
         `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
         仅当所有非冷却叶子都被标死时才回退到首个可用候选。
         """
+        from .ban import is_node_banned, load_active_bans
+
+        active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
         for cand in group.candidates:
             if not cand or cand == current:
+                continue
+            if active_bans and is_node_banned(str(cand), active_bans):
                 continue
             entry = groups.get(cand)
             if entry is not None and entry.candidates:

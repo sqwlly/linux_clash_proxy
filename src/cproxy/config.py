@@ -85,6 +85,16 @@ def ai_watch_state_file(paths: AppPaths) -> Path:
     return paths.state_dir / "ai-watch.json"
 
 
+def node_bans_file(paths: AppPaths) -> Path:
+    """cproxy ban 持久化的节点屏蔽列表（state 文件）。"""
+    return paths.state_dir / "node-bans.json"
+
+
+def custom_rules_file(paths: AppPaths) -> Path:
+    """cproxy rule 持久化的用户自定义分流规则（state 文件）。"""
+    return paths.state_dir / "custom-rules.json"
+
+
 def load_yaml_file(path: Path) -> Any:
     """读 YAML。文件不存在返回 None。按路径 + 内容哈希缓存，写入后自动失效。"""
     try:

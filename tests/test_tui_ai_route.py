@@ -56,7 +56,7 @@ def test_ai_route_panel_renders_resolved_exit_for_pinned_node(ai_route_groups, t
             assert "AI-US → 🇺🇸美国 01 IEPL 1.7X CM (210ms)" in labels["standby"]
             # Gemini 也拿到真实延迟（其组自身 history 为空）
             assert "AI-GEMINI → 🇰🇷韩国 01 IEPL 1.7X CM (140ms)" in labels["gemini"]
-            assert "兜底 · 直连池" in labels["mode"]
+            assert "兜底 · 优选池" in labels["mode"]
             # 链路树不再画空叶子
             assert "通用 AI-MANUAL" in labels["chain"]
             assert "→ -" not in labels["chain"]

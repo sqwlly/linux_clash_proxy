@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,24 @@ from ..config import AppPaths, read_config, subscription_info_file
 # 主订阅在状态文件中的键；附加机场以其配置名（subscriptions[].name）为键
 MAIN_SUBSCRIPTION_KEY = "main"
 MAIN_SUBSCRIPTION_LABEL = "主订阅"
+
+_PANEL_REMAINING_RE = re.compile(
+    r"剩余(?:流量)?\s*[：:]?\s*(\d+(?:\.\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB)",
+    re.IGNORECASE,
+)
+_PANEL_EXPIRE_DATE_RE = re.compile(
+    r"(?:套餐到期|到期时间|过期时间|有效期|到期)\s*[：:]?\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"
+)
+_UNIT_MULTIPLIERS = {
+    "kb": 1024,
+    "kib": 1024,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "tb": 1024**4,
+    "tib": 1024**4,
+}
 
 
 @dataclass
@@ -76,6 +95,51 @@ def parse_userinfo_header(value: str | None) -> SubscriptionUsage | None:
     )
 
 
+def parse_panel_info_nodes(proxies: list | None) -> SubscriptionUsage | None:
+    """从订阅的面板信息节点（如『剩余流量：577.12 GB』『套餐到期：2027-05-01』）提取余量与到期时间。
+
+    当机场不返回 ``subscription-userinfo`` 响应头或头字段缺失时，变废为宝提取结构化用量。
+    """
+    if not isinstance(proxies, list):
+        return None
+    remaining_bytes: int | None = None
+    expire_ts: int | None = None
+    for item in proxies:
+        name = str(item.get("name") if isinstance(item, dict) else item or "").strip()
+        if not name:
+            continue
+        if remaining_bytes is None:
+            match_rem = _PANEL_REMAINING_RE.search(name)
+            if match_rem:
+                amount = float(match_rem.group(1))
+                unit = match_rem.group(2).lower()
+                remaining_bytes = int(amount * _UNIT_MULTIPLIERS.get(unit, 1024**3))
+        if expire_ts is None:
+            match_exp = _PANEL_EXPIRE_DATE_RE.search(name)
+            if match_exp:
+                try:
+                    dt = datetime(
+                        int(match_exp.group(1)),
+                        int(match_exp.group(2)),
+                        int(match_exp.group(3)),
+                        23,
+                        59,
+                        59,
+                    )
+                    expire_ts = int(dt.timestamp())
+                except ValueError:
+                    pass
+    if remaining_bytes is None and expire_ts is None:
+        return None
+    return SubscriptionUsage(
+        upload=0 if remaining_bytes is not None else None,
+        download=0 if remaining_bytes is not None else None,
+        total=remaining_bytes,
+        expire=expire_ts,
+        updated_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
 def load_subscription_info(paths: AppPaths) -> dict[str, SubscriptionUsage]:
     """读取全部已记录的订阅用量；文件缺失/损坏时返回空 dict，绝不抛错。"""
     path = subscription_info_file(paths)
@@ -102,13 +166,22 @@ def load_subscription_info(paths: AppPaths) -> dict[str, SubscriptionUsage]:
     return entries
 
 
-def record_subscription_info(paths: AppPaths, key: str, header_value: str | None) -> bool:
-    """记录一份订阅的用量；头缺失/不可解析时保留原有记录并返回 False。
-
-    读-改-写非事务：理论上 timer 与手动 refresh 并发时可能丢失一次写入
-    （文件不致损坏，原子 rename 保证），refresh 由 systemd 串行触发，可接受。
-    """
+def record_subscription_info(
+    paths: AppPaths,
+    key: str,
+    header_value: str | None,
+    proxies: list | None = None,
+) -> bool:
+    """记录一份订阅的用量；优先用响应头，缺失字段由面板信息节点补齐。"""
     usage = parse_userinfo_header(header_value)
+    panel_usage = parse_panel_info_nodes(proxies) if proxies else None
+    if usage is None:
+        usage = panel_usage
+    elif panel_usage is not None:
+        if usage.total is None and panel_usage.total is not None:
+            usage.total = usage.used + panel_usage.total
+        if usage.expire is None and panel_usage.expire is not None:
+            usage.expire = panel_usage.expire
     if usage is None:
         return False
     entries = load_subscription_info(paths)

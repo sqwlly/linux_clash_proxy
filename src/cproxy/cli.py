@@ -11,6 +11,7 @@ from .cli_render import (
     _accent,
     _render_ai_connections,
     _render_ai_status,
+    _render_benchmark,
     _render_connectivity_report,
     _render_current,
     _render_doctor,
@@ -27,9 +28,18 @@ from .cli_render import (
     _render_snapshots,
     _render_status,
     _render_traffic,
+    _render_why,
+    _run_ban,
     _run_bootstrap,
     _run_compact_snapshots,
+    _run_export,
+    _run_flush,
+    _run_import,
+    _run_notify,
+    _run_prompt,
     _run_rollback,
+    _run_rule,
+    _run_unban,
     _section_heading,
     _section_title,
     print_error,
@@ -274,8 +284,12 @@ def run(argv: list[str] | None = None) -> int:
             path = _resolve_switch(service, args)
             root_group = path[0][0]
             snapshot = service.groups_snapshot
-            old_leaf = resolve_current_leaf(snapshot, root_group)
+            old_leaf = resolve_current_leaf(snapshot, root_group) if snapshot else None
             group = service.switch_path(path)
+            if len(path) == 1:
+                root_group = group.name
+            if not old_leaf and service.last_switch_from and service.last_switch_from != "-":
+                old_leaf = resolve_current_leaf(service.groups_snapshot, service.last_switch_from) or service.last_switch_from
             snapshot = service.groups_snapshot
             new_leaf = resolve_current_leaf(snapshot, root_group)
             old_selection = normalize_name(old_leaf) if old_leaf else None
@@ -410,6 +424,85 @@ def run(argv: list[str] | None = None) -> int:
                 node=args.node,
                 timeout=args.timeout,
                 raw=args.raw,
+            )
+        if args.command == "why":
+            return _render_why(
+                default_paths(),
+                args.target,
+                process=args.process,
+                raw=args.raw,
+                as_json=args.json,
+            )
+        if args.command == "ban":
+            return _run_ban(
+                default_paths(),
+                args.pattern,
+                hours=args.hours,
+                reason=args.reason,
+                apply=args.apply,
+                raw=args.raw,
+                as_json=args.json,
+            )
+        if args.command == "unban":
+            return _run_unban(
+                default_paths(),
+                args.pattern,
+                clear_all=args.clear_all,
+                apply=args.apply,
+            )
+        if args.command == "notify":
+            return _run_notify(
+                default_paths(),
+                args.action,
+                webhook=args.webhook,
+                desktop=args.desktop,
+                title=args.title,
+                message=args.message,
+                as_json=args.json,
+            )
+        if args.command == "prompt":
+            return _run_prompt(default_paths(), fmt=args.format, raw=args.raw)
+        if args.command == "rule":
+            return _run_rule(
+                default_paths(),
+                args.action,
+                args.target,
+                args.policy,
+                rule_type=args.rule_type,
+                comment=args.comment,
+                clear_all=args.clear_all,
+                apply=args.apply,
+                raw=args.raw,
+                as_json=args.json,
+            )
+        if args.command == "flush":
+            return _run_flush(
+                default_paths(),
+                args.target,
+                stale=args.stale,
+                raw=args.raw,
+                as_json=args.json,
+            )
+        if args.command == "benchmark":
+            return _render_benchmark(
+                default_paths(),
+                raw=args.raw,
+                as_json=args.json,
+            )
+        if args.command == "export":
+            return _run_export(
+                default_paths(),
+                output=args.output,
+                redact=args.redact,
+                as_json=args.json,
+            )
+        if args.command == "import":
+            return _run_import(
+                default_paths(),
+                args.file,
+                replace=args.replace,
+                apply=args.apply,
+                as_json=args.json,
             )
         if args.command == "completion":
             from .completion import run_completion

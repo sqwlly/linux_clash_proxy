@@ -223,7 +223,7 @@ def test_query_commands_use_api_output(tmp_path: Path):
         # 候选池取代旧「分组」：只讲拓扑（无延迟列），自动池要标出当前项是区域组指针
         assert ["池", "类型", "候选", "当前指向"] in rows
         assert ["AI-AUTO", "自动池", "2", "AI-US → United States 01"] in rows
-        assert ["AI-MANUAL", "直连池", "5", "United States 01"] in rows
+        assert ["AI-MANUAL", "优选池", "5", "United States 01"] in rows
         assert "ms" not in out.split("候选池", 1)[1]  # 候选池不列延迟
 
         ai_status_raw = _run(env, "ai-status", "--raw")
@@ -303,7 +303,7 @@ def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_p
     rows = _table_cells(out)
 
     # 非自动池的措辞：出口由 mihomo 在直连候选池里自动择优，「手动」是与行为不符的说法
-    assert "AI 出口（兜底 · 直连池）" in out
+    assert "AI 出口（兜底 · 优选池）" in out
     assert "兜底 · 手动" not in out
     # 哨兵如实标注：5000 → 超时、0 → 未测得，都不能按毫秒展示。
     # 状态列为**空**——延迟非 ok 时再并排一个健康标记会读成「超时 · 正常」。
@@ -315,7 +315,7 @@ def test_ai_status_panel_labels_timeout_and_unmeasured_delays(monkeypatch, tmp_p
     # ok 的那条仍完整显示延迟与健康（出口从节点自身取到 140ms）
     assert ["通用", "AI-MANUAL", "🇰🇷韩国 01 IEPL 1.7X CM", "140ms", "正常"] in rows
     # 候选池只讲拓扑，不列延迟——避免同一节点在出口表与候选池出现两个口径的数
-    assert ["AI-MANUAL", "直连池", "2", "🇰🇷韩国 01 IEPL 1.7X CM"] in rows
+    assert ["AI-MANUAL", "优选池", "2", "🇰🇷韩国 01 IEPL 1.7X CM"] in rows
     assert ["AI-AUTO", "自动池", "1", "AI-US → 🇺🇸美国 01 1X"] in rows
     assert "ms" not in out.split("候选池", 1)[1]
 

@@ -40,7 +40,7 @@ def test_dashboard_ai_cards_render_resolved_exit(ai_route_groups, tmp_path):
             standby = str(dashboard.query_one("#dash-ai-standby", Label).render())
             gemini = str(dashboard.query_one("#dash-ai-gemini", Label).render())
 
-            assert "兜底 · 直连池" in mode
+            assert "兜底 · 优选池" in mode
             assert "→ -" not in active
             assert "AI-MANUAL → 🇰🇷韩国 01 IEPL 1.7X CM (140ms)" in active
             assert "140ms" in gemini

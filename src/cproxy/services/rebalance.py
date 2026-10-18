@@ -15,12 +15,14 @@ from ..backend.runtime import (
     AI_AUTO_GROUP,
     AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
+    DEFAULT_MAX_AI_MULTIPLIER,
     RuntimeBackend,
+    _deprioritize_high_multiplier,
     _load_ai_gemini_order,
     _load_ai_manual_order,
 )
-from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, runtime_file
-from .probe import ProbeService, ProbeSummary, is_iepl_node
+from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, read_config, runtime_file
+from .probe import ProbeService, ProbeSummary, is_healthy_non_iepl_summary, is_iepl_node
 from .query import QueryService
 
 REBALANCE_PROFILE = "codex"
@@ -42,10 +44,10 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
 
     rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
     这里把已叠加的惩罚还原成裸延迟，再按权重重新叠加，得到更稳的排序。
-    当 `prefer_non_iepl=True`（AI-GEMINI）时，在「本轮零失败且历史惩罚健康」的
-    第一梯队内，将非 IEPL（1X WebSocket）节点排在 IEPL（xtls-rprx-vision 中转对
-    Gemini 长思考 SSE 流存在 15s 空闲 / 50s 等待首包硬超时及 bad record MAC）之前；
-    本轮有失败或慢性丢包的节点仍按失效率垫后。
+    当 `prefer_non_iepl=True`（AI-GEMINI）时，仅当 1X WebSocket 节点「本轮零失败、
+    历史惩罚健康且延迟健康（avg<=550ms, max<=700ms）」时排在 IEPL 之前；若 1X 节点
+    因跨境 Cloudflare Anycast 拥塞出现 700ms~1900ms 高延迟，则与 IEPL 同台按真实延迟竞速，
+    避免把拥塞假活的 Cloudflare 1X 节点排在 150ms 专线前面。
     """
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     weighted = penalty * HISTORY_PENALTY_WEIGHT
@@ -62,10 +64,10 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
         )
     is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
     if is_healthy:
-        tier = 0 if not is_iepl_node(name) else 1
+        tier = 0 if is_healthy_non_iepl_summary(summary) else 1
     else:
         tier = 2
-    iepl_tiebreak = 1 if is_iepl_node(name) else 0
+    iepl_tiebreak = 0 if is_healthy_non_iepl_summary(summary) else 1
     return (
         tier,
         neg_success,
@@ -102,6 +104,15 @@ class RebalanceService:
         self.paths = paths
 
     def rebalance(self, dry_run: bool = False) -> RebalanceReport:
+        cfg = read_config(self.paths)
+        raw_max_mult = cfg.get("max-ai-multiplier") if isinstance(cfg, dict) else None
+        try:
+            max_mult = float(raw_max_mult) if raw_max_mult is not None else DEFAULT_MAX_AI_MULTIPLIER
+        except (TypeError, ValueError):
+            max_mult = DEFAULT_MAX_AI_MULTIPLIER
+        manual_prefer = cfg.get("ai-manual-prefer") if isinstance(cfg, dict) else None
+        gemini_prefer = cfg.get("ai-gemini-prefer") if isinstance(cfg, dict) else None
+
         probe_service = ProbeService(self.paths)
         report = probe_service.probe(
             group=AI_MANUAL_GROUP,
@@ -109,6 +120,11 @@ class RebalanceService:
             record_history=True,
         )
         ordered = [summary.name for summary in sorted(report.summaries, key=_smooth_rank_key)]
+        ordered = _deprioritize_high_multiplier(
+            ordered,
+            max_mult=max_mult,
+            prefer=manual_prefer if isinstance(manual_prefer, list) else None,
+        )
         order_path = ai_manual_order_file(self.paths)
 
         gemini_report = None
@@ -127,6 +143,11 @@ class RebalanceService:
                     key=lambda s: _smooth_rank_key(s, prefer_non_iepl=True),
                 )
             ]
+            gemini_ordered = _deprioritize_high_multiplier(
+                gemini_ordered,
+                max_mult=max_mult,
+                prefer=gemini_prefer if isinstance(gemini_prefer, list) else None,
+            )
         except (RuntimeError, KeyError, ValueError):
             gemini_report = None
             gemini_ordered = []
@@ -290,13 +311,20 @@ class RebalanceService:
         best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
         if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
             return None
+        cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
         migrating_gemini_off_iepl = (
             group_name == AI_GEMINI_GROUP
             and is_iepl_node(current_node)
-            and not is_iepl_node(best_candidate)
+            and is_healthy_non_iepl_summary(best_summary)
         )
-        if current_verdict.stable and not migrating_gemini_off_iepl:
-            cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
+        migrating_gemini_off_congested_1x = (
+            group_name == AI_GEMINI_GROUP
+            and not is_iepl_node(current_node)
+            and is_iepl_node(best_candidate)
+            and cur_summary is not None
+            and not is_healthy_non_iepl_summary(cur_summary)
+        )
+        if current_verdict.stable and not (migrating_gemini_off_iepl or migrating_gemini_off_congested_1x):
             cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
             best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
             if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:

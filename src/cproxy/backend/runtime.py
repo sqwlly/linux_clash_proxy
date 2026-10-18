@@ -97,17 +97,38 @@ AI_REGION_CODE_BY_GROUP = {
 }
 
 
-def _prefer_non_iepl_nodes(proxies: list) -> list:
-    """区域组把非 IEPL（1X 等）排在前面，作为热重载/冷启动后的默认出口。
+def is_stream_fragile_proxy(proxy: dict | None, name: str = "") -> bool:
+    """判定节点在长连接 SSE 流（如 Gemini streamGenerateContent）下是否易断流。
 
-    Antigravity Cloud Code 的 streamGenerateContent 按出口 IP 做地区校验。
-    日本 IEPL（即便 ipinfo 显示东京 NTT）在实测里 loadCodeAssist 能通、
-    generate 仍 400；同一账号在美国 01 | 1X 上才能打出 streamGenerateContent。
+    除名字显式标 IEPL 外，部分机场不写 IEPL 标签但底层用裸 TCP + xtls-rprx-vision，
+    在 15~60s 工具执行空闲期极易被沿途专线网关静默掐断（EOF / bad record MAC）；
+    而 ws / grpc 传输层或非 vision 节点在长连接保持上明显更稳。
+    """
+    node_name = str(name or (proxy or {}).get("name") or "")
+    if "IEPL" in node_name.upper():
+        return True
+    if not isinstance(proxy, dict):
+        return False
+    flow = str(proxy.get("flow") or "").strip().lower()
+    network = str(proxy.get("network") or "tcp").strip().lower()
+    return flow == "xtls-rprx-vision" and network not in {"ws", "grpc"}
+
+
+def _prefer_non_iepl_nodes(proxies: list, proxy_map: dict[str, dict] | None = None) -> list:
+    """区域组把非易断流节点（1X / ws / grpc 等）排在 IEPL 及裸 vision 节点前面。
+
+    Antigravity Cloud Code 的 streamGenerateContent 既按出口 IP 校验地区，又对
+    长连接保活敏感；把非 IEPL / 非裸 vision 节点排前面作为热重载/冷启动默认出口。
     """
     names = [str(item) for item in proxies if item]
-    iepl = [name for name in names if "IEPL" in name]
-    other = [name for name in names if name not in iepl]
-    return other + iepl
+    fragile = [
+        name
+        for name in names
+        if is_stream_fragile_proxy((proxy_map or {}).get(name), name)
+    ]
+    fragile_set = set(fragile)
+    other = [name for name in names if name not in fragile_set]
+    return other + fragile
 
 
 AUTO_POLICY_NAMES = frozenset({AI_AUTO_GROUP, "自动选择", "Auto", "故障转移"})
@@ -328,6 +349,14 @@ def _drop_named_groups(groups: list, names: set[str]) -> list:
     return kept
 
 
+def _proxy_map(proxies: list | None) -> dict[str, dict]:
+    return {
+        str(proxy["name"]): proxy
+        for proxy in proxies or []
+        if isinstance(proxy, dict) and proxy.get("name")
+    }
+
+
 def _collect_ai_region_nodes(
     proxies: list | None,
     group_map: dict[str, dict],
@@ -339,6 +368,7 @@ def _collect_ai_region_nodes(
     AI-US / AI-SG / AI-AUTO 仍只用美/新，避免污染自动池的地区语义。
     """
     extra_set = set(extra_names)
+    proxy_by_name = _proxy_map(proxies)
     buckets: dict[str, list[str]] = {"JP": [], "US": [], "SG": [], "KR": [], "GB": []}
     seen: dict[str, set[str]] = {code: set() for code in buckets}
 
@@ -370,7 +400,7 @@ def _collect_ai_region_nodes(
         for member in region.get("proxies") or []:
             add(code, str(member))
 
-    return {code: _prefer_non_iepl_nodes(names) for code, names in buckets.items()}
+    return {code: _prefer_non_iepl_nodes(names, proxy_by_name) for code, names in buckets.items()}
 
 
 def _collect_gemini_nodes(
@@ -379,13 +409,14 @@ def _collect_gemini_nodes(
     extra_names: list[str],
     prefer: list | None = None,
 ) -> list[str]:
-    """收集 Gemini 专用出口：优先韩/台/欧/巴东等实测可用地区，1X 排 IEPL 前。
+    """收集 Gemini 专用出口：优先韩/台/欧/巴东等实测可用地区，1X/ws/grpc 排 IEPL/裸vision 前。
 
     prefer（config.yaml 的 ai-gemini-prefer）按给定顺序把已入选的节点提到最前，
     用于把实测更稳的节点钉成 fallback 默认出口；未入选（改名/不在优选地区）
     的名字静默忽略，不绕过地区筛选。
     """
     extra_set = set(extra_names)
+    proxy_by_name = _proxy_map(proxies)
     buckets: dict[str, list[str]] = {code: [] for code in AI_GEMINI_REGION_ORDER}
     seen: set[str] = set()
 
@@ -411,13 +442,50 @@ def _collect_gemini_nodes(
 
     ordered: list[str] = []
     for code in AI_GEMINI_REGION_ORDER:
-        ordered.extend(_prefer_non_iepl_nodes(buckets[code]))
-    ordered = _prefer_non_iepl_nodes(ordered)
+        ordered.extend(_prefer_non_iepl_nodes(buckets[code], proxy_by_name))
+    ordered = _prefer_non_iepl_nodes(ordered, proxy_by_name)
     for name in reversed([str(item) for item in prefer or []]):
         if name in ordered:
             ordered.remove(name)
             ordered.insert(0, name)
     return ordered
+
+
+def _collect_extra_ai_nodes(
+    proxies: list | None,
+    group_map: dict[str, dict],
+    extra_names: list[str],
+    regions: tuple[str, ...],
+) -> list[str]:
+    """收集附加机场（subscriptions）中属于指定 AI 地区的真实节点，作为主机场全挂时的跨供应商热备。
+
+    只从 proxies 列表收集以附加订阅名为前缀的真实节点，不碰主订阅节点与分组名。
+    """
+    if not extra_names:
+        return []
+    proxy_by_name = _proxy_map(proxies)
+    buckets: dict[str, list[str]] = {code: [] for code in regions}
+    seen: set[str] = set()
+    for proxy in proxies or []:
+        if not isinstance(proxy, dict) or not proxy.get("name"):
+            continue
+        name = str(proxy["name"])
+        if (
+            not name
+            or name in seen
+            or is_panel_info_node(name)
+            or name in group_map
+            or not _is_extra_node(name, extra_names)
+        ):
+            continue
+        code = match_region(name)
+        if code in buckets:
+            seen.add(name)
+            buckets[code].append(name)
+    ordered: list[str] = []
+    for code in regions:
+        ordered.extend(_prefer_non_iepl_nodes(buckets[code], proxy_by_name))
+    return _prefer_non_iepl_nodes(ordered, proxy_by_name)
 
 
 def _load_order_file(path: Path) -> list[str]:
@@ -440,8 +508,39 @@ def _load_ai_gemini_order(paths: AppPaths) -> list[str]:
     return _load_order_file(ai_gemini_order_file(paths))
 
 
-def _order_manual_candidates(leaves: list[str], prefer: list | None, order: list | None) -> list[str]:
-    """按「用户钉选 → 实测稳定度序 → 静态地区兜底」排 AI-MANUAL 叶子候选。
+DEFAULT_MAX_AI_MULTIPLIER = 3.0
+_STAGGERED_AUTO_INTERVALS = (317, 323, 331, 337, 347, 349, 353, 359)
+
+
+def _deprioritize_high_multiplier(
+    nodes: list[str],
+    max_mult: float = DEFAULT_MAX_AI_MULTIPLIER,
+    prefer: list | None = None,
+) -> list[str]:
+    """将高于阈值（默认 >= 3.0X）的『高倍率刺客』节点沉底，除非用户已在 prefer 中显式钉选。"""
+    if max_mult <= 0:
+        return list(nodes)
+    from ..services.node_tags import parse_node_tag
+
+    pinned = {str(item) for item in (prefer or []) if item}
+    normal: list[str] = []
+    high: list[str] = []
+    for name in nodes:
+        if name in pinned or parse_node_tag(name).multiplier < max_mult:
+            normal.append(name)
+        else:
+            high.append(name)
+    return normal + high
+
+
+def _order_manual_candidates(
+    leaves: list[str],
+    prefer: list | None,
+    order: list | None,
+    *,
+    max_mult: float = DEFAULT_MAX_AI_MULTIPLIER,
+) -> list[str]:
+    """按「用户钉选 → 实测稳定度序 → 静态地区兜底」排 AI-MANUAL 叶子候选，并将高倍率节点沉底。
 
     AI-MANUAL 是 fallback：mihomo 按列表顺序找第一个存活节点，顺序即兜底优先级。
     prefer 是 config 的 ai-manual-prefer（手动钉选），order 是 cproxy ai-rebalance
@@ -463,7 +562,7 @@ def _order_manual_candidates(leaves: list[str], prefer: list | None, order: list
         add(name)
     for name in leaves:
         add(name)
-    return ordered
+    return _deprioritize_high_multiplier(ordered, max_mult=max_mult, prefer=prefer)
 
 
 def _strip_panel_members(group: dict) -> None:
@@ -472,12 +571,16 @@ def _strip_panel_members(group: dict) -> None:
 
 
 def _sanitize_auto_groups(groups: list) -> None:
-    """清理自动测速/故障转移组：剔除面板伪节点，并将易被劫持的明文 http:// 测速地址升级为 HTTPS。
+    """清理自动测速/故障转移组：剔除面板伪节点、升级 HTTPS 测速 URL、并对同秒 300s 周期错峰。
 
-    unified-delay 开启时 mihomo 会对测速 URL 连发两次 HEAD；部分机场在第一次明文 HTTP
-    返回 204 后截断第二次请求（`failed to get the second response ... context deadline exceeded`），
-    把存活的 1X 节点写死为 `alive=False, delay=0`。统一升级到 HTTPS `TEST_URL` 可彻底规避。
+    1. unified-delay 开启时 mihomo 会对测速 URL 连发两次 HEAD；部分机场在第一次明文 HTTP
+       返回 204 后截断第二次请求，统一升级到 HTTPS `TEST_URL` 可彻底规避。
+    2. 机场自带的 `自动选择`/`故障转移` 默认均为 `interval: 300`，若与 `AI-MANUAL` (300s)
+       同秒触发，会对共享节点（如英国/韩国节点）产生 4 路并发测速踩踏，导致排在队尾的测速
+       超时并引发 fallback 误切换。将非 AI 组的 300s 周期错峰为互质素数周期可根除碰撞。
     """
+    managed_ai = {AI_US_GROUP, AI_SG_GROUP, AI_AUTO_GROUP, AI_MANUAL_GROUP, AI_GEMINI_GROUP}
+    stagger_idx = 0
     for group in groups:
         if not isinstance(group, dict):
             continue
@@ -489,6 +592,9 @@ def _sanitize_auto_groups(groups: list) -> None:
         url = group.get("url")
         if isinstance(url, str) and url.strip().lower().startswith("http://"):
             group["url"] = TEST_URL
+        if name not in managed_ai and group.get("interval") == 300:
+            group["interval"] = _STAGGERED_AUTO_INTERVALS[stagger_idx % len(_STAGGERED_AUTO_INTERVALS)]
+            stagger_idx += 1
 
 
 def _normalize_ip_cidr_rule(rule: object) -> object:
@@ -723,52 +829,84 @@ class RuntimeBackend:
         if not isinstance(groups, list):
             raise ValueError("proxy-groups 必须是列表")
 
+        from ..services.ban import filter_unbanned_nodes, load_active_bans
+
+        active_bans = load_active_bans(self.paths)
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
         extra_names = _extra_subscription_names(data)
         region_nodes = _collect_ai_region_nodes(data.get("proxies"), group_map, extra_names)
-        us_proxies = region_nodes["US"]
-        sg_proxies = region_nodes["SG"]
-        jp_proxies = region_nodes["JP"]
-        kr_proxies = region_nodes["KR"]
-        gb_proxies = region_nodes["GB"]
+        us_proxies = filter_unbanned_nodes(region_nodes["US"], active_bans, keep_fallback=True)
+        sg_proxies = filter_unbanned_nodes(region_nodes["SG"], active_bans, keep_fallback=True)
+        jp_proxies = filter_unbanned_nodes(region_nodes["JP"], active_bans, keep_fallback=False)
+        kr_proxies = filter_unbanned_nodes(region_nodes["KR"], active_bans, keep_fallback=False)
+        gb_proxies = filter_unbanned_nodes(region_nodes["GB"], active_bans, keep_fallback=False)
         if not us_proxies or not sg_proxies:
             raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
+        raw_max_mult = data.get("max-ai-multiplier")
+        try:
+            max_ai_mult = float(raw_max_mult) if raw_max_mult is not None else DEFAULT_MAX_AI_MULTIPLIER
+        except (TypeError, ValueError):
+            max_ai_mult = DEFAULT_MAX_AI_MULTIPLIER
+
         gemini_prefer = data.get("ai-gemini-prefer")
         if not isinstance(gemini_prefer, list):
             gemini_prefer = []
         gemini_order = _load_ai_gemini_order(self.paths)
         gemini_leaves = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names, gemini_prefer)
+        gemini_leaves = filter_unbanned_nodes(gemini_leaves, active_bans, keep_fallback=True)
         if not gemini_leaves:
             # 订阅缺少韩/台/欧等优选区时，退回日美新，避免 render 直接失败
             gemini_leaves = list(jp_proxies) + list(us_proxies) + list(sg_proxies)
-        gemini_proxies = _order_manual_candidates(gemini_leaves, gemini_prefer, gemini_order)
+        extra_gemini_nodes = filter_unbanned_nodes(
+            _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, AI_GEMINI_REGION_ORDER),
+            active_bans,
+            keep_fallback=False,
+        )
+        gemini_proxies = _order_manual_candidates(
+            gemini_leaves, gemini_prefer, gemini_order, max_mult=max_ai_mult
+        ) + _deprioritize_high_multiplier(
+            [n for n in extra_gemini_nodes if n not in gemini_leaves], max_mult=max_ai_mult
+        )
 
         groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
 
         # AI-MANUAL 是 fallback：固定节点挂掉后 mihomo 自动切到列表下一个存活节点，
         # 列表顺序即兜底优先级——按「用户钉选 → 实测稳定度 → 静态地区」排。
-        # AI-AUTO 垫底作最终兜底；Gemini/Google 仍单独走 AI-GEMINI。
+        # 附加机场 AI 地区节点排在主机场节点之后作跨供应商热备，AI-AUTO 垫底作最终兜底。
         manual_prefer = data.get("ai-manual-prefer")
         if not isinstance(manual_prefer, list):
             manual_prefer = []
         manual_order = _load_ai_manual_order(self.paths)
-        us_ordered = _order_manual_candidates(us_proxies, manual_prefer, manual_order)
-        sg_ordered = _order_manual_candidates(sg_proxies, manual_prefer, manual_order)
+        us_ordered = _order_manual_candidates(us_proxies, manual_prefer, manual_order, max_mult=max_ai_mult)
+        sg_ordered = _order_manual_candidates(sg_proxies, manual_prefer, manual_order, max_mult=max_ai_mult)
         manual_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies) + list(kr_proxies) + list(gb_proxies)
-        manual_candidates = _order_manual_candidates(manual_leaves, manual_prefer, manual_order) + [AI_AUTO_GROUP]
+        extra_manual_nodes = filter_unbanned_nodes(
+            _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, ("US", "JP", "SG", "KR", "GB")),
+            active_bans,
+            keep_fallback=False,
+        )
+        manual_ordered = _order_manual_candidates(manual_leaves, manual_prefer, manual_order, max_mult=max_ai_mult)
+        manual_candidates = (
+            manual_ordered
+            + _deprioritize_high_multiplier(
+                [n for n in extra_manual_nodes if n not in manual_ordered], max_mult=max_ai_mult
+            )
+            + [AI_AUTO_GROUP]
+        )
 
+        # 互质错峰测速间隔：避免多个 fallback 组在同一毫秒并发测速同一节点引发队尾超时与误切换
         ai_groups = [
-            {"name": AI_US_GROUP, "type": "fallback", "proxies": us_ordered, "url": TEST_URL, "interval": 300},
-            {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_ordered, "url": TEST_URL, "interval": 300},
-            {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 300},
+            {"name": AI_US_GROUP, "type": "fallback", "proxies": us_ordered, "url": TEST_URL, "interval": 283},
+            {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_ordered, "url": TEST_URL, "interval": 293},
+            {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 307},
             {"name": AI_MANUAL_GROUP, "type": "fallback", "proxies": manual_candidates, "url": TEST_URL, "interval": 300},
             {
                 "name": AI_GEMINI_GROUP,
                 "type": "fallback",
                 "proxies": gemini_proxies,
                 "url": TEST_URL,
-                "interval": 300,
+                "interval": 313,
             },
         ]
 
@@ -823,16 +961,29 @@ class RuntimeBackend:
             # 人机验证与通用 AI 出口保持一致
             f"DOMAIN-SUFFIX,challenges.cloudflare.com,{AI_MANUAL_GROUP}",
         ]
-        # 大流量开发下载源直连，避免耗尽代理套餐流量
+        # 大流量开发下载源与国产大模型 API 直连，避免绕海外节点增高延迟或耗尽代理套餐流量
         bulk_download_direct = [
             "DOMAIN-SUFFIX,pytorch.org,DIRECT",
             "DOMAIN-SUFFIX,pypi.org,DIRECT",
             "DOMAIN-SUFFIX,pythonhosted.org,DIRECT",
             "DOMAIN-SUFFIX,npmjs.org,DIRECT",
             "DOMAIN-SUFFIX,npmmirror.com,DIRECT",
+            "DOMAIN-SUFFIX,moonshot.cn,DIRECT",
+            "DOMAIN-SUFFIX,minimaxi.com,DIRECT",
+            "DOMAIN-SUFFIX,minimax.io,DIRECT",
+            "DOMAIN-SUFFIX,deepseek.com,DIRECT",
+            "DOMAIN-SUFFIX,dashscope.aliyuncs.com,DIRECT",
         ]
         mainland_direct = ["GEOIP,CN,DIRECT,no-resolve"]
         rules = data.get("rules") or []
+
+        from ..services.rules import load_custom_rules
+
+        match_grp = _match_group_name(rules)
+        user_custom_rules = [
+            entry.format_mihomo_rule(match_group=match_grp)
+            for entry in load_custom_rules(self.paths)
+        ]
 
         # 订阅自带或历史遗留的有害/失效规则，重渲染时移除
         stale_rules = {
@@ -848,7 +999,8 @@ class RuntimeBackend:
         clean_rules = [
             _normalize_ip_cidr_rule(rule)
             for rule in rules
-            if rule not in ai_rules
+            if rule not in user_custom_rules
+            and rule not in ai_rules
             and rule not in bulk_download_direct
             and not _is_ai_conflict_rule(rule)
             and rule not in stale_rules
@@ -856,9 +1008,10 @@ class RuntimeBackend:
             and rule != CHINAMAX_RULE
         ]
 
-        # AI 与下载直连规则前移到订阅规则之前：无论订阅商如何调整规则，
-        # AI 域名始终命中注入规则，不会被订阅的通用规则（如 DOMAIN-SUFFIX,google.com）遮蔽
-        front_rules = ai_rules + bulk_download_direct
+        # 用户自定义规则置顶，随后是 AI 与下载直连规则：确保不被任何订阅规则遮蔽
+        front_rules = user_custom_rules + [
+            r for r in (ai_rules + bulk_download_direct) if r not in user_custom_rules
+        ]
 
         match_index = None
         for idx, rule in enumerate(clean_rules):

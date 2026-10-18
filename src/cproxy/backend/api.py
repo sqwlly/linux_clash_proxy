@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,59 @@ _LEGACY_AI_REGION = {
     "🇺🇸 United States": "US",
     "🇸🇬 Singapore": "SG",
 }
+_BURST_COLLISION_WINDOW_SECONDS = 6.0
+
+
+def _parse_history_time(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def _opt_delay(value: object) -> int | None:
+    if value in (None, "-"):
+        return None
+    if isinstance(value, (int, float, str, bytes, bytearray)):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _latest_history_delay(history: list, *, alive: object = None) -> int | None:
+    """从 mihomo `history` 取最新延迟；消除多组同秒并发测速尾项超时覆盖真实延迟的问题。
+
+    当同一节点同时存在于多个 `interval: 300` 的代理组（如 `AI-GEMINI`、`AI-MANUAL`、
+    `自动选择`、`故障转移`）时，每轮整点会同秒并发打 4 组 `unified-delay` 探针：前几组
+    以 ~600ms 成功返回（`alive=True`），最后一组偶发排队到 5000ms 超时并排在 `history[-1]`
+    （因为 5000ms 必然比同秒发出的 600ms 晚 4.4s 结束）。若 `alive` 非 False 且前序记录
+    与末项处于同一 6s 并发窗口内并测得有效延迟（`0 < d < 5000`），取该轮真实延迟而非尾项超时哨兵。
+    """
+    if not isinstance(history, list) or not history:
+        return None
+    last = history[-1]
+    if not isinstance(last, dict):
+        return None
+    d = _opt_delay(last.get("delay"))
+    if d is None or d < 5000 or alive is False or len(history) < 2:
+        return d
+    last_ts = _parse_history_time(last.get("time"))
+    if last_ts is None:
+        return d
+    for prev in reversed(history[:-1]):
+        if not isinstance(prev, dict):
+            continue
+        prev_ts = _parse_history_time(prev.get("time"))
+        if prev_ts is None or abs(last_ts - prev_ts) > _BURST_COLLISION_WINDOW_SECONDS:
+            break
+        prev_d = _opt_delay(prev.get("delay"))
+        if prev_d is not None and 0 < prev_d < 5000:
+            return prev_d
+    return d
 
 
 class APIUnavailableError(RuntimeError):
@@ -191,14 +245,15 @@ class APIBackend:
 
     def _to_proxy_group(self, name: str, payload: dict[str, Any]) -> ProxyGroup:
         history = payload.get("history") or []
-        delay = history[-1].get("delay") if history else None
+        alive = payload.get("alive")
+        delay = _latest_history_delay(history, alive=alive)
         return ProxyGroup(
             name=name,
             type=str(payload.get("type", "")),
             current=str(payload.get("now", "-")),
             candidates=[str(item) for item in payload.get("all", [])],
-            alive=payload.get("alive"),
-            delay=int(delay) if delay is not None and delay != "-" else None,
+            alive=alive,
+            delay=delay,
             source="api",
         )
 
@@ -215,15 +270,9 @@ class APIBackend:
             if not isinstance(item, dict):
                 continue
             history = item.get("history") or []
-            if not history:
-                continue
-            delay = history[-1].get("delay")
-            if delay in (None, "-"):
-                continue
-            try:
-                delays[str(name)] = int(delay)
-            except (TypeError, ValueError):
-                continue
+            delay = _latest_history_delay(history, alive=item.get("alive"))
+            if delay is not None:
+                delays[str(name)] = delay
         return delays
 
     def get_groups(self, *, request_timeout: float | None = None) -> dict[str, ProxyGroup]:

@@ -22,7 +22,11 @@ from pathlib import Path
 from .config import AppPaths
 from .output import (
     _COMMAND_HELP,
+    NOTIFY_ACTIONS,
     PROFILE_CHOICES,
+    PROMPT_FORMAT_CHOICES,
+    RULE_ACTIONS,
+    RULE_TYPE_CHOICES,
     STRATEGY_CHOICES,
     TRAFFIC_ACTIONS,
     TRAFFIC_DIMENSIONS,
@@ -40,6 +44,10 @@ _POSITIONAL_SOURCES: dict[str, tuple[str, ...]] = {
     "test-group": ("groups",),
     "probe-stable-node": ("groups",),
     "switch": ("selector-groups", "nodes"),
+    "ban": ("nodes",),
+    "unban": ("banned-patterns",),
+    "rule": ("rule-actions",),
+    "flush": ("groups",),
     "guard": ("profiles",),
     "incident": ("profiles",),
     "ai-use": ("profiles",),
@@ -47,6 +55,7 @@ _POSITIONAL_SOURCES: dict[str, tuple[str, ...]] = {
     "traffic": ("traffic-actions",),
     "tun": ("tun-actions",),
     "snapshots": ("snapshots-actions",),
+    "notify": ("notify-actions",),
 }
 
 # `--flag` 取值补什么
@@ -57,6 +66,8 @@ _FLAG_SOURCES: dict[str, str] = {
     "--group": "groups",
     "--node": "nodes",
     "--kind": "snapshot-kinds",
+    "--format": "prompt-formats",
+    "--type": "rule-types",
 }
 
 
@@ -144,6 +155,18 @@ def _values_for(paths: AppPaths, source: str, prior_args: list[str]) -> list[str
         return ["runtime", "config"]
     if source == "traffic-dimensions":
         return list(TRAFFIC_DIMENSIONS)
+    if source == "notify-actions":
+        return list(NOTIFY_ACTIONS)
+    if source == "prompt-formats":
+        return list(PROMPT_FORMAT_CHOICES)
+    if source == "rule-actions":
+        return list(RULE_ACTIONS)
+    if source == "rule-types":
+        return list(RULE_TYPE_CHOICES)
+    if source == "banned-patterns":
+        from .services.ban import load_active_bans
+
+        return [item.pattern for item in load_active_bans(paths)]
     if source == "groups":
         return _group_names(paths)
     if source == "selector-groups":

@@ -25,7 +25,7 @@ from .backend.runtime import (
     resolve_ai_route,
 )
 from .backend.runtime_metrics import collect_runtime_metrics
-from .config import default_paths, log_file, read_config
+from .config import AppPaths, default_paths, log_file, read_config
 from .diagnostics import ConnectivityReport, GroupCheckReport, run_ai_probe
 from .doctor import run_doctor
 from .feedback import Spinner
@@ -38,11 +38,12 @@ from .runtime import render_runtime
 from .security import validate_controller_security
 from .services.ipcheck import IpCheckService
 from .services.nodelist import is_panel_info_node
-from .services.ops import build_incident, get_ai_connections
+from .services.ops import build_incident, get_active_ai_processes, get_ai_connections
 from .services.probe_history import load_history_rows, probe_history_file
 from .services.query import QueryService
 from .services.refresh import RefreshReport, update_source_from_subscription
 from .services.subscription_info import SubscriptionUsage, display_entries
+from .services.switch_tree import delay_label as _delay_label
 from .services.switch_tree import lookup_choice, resolve_group_query
 from .services.traffic import ProcessTrafficReport, TrafficService, format_bytes
 from .snapshots import (
@@ -417,7 +418,7 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
         # （暗示用户钉住了节点）。两者都不准：出口由 mihomo 在 AI-MANUAL 的**直连候选池**
         # 里按列表顺序取第一个存活节点，池内顺序才是用户意图（`ai-rebalance` 维护），
         # 节点本身并未被钉死——实测出现过韩国节点挂掉后自动落到新加坡。
-        "mode_label": "自动切换" if route.auto_mode else "兜底 · 直连池",
+        "mode_label": "自动切换" if route.auto_mode else "兜底 · 优选池",
         "active_group": active.group,
         "active_node": active.node,
         "active_delay": _delay_cell(active.delay),
@@ -616,6 +617,12 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     # 三个 HTTP 语义探测（含瞬时失败重试）是这条命令的主要耗时；与 status 面板一致，
     # 用 Spinner 兜住，免得终端在探测期间看起来卡死
     with Spinner("正在探测 AI 出口…", delay=0.4, enabled=not (raw or json_output)):
+        active_procs = []
+        if not (raw or json_output):
+            try:
+                active_procs = get_active_ai_processes(default_paths())
+            except Exception:
+                active_procs = []
         probe_report = run_ai_probe(default_paths())
         route = _resolve_ai_route(groups)
     probe_ok = all(item.ok for item in probe_report.results)
@@ -745,7 +752,7 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
             kind, target = "自动池", f"{pointer} → {normalize_name(node)}"
         else:
             # AI-US/AI-SG 是自动池的两个区域臂（被 AI-AUTO 引用），其余组直接挂节点
-            kind = "区域组" if name in {AI_US_GROUP, AI_SG_GROUP} else "直连池"
+            kind = "区域组" if name in {AI_US_GROUP, AI_SG_GROUP} else "优选池"
             target = normalize_name(node)
         pool_rows.append([(name, ()), (kind, ()), (str(candidates), ()), (target, (ANSI_CYAN,))])
     pool_headers = ["池", "类型", "候选", "当前指向"]
@@ -754,6 +761,23 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     print()
     _print_section("候选池", rule=False)
     _render_table(pool_headers, pool_rows, aligns=pool_aligns, widths=pool_widths, grid=True)
+
+    if active_procs:
+        proc_rows: list[list[TableCell]] = [
+            [
+                (item.process, (ANSI_BOLD,)),
+                (item.host, ()),
+                (str(item.count), (ANSI_GREEN,)),
+                (normalize_name(item.route), (ANSI_CYAN,)),
+            ]
+            for item in active_procs
+        ]
+        proc_headers = ["进程", "目标主机", "连接", "实时链路"]
+        proc_aligns = ["l", "l", "r", "l"]
+        proc_widths = _table_widths(proc_headers, proc_rows)
+        print()
+        _print_section("活跃 AI 进程", rule=False)
+        _render_table(proc_headers, proc_rows, aligns=proc_aligns, widths=proc_widths, grid=True)
     return 0
 
 
@@ -2317,3 +2341,497 @@ def _render_ipcheck(paths, *, ip: str | None, group: str | None, node: str | Non
             f"，已恢复为 {normalize_name(report.previous_selection)}"
         )
     return 0
+
+
+def _render_why(
+    paths: AppPaths,
+    target: str,
+    *,
+    process: str | None = None,
+    raw: bool = False,
+    as_json: bool = False,
+) -> int:
+    from .services.why import explain_route
+
+    report = explain_route(paths, target, process=process)
+    if as_json:
+        emit_json("why", report.to_dict())
+        return 0
+    chain_display = " -> ".join(normalize_name(step) for step in report.chain)
+    delay_text = _delay_label(report.exit_delay) if report.exit_delay is not None else "-"
+    if raw:
+        print(f"HOST\t{report.host}")
+        print(f"PROCESS\t{report.process or '-'}")
+        print(f"RULE\t{report.matched_rule}\tindex={report.rule_index}")
+        print(f"GROUP\t{report.policy_group}")
+        print(f"EXIT\t{report.exit_node}\tdelay={delay_text}")
+        print(f"CHAIN\t{' -> '.join(report.chain)}")
+        for conn in report.active_connections:
+            print(
+                f"ACTIVE\t{conn.process}\t{conn.destination}\t{conn.rule}"
+                f"\t{' -> '.join(conn.chain)}\tdown={conn.download}\tup={conn.upload}"
+            )
+        return 0
+
+    _print_section(f"分流追查 ({report.host})")
+    rows: list[tuple[str, str]] = [
+        ("目标主机", report.host),
+        ("命中规则", f"{report.matched_rule}" + (f"  (#{report.rule_index})" if report.rule_index else "")),
+        ("策略入口", report.policy_group),
+        ("完整链路", chain_display),
+    ]
+    if report.process:
+        rows.insert(1, ("关联进程", report.process))
+    exit_label = normalize_name(report.exit_node)
+    if report.exit_delay is not None and report.exit_delay > 0:
+        exit_label += f" ({delay_text})"
+    rows.append(("最终出口", _accent(exit_label)))
+    _render_kv(rows)
+
+    if report.active_connections:
+        print()
+        _print_section(f"当前活跃连接 ({len(report.active_connections)})")
+        conn_rows: list[list[TableCell]] = []
+        for conn in report.active_connections[:10]:
+            conn_chain = " -> ".join(normalize_name(c) for c in conn.chain) or "-"
+            traffic_str = f"↓{format_bytes(conn.download)} ↑{format_bytes(conn.upload)}"
+            conn_rows.append(
+                [
+                    (conn.process, (ANSI_CYAN,)),
+                    (conn.destination, ()),
+                    (conn.rule, (ANSI_DIM,)),
+                    (conn_chain, ()),
+                    (traffic_str, (ANSI_GREEN,)),
+                ]
+            )
+        _render_table(
+            ["进程", "目标", "实时规则", "实际链路", "流量"],
+            conn_rows,
+            aligns=["l", "l", "l", "l", "r"],
+        )
+    return 0
+
+
+def _apply_runtime_reload_if_needed(paths: AppPaths) -> bool:
+    runtime_path = render_runtime(paths)
+    process = ProcessBackend(paths)
+    if process.is_running():
+        APIBackend(paths).reload_config(str(runtime_path))
+        process.mark_runtime_applied(runtime_path)
+        return True
+    return False
+
+
+def _run_ban(
+    paths: AppPaths,
+    pattern: str | None,
+    *,
+    hours: float | None = None,
+    reason: str = "",
+    apply: bool = False,
+    raw: bool = False,
+    as_json: bool = False,
+) -> int:
+    from .services.ban import add_ban, load_active_bans
+
+    if pattern:
+        entry = add_ban(paths, pattern, hours=hours, reason=reason)
+        reloaded = False
+        if apply:
+            reloaded = _apply_runtime_reload_if_needed(paths)
+        if as_json:
+            emit_json("ban", {"added": entry.to_dict(), "applied": apply, "hot_reloaded": reloaded})
+            return 0
+        if raw:
+            rem = entry.remaining_seconds()
+            rem_str = f"{rem / 3600:.1f}h" if rem is not None else "permanent"
+            print(f"BANNED\t{entry.pattern}\texpires={rem_str}\treason={entry.reason or '-'}")
+            return 0
+        ttl_text = f"{hours:g} 小时" if (hours is not None and hours > 0) else "长期有效（直至 unban）"
+        print(f"已屏蔽节点模式: {_accent(entry.pattern)}（{ttl_text}）")
+        if entry.reason:
+            print(f"原因: {entry.reason}")
+        if apply:
+            print("运行配置: " + ("已重渲染并热重载生效" if reloaded else "已重渲染（代理未运行）"))
+        else:
+            print("提示: 下次 render / refresh / probe 自动生效，或加 --apply 立即热重载")
+        return 0
+
+    bans = load_active_bans(paths)
+    if as_json:
+        emit_json("ban", {"bans": [item.to_dict() for item in bans]})
+        return 0
+    if raw:
+        for item in bans:
+            rem = item.remaining_seconds()
+            rem_str = f"{rem / 3600:.1f}h" if rem is not None else "permanent"
+            print(f"BAN\t{item.pattern}\texpires={rem_str}\treason={item.reason or '-'}\tcreated={item.created_at}")
+        return 0
+    _print_section("节点屏蔽列表")
+    if not bans:
+        print("当前没有生效的节点屏蔽规则（使用 cproxy ban <节点关键词> 添加）")
+        return 0
+    table_rows: list[list[TableCell]] = []
+    for item in bans:
+        rem = item.remaining_seconds()
+        ttl = f"剩 {rem / 3600:.1f} 小时" if rem is not None else "长期"
+        table_rows.append(
+            [
+                (item.pattern, (ANSI_YELLOW,)),
+                (ttl, ()),
+                (item.reason or "-", (ANSI_DIM,)),
+                (item.created_at or "-", (ANSI_DIM,)),
+            ]
+        )
+    _render_table(["屏蔽模式", "有效期", "原因", "创建时间"], table_rows)
+    return 0
+
+
+def _run_unban(
+    paths: AppPaths,
+    pattern: str | None,
+    *,
+    clear_all: bool = False,
+    apply: bool = False,
+) -> int:
+    from .services.ban import remove_ban
+
+    if not clear_all and not (pattern and pattern.strip()):
+        print_error("错误: 请指定要解除屏蔽的节点模式，或使用 --all 清空全部")
+        return 2
+    removed = remove_ban(paths, pattern, clear_all=clear_all)
+    if not removed:
+        target_desc = "全部规则" if clear_all else f"[{pattern}]"
+        print(f"未找到匹配的节点屏蔽规则: {target_desc}")
+        return 0
+    names = "、".join(item.pattern for item in removed)
+    print(f"已解除屏蔽 ({len(removed)} 条): {names}")
+    if apply:
+        reloaded = _apply_runtime_reload_if_needed(paths)
+        print("运行配置: " + ("已重渲染并热重载生效" if reloaded else "已重渲染（代理未运行）"))
+    return 0
+
+
+def _run_notify(
+    paths: AppPaths,
+    action: str,
+    *,
+    webhook: str | None = None,
+    desktop: bool = False,
+    title: str = "cproxy 测试通知",
+    message: str = "这是一条来自 cproxy 的连通性测试消息。",
+    as_json: bool = False,
+) -> int:
+    from .services.notify import (
+        clear_notify_config,
+        load_notify_config,
+        save_notify_config,
+        send_notification,
+    )
+
+    if action == "clear":
+        clear_notify_config(paths)
+        if as_json:
+            emit_json("notify", {"cleared": True})
+        else:
+            print("已清除主动告警通知配置")
+        return 0
+
+    if action == "set":
+        if webhook is None and not desktop:
+            print_error("错误: cproxy notify set 需要指定 --webhook <URL> 或 --desktop")
+            return 2
+        cfg = save_notify_config(paths, webhook_url=webhook, desktop=True if desktop else None)
+        if as_json:
+            emit_json("notify", cfg.to_dict())
+        else:
+            print(f"已保存通知配置: 渠道={cfg.channel_kind}，桌面通知={'开启' if cfg.desktop else '关闭'}")
+        return 0
+
+    if action == "test":
+        send_notification(paths, title, message, event="test", raise_on_error=True)
+        cfg = load_notify_config(paths)
+        if as_json:
+            emit_json("notify", {"tested": True, **cfg.to_dict()})
+        else:
+            print(f"测试通知已发送（渠道: {cfg.channel_kind}）")
+        return 0
+
+    cfg = load_notify_config(paths)
+    if as_json:
+        emit_json("notify", cfg.to_dict())
+        return 0
+    _print_section("主动告警通知")
+    _render_kv(
+        [
+            ("状态", _status_label("已启用") if cfg.enabled else "未配置"),
+            ("渠道类型", cfg.channel_kind),
+            ("Webhook", cfg.to_dict()["webhook_url"] or "-"),
+            ("桌面通知", "开启" if cfg.desktop else "关闭"),
+            ("配置来源", cfg.source),
+        ]
+    )
+    return 0
+
+
+def _run_prompt(paths: AppPaths, *, fmt: str = "compact", raw: bool = False) -> int:
+    from .services.prompt import collect_prompt_snapshot, format_prompt
+
+    snapshot = collect_prompt_snapshot(paths)
+    print(format_prompt(snapshot, fmt=fmt, raw=raw))
+    return 0
+
+
+def _run_rule(
+    paths: AppPaths,
+    action: str,
+    target: str | None = None,
+    policy: str | None = None,
+    *,
+    rule_type: str | None = None,
+    comment: str = "",
+    clear_all: bool = False,
+    apply: bool = False,
+    raw: bool = False,
+    as_json: bool = False,
+) -> int:
+    from .services.rules import add_custom_rule, load_custom_rules, remove_custom_rule
+
+    if action == "add":
+        if not (target and target.strip()):
+            print_error("错误: cproxy rule add 需要指定目标域名/IP/进程（如 cproxy rule add perplexity.ai ai）")
+            return 2
+        entry = add_custom_rule(paths, target, policy, rule_type=rule_type, comment=comment)
+        reloaded = False
+        if apply:
+            reloaded = _apply_runtime_reload_if_needed(paths)
+        if as_json:
+            emit_json("rule", {"added": entry.to_dict(), "applied": apply, "hot_reloaded": reloaded})
+            return 0
+        if raw:
+            print(f"RULE_ADDED\t{entry.format_mihomo_rule()}\tcomment={entry.comment or '-'}")
+            return 0
+        print(f"已添加置顶规则: {_accent(entry.format_mihomo_rule())}")
+        if entry.comment:
+            print(f"备注: {entry.comment}")
+        if apply:
+            print("运行配置: " + ("已重渲染并热重载生效" if reloaded else "已重渲染（代理未运行）"))
+        else:
+            print("提示: 下次 render / refresh 自动注入，或加 --apply 立即热重载")
+        return 0
+
+    if action == "remove":
+        if not clear_all and not (target and target.strip()):
+            print_error("错误: 请指定要移除的规则目标/序号，或使用 --all 清空")
+            return 2
+        removed = remove_custom_rule(paths, target, clear_all=clear_all)
+        reloaded = False
+        if removed and apply:
+            reloaded = _apply_runtime_reload_if_needed(paths)
+        if as_json:
+            emit_json(
+                "rule",
+                {
+                    "removed": [item.to_dict() for item in removed],
+                    "applied": apply,
+                    "hot_reloaded": reloaded,
+                },
+            )
+            return 0
+        if not removed:
+            print(f"未找到匹配的自定义规则: {target or '全部'}")
+            return 0
+        print(f"已移除自定义规则 ({len(removed)} 条): " + "、".join(r.format_mihomo_rule() for r in removed))
+        if apply:
+            print("运行配置: " + ("已重渲染并热重载生效" if reloaded else "已重渲染（代理未运行）"))
+        return 0
+
+    rules = load_custom_rules(paths)
+    if as_json:
+        emit_json("rule", {"rules": [item.to_dict() for item in rules]})
+        return 0
+    if raw:
+        for idx, item in enumerate(rules, start=1):
+            print(f"RULE\t{idx}\t{item.format_mihomo_rule()}\tcomment={item.comment or '-'}")
+        return 0
+    _print_section("自定义置顶分流规则")
+    if not rules:
+        print("当前没有自定义分流规则（示例: cproxy rule add perplexity.ai ai --apply）")
+        return 0
+    rows: list[list[TableCell]] = []
+    for idx, item in enumerate(rules, start=1):
+        rows.append(
+            [
+                (str(idx), (ANSI_DIM,)),
+                (item.rule_type, ()),
+                (item.value, (ANSI_CYAN,)),
+                (item.policy, (ANSI_GREEN,)),
+                (item.comment or "-", (ANSI_DIM,)),
+            ]
+        )
+    _render_table(["#", "类型", "匹配目标", "策略出口", "备注"], rows, aligns=["r", "l", "l", "l", "l"])
+    return 0
+
+
+def _run_flush(
+    paths: AppPaths,
+    target: str | None = None,
+    *,
+    stale: bool = False,
+    raw: bool = False,
+    as_json: bool = False,
+) -> int:
+    from .services.flush import flush_connections
+
+    report = flush_connections(paths, target, stale_only=stale)
+    if as_json:
+        emit_json("flush", report.to_dict())
+        return 0
+    if raw:
+        print(f"FLUSH\tmode={report.mode}\ttarget={report.target}\tscanned={report.scanned}\tclosed={len(report.closed)}")
+        for item in report.closed:
+            print(f"CLOSED\t{item.conn_id}\t{item.process}\t{item.host}\t{item.group}\t{item.old_leaf}->{item.active_leaf}")
+        return 0
+
+    _print_section("连接清理")
+    print(f"扫描连接: {report.scanned} 条  ·  模式: {report.target}")
+    if not report.closed:
+        print("没有需要断开的连接（当前无分裂或匹配的陈旧长连接）")
+        return 0
+    print(f"已断开连接: {_accent(len(report.closed))} 条")
+    rows: list[list[TableCell]] = []
+    for item in report.closed[:15]:
+        rows.append(
+            [
+                (item.process, (ANSI_CYAN,)),
+                (item.host, ()),
+                (item.group, ()),
+                (normalize_name(item.old_leaf), (ANSI_YELLOW,)),
+                (normalize_name(item.active_leaf), (ANSI_GREEN,)),
+            ]
+        )
+    _render_table(["进程", "目标主机", "策略组", "原滞留节点", "当前组出口"], rows)
+    return 0
+
+
+def _render_benchmark(paths: AppPaths, *, raw: bool = False, as_json: bool = False) -> int:
+    from .services.benchmark import evaluate_providers
+
+    cards = evaluate_providers(paths)
+    if as_json:
+        emit_json("benchmark", {"providers": [card.to_dict() for card in cards]})
+        return 0
+    if raw:
+        for card in cards:
+            print(
+                f"BENCHMARK\t{card.name}\tgrade={card.grade}\tscore={card.score}"
+                f"\talive={card.alive_nodes}/{card.total_nodes}\tavg_ms={card.avg_delay_ms or '-'}"
+                f"\tregions={card.regions_count}\tdedicated={card.dedicated_count}\tai_ready={card.ai_ready_count}"
+            )
+        return 0
+
+    _print_section("机场订阅健康度评分卡")
+    if not cards:
+        print("未找到可评估的机场节点")
+        return 0
+    rows: list[list[TableCell]] = []
+    for card in cards:
+        grade_color = (
+            (ANSI_GREEN, ANSI_BOLD)
+            if card.grade in {"S", "A"}
+            else ((ANSI_YELLOW,) if card.grade == "B" else (ANSI_RED,))
+        )
+        avg_str = f"{card.avg_delay_ms} ms" if card.avg_delay_ms is not None else "-"
+        min_str = f"{card.min_delay_ms} ms" if card.min_delay_ms is not None else "-"
+        rows.append(
+            [
+                (card.name, (ANSI_BOLD,)),
+                (f"{card.grade} ({card.score})", grade_color),
+                (f"{card.alive_nodes}/{card.total_nodes} ({card.alive_rate:.0f}%)", ()),
+                (avg_str, ()),
+                (min_str, (ANSI_DIM,)),
+                (str(card.regions_count), ()),
+                (str(card.dedicated_count), ()),
+                (str(card.ai_ready_count), (ANSI_CYAN,)),
+            ]
+        )
+    _render_table(
+        ["订阅源", "评级(分)", "存活率", "平均延迟", "最低延迟", "地区", "专线数", "AI就绪"],
+        rows,
+        aligns=["l", "l", "r", "r", "r", "r", "r", "r"],
+    )
+    return 0
+
+
+def _run_export(
+    paths: AppPaths,
+    *,
+    output: str | None = None,
+    redact: bool = False,
+    as_json: bool = False,
+) -> int:
+    import json as _json
+
+    import yaml as _yaml
+
+    from .services.bundle import export_bundle
+
+    bundle = export_bundle(paths, redact=redact)
+    if as_json and not output:
+        emit_json("export", bundle)
+        return 0
+    if output:
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.suffix.lower() == ".json" or as_json:
+            text = _json.dumps(bundle, ensure_ascii=False, indent=2) + "\n"
+        else:
+            text = _yaml.safe_dump(bundle, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        out_path.write_text(text, encoding="utf-8")
+        if as_json:
+            emit_json("export", {"output": str(out_path), "redacted": redact})
+        else:
+            print(f"已导出配置 Bundle: {_accent(out_path)}" + ("（已脱敏）" if redact else ""))
+        return 0
+
+    print(_yaml.safe_dump(bundle, allow_unicode=True, sort_keys=False, default_flow_style=False), end="")
+    return 0
+
+
+def _run_import(
+    paths: AppPaths,
+    file_path: str,
+    *,
+    replace: bool = False,
+    apply: bool = False,
+    as_json: bool = False,
+) -> int:
+    from .services.bundle import import_bundle
+
+    stats = import_bundle(paths, Path(file_path), merge=not replace)
+    reloaded = False
+    if apply:
+        reloaded = _apply_runtime_reload_if_needed(paths)
+    stats["applied"] = apply
+    stats["hot_reloaded"] = reloaded
+    if as_json:
+        emit_json("import", stats)
+        return 0
+    runtime_status = (
+        ("已重渲染并热重载生效" if reloaded else "已重渲染（代理未运行）")
+        if apply
+        else "未自动重渲染（加 --apply 立即生效）"
+    )
+    _print_section("Bundle 导入结果")
+    _render_kv(
+        [
+            ("配置项更新", f"{stats['config_keys_updated']} 项"),
+            ("自定义规则", f"{stats['custom_rules_imported']} 条"),
+            ("节点屏蔽项", f"{stats['bans_imported']} 条"),
+            ("稳定度排序", "已恢复" if stats["orders_restored"] else "未变更"),
+            ("运行配置", runtime_status),
+        ]
+    )
+    return 0
+
+

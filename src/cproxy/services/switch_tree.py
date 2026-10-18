@@ -239,10 +239,16 @@ def resolve_group_query(
     groups: dict[str, ProxyGroup],
     entries: tuple[SwitchChoice, ...],
 ) -> str:
-    """把用户输入的显示名或内部名收成 Mihomo 组名。找不到就 SystemExit。"""
+    """把用户输入的显示名、简写别名或内部名收成 Mihomo 组名。找不到就 SystemExit。"""
+    from ..names import resolve_group_alias
+
     needle = query.strip()
     if needle in groups:
         return needle
+    default_entry = next((item.key for item in entries if item.current), None)
+    aliased = resolve_group_alias(needle, groups.keys(), match_group=default_entry)
+    if aliased is not None:
+        return aliased
     choice = lookup_choice(needle, entries)
     if choice is None:
         raise SystemExit(f"错误: 未找到代理组: {query}\n{_suggest_group_hints(query, entries)}")

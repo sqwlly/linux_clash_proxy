@@ -222,9 +222,23 @@ def simulate_gemini_stream_hold(
                 pass
 
 
+NON_IEPL_HEALTHY_AVG_MS = 550
+NON_IEPL_HEALTHY_MAX_MS = 700
+
+
+def is_healthy_non_iepl_summary(summary: ProbeSummary | None) -> bool:
+    if summary is None or is_iepl_node(summary.name):
+        return False
+    if summary.success_count <= 0 or summary.failures > 0:
+        return False
+    if summary.avg_delay is None or summary.max_delay is None:
+        return False
+    return summary.avg_delay <= NON_IEPL_HEALTHY_AVG_MS and summary.max_delay <= NON_IEPL_HEALTHY_MAX_MS
+
+
 def probe_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False) -> tuple[int, int, int, int, int, int, str]:
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
-    iepl_tier = (1 if is_iepl_node(name) else 0) if prefer_non_iepl else 0
+    iepl_tier = (0 if is_healthy_non_iepl_summary(summary) else 1) if prefer_non_iepl else 0
     return (neg_success, failures, iepl_tier, max_plus_p, avg_plus_p, penalty, name)
 
 
@@ -300,7 +314,7 @@ def switch_skip_reason(
         return "没有可切换的成功节点"
     if current == best.name:
         return "当前已是推荐稳定节点"
-    if prefer_non_iepl and is_iepl_node(current) and not is_iepl_node(best.name):
+    if prefer_non_iepl and is_iepl_node(current) and is_healthy_non_iepl_summary(best):
         return ""
     if not current_verdict.stable or current_summary is None:
         return ""
@@ -381,12 +395,21 @@ class ProbeService:
 
         groups = self.api.get_groups()
         if group not in groups:
+            from ..names import resolve_group_alias
+
+            aliased = resolve_group_alias(group, groups.keys())
+            if aliased:
+                group = aliased
+        if group not in groups:
             from .switch_tree import suggest_groups_from_names
 
             hint = suggest_groups_from_names(group, list(groups.keys()))
             raise RuntimeError(f"错误: 未找到代理组或节点: {group}\n{hint}")
 
+        from .ban import filter_unbanned_nodes, load_active_bans
+
         candidates, switch_paths = collect_leaf_candidates(groups, group)
+        candidates = filter_unbanned_nodes(candidates, load_active_bans(self.paths), keep_fallback=True)
         current = resolve_current_leaf(groups, group)
 
         results: dict[str, dict] = {n: {"delays": [], "failures": 0} for n in candidates}

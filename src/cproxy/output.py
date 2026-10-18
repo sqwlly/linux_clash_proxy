@@ -157,6 +157,10 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("guard", "先选稳定 AI 出口，再按需注入代理执行命令"),
             ("ai-connections", "查看 AI/GitHub 相关活动连接"),
             ("incident", "输出 AI 出口故障排查报告"),
+            ("ban", "屏蔽故障节点并在渲染与探测时自动剔除"),
+            ("unban", "解除节点屏蔽并恢复候选资格"),
+            ("rule", "管理免改 YAML 的自定义置顶分流规则"),
+            ("flush", "精准掐断分裂出口或指定目标的活跃长连接"),
         ),
     ),
     (
@@ -170,6 +174,8 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "诊断与排障",
         (
+            ("why", "追查域名/URL/IP 命中的分流规则与出口链路"),
+            ("benchmark", "评估各订阅机场节点存活率、延迟与 AI 就绪度评分"),
             ("test", "测试代理连通性"),
             ("doctor", "检查本地状态并给出恢复建议"),
             ("security-check", "校验本地 GA 安全配置"),
@@ -185,12 +191,16 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("refresh", "更新订阅、渲染、重启并探测分组"),
             ("snapshots", "列出运行时/配置快照"),
             ("rollback", "回滚到历史快照"),
+            ("export", "导出可移植的多机配置与路由策略 Bundle"),
+            ("import", "从 Bundle 文件导入配置、自定义规则与屏蔽列表"),
+            ("notify", "配置或测试主动告警通知（Webhook / 桌面通知）"),
         ),
     ),
     (
         "交互界面",
         (
             ("tui", "启动终端 UI 面板"),
+            ("prompt", "输出供 Shell PS1 / tmux 使用的极速状态徽章"),
             ("completion", "输出或安装 shell 补全脚本"),
         ),
     ),
@@ -207,6 +217,10 @@ PROFILE_CHOICES = ("codex", "chatgpt", "github", "claude", "gemini")
 STRATEGY_CHOICES = ("conservative", "balanced", "aggressive")
 TRAFFIC_ACTIONS = ("show", "collect", "audit")
 TRAFFIC_DIMENSIONS = ("node", "rule", "host", "process")
+NOTIFY_ACTIONS = ("status", "set", "test", "clear")
+RULE_ACTIONS = ("list", "add", "remove")
+RULE_TYPE_CHOICES = ("suffix", "domain", "keyword", "cidr", "process")
+PROMPT_FORMAT_CHOICES = ("compact", "full", "tmux")
 
 # 命令名左对齐宽度：留出最长命令名（`migrate-from-legacy` 19 字符）的余量
 _COMMAND_NAME_WIDTH = 24
@@ -480,6 +494,76 @@ def build_root_parser() -> ArgumentParser:
     ipcheck_parser.add_argument("--group", help="检测期间临时切换的分组（给了 --node 时默认 CyberGuard）")
     ipcheck_parser.add_argument("--node", help="检测期间走该节点出口（临时切换分组，结束后自动恢复）")
     ipcheck_parser.add_argument("--timeout", type=int, default=30, help="请求超时秒数（默认 30）")
+
+    why_parser = _add_command(subparsers, "why", raw=True, json_output=True)
+    why_parser.add_argument("target", help="要追查的域名、完整 URL 或 IP")
+    why_parser.add_argument("--process", help="按指定发起进程名模拟匹配（如 agy、codex）")
+
+    ban_parser = _add_command(subparsers, "ban", raw=True, json_output=True)
+    ban_parser.add_argument("pattern", nargs="?", help="要屏蔽的节点名称或模糊简写（省略则列出当前屏蔽）")
+    ban_parser.add_argument("--hours", type=float, help="临时屏蔽时长（小时，省略则长期有效直至 unban）")
+    ban_parser.add_argument("--reason", default="", help="屏蔽原因备注（如 Claude 403、晚高峰丢包）")
+    ban_parser.add_argument("--apply", action="store_true", help="立即重渲染运行配置并热重载生效")
+
+    unban_parser = _add_command(subparsers, "unban")
+    unban_parser.add_argument("pattern", nargs="?", help="要解除屏蔽的节点关键词或模式")
+    unban_parser.add_argument("--all", action="store_true", dest="clear_all", help="清空全部节点屏蔽规则")
+    unban_parser.add_argument("--apply", action="store_true", help="立即重渲染运行配置并热重载生效")
+
+    notify_parser = _add_command(subparsers, "notify", json_output=True)
+    notify_parser.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=NOTIFY_ACTIONS,
+        help="通知动作：status（查看配置）、set（保存配置）、test（发送测试通知）、clear（清除配置）",
+    )
+    notify_parser.add_argument("--webhook", help="Webhook URL（支持飞书 / Telegram / Bark / Discord / Slack / 通用 JSON）")
+    notify_parser.add_argument("--desktop", action="store_true", help="启用本地桌面通知（notify-send）")
+    notify_parser.add_argument("--title", default="cproxy 测试通知", help="test 动作的通知标题")
+    notify_parser.add_argument("--message", default="这是一条来自 cproxy 的连通性测试消息。", help="test 动作的通知正文")
+
+    prompt_parser = _add_command(subparsers, "prompt", raw=True)
+    prompt_parser.add_argument(
+        "--format",
+        choices=PROMPT_FORMAT_CHOICES,
+        default="compact",
+        help="输出样式：compact（默认）、full（同时展示通用与 Gemini）、tmux（带 tmux 颜色码）",
+    )
+
+    rule_parser = _add_command(subparsers, "rule", raw=True, json_output=True)
+    rule_parser.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=RULE_ACTIONS,
+        help="规则动作：list（列出规则）、add（添加置顶规则）、remove（移除规则）",
+    )
+    rule_parser.add_argument("target", nargs="?", help="域名/URL/IP/进程名，或完整规则串，或要移除的序号")
+    rule_parser.add_argument("policy", nargs="?", help="目标策略或简写（如 ai、gemini、direct、reject、default，默认 ai）")
+    rule_parser.add_argument("--type", choices=RULE_TYPE_CHOICES, dest="rule_type", help="显式指定匹配类型（默认自动推断）")
+    rule_parser.add_argument("--comment", default="", help="规则备注说明")
+    rule_parser.add_argument("--all", action="store_true", dest="clear_all", help="与 remove 一起使用：清空全部自定义规则")
+    rule_parser.add_argument("--apply", action="store_true", help="立即重渲染运行配置并热重载生效")
+
+    flush_parser = _add_command(subparsers, "flush", raw=True, json_output=True)
+    flush_parser.add_argument(
+        "target",
+        nargs="?",
+        help="要断开的目标：ai、gemini、all、域名或进程名（省略则默认只清理分裂旧连接）",
+    )
+    flush_parser.add_argument("--stale", action="store_true", help="仅断开滞留在非当前出口节点上的分裂旧连接")
+
+    _add_command(subparsers, "benchmark", raw=True, json_output=True)
+
+    export_parser = _add_command(subparsers, "export", json_output=True)
+    export_parser.add_argument("-o", "--output", help="输出文件路径（省略则打印到 stdout）")
+    export_parser.add_argument("--redact", action="store_true", help="对订阅链接与密钥进行脱敏，便于安全分享")
+
+    import_parser = _add_command(subparsers, "import", json_output=True)
+    import_parser.add_argument("file", help="要导入的 Bundle 文件路径（YAML 或 JSON）")
+    import_parser.add_argument("--replace", action="store_true", help="覆盖而非合并现有的自定义规则与屏蔽列表")
+    import_parser.add_argument("--apply", action="store_true", help="导入后立即重渲染运行配置并热重载生效")
 
     _add_command(subparsers, "tui")
 

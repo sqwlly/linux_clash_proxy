@@ -18,7 +18,7 @@ from ..backend.runtime import (
     RuntimeBackend,
 )
 from ..config import AppPaths, load_yaml_file, runtime_file
-from ..names import resolve_candidate
+from ..names import match_candidates_fuzzy, normalize_name, resolve_candidate, resolve_group_alias
 
 AI_SWITCH_DROP_GROUPS = frozenset(
     {
@@ -112,18 +112,27 @@ class QueryService:
         self.groups_snapshot = groups
         group = groups.get(group_name)
         if not group:
+            aliased = resolve_group_alias(group_name, groups.keys(), match_group=self.match_rule_group())
+            if aliased:
+                group_name = aliased
+                group = groups.get(group_name)
+        if not group:
             raise SystemExit(f"错误: 未找到代理组: {group_name}")
 
         group_type = str(group.type).lower()
         if group_type not in {"selector", "select", "fallback"}:
             raise SystemExit(f"错误: 代理组 [{group_name}] 不是可手动切换的 Selector 类型")
         # 面板展示会经 normalize_name 剥掉 emoji 与 `丨`（`🇯🇵 Japan` → `Japan`），
-        # 用户照屏幕上的名字输入是自然行为——按规范化名再解析一次候选，
-        # 避免出现「照着显示敲却切不动」
+        # 用户照屏幕上的名字或模糊简写（如 kr01）输入是自然行为——按规范化与模糊规则解析候选
         resolved = resolve_candidate(target_name, group.candidates)
         if resolved is None:
+            fuzzy_hits = match_candidates_fuzzy(target_name, group.candidates)
+            ambiguous_note = ""
+            if len(fuzzy_hits) > 1:
+                preview = "、".join(normalize_name(item) for item in fuzzy_hits[:6])
+                ambiguous_note = f"\n匹配到多个候选: {preview}"
             raise SystemExit(
-                f"错误: 目标 [{target_name}] 不在代理组 [{group_name}] 的候选列表中\n"
+                f"错误: 目标 [{target_name}] 不在代理组 [{group_name}] 的候选列表中{ambiguous_note}\n"
                 f"提示: cproxy list-nodes {group_name} 查看候选"
             )
         target_name = resolved

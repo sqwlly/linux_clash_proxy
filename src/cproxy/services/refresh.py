@@ -80,6 +80,9 @@ LOCAL_PREFERRED_KEYS = {
     "ai-probe-timeout",
     "ai-gemini-prefer",
     "ai-manual-prefer",
+    "max-ai-multiplier",
+    "notify-webhook",
+    "notify-desktop",
     "refresh-groups",
     "subscriptions",
     "profile",
@@ -414,6 +417,7 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
         raise RuntimeError(f"{exc}{hint}") from exc
     if not isinstance(data, dict) or not data.get("proxies"):
         raise RuntimeError("错误: 订阅未返回任何节点")
+    record_subscription_info(paths, MAIN_SUBSCRIPTION_KEY, userinfo, data.get("proxies"))
 
     path = config_file(paths)
     existing = read_config(paths)
@@ -621,6 +625,7 @@ def apply_extra_subscriptions(
             raw, userinfo = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
             record_subscription_info(paths, name, userinfo)
             data = parse_subscription_payload(raw)
+            record_subscription_info(paths, name, userinfo, data.get("proxies"))
             valid_proxies = [
                 proxy
                 for proxy in data.get("proxies") or []

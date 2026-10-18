@@ -18,6 +18,11 @@ from .probe_history import load_history_rows, probe_history_file
 AI_HOST_KEYWORDS = (
     "chatgpt", "openai", "claude", "anthropic", "github",
     "gemini", "google", "antigravity", "googleapis",
+    "moonshot", "minimaxi", "minimax", "deepseek", "dashscope",
+    "grok", "x.ai",
+)
+AI_KNOWN_PROCESSES = (
+    "agy", "claude", "codex", "gemini", "cursor", "aider", "opencode", "kimi",
 )
 
 
@@ -29,9 +34,92 @@ class AIConnection:
 
 
 @dataclass(frozen=True)
+class AIProcessRoute:
+    process: str
+    host: str
+    count: int
+    route: str
+
+
+@dataclass(frozen=True)
 class IncidentSection:
     title: str
     lines: list[str]
+
+
+def _process_basename(metadata: dict) -> str:
+    raw = str(metadata.get("process") or metadata.get("processPath") or "").strip()
+    if not raw:
+        return "-"
+    base = raw.rsplit("/", 1)[-1].removesuffix(" (deleted)")
+    if base.startswith("agy.") and base.endswith(".old"):
+        return "agy"
+    return base or "-"
+
+
+def _is_known_ai_process(proc_name: str) -> bool:
+    lower = proc_name.lower()
+    return any(lower == item or lower.startswith(f"{item}.") or lower.startswith(f"{item}-") for item in AI_KNOWN_PROCESSES)
+
+
+def _format_merged_hosts(host_counts: Counter[str]) -> str:
+    ordered = [host for host, _ in host_counts.most_common()]
+    if not ordered:
+        return "-"
+    if len(ordered) == 1:
+        return ordered[0]
+    if len(ordered) == 2:
+        return f"{ordered[0]}, {ordered[1]}"
+    return f"{ordered[0]}, {ordered[1]} 等 {len(ordered)} 个"
+
+
+def get_active_ai_processes(paths: AppPaths) -> list[AIProcessRoute]:
+    """查询当前活跃的 AI 进程，按（进程, 顶层策略组）合并目标域名与连接数。"""
+    api = APIBackend(paths)
+    payload = api.get_connections()
+    connections = payload.get("connections") if isinstance(payload, dict) else []
+    if not isinstance(connections, list):
+        return []
+
+    counts: Counter[tuple[str, str]] = Counter()
+    host_buckets: defaultdict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    routes: defaultdict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    for item in connections:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            continue
+        host = str(
+            metadata.get("host")
+            or metadata.get("sniffHost")
+            or metadata.get("remoteDestination")
+            or "-"
+        ).lower()
+        proc = _process_basename(metadata)
+        if proc == "-":
+            continue
+        host_hit = any(keyword in host for keyword in AI_HOST_KEYWORDS)
+        proc_hit = _is_known_ai_process(proc)
+        if not host_hit and not proc_hit:
+            continue
+        chains = item.get("chains") or []
+        policy_group = str(chains[-1]) if chains else "-"
+        route = " -> ".join(str(part) for part in reversed(chains[:3])) if chains else "-"
+        key = (proc, policy_group)
+        counts[key] += 1
+        host_buckets[key][host] += 1
+        routes[key][route] += 1
+
+    return [
+        AIProcessRoute(
+            process=proc,
+            host=_format_merged_hosts(host_buckets[(proc, policy_group)]),
+            count=count,
+            route=routes[(proc, policy_group)].most_common(1)[0][0],
+        )
+        for (proc, policy_group), count in counts.most_common(15)
+    ]
 
 
 def get_ai_connections(paths: AppPaths) -> list[AIConnection]:
