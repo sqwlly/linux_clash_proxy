@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import socket
+import ssl
+import time
 from dataclasses import dataclass
 from math import ceil
 
@@ -12,6 +15,10 @@ from .probe_history import load_history_penalties, probe_history_file, record_pr
 
 DEFAULT_GROUP = "AI-MANUAL"
 DEFAULT_TIMEOUT_MS = 8000
+GEMINI_HOLD_HOST = "daily-cloudcode-pa.googleapis.com"
+GEMINI_HOLD_PORT = 443
+GEMINI_HOLD_PATH = "/v1internal:streamGenerateContent?alt=sse"
+GEMINI_HOLD_SECONDS = 15.5
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,66 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
 
 def is_iepl_node(name: str | None) -> bool:
     return bool(name and "IEPL" in name.upper())
+
+
+def simulate_gemini_stream_hold(
+    proxy_host: str = "127.0.0.1",
+    proxy_port: int = 7890,
+    hold_seconds: float = GEMINI_HOLD_SECONDS,
+    timeout: float = 10.0,
+) -> tuple[bool, str]:
+    """模拟 agy 的 Gemini 真实长连接：HTTP CONNECT → TLS 握手 → 保持连接越过 15s 空闲掐流阈值 →
+    发送 streamGenerateContent POST 并校验 HTTP 响应状态行。
+
+    用于捕获「短包 delay_test 看似正常，但 15s 空闲 / 50s 长思考必被中转机 EOF 掐断
+    或触发 xtls-rprx-vision `tls: bad record MAC`」的节点。
+    """
+    raw_sock: socket.socket | None = None
+    tls_sock: ssl.SSLSocket | None = None
+    try:
+        raw_sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+        connect_req = (
+            f"CONNECT {GEMINI_HOLD_HOST}:{GEMINI_HOLD_PORT} HTTP/1.1\r\n"
+            f"Host: {GEMINI_HOLD_HOST}:{GEMINI_HOLD_PORT}\r\n\r\n"
+        ).encode("ascii")
+        raw_sock.sendall(connect_req)
+        banner = raw_sock.recv(4096)
+        first_line = banner.splitlines()[0].decode("latin-1", "replace") if banner else ""
+        if " 200 " not in first_line:
+            return False, f"CONNECT 失败: {first_line or 'EOF'}"
+
+        ctx = ssl.create_default_context()
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=GEMINI_HOLD_HOST)
+        tls_sock.settimeout(timeout)
+        if hold_seconds > 0:
+            time.sleep(hold_seconds)
+        post_req = (
+            f"POST {GEMINI_HOLD_PATH} HTTP/1.1\r\n"
+            f"Host: {GEMINI_HOLD_HOST}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 2\r\n\r\n{}"
+        ).encode("ascii")
+        tls_sock.sendall(post_req)
+        resp = tls_sock.recv(1024)
+        if not resp:
+            return False, "保持连接后读取 EOF"
+        status_line = resp.splitlines()[0].decode("latin-1", "replace").strip()
+        if not status_line.startswith("HTTP/1."):
+            return False, f"非预期响应: {status_line}"
+        return True, status_line
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        if tls_sock is not None:
+            try:
+                tls_sock.close()
+            except OSError:
+                pass
+        elif raw_sock is not None:
+            try:
+                raw_sock.close()
+            except OSError:
+                pass
 
 
 def probe_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False) -> tuple[int, int, int, int, int, int, str]:

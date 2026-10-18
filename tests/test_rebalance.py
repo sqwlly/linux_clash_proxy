@@ -558,3 +558,106 @@ def test_probe_round_elimination_prefers_non_iepl_for_gemini():
     kept = active_candidates_after_round(results, current=None, prefer_non_iepl=True)
     assert kept == {"🇬🇧英国 01 | 1X", "🇰🇷韩国 01 | 1X"}
 
+
+def test_render_enables_15s_tcp_keepalive(tmp_path):
+    rendered = _render(tmp_path)
+    assert rendered["disable-keep-alive"] is False
+    assert rendered["keep-alive-idle"] == 15
+    assert rendered["keep-alive-interval"] == 15
+
+
+def test_simulate_gemini_stream_hold_detects_eof_and_valid_response(monkeypatch):
+    from cproxy.services import probe as probe_mod
+
+    class _FakeTLS:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+            self.closed = False
+
+        def settimeout(self, _t):
+            pass
+
+        def sendall(self, _data: bytes):
+            pass
+
+        def recv(self, _n: int) -> bytes:
+            return self._payload
+
+        def close(self):
+            self.closed = True
+
+    class _FakeRaw:
+        def sendall(self, _data: bytes):
+            pass
+
+        def recv(self, _n: int) -> bytes:
+            return b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(probe_mod.socket, "create_connection", lambda *_a, **_k: _FakeRaw())
+    monkeypatch.setattr(
+        probe_mod.ssl,
+        "create_default_context",
+        lambda: SimpleNamespace(wrap_socket=lambda _s, server_hostname=None: _FakeTLS(b"HTTP/1.1 401 Unauthorized\r\n\r\n")),
+    )
+    ok, reason = probe_mod.simulate_gemini_stream_hold(hold_seconds=0.0)
+    assert ok is True
+    assert "401" in reason
+
+    monkeypatch.setattr(
+        probe_mod.ssl,
+        "create_default_context",
+        lambda: SimpleNamespace(wrap_socket=lambda _s, server_hostname=None: _FakeTLS(b"")),
+    )
+    ok_eof, reason_eof = probe_mod.simulate_gemini_stream_hold(hold_seconds=0.0)
+    assert ok_eof is False
+    assert "EOF" in reason_eof
+
+
+def test_verify_gemini_stream_hold_demotes_failing_node_and_switches(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services import probe as probe_mod
+
+    paths = _paths(tmp_path)
+    order_path = ai_gemini_order_file(paths)
+    switched: list[tuple[str, str]] = []
+    state = {"current": "NODE-BAD"}
+
+    class _FakeAPI:
+        def get_groups(self):
+            return {
+                "AI-GEMINI": ProxyGroup(
+                    name="AI-GEMINI",
+                    type="fallback",
+                    current=state["current"],
+                    candidates=["NODE-BAD", "NODE-GOOD"],
+                )
+            }
+
+    class _FakeQuery:
+        def __init__(self, _p):
+            self.api = _FakeAPI()
+
+        def switch_group(self, group: str, target: str):
+            switched.append((group, target))
+            state["current"] = target
+
+    outcomes = iter([(False, "保持连接后读取 EOF"), (True, "HTTP/1.1 401 Unauthorized")])
+    monkeypatch.setattr(probe_mod, "simulate_gemini_stream_hold", lambda **_kw: next(outcomes))
+    monkeypatch.setattr(rebalance_mod, "QueryService", _FakeQuery)
+    monkeypatch.setattr(rebalance_mod, "RuntimeBackend", lambda _p: SimpleNamespace(mixed_port=lambda: 7890))
+
+    ordered, new_switch = RebalanceService(paths)._verify_gemini_stream_hold(
+        ["NODE-BAD", "NODE-GOOD"],
+        order_path,
+        switched_to=None,
+    )
+    assert ordered == ["NODE-GOOD", "NODE-BAD"]
+    assert new_switch == "NODE-GOOD"
+    assert switched == [("AI-GEMINI", "NODE-GOOD")]
+    assert json.loads(order_path.read_text(encoding="utf-8")) == ["NODE-GOOD", "NODE-BAD"]
+
+

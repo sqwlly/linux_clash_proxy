@@ -192,6 +192,12 @@ class RebalanceService:
             gemini_switched_to = self._switch_if_current_unstable(
                 gemini_report, effective_gemini_order[0], AI_GEMINI_GROUP
             )
+            if type(probe_service) is ProbeService:
+                effective_gemini_order, gemini_switched_to = self._verify_gemini_stream_hold(
+                    list(effective_gemini_order),
+                    gemini_order_path,
+                    gemini_switched_to,
+                )
 
         return RebalanceReport(
             ordered=tuple(effective_order),
@@ -203,6 +209,61 @@ class RebalanceService:
             gemini_order_path=str(gemini_order_path) if effective_gemini_order else "",
             gemini_switched_to=gemini_switched_to,
         )
+
+    def _verify_gemini_stream_hold(
+        self,
+        ordered: list[str],
+        order_path,
+        switched_to: str | None,
+        max_attempts: int = 3,
+    ) -> tuple[list[str], str | None]:
+        """对 AI-GEMINI 当前生效节点做一次模拟长连接保持验毒（Hold Probe）。
+
+        若当前节点在保持期间发生 15s 空闲 EOF 或 TLS bad record MAC，则将其降级到列表尾部，
+        并依次切换到下一个候选复测，确保最终落地的 AI-GEMINI 出口具备长连接存活能力。
+        """
+        from .probe import simulate_gemini_stream_hold
+
+        try:
+            query = QueryService(self.paths)
+            group_obj = query.api.get_groups().get(AI_GEMINI_GROUP)
+            if group_obj is None:
+                return ordered, switched_to
+            active_node = switched_to or str(group_obj.current or "") or (ordered[0] if ordered else "")
+            proxy_port = RuntimeBackend(self.paths).mixed_port()
+        except Exception:
+            return ordered, switched_to
+
+        tried: set[str] = set()
+        demoted = False
+        for _ in range(max(1, max_attempts)):
+            if not active_node or active_node in tried:
+                break
+            tried.add(active_node)
+            ok, _reason = simulate_gemini_stream_hold(proxy_port=proxy_port)
+            if ok:
+                break
+            if active_node in ordered:
+                ordered.remove(active_node)
+                ordered.append(active_node)
+                demoted = True
+            next_candidate = next((c for c in ordered if c not in tried), None)
+            if not next_candidate:
+                break
+            try:
+                query.switch_group(AI_GEMINI_GROUP, next_candidate)
+                switched_to = next_candidate
+                active_node = next_candidate
+            except Exception:
+                break
+
+        if demoted:
+            try:
+                order_path.parent.mkdir(parents=True, exist_ok=True)
+                order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
+        return ordered, switched_to
 
     def _switch_if_current_unstable(
         self,

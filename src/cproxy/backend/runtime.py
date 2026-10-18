@@ -642,6 +642,20 @@ class RuntimeBackend:
     def __init__(self, paths: AppPaths):
         self.paths = paths
 
+    def mixed_port(self) -> int:
+        for candidate in (runtime_file(self.paths), config_file(self.paths)):
+            if not candidate.exists():
+                continue
+            try:
+                data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                port = data.get("mixed-port") or data.get("port")
+                if isinstance(port, int) and port > 0:
+                    return port
+        return 7890
+
     def get_groups(self) -> dict[str, ProxyGroup]:
         path = runtime_file(self.paths)
         if not path.exists():
@@ -683,6 +697,14 @@ class RuntimeBackend:
         # 每个连接都查找发起进程，供 /connections API 与流量统计按进程归因
         if not data.get("find-process-mode"):
             data["find-process-mode"] = "always"
+
+        # 开启 15s TCP Keep-Alive（mihomo 默认 KeepAliveIdle/Interval 为 0，会退回内核默认 7200s），
+        # 防止 agy / codex 在本地执行工具或等待用户输入（15~60s 空闲）期间连接被沿途 NAT/网关静默回收。
+        data["disable-keep-alive"] = False
+        if not data.get("keep-alive-idle"):
+            data["keep-alive-idle"] = 15
+        if not data.get("keep-alive-interval"):
+            data["keep-alive-interval"] = 15
 
         rule_providers = data.get("rule-providers")
         if not isinstance(rule_providers, dict):
