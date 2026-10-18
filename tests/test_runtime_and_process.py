@@ -564,66 +564,82 @@ def test_start_refuses_when_mixed_port_already_listening(tmp_path: Path):
         listener.close()
 
 
-def test_production_service_guard_checks_the_user_level_unit(tmp_path: Path, monkeypatch):
-    """生产代理是**用户级** `cproxy.service`，守卫必须查 `--user` 那一份。
+def test_restart_succeeds_when_user_cproxy_service_is_active(tmp_path: Path, monkeypatch):
+    """`cproxy.service` 就是 cproxy 自身（`ExecStart=cproxy start` / `ExecReload=cproxy restart`）。
 
-    它当年查的是系统级 legacy `clash-proxy.service`（那个单元已随退役删除），所以那几处
-    调用一直空转。这里同时锁住单元名与 `--user`：少了 `--user` 就查不到用户级单元。
+    回归：若 `start()` 因 `systemctl --user is-active cproxy.service == 0` 抛
+    `ForeignInstanceError`，则 `restart()` 在 `stop()` 杀掉旧进程后会立刻被自己的
+    `start()` 拦死（`ExecReload` 时单元状态为 `reloading`，`is-active` 同样返回 0）。
+    这里不 mock `backend.start`，走真实的 `start() -> restart() -> stop()` 完整链路。
     """
     from cproxy.backend import process as process_module
     from cproxy.backend.process import SYSTEMD_SERVICE_NAME, ProcessBackend
+    from cproxy.config import default_paths, runtime_file
 
     assert SYSTEMD_SERVICE_NAME == "cproxy.service"
+
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    paths.data_dir.mkdir(parents=True)
+    runtime_file(paths).write_text("mode: rule\n", encoding="utf-8")
+
+    fake_bin = tmp_path / "fake-mihomo.sh"
+    fake_bin.write_text(
+        "#!/bin/bash\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
+        encoding="utf-8",
+    )
+    fake_bin.chmod(0o755)
+    (paths.config_dir / "config.yaml").write_text(
+        f"mixed-port: 0\nexternal-controller: 127.0.0.1:{_free_port()}\nprogram-path: {fake_bin}\n",
+        encoding="utf-8",
+    )
+
+    ran: list[list[str]] = []
+
+    class _ActiveResult:
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        ran.append(list(argv))
+        return _ActiveResult()
+
+    monkeypatch.delenv("CPROXY_NO_SYSTEMD", raising=False)
+    monkeypatch.setattr(process_module.subprocess, "run", _fake_run)
+
+    backend = ProcessBackend(paths)
+    try:
+        pid1 = backend.start()
+        assert pid1 > 0
+        pid2 = backend.restart()
+        assert pid2 > 0
+        assert pid2 != pid1
+        assert backend.is_running() is True
+        assert ran == []  # start/restart 均不调 systemctl
+    finally:
+        backend.stop()
+
+
+def test_incident_queries_user_level_cproxy_service(tmp_path: Path, monkeypatch):
+    """`cproxy incident` 的服务诊断必须查用户级 `--user cproxy.service`。"""
+    from cproxy.config import default_paths
+    from cproxy.services import ops as ops_module
 
     calls: list[list[str]] = []
 
     class _Result:
-        returncode = 0  # 假装「正在运行」
+        returncode = 0
+        stdout = "ActiveState=active\nSubState=running\n"
 
     def _fake_run(argv, **kwargs):
         calls.append(list(argv))
         return _Result()
 
-    monkeypatch.delenv("CPROXY_NO_SYSTEMD", raising=False)
-    monkeypatch.setattr(process_module.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(process_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(ops_module.subprocess, "run", _fake_run)
+    sections = ops_module.build_incident(default_paths(tmp_path))
+    service_sec = next(sec for sec in sections if sec.title == "service")
 
-    assert ProcessBackend._production_service_active() is True
-    assert calls == [["/usr/bin/systemctl", "--user", "is-active", "cproxy.service"]]
-
-
-def test_production_service_guard_stays_out_of_the_way_when_inactive(tmp_path: Path, monkeypatch):
-    from cproxy.backend import process as process_module
-    from cproxy.backend.process import ProcessBackend
-
-    class _Result:
-        returncode = 3  # inactive / activating（forking 单元自身启动时就是这个）
-
-    monkeypatch.delenv("CPROXY_NO_SYSTEMD", raising=False)
-    monkeypatch.setattr(process_module.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(process_module.subprocess, "run", lambda argv, **kwargs: _Result())
-
-    assert ProcessBackend._production_service_active() is False
-
-
-def test_restart_never_shells_out_to_systemctl(tmp_path: Path, monkeypatch):
-    """`restart()` 就是 `cproxy.service` 的 `ExecReload`——再回头调 systemd 会自我递归，
-    所以它只能是 stop+start。"""
-    from cproxy.backend import process as process_module
-    from cproxy.backend.process import ProcessBackend
-    from cproxy.config import default_paths
-
-    backend = ProcessBackend(default_paths(tmp_path))
-    ran: list[list[str]] = []
-    monkeypatch.setattr(process_module.subprocess, "run", lambda argv, **kwargs: ran.append(list(argv)))
-
-    stopped: list[bool] = []
-    monkeypatch.setattr(backend, "stop", lambda: stopped.append(True))
-    monkeypatch.setattr(backend, "start", lambda: 4242)
-
-    assert backend.restart() == 4242
-    assert stopped == [True]
-    assert ran == []  # 没有任何 systemctl 调用
+    assert calls[0][:4] == ["systemctl", "--user", "show", "cproxy.service"]
+    assert "ActiveState=active" in service_sec.lines
 
 
 def test_render_auto_creates_region_groups_from_proxy_names(tmp_path: Path):

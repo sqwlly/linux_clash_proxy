@@ -164,7 +164,8 @@ class AIRouteScreen(Widget):
             return
         probe_table = self.query_one("#ai-probe-table", DataTable)
         status = "[#a3e635]● 正常[/]" if item.ok else "[#fb7185]○ 失败[/]"
-        detail = item.detail or item.url
+        # 成功时显示探测地址而非 HTTP 401/403（可达但需鉴权，摆在「正常」旁像故障码）
+        detail = item.url if item.ok else (item.detail or item.url)
         if item.name in probe_table.rows:
             probe_table.update_cell(item.name, "status", status, update_width=True)
             probe_table.update_cell(item.name, "detail", detail, update_width=True)

@@ -17,6 +17,7 @@ from ...runtime import render_runtime
 from ...services.diagnostics import DiagnosticsService
 from ...services.query import QueryService
 from ...services.switch_tree import SwitchChoice, build_switch_tree, extra_subscription_names
+from ..ai_status import delay_text
 from ..widgets import NavigationDataTable as DataTable
 
 _PLACEHOLDER_KEY = "__placeholder__"
@@ -204,8 +205,8 @@ class ProxiesScreen(Widget):
                 for node in self._current_group.candidates:
                     is_current = node == self._current_group.current
                     delay = "─"
-                    if is_current and self._current_group.delay:
-                        delay = f"{self._current_group.delay}ms"
+                    if is_current and isinstance(self._current_group.delay, int):
+                        delay = delay_text(self._current_group.delay)
                     prefix = "[#a3e635]●[/] " if is_current else "  "
                     rows[node] = (f"{prefix}{node}", delay)
             else:

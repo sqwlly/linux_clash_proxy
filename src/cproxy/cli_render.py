@@ -110,10 +110,6 @@ def _group_value(group, key: str, default=None):
     return group.get(key, default)
 
 
-def _format_delay_label(delay) -> str:
-    return f"{delay}ms" if isinstance(delay, int) else "-"
-
-
 @lru_cache(maxsize=1)
 def _output_config() -> dict:
     try:
@@ -260,19 +256,15 @@ def _section_heading(title: str, *, icon: str = "▸") -> str:
 _SECTION_RULE_WIDTH = 36
 
 
-def _section_rule(width: int | None = None) -> str:
-    """标题下的细分隔线；配色与标题一致，NO_COLOR 下为普通横线。
-
-    `width` 让表格化的区块把分隔线拉齐到表宽（`cproxy ai-status` 用），
-    缺省仍是定长的 `_SECTION_RULE_WIDTH`。
-    """
-    return _style("─" * (width if width else _SECTION_RULE_WIDTH), ANSI_BLUE)
+def _section_rule() -> str:
+    """标题下的细分隔线；配色与标题一致，NO_COLOR 下为普通横线。"""
+    return _style("─" * _SECTION_RULE_WIDTH, ANSI_BLUE)
 
 
-def _print_section(title: str, *, rule_width: int | None = None, rule: bool = True) -> None:
+def _print_section(title: str, *, rule: bool = True) -> None:
     print(_section_heading(title))
     if rule:
-        print(_section_rule(rule_width))
+        print(_section_rule())
 
 
 #: 表格列间距
@@ -290,16 +282,6 @@ def _table_widths(headers: list[str], rows: list[list[TableCell]]) -> list[int]:
     ]
 
 
-def _table_rule_width(widths: list[int]) -> int:
-    """表格实际占用的显示宽度，供分隔线拉齐。"""
-    return sum(widths) + _display_width(_TABLE_GUTTER) * (len(widths) - 1)
-
-
-def _table_grid_width(widths: list[int]) -> int:
-    """带行列分隔线时的表格宽度：每列两侧各一空格，列间/两端各一条竖线。"""
-    return sum(widths) + 2 * len(widths) + (len(widths) + 1)
-
-
 def _render_table(
     headers: list[str],
     rows: list[list[TableCell]],
@@ -307,8 +289,8 @@ def _render_table(
     aligns: list[str] | None = None,
     widths: list[int] | None = None,
     grid: bool = False,
-) -> int:
-    """渲染列对齐的表格，返回其显示宽度（供分隔线对齐）。
+) -> None:
+    """渲染列对齐的表格。
 
     单元格传**未着色文本 + 上色码**，pad 到列宽之后再上色——与
     `_render_traffic_table` 同一心法，ANSI 转义不会掺进宽度计算（CJK 走
@@ -318,10 +300,9 @@ def _render_table(
     浅色），表宽相应变宽；缺省只用列间距，留给不需要视觉重量表的调用方。
 
     列宽完全由内容决定，不感知终端宽度：过窄的终端会折行，但不会丢信息。
-    `widths` 可由调用方预先算好（它要先拿宽度去定分隔线长度）。
     """
     if not rows:
-        return 0
+        return
     aligns = aligns or ["l"] * len(headers)
     widths = widths if widths is not None else _table_widths(headers, rows)
 
@@ -343,11 +324,11 @@ def _render_table(
         print(node("┌", "┬", "┐"))
         print(grid_line(cells_of([(header, (ANSI_BOLD,)) for header in headers])))
         # 逐行之间也画横线：只隔列不隔行时，相邻行的值容易连读成同一格
-        for index, row in enumerate(rows):
+        for row in rows:
             print(node("├", "┼", "┤"))
             print(grid_line(cells_of(row)))
         print(node("└", "┴", "┘"))
-        return _table_grid_width(widths)
+        return
 
     def plain_line(cells: list[str]) -> str:
         return _TABLE_GUTTER.join(cells).rstrip()
@@ -355,12 +336,13 @@ def _render_table(
     print(plain_line(cells_of([(header, (ANSI_BOLD,)) for header in headers])))
     for row in rows:
         print(plain_line(cells_of(row)))
-    return _table_rule_width(widths)
 
 
 def _exit_summary(group_name: object, node: object, delay: object) -> str:
     summary = f"{group_name} -> {normalize_name(node)}"
-    if isinstance(delay, int):
+    # `None`（无 history）与 `0`（本轮未测得）同属 `unknown`，都不附括号后缀，
+    # 避免两边行为分裂；仅在有实测值（`NNNms`）或明确超时（`超时`）时标注。
+    if isinstance(delay, int) and delay_state(delay) != "unknown":
         summary = f"{summary} ({_exit_delay_label(delay)})"
     return summary
 
@@ -476,9 +458,9 @@ def _render_current(groups: dict, group_name: str, raw: bool, json_output: bool 
         print(f"代理组  : {group_name}")
         if group_type:
             print(f"组类型  : {group_type}")
-        if delay is not None and delay != "-":
-            print(f"延迟    : {_format_delay_label(delay)}")
-        if alive is not None and alive != "-":
+        if isinstance(delay, int):
+            print(f"延迟    : {_exit_delay_label(delay)}")
+        if alive is not None and alive != "-" and (not isinstance(delay, int) or delay_state(delay) == "ok"):
             status = "正常" if alive is True else "异常" if alive is False else "未知"
             print(f"状态    : {_status_label(status)}")
         if candidates:

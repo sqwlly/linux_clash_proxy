@@ -152,9 +152,10 @@ README 已声明 cproxy 的目标是替代 `proxy.sh` 工作流，但没有明�
 删前逐个复核 `is-active`（6 个 legacy 均 inactive，唯一 active 的 `traffic-collector.timer` 予以保留），
 并打包到 `/root/legacy-system-backup-20261017.tar.gz`（回滚：`tar xzf … -C /`）。
 
-**同批修掉的连带遗留**：`process.py` 的 systemd 守卫曾指向 legacy 服务名（当年正确、退役后空转），
-已改查**用户级** `cproxy.service` 并带 `--user`；`restart()` 刻意不调 systemd（它是该单元的
-`ExecReload`，会自我递归）。详见 `STATUS.md` 的「已知遗留项」。
+**同批修掉的连带遗留**：`process.py` 与 `ops.py` 的 systemd 单元引用曾指向 legacy 服务名，
+已改指**用户级** `cproxy.service`（`ops.py` 带 `--user` 查询状态），并移除原针对异构 legacy 单元的
+`_production_service_active()` 预检以免 `restart()` / `ExecReload` 在 `stop()` 后自锁；`restart()`
+刻意不调 systemd（它是该单元的 `ExecReload`，会自我递归）。详见 `STATUS.md` 的「已知遗留项」。
 
 ## 回滚
 

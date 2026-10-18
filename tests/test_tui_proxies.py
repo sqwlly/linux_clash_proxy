@@ -386,3 +386,51 @@ def test_proxies_refresh_updates_cells_in_place_without_cursor_events(monkeypatc
             assert highlights == []
 
     asyncio.run(run_case())
+
+
+def test_proxies_fallback_group_delay_uses_sentinel_labels(monkeypatch, tmp_path):
+    """代理页候选表对当前选中节点回退取组自身 delay 时，必须走 `delay_text` 过滤哨兵值
+    （5000 → 超时，0 → 未测得），不能直接拼出 `5000ms` / `0ms`。"""
+    group_with_timeout = ProxyGroup(
+        name="AI-MANUAL",
+        type="select",
+        current="Node A",
+        candidates=["Node A", "Node B"],
+        delay=5000,
+    )
+
+    class FakeQueryService:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def load_context(self, require_api=False):
+            return SimpleNamespace(groups={"AI-MANUAL": group_with_timeout}, api_available=True)
+
+    monkeypatch.setattr(proxies_module, "QueryService", FakeQueryService)
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+
+    async def run_case():
+        app = _ProxiesApp(paths)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            screen = app.query_one(ProxiesScreen)
+            nodes_table = screen.query_one("#nodes-table", DataTable)
+            screen._current_entry = None
+            screen._current_group = group_with_timeout
+            screen._update_nodes_table()
+            assert str(nodes_table.get_row("Node A")[1]) == "超时"
+            assert "5000ms" not in str(nodes_table.get_row("Node A")[1])
+
+            screen._current_group = ProxyGroup(
+                name="AI-MANUAL",
+                type="select",
+                current="Node A",
+                candidates=["Node A", "Node B"],
+                delay=0,
+            )
+            screen._update_nodes_table()
+            assert str(nodes_table.get_row("Node A")[1]) == "未测得"
+            assert "0ms" not in str(nodes_table.get_row("Node A")[1])
+
+    asyncio.run(run_case())
+

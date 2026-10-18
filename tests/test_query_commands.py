@@ -397,3 +397,46 @@ def test_ai_commands_report_friendly_error_when_api_unavailable(tmp_path: Path):
     test_group_result = _run(env, "test-group", "AI-AUTO")
     assert test_group_result.returncode != 0
     assert "错误: Mihomo API 不可访问" in test_group_result.stderr
+
+
+def test_exit_summary_and_render_current_handle_sentinel_delays(capsys):
+    """`status` 的 `_exit_summary` 与 `current` 的 `_render_current` 必须统一遵守哨兵口径：
+    - `_exit_summary`: `delay=None` 与 `delay=0`（未测得）均省略括号，`5000` 显示 `(超时)`，正常值显示 `(140ms)`
+    - `_render_current`: `5000` 显示 `超时` 且不并排输出矛盾的 `状态: 正常`；`0` 显示 `未测得`
+    """
+    from cproxy import cli_render
+    from cproxy.backend.models import ProxyGroup
+
+    assert cli_render._exit_summary("AI-MANUAL", "Node A", None) == "AI-MANUAL -> Node A"
+    assert cli_render._exit_summary("AI-MANUAL", "Node A", 0) == "AI-MANUAL -> Node A"
+    assert cli_render._exit_summary("AI-MANUAL", "Node A", 5000) == "AI-MANUAL -> Node A (超时)"
+    assert cli_render._exit_summary("AI-MANUAL", "Node A", 140) == "AI-MANUAL -> Node A (140ms)"
+
+    timeout_group = ProxyGroup(
+        name="AI-US",
+        type="Fallback",
+        current="🇺🇸美国 01 | 1X",
+        candidates=["🇺🇸美国 01 | 1X"],
+        alive=True,
+        delay=5000,
+    )
+    assert cli_render._render_current({"AI-US": timeout_group}, "AI-US", raw=False) == 0
+    out_timeout = capsys.readouterr().out
+    assert "延迟" in out_timeout and "超时" in out_timeout
+    assert "5000ms" not in out_timeout
+    assert "状态" not in out_timeout
+
+    unmeasured_group = ProxyGroup(
+        name="AI-SG",
+        type="Fallback",
+        current="🇸🇬新加坡 01 | 1X",
+        candidates=["🇸🇬新加坡 01 | 1X"],
+        alive=True,
+        delay=0,
+    )
+    assert cli_render._render_current({"AI-SG": unmeasured_group}, "AI-SG", raw=False) == 0
+    out_unmeasured = capsys.readouterr().out
+    assert "延迟" in out_unmeasured and "未测得" in out_unmeasured
+    assert re.search(r"(?<!\d)0ms", out_unmeasured) is None
+    assert "状态" not in out_unmeasured
+

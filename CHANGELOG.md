@@ -29,7 +29,7 @@
 
 ### 修复
 
-- `cproxy start` 的「生产服务已在运行」守卫与 `cproxy incident` 的服务诊断此前查的是系统级 legacy `clash-proxy.service`（该单元已随退役删除），实际空转。现改查真实生产单元——**用户级** `cproxy.service`（`systemctl --user ...`）；`restart()` 刻意仍只做 stop+start，因为它是该单元的 `ExecReload`，回头调 `systemctl --user restart` 会自我递归
+- `cproxy start` 的外来实例提示与 `cproxy incident` 的服务诊断此前指向系统级 legacy `clash-proxy.service`（该单元已随退役删除）。现改指真实生产单元——**用户级** `cproxy.service`（`systemctl --user ...`），同时移除 `start()` 中原用于拦截异构 legacy 服务的 `systemctl is-active` 预检，避免 `cproxy.service` active 时执行 `cproxy restart` / `ExecReload` 在 `stop()` 后被自身单元状态拦死；`restart()` 刻意仍只做 stop+start，以免 `ExecReload` 回头调 `systemctl --user restart` 自我递归
 - `ai-status` / TUI 的延迟不再把 mihomo 的**哨兵值**当真实延迟展示：`history` 里的 `5000` 是探测**超时**（本项目组配置不设 `timeout`，取 mihomo 默认 5000ms），`0` 是**未测得**。此前按毫秒渲染，会把「备用节点其实在超时」显示成 `5000ms · 正常`——读起来又快又健康，是比旧版显示 `─` 更糟的错误信息（生产实测 AI-US 的 history 为 `[5000, 861, 5000, 267]`）。现按三态渲染 `NNNms` / `超时` / `未测得`，且非 ok 时不再并排显示健康标记（避免「超时 · 正常」这种自相矛盾）；`--raw` / `--json` 仍保留原始数值供机器解析
 - `ai-status` 的连通性明细只在探测失败时显示：成功时的 `HTTP 401/403` 是「可达但需鉴权」，摆在「正常」后面会被读成故障码
 - `cproxy snapshot compact` / `snapshots --json` 遇文件名时间戳不可解析的快照（如手工拷入的 `runtime-backup.yaml`）会直接 `TypeError` 崩溃：回退取文件 mtime 时把关键字写成了 `tzinfo=`，而 `datetime.fromtimestamp` 的参数名是 `tz`。真实快照名都合规，所以该分支一直未被触发；已修并补回归测试

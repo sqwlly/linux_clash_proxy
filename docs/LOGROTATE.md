@@ -89,8 +89,8 @@ ls -lh ~/.local/state/cproxy/cproxy.log*
 
 ### 为什么用 copytruncate 而不是发信号
 
-`cproxy` 通过 shell 重定向把 `stdout/stderr` 写入日志文件——单纯向 mihomo 发送信号并不能
-可靠地让 shell 持有的文件描述符切到新文件，所以采用 `copytruncate`。
+`cproxy` 启动 `mihomo` 时直接把追加模式打开的日志文件描述符赋给其 `stdout/stderr`，且 `mihomo`
+本身不支持通过信号重新打开日志文件，所以采用 `copytruncate` 原地截断。
 
 ## 自定义配置
 

@@ -56,7 +56,7 @@ def test_ai_route_panel_renders_resolved_exit_for_pinned_node(ai_route_groups, t
             assert "AI-US → 🇺🇸美国 01 IEPL 1.7X CM (210ms)" in labels["standby"]
             # Gemini 也拿到真实延迟（其组自身 history 为空）
             assert "AI-GEMINI → 🇰🇷韩国 01 IEPL 1.7X CM (140ms)" in labels["gemini"]
-            assert "兜底" in labels["mode"]
+            assert "兜底 · 直连池" in labels["mode"]
             # 链路树不再画空叶子
             assert "通用 AI-MANUAL" in labels["chain"]
             assert "→ -" not in labels["chain"]
@@ -112,7 +112,7 @@ def test_ai_route_panel_shows_placeholder_when_groups_missing(tmp_path):
 
 
 def test_ai_route_probe_streams_results_per_target(monkeypatch, tmp_path):
-    item1 = AIProbeResult(name="ChatGPT Web", url="https://chatgpt.com", ok=True, detail="HTTP 200")
+    item1 = AIProbeResult(name="ChatGPT Web", url="https://chatgpt.com", ok=True, detail="HTTP 403")
     item2 = AIProbeResult(name="OpenAI API", url="https://api.openai.com/v1/models", ok=False, detail="超时")
 
     class FakeDiagnostics:
@@ -149,6 +149,12 @@ def test_ai_route_probe_streams_results_per_target(monkeypatch, tmp_path):
             # 前两次回调对应流式上表：第一个目标出结果时表里有 1 行，第二个出结果时有 2 行
             assert streamed[:2] == [("ChatGPT Web", 1), ("OpenAI API", 2)]
             assert probe_table.row_count == 2
+            # 成功行不展示 HTTP 401/403 状态码（避免读成故障），改展示探测 URL；失败行才展示故障详情
+            row_ok = [str(cell) for cell in probe_table.get_row("ChatGPT Web")]
+            row_fail = [str(cell) for cell in probe_table.get_row("OpenAI API")]
+            assert row_ok[2] == "https://chatgpt.com"
+            assert "HTTP 403" not in row_ok[2]
+            assert row_fail[2] == "超时"
             assert "1/2 部分正常" in str(screen.query_one("#ai-probe-status").render())
             assert screen.query_one("#btn-ai-probe", Button).disabled is False
             assert screen._probe_running is False

@@ -78,7 +78,6 @@ bash "scripts/verify-ga-artifacts.sh" "/tmp/cproxy-ga"
 |---|---|
 | `systemd_user_examples_test.sh` | 用户级 service/override/env 示例仍指向 `/usr/local/bin/cproxy` 和用户环境文件 |
 | `systemd-analyze verify` | systemd 能解析仓库内 user service；如果输出其他系统 unit 的 warning，只要返回码为 0 且没有指向 `systemd-user/cproxy.service` 的 error 即可 |
-| `system_command_installer_test.sh` | wrapper 安装 dry-run 不创建 bindir，真实测试只写临时目录 |
 | `systemd_helper_scripts_test.sh` | 系统级安装脚本只装活跃的 `clash-proxy-traffic-collector`，且不再有 legacy 安装开关（`--with-legacy` 已随退役移除） |
 | `build-ga-artifacts.sh` / `verify-ga-artifacts.sh` | 生成 source tarball、`SHA256SUMS` 和 `provenance.json`，并能校验 checksum 与 provenance 字段 |
 

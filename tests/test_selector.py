@@ -268,6 +268,7 @@ def test_delay_label_separates_timeout_from_missing():
     """
     assert delay_label(None) == "-"
     assert delay_label(0) == "超时"
+    assert delay_label(5000) == "超时"
     assert delay_label(123) == "123 ms"
 
 

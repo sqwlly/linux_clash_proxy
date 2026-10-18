@@ -41,17 +41,17 @@
 
 ## 已知遗留项
 
-- ~~`process.py` 的 systemd 守卫指向已删的 legacy 服务名~~ **已于 2026-10-17 修正**。
+- ~~`process.py` 的 systemd 引用指向已删的 legacy 服务名~~ **已于 2026-10-17 修正**。
   修正后：`SYSTEMD_SERVICE_NAME = "cproxy.service"`（真实生产单元是**用户级**
-  `systemd-user/cproxy.service`），`_production_service_active()` 改查
-  `systemctl --user is-active cproxy.service`，两处守卫文案与 `incident` 报告（`ops.py`）
-  也一并改指用户级单元。
+  `systemd-user/cproxy.service`），端口冲突提示与 `incident` 报告（`ops.py`）均改指用户级单元。
+  - 同时移除了 `start()` 中原针对异构 legacy 单元的 `_production_service_active()` 拦截：
+    因为 `cproxy.service` 就是 `cproxy` 自身（共享 `cproxy.pid`），若在 `start()` 查
+    `systemctl --user is-active cproxy.service`，会导致 `cproxy restart` / `systemctl --user reload`
+    在 `stop()` 杀掉 `mihomo` 后调 `start()` 时被 `active`/`reloading` 状态的单元自己拦死。
+    同实例幂等现由 `is_running()` 负责，外来实例冲突由 `_ensure_no_foreign_instance()` 端口预检负责。
   - 刻意**没有**让 `restart()` 去调 `systemctl --user restart cproxy.service`：`restart()`
     本身就是该单元的 `ExecReload`（`systemctl --user reload` → `cproxy restart`），
     再回头调 systemd 会**自我递归**。整单元重启请直接用 `systemctl --user restart cproxy.service`。
-  - 实测：该守卫现在能真正检出用户级服务在运行（此前恒为 False、属空转）；
-    服务 active 时 `cproxy start` 仍幂等返回原 pid（`is_running()` 先短路），线上进程未受影响。
-  - 这是**行为变更**，需部署后才在生产生效；已补 3 条测试（单元名与 `--user` 参数、inactive 时不误判、`restart()` 不 shell out）。
 
 ## 发布
 

@@ -465,7 +465,7 @@ legacy 入口的子命令与 cproxy **绝大多数同名同义**——`status`�
 - `mihomo -h` 确实没有 CLI 级 reload 参数，但 controller API 提供 `PUT /configs`。
   `cproxy refresh` 正是经这条路应用新配置——长会话与长任务不中断。
 - 失败回滚改由快照承担：render 与订阅更新在覆盖配置前各留一份
-  （`cproxy snapshots` / `cproxy rollback`，各保留 10 份，运行中回滚自动重启）。
+  （`cproxy snapshots` / `cproxy rollback`，支持 SHA256 智能去重与分级压缩轮转，运行中回滚自动重启）。
 - 仅当 API 不可达时才回退到进程重启。
 
 原评估记录见

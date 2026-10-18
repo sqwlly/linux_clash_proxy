@@ -264,12 +264,9 @@ class DiagnosticsService:
         回调在调用方线程内同步执行。默认 `None` 时行为与输出和历史版本完全一致。
         """
         config = read_config(self.paths)
-        # 面板这一档用紧预算；用户在 config 里显式写了 ai-probe-timeout 则以其为准
-        timeout = _config_int(
-            config,
-            "ai-probe-timeout",
-            _config_int(config, "connectivity-timeout", PANEL_AI_PROBE_TIMEOUT),
-        )
+        # 面板这一档用紧预算（3s）；用户在 config 里显式写了 ai-probe-timeout 则以其为准，
+        # 不再回退到 connectivity-timeout（后者推荐配 5s，会把面板紧预算冲掉）
+        timeout = _config_int(config, "ai-probe-timeout", PANEL_AI_PROBE_TIMEOUT)
         targets = [
             ("ChatGPT Web", _config_str(config, "ai-chatgpt-url", DEFAULT_AI_PROBE_TARGETS[0][1])),
             ("OpenAI API", _config_str(config, "ai-openai-api-url", DEFAULT_AI_PROBE_TARGETS[1][1])),

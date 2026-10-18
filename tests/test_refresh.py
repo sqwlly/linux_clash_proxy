@@ -17,6 +17,7 @@ mixed-port: 7890
 external-controller: 127.0.0.1:9090
 program-path: /usr/local/bin/mihomo
 secret-file: /home/user/.config/cproxy/secret
+ai-probe-timeout: 4
 proxy-groups:
   - name: SSRDOG
     type: select
@@ -105,6 +106,7 @@ def test_update_source_from_subscription_merges_local_keys(tmp_path: Path):
     assert merged["external-controller"] == "127.0.0.1:9090"
     assert merged["program-path"] == "/usr/local/bin/mihomo"
     assert merged["secret-file"] == "/home/user/.config/cproxy/secret"
+    assert merged["ai-probe-timeout"] == 4
     # 安全相关键即使订阅携带也一律剔除
     assert "allow-lan" not in merged
     assert "secret" not in merged

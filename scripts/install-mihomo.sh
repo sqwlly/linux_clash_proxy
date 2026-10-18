@@ -229,7 +229,7 @@ action_install() {
 
     echo "mihomo 已安装: ${current:-未安装} -> $("${BINDIR}/mihomo" -v | head -1)"
     if pidof mihomo >/dev/null 2>&1; then
-        echo "提示: mihomo 正在运行，重启服务后生效（systemctl restart clash-proxy 或 cproxy restart）"
+        echo "提示: mihomo 正在运行，重启服务后生效（systemctl --user restart cproxy.service 或 cproxy restart）"
     fi
 }
 

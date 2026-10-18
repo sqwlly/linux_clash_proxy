@@ -414,9 +414,8 @@ cproxy migrate-from-legacy /root/clash_proxy
 - `流量`
 - `路径`
 - `连通性`
-- `链路`
-- `备用`
-- `分组`
+- `AI 出口`
+- `候选池`
 - `列表`
 - `结果`
 

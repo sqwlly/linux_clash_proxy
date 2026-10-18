@@ -282,12 +282,14 @@ ip-check-urls:
 
 
 def test_ai_probe_uses_panel_timeout_by_default(tmp_path: Path, monkeypatch):
-    """面板块走**紧**预算（3s）：它只是给人看的快照，宁可快。看门狗那档见
-    `test_watchdog_probe_keeps_patient_budget`——两档刻意不同，别把面板的提速搬过去。"""
+    """面板块走**紧**预算（3s）：它只是给人看的快照，宁可快。即便 `config.yaml` 配了
+    推荐示例里的 `connectivity-timeout: 5`，也不得回退读取它把 3s 覆盖成 5s；只有显式配
+    `ai-probe-timeout` 时才按用户指定值覆盖。"""
     config_dir = tmp_path / ".config" / "cproxy"
     config_dir.mkdir(parents=True)
     (config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\n",
+        "mixed-port: 7890\n"
+        "connectivity-timeout: 5\n",
         encoding="utf-8",
     )
 
@@ -316,6 +318,16 @@ def test_ai_probe_uses_panel_timeout_by_default(tmp_path: Path, monkeypatch):
 
     assert len(report.results) == 3
     assert captured == [3, 3, 3]
+
+    captured.clear()
+    (config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\n"
+        "connectivity-timeout: 5\n"
+        "ai-probe-timeout: 6\n",
+        encoding="utf-8",
+    )
+    DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
+    assert captured == [6, 6, 6]
 
 
 def test_ai_probe_retries_transient_failures(tmp_path: Path, monkeypatch):

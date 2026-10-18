@@ -17,6 +17,7 @@ from ..backend.runtime import (
     AI_REGION_US,
     AI_SG_GROUP,
     AI_US_GROUP,
+    HEALTH_CHECK_TIMEOUT_MS,
 )
 from .nodelist import (
     SUBSCRIPTION_REGION_ORDER,
@@ -80,12 +81,13 @@ def extra_subscription_names(config: dict | None) -> list[str]:
 def delay_label(delay: int | None) -> str:
     """选择器里的延迟标注。
 
-    `0` 是 mihomo 的**测速失败**标记，不是「极快」——直接显示 `0 ms` 会让人
-    挑中实际不可用的节点。取不到记录则标 `-`，与「失败」区分开。
+    `0` 与 `>= 5000`（`HEALTH_CHECK_TIMEOUT_MS`）都是 mihomo 的**测速失败/超时**哨兵，
+    不是真实毫秒数——直接显示 `0 ms` / `5000 ms` 会让人挑中实际不可用的节点。
+    取不到记录则标 `-`，与「超时」区分开。
     """
     if delay is None:
         return "-"
-    return "超时" if delay <= 0 else f"{delay} ms"
+    return "超时" if delay <= 0 or delay >= HEALTH_CHECK_TIMEOUT_MS else f"{delay} ms"
 
 
 def delay_style(delay: int | None) -> str:

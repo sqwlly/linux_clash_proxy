@@ -64,10 +64,10 @@ def exit_line_or_idle(exit_: AIExit | None, groups: dict) -> str:
 
 
 def mode_markup(route: AIRoute) -> str:
-    """`自动` 或 `兜底（<出口节点>）`。措辞只在这里定义，避免两个面板再次漂移。"""
+    """`自动` 或 `兜底 · 直连池`。与 CLI `mode_label` 语义对齐，避免两处再次漂移。"""
     if route.auto_mode:
         return f"[{_ACCENT}]自动[/]"
-    return f"[{_ACCENT}]兜底[/]（[{_NODE}]{normalize_name(route.active.node)}[/]）"
+    return f"[{_ACCENT}]兜底 · 直连池[/]"
 
 
 def chain_markup(route: AIRoute) -> str:

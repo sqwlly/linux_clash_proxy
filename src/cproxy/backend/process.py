@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -14,9 +13,13 @@ from pathlib import Path
 from ..config import AppPaths, config_file, log_file, pid_file, process_meta_file, read_config, runtime_file
 from .models import ProcessOwner, StatusSnapshot
 
-#: 生产代理的 systemd 单元名。它是**用户级**单元（`systemd-user/cproxy.service`，
-#: `ExecStart=/usr/local/bin/cproxy start`），所以所有 systemctl 调用都要带 `--user`。
-#: 不要改回系统级 `clash-proxy.service`——那个 legacy 单元已随 2026-10-17 的退役删除。
+#: 生产代理的 systemd 单元名（用户级 `systemd-user/cproxy.service`），供端口冲突提示与
+#: `incident` 报告引用。注意：`start()` 刻意不查 `systemctl --user is-active cproxy.service`
+#: 来拒启动——当年（1eb4304）守卫拦的是使用独立 PID 文件的系统级 legacy `clash-proxy.service`；
+#: 而 `cproxy.service` 就是 cproxy 自身（共用同一个 `cproxy.pid`），同目录幂等由 `is_running()`
+#: 短路，异实例抢端口由 `_ensure_no_foreign_instance()` 拦截。若在 `start()` 里对 `cproxy.service`
+#: 的 active/reloading 状态抛错，`cproxy restart` 与 `ExecReload` 在 `stop()` 杀掉旧进程后会
+#: 被自己拦死。
 SYSTEMD_SERVICE_NAME = "cproxy.service"
 LOCK_STALE_SECONDS = 30
 
@@ -56,28 +59,6 @@ class ProcessBackend:
 
     def _release_lock(self) -> None:
         self._lock_path().unlink(missing_ok=True)
-
-    @staticmethod
-    def _production_service_active() -> bool:
-        """生产代理的用户级 systemd 单元是否在运行。
-
-        查的是 `--user` 那一份：生产入口是 `systemd-user/cproxy.service`。单元为
-        `Type=forking`，它自己的 `ExecStart` 跑起来时状态是 `activating`（rc≠0），
-        所以服务启动自身时不会误判成「已在运行」。
-        """
-        if os.environ.get("CPROXY_NO_SYSTEMD"):
-            return False
-        systemctl = shutil.which("systemctl")
-        if not systemctl:
-            return False
-        try:
-            result = subprocess.run(
-                [systemctl, "--user", "is-active", SYSTEMD_SERVICE_NAME],
-                capture_output=True, timeout=5,
-            )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, OSError):
-            return False
 
     def _read_pid(self) -> int | None:
         path = pid_file(self.paths)
@@ -257,13 +238,6 @@ class ProcessBackend:
             pid = self._read_pid()
             if pid is not None:
                 return pid
-
-        if self._production_service_active():
-            raise ForeignInstanceError(
-                f"错误: 用户级服务 {SYSTEMD_SERVICE_NAME} 正在运行，再启动 cproxy 会抢占相同端口\n"
-                f"提示: 使用 systemctl --user restart {SYSTEMD_SERVICE_NAME} 管理生产代理，"
-                f"或先 systemctl --user stop {SYSTEMD_SERVICE_NAME} 再启动 cproxy"
-            )
 
         runtime = runtime_file(self.paths)
         if not runtime.exists():

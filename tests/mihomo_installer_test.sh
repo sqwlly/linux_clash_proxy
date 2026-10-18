@@ -136,4 +136,10 @@ if run_installer --check >/dev/null 2>&1; then
     fail "--check 未安装时应返回非 0"
 fi
 
+echo ">>> 场景 10: 重启提示指向用户级 cproxy.service，残留检查不含已退役 clash-proxy"
+grep -Fq "systemctl --user restart cproxy.service" "$INSTALLER" || fail "重启提示应指向 systemctl --user restart cproxy.service"
+if grep -Fq "clash-proxy" "$INSTALLER"; then
+    fail "install-mihomo.sh 不应残留已退役的 clash-proxy 服务名"
+fi
+
 echo "mihomo installer 测试通过"
