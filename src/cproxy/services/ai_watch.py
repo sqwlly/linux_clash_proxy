@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
 from ..config import AppPaths, ai_watch_state_file, read_config
@@ -20,6 +24,11 @@ from .query import QueryService
 
 CONSECUTIVE_FAILURE_THRESHOLD = 2
 COOLDOWN_SECONDS = 10 * 60
+# agy 自更新会把旧二进制重命名为 `agy.<ns>.old`（或进一步 unlink 成 `(deleted)`）。
+# 闲置超过 30 分钟的 `.old` 进程仍会每 ~15s 轮询 daily-cloudcode-pa.googleapis.com，
+# 抢占同账号流式配额导致活跃会话报 "There was a network issue connecting to the server"。
+STALE_AGY_IDLE_SECONDS = 30 * 60
+_STALE_AGY_EXE_RE = re.compile(r"(?:^|/)agy\.\d+\.old(?:\s+\(deleted\))?$")
 
 VERDICT_LABELS = {
     PROBE_OK: "ok",
@@ -41,6 +50,118 @@ class WatchGroupResult:
 @dataclass
 class WatchReport:
     results: list[WatchGroupResult] = field(default_factory=list)
+    reaped_pids: list[int] = field(default_factory=list)
+
+
+def _read_ppid_and_uid(proc_dir: Path) -> tuple[int | None, int | None]:
+    ppid: int | None = None
+    uid: int | None = None
+    try:
+        text = (proc_dir / "status").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    for line in text.splitlines():
+        if line.startswith("PPid:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                ppid = int(parts[1])
+        elif line.startswith("Uid:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                uid = int(parts[1])
+        if ppid is not None and uid is not None:
+            break
+    return ppid, uid
+
+
+def _ancestor_pids(proc_root: Path, start_pid: int | None = None) -> set[int]:
+    pid = os.getpid() if start_pid is None else start_pid
+    ancestors: set[int] = set()
+    while pid and pid > 1 and pid not in ancestors:
+        ancestors.add(pid)
+        ppid, _ = _read_ppid_and_uid(proc_root / str(pid))
+        if ppid is None:
+            break
+        pid = ppid
+    return ancestors
+
+
+def reap_stale_agy_processes(
+    proc_root: Path = Path("/proc"),
+    *,
+    now: float | None = None,
+    idle_seconds: int = STALE_AGY_IDLE_SECONDS,
+    dry_run: bool = False,
+    kill_fn: Callable[[int, int], None] = os.kill,
+    current_uid: int | None = None,
+    self_pid: int | None = None,
+) -> list[int]:
+    """清理已被热更新替换且终端长期闲置的 `agy.<timestamp>.old` 残留进程。
+
+    三重安全保护（防止误杀正在使用的会话）：
+    1. 绝不触碰当前进程及任何祖先进程；
+    2. 若存在非 `statusline` 的活跃子进程（正在跑命令/子任务），跳过；
+    3. 若控制终端（`fd/0`）存在且最近输入时间距今不足 `idle_seconds`（默认 30 分钟），跳过。
+    """
+    if not proc_root.is_dir():
+        return []
+    ts_now = time.time() if now is None else now
+    uid_target = os.getuid() if current_uid is None else current_uid
+    protected = _ancestor_pids(proc_root, start_pid=self_pid)
+
+    children_by_ppid: dict[int, list[tuple[int, str]]] = {}
+    candidates: list[tuple[int, Path]] = []
+
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        ppid, uid = _read_ppid_and_uid(entry)
+        try:
+            cmdline = (entry / "cmdline").read_text(encoding="utf-8", errors="replace").replace("\x00", " ").strip()
+        except OSError:
+            cmdline = ""
+        if ppid is not None:
+            children_by_ppid.setdefault(ppid, []).append((pid, cmdline))
+
+        if uid is not None and uid != uid_target:
+            continue
+        try:
+            exe_target = os.readlink(entry / "exe")
+        except OSError:
+            continue
+        if _STALE_AGY_EXE_RE.search(exe_target):
+            candidates.append((pid, entry))
+
+    reaped: list[int] = []
+    for pid, entry in sorted(candidates, key=lambda item: item[0]):
+        if pid in protected:
+            continue
+        active_children = [
+            child_pid
+            for child_pid, child_cmd in children_by_ppid.get(pid, [])
+            if "statusline" not in child_cmd
+        ]
+        if active_children:
+            continue
+        try:
+            tty_stat = os.stat(entry / "fd" / "0")
+        except OSError:
+            tty_stat = None
+        if tty_stat is not None and (ts_now - float(tty_stat.st_atime)) < idle_seconds:
+            continue
+        if not dry_run:
+            try:
+                kill_fn(pid, signal.SIGTERM)
+            except OSError:
+                continue
+        reaped.append(pid)
+    return reaped
 
 
 def _watch_url(paths: AppPaths, group: str) -> str:
@@ -83,9 +204,10 @@ def _group_state(state: dict, group: str) -> dict:
 
 
 class AIWatchService:
-    def __init__(self, paths: AppPaths):
+    def __init__(self, paths: AppPaths, proc_root: Path = Path("/proc")):
         self.paths = paths
         self.query = QueryService(paths)
+        self.proc_root = proc_root
 
     def watch(self, dry_run: bool = False) -> WatchReport:
         report = WatchReport()
@@ -99,6 +221,7 @@ class AIWatchService:
         now = time.time()
         for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
             report.results.append(self._watch_group(groups, group, state, now, dry_run))
+        report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
         if not dry_run:
             _save_state(self.paths, state)
         return report

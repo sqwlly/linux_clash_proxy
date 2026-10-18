@@ -81,8 +81,8 @@ def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
         hit = domain in AI_DOMAINS
     elif rtype == "DOMAIN-KEYWORD":
         hit = domain in AI_CONFLICT_KEYWORDS
-    elif rtype == "PROCESS-NAME":
-        hit = domain in AI_PROCESS_NAMES
+    elif rtype in ("PROCESS-NAME", "PROCESS-NAME-REGEX"):
+        hit = domain in AI_PROCESS_NAMES or domain.startswith("^agy")
     else:
         return False
     # 末段为目标组（no-resolve 等修饰符位于中间）
@@ -725,8 +725,10 @@ class RuntimeBackend:
             f"DOMAIN-KEYWORD,antigravity,{AI_GEMINI_GROUP}",
             f"DOMAIN-KEYWORD,gemini,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,goog,{AI_GEMINI_GROUP}",
-            # agy 非 Google 出站（github / playwright CDN 等）仍走通用 AI 出口
+            # agy 非 Google 出站（github / playwright CDN 等）仍走通用 AI 出口；
+            # 热更新后旧会话的二进制名变成 agy.<timestamp>.old，用正则一并兜底
             f"PROCESS-NAME,agy,{AI_MANUAL_GROUP}",
+            f"PROCESS-NAME-REGEX,^agy\\.[0-9]+\\.old,{AI_MANUAL_GROUP}",
             # OpenAI
             f"DOMAIN-SUFFIX,openai.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,chatgpt.com,{AI_MANUAL_GROUP}",

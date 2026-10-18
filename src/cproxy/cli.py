@@ -358,6 +358,10 @@ def run(argv: list[str] | None = None) -> int:
                 if item.switched and item.target:
                     line += f" → 已切换 {item.target}"
                 print(line)
+            if watch_report.reaped_pids:
+                pids_str = ", ".join(str(pid) for pid in watch_report.reaped_pids)
+                action_label = "发现可清理残留 agy 进程" if args.dry_run else "已清理残留 agy 进程"
+                print(f"{action_label}: {pids_str}")
             return 0
         if args.command == "guard":
             command = args.command_args

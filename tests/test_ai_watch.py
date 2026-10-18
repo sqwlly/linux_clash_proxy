@@ -234,3 +234,83 @@ def test_pick_next_with_leaf_entries_in_groups_and_health_preference(tmp_path):
     assert svc._pick_next(groups, group, "US-01", {}, now) == "JP-01"
     # 当唯一健康叶子 JP-01 也在冷却期时，回退到首个非冷却叶子 DEAD-01，而非彻底返回 None
     assert svc._pick_next(groups, group, "US-01", {"JP-01": now}, now) == "DEAD-01"
+
+
+def _make_fake_proc(
+    proc_root: Path,
+    pid: int,
+    *,
+    ppid: int = 1,
+    uid: int = 0,
+    exe: str | None = None,
+    cmdline: str = "agy",
+    tty_atime: float | None = None,
+) -> None:
+    pdir = proc_root / str(pid)
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "status").write_text(f"Name:\tagy\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n", encoding="utf-8")
+    (pdir / "cmdline").write_text(cmdline.replace(" ", "\x00"), encoding="utf-8")
+    if exe is not None:
+        (pdir / "exe").symlink_to(exe)
+    if tty_atime is not None:
+        fd_dir = pdir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        tty_file = proc_root / f"pts_{pid}"
+        tty_file.write_text("", encoding="utf-8")
+        import os as _os
+
+        _os.utime(tty_file, (tty_atime, tty_atime))
+        (fd_dir / "0").symlink_to(tty_file)
+
+
+def test_reap_stale_agy_processes_respects_all_safety_guards(tmp_path):
+    """验证自动清理仅杀闲置超时的 agy.<ts>.old 残留进程，绝不误杀：
+    - 正常最新二进制 (/root/.local/bin/agy)
+    - 当前调用链祖先进程
+    - 终端在 30 分钟内仍有输入的 .old 会话
+    - 存在非 statusline 活跃子进程的 .old 会话
+    """
+    from cproxy.services.ai_watch import reap_stale_agy_processes
+
+    proc_root = tmp_path / "proc"
+    now = 1_800_000_000.0
+    old_exe = "/root/.local/bin/agy.1792306061959817128.old (deleted)"
+    fresh_exe = "/root/.local/bin/agy"
+
+    # 100: 闲置 2 小时的 .old 进程，仅挂着 statusline 子进程(101) -> 应清理
+    _make_fake_proc(proc_root, 100, ppid=1, uid=0, exe=old_exe, tty_atime=now - 7200)
+    _make_fake_proc(
+        proc_root, 101, ppid=100, uid=0, exe="/usr/bin/node", cmdline="node /root/.gemini/agy-hud.js statusline"
+    )
+    # 200: 正常最新 agy（即便闲置 2 小时） -> 不清理
+    _make_fake_proc(proc_root, 200, ppid=1, uid=0, exe=fresh_exe, tty_atime=now - 7200)
+    # 300: 刚在 5 分钟前有终端输入的 .old 进程 -> 不清理
+    _make_fake_proc(proc_root, 300, ppid=1, uid=0, exe=old_exe, tty_atime=now - 300)
+    # 400: 闲置 2 小时但有正在执行 bash 子任务(401)的 .old 进程 -> 不清理
+    _make_fake_proc(proc_root, 400, ppid=1, uid=0, exe=old_exe, tty_atime=now - 7200)
+    _make_fake_proc(proc_root, 401, ppid=400, uid=0, exe="/usr/bin/bash", cmdline="bash -c pytest")
+    # 500: 调用链自身祖先进程(500 -> 501) -> 绝不清理
+    _make_fake_proc(proc_root, 500, ppid=1, uid=0, exe=old_exe, tty_atime=now - 7200)
+    _make_fake_proc(proc_root, 501, ppid=500, uid=0, exe="/usr/bin/python3", cmdline="python3 cproxy")
+
+    killed: list[tuple[int, int]] = []
+    reaped = reap_stale_agy_processes(
+        proc_root,
+        now=now,
+        idle_seconds=1800,
+        dry_run=False,
+        kill_fn=lambda pid, sig: killed.append((pid, sig)),
+        current_uid=0,
+        self_pid=501,
+    )
+    assert reaped == [100]
+    assert len(killed) == 1 and killed[0][0] == 100
+
+
+def test_normalize_agy_old_process_label():
+    from cproxy.services.traffic import _normalize_process_label
+
+    assert _normalize_process_label("/root/.local/bin/agy.1792306061959817128.old (deleted)") == "/root/.local/bin/agy"
+    assert _normalize_process_label("/root/.local/bin/agy.1792306061959817128.old") == "/root/.local/bin/agy"
+    assert _normalize_process_label("agy.1792306061959817128.old (deleted)") == "agy"
+    assert _normalize_process_label("/usr/bin/curl") == "/usr/bin/curl"

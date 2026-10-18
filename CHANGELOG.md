@@ -28,6 +28,7 @@
 - `ai-rebalance` 排序加重历史失败惩罚权重，平滑单轮 codex 探测噪声（削弱「一轮 5/5、下一轮 1/5」的名次翻转）；当候选集未变且前 5 名顺序完全一致时抑制尾部 1 轮样本抖动触发的无意义重写与热重载；若当前 `AI-MANUAL` 出口在多轮实测中已不稳定而榜首稳定，重排后主动切到榜首叶子
 - `cproxy render --apply`（及 `cproxy-refresh.service` 15 分钟定时任务与 `bootstrap`）：当磁盘 `runtime.yaml` 落后于运行实例时自动热重载并同步 `runtime_hash` 指纹，消除配置变更后 `status`/`doctor` 长期报「配置时效: 待刷新」的盲区
 - `probe_history.jsonl` 限制最多保留最近 200 条记录（原子截断），防止 30 分钟周期定时任务让探测历史无限膨胀
+- `agy` 热更新残留适配：`cproxy ai-watch`（2 分钟周期）自动回收终端闲置满 30 分钟且无活跃任务子进程的 `agy.<timestamp>.old` 残留进程（保护当前调用链与活跃终端），消除旧实例长期后台轮询 `daily-cloudcode-pa.googleapis.com` 抢占流式连接配额的问题；`runtime.py` 新增 `PROCESS-NAME-REGEX,^agy\.[0-9]+\.old,AI-MANUAL` 兜底热更新窗口期路由；`traffic.py` 自动剥离 `(deleted)` 并将 `agy.<timestamp>.old` 归并回 `agy`
 
 ### 修复
 

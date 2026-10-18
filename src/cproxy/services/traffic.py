@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ SEEN_RETENTION = timedelta(hours=24)
 SAMPLE_RETENTION_DAYS = 90
 
 DIMENSIONS = ("node", "rule", "host", "process")
+
+_DELETED_SUFFIX_RE = re.compile(r"\s+\(deleted\)$")
+_AGY_OLD_BINARY_RE = re.compile(r"(^|/)agy\.\d+\.old$")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS traffic_samples (
@@ -49,12 +53,19 @@ CREATE TABLE IF NOT EXISTS connections_seen (
 """
 
 
+def _normalize_process_label(raw: str) -> str:
+    """剥离内核 `(deleted)` 标记并将热更新产生的 `agy.<ts>.old` 归并回 `agy`。"""
+    cleaned = _DELETED_SUFFIX_RE.sub("", raw.strip())
+    cleaned = _AGY_OLD_BINARY_RE.sub(r"\1agy", cleaned)
+    return cleaned or "-"
+
+
 def _conn_process(conn: dict[str, Any]) -> str:
     metadata = conn.get("metadata") or {}
     process = str(metadata.get("processPath") or "").strip()
     if not process:
         process = str(metadata.get("process") or "").strip()
-    return process or "-"
+    return _normalize_process_label(process)
 
 
 @dataclass(frozen=True)
