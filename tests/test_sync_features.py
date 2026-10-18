@@ -115,6 +115,33 @@ def test_penalties_cap(tmp_path: Path):
     assert penalties["n"] == 300  # capped at HISTORY_PENALTY_CAP_MS
 
 
+def test_penalties_ignores_pruned_zero_failure_and_separates_chronic_failures(tmp_path: Path):
+    """回归：折半淘汰下 0 失败但仅跑了 1 轮的健康节点不应被罚分；
+    偶发 1 次失败的节点与高频失败节点的惩罚值必须拉开差距，不能双双封顶 300ms。"""
+    history = tmp_path / "history.jsonl"
+    entries = []
+    for idx in range(10):
+        entries.append(
+            {
+                "group": "G",
+                "profile": "codex",
+                "url": "https://x.com",
+                "rounds": 5,
+                "nodes": [
+                    {"name": "pruned-iepl", "success": 1, "total": 1, "failures": 0},
+                    {"name": "rare-blip", "success": 0 if idx == 0 else 5, "failures": 5 if idx == 0 else 0},
+                    {"name": "chronic-1x", "success": 0 if idx < 8 else 5, "failures": 5 if idx < 8 else 0},
+                ],
+            }
+        )
+    _write_history(history, entries)
+    penalties = load_history_penalties(history, "G", "codex", "https://x.com", 5)
+    assert penalties.get("pruned-iepl", 0) == 0
+    assert 0 < penalties["rare-blip"] < 60
+    assert penalties["chronic-1x"] >= 200
+    assert penalties["chronic-1x"] > penalties["rare-blip"] * 4
+
+
 def test_penalties_filter_by_group_profile_url(tmp_path: Path):
     history = tmp_path / "history.jsonl"
     _write_history(history, [
@@ -263,7 +290,8 @@ rules:
 
 
 def test_render_ssrdog_rules_removed(tmp_path: Path):
-    data = _render_config(tmp_path, BASE_CONFIG)
+    data = _render_config(tmp_path, "tcp-concurrent: true\n" + BASE_CONFIG)
+    assert data["tcp-concurrent"] is False
     ssrdog = [r for r in data["rules"] if "SSRDOG" in str(r)]
     assert ssrdog == []
     manual_rules = [r for r in data["rules"] if "AI-MANUAL" in str(r)]

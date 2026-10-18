@@ -640,6 +640,10 @@ class RuntimeBackend:
 
         _sanitize_dns_fallback_filter(data)
 
+        # 关闭 tcp-concurrent：避免出站拨号前先在本机跑 DNS（223.5.5.5 + 1.1.1.1/8.8.8.8 fallback）
+        # 造成每次新建 TLS 连接卡顿 4~5s，或把经默认池解析出的日本/香港边缘 IP 喂给韩国/新加坡 AI 节点。
+        data["tcp-concurrent"] = False
+
         # 每个连接都查找发起进程，供 /connections API 与流量统计按进程归因
         if not data.get("find-process-mode"):
             data["find-process-mode"] = "always"

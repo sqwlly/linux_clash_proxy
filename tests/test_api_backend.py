@@ -304,17 +304,29 @@ def test_restore_selectors_includes_fallback(tmp_path, monkeypatch):
             current="US-01",
             candidates=["US-01", "JP-01", "AI-AUTO"],
         ),
+        "AI-GEMINI": ProxyGroup(
+            name="AI-GEMINI",
+            type="fallback",
+            current="KR-01",
+            candidates=["KR-01", "DE-01"],
+        ),
+        "AI-US": ProxyGroup(
+            name="AI-US",
+            type="fallback",
+            current="US-02",
+            candidates=["US-01", "US-02"],
+        ),
     }
     switches: list[tuple[str, str]] = []
     monkeypatch.setattr(backend, "get_groups", lambda: groups)
     monkeypatch.setattr(backend, "switch_group", lambda name, target: switches.append((name, target)))
     monkeypatch.setattr(backend, "_drop_connections_using_groups", lambda names: 0)
 
-    # fallback 组（AI-MANUAL 改 fallback 后）也应被快照与恢复
-    assert backend.selector_now() == {"AI-MANUAL": "US-01"}
-    restored = backend.restore_selectors({"AI-MANUAL": "JP-01"})
+    # AI-MANUAL / AI-GEMINI 应被快照与恢复，而纯自动子池 AI-US 不应被快照或写 fixed
+    assert backend.selector_now() == {"AI-MANUAL": "US-01", "AI-GEMINI": "KR-01"}
+    restored = backend.restore_selectors({"AI-MANUAL": "JP-01", "AI-US": "US-01"})
     assert switches == [("AI-MANUAL", "JP-01")]
-    assert restored["AI-MANUAL"] == "JP-01"
+    assert restored == {"AI-MANUAL": "JP-01"}
 
 
 def test_restore_selectors_maps_leaf_into_country_group(tmp_path, monkeypatch):

@@ -243,11 +243,22 @@ class APIBackend:
     def patch_config(self, patch: dict[str, Any]) -> dict[str, Any]:
         return self.request("PATCH", "/configs", patch)
 
+    @staticmethod
+    def _is_restorable_group(name: str, group: ProxyGroup) -> bool:
+        gtype = str(group.type).lower()
+        if gtype in {"select", "selector"}:
+            return True
+        return gtype == "fallback" and name in {"AI-MANUAL", "AI-GEMINI"}
+
     def selector_now(self) -> dict[str, str]:
-        """当前 Selector/fallback 组的选中项，供热重载后原样写回。"""
+        """当前 Selector 及 AI 出口（AI-MANUAL/AI-GEMINI）的选中项，供热重载后原样写回。
+
+        AI-AUTO / AI-US / AI-SG 等纯自动 fallback 子池不进快照：对 Mihomo 的 fallback
+        组调 PUT /proxies 会写入 `fixed` 钉死节点，自动子池若被钉死就失去自动回切能力。
+        """
         snapshot: dict[str, str] = {}
         for name, group in self.get_groups().items():
-            if str(group.type).lower() not in {"select", "selector", "fallback"}:
+            if not self._is_restorable_group(name, group):
                 continue
             current = str(group.current or "").strip()
             if current and current != "-":
@@ -266,7 +277,7 @@ class APIBackend:
         groups = self.get_groups()
         for name, wanted in snapshot.items():
             group = groups.get(name)
-            if group is None or str(group.type).lower() not in {"select", "selector", "fallback"}:
+            if group is None or not self._is_restorable_group(name, group):
                 continue
             parent_target, child_target = _restore_selector_targets(name, wanted, groups, snapshot)
             if parent_target is None:

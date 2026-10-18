@@ -27,7 +27,10 @@ REBALANCE_PROFILE = "codex"
 REBALANCE_GEMINI_PROFILE = "gemini"
 # 排序时对历史失败惩罚的加权倍数：跨多次探测的惩罚自然平滑单轮噪声，
 # 削弱「一轮 5/5、下一轮 1/5」的名次翻转。
-HISTORY_PENALTY_WEIGHT = 2.0
+HISTORY_PENALTY_WEIGHT = 4.0
+# 当现役节点历史平均失败惩罚达到该阈值（如近 20 轮有 ≥35% 轮次出现超时/丢包），
+# 即便本轮碰巧 5/5 通过，也主动切到历史更稳的榜首节点。
+CHRONIC_PENALTY_SWITCH_THRESHOLD_MS = 80
 # 逐轮折半淘汰（active_candidates_after_round）下，尾部候选只有 1~2 轮样本，
 # 几毫秒抖动就会让尾部名次每 30 分钟洗牌一次。若候选集合未变且前 TOP_K 名次
 # 完全一致，视为有效兜底序未变，保留原排序以避免无意义的快照膨胀与热重载。
@@ -180,7 +183,7 @@ class RebalanceService:
         best_candidate: str,
         group_name: str = AI_MANUAL_GROUP,
     ) -> str | None:
-        """当前出口在多轮实测中已不稳定而榜首节点稳定时，主动切到榜首。
+        """当前出口在多轮实测中已不稳定（或历史高频丢包）而榜首节点稳定时，主动切到榜首。
 
         mihomo fallback 仅在 generate_204 超时（5000ms）时被动切换；对于「能通但丢包/
         抖动不达标」的裂化节点，热重载还会保留原选中项。此处在非自动模式下主动切到
@@ -190,11 +193,19 @@ class RebalanceService:
         best_verdict = getattr(report, "verdict", None)
         if current_verdict is None or best_verdict is None:
             return None
-        if current_verdict.stable or not best_verdict.stable:
+        if not best_verdict.stable:
             return None
         current_node = getattr(report, "current", None)
         if not best_candidate or best_candidate == current_node:
             return None
+        if current_verdict.stable:
+            summaries = getattr(report, "summaries", ()) or ()
+            cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
+            best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
+            cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
+            best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
+            if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:
+                return None
         try:
             query = QueryService(self.paths)
             group_obj = query.api.get_groups().get(group_name)

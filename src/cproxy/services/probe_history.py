@@ -45,7 +45,7 @@ def load_history_penalties(
     except OSError:
         return {}
 
-    penalties: dict[str, int] = {}
+    raw_penalties: dict[str, int] = {}
     matched = 0
     for line in reversed(recent_lines):
         if matched >= HISTORY_LOOKBACK:
@@ -69,12 +69,22 @@ def load_history_penalties(
                 continue
             success = _int_value(node.get("success"))
             failures = _int_value(node.get("failures"))
+            if failures <= 0:
+                continue
             missed_rounds = max(0, rounds - success)
-            penalty = failures * HISTORY_FAILURE_PENALTY_MS
-            penalty += missed_rounds * HISTORY_MISSED_ROUND_PENALTY_MS
+            run_penalty = min(
+                HISTORY_PENALTY_CAP_MS,
+                failures * HISTORY_FAILURE_PENALTY_MS + missed_rounds * HISTORY_MISSED_ROUND_PENALTY_MS,
+            )
             name = str(node["name"])
-            penalties[name] = min(HISTORY_PENALTY_CAP_MS, penalties.get(name, 0) + penalty)
-    return penalties
+            raw_penalties[name] = raw_penalties.get(name, 0) + run_penalty
+    if not matched:
+        return {}
+    return {
+        name: min(HISTORY_PENALTY_CAP_MS, round(total / matched))
+        for name, total in raw_penalties.items()
+        if round(total / matched) > 0
+    }
 
 
 def load_history_rows(history_path: Path, limit: int) -> list[dict]:
