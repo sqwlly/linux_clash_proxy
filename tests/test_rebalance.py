@@ -449,3 +449,112 @@ def test_rebalance_orders_and_switches_ai_gemini(tmp_path, monkeypatch):
     assert report.gemini_ordered == ("DE-IEPL", "KR-1X")
     assert report.gemini_switched_to == "DE-IEPL"
     assert switched == [("AI-GEMINI", "DE-IEPL")]
+
+
+def test_rebalance_gemini_prefers_healthy_1x_over_iepl_and_migrates(tmp_path, monkeypatch):
+    """当 AI-GEMINI 当前在短包延迟更低的 IEPL 节点上（current_verdict.stable=True），
+    且存在零丢包的 1X WebSocket 节点时，排序必须将零丢包 1X 排在 IEPL 之前、全挂 1X 垫底，
+    并主动将 AI-GEMINI 从 IEPL 迁移到榜首 1X 节点（规避 IEPL 50s EOF 与 bad record MAC）。"""
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.probe import StabilityVerdict
+
+    paths = _paths(tmp_path)
+    switched: list[tuple[str, str]] = []
+
+    class _GeminiIEPLProbe:
+        def __init__(self, p):
+            pass
+
+        def probe(self, **kwargs):
+            group = kwargs.get("group")
+            if group == "AI-GEMINI":
+                return SimpleNamespace(
+                    current="🇰🇷韩国 01 | IEPL 1.7X | CM",
+                    current_verdict=StabilityVerdict(True, "5/5 稳定"),
+                    verdict=StabilityVerdict(True, "5/5 稳定"),
+                    summaries=[
+                        _summary("🇹🇼台湾 01 | 1X", (), failures=1),
+                        _summary("🇰🇷韩国 01 | IEPL 1.7X | CM", (180, 190, 200, 195, 205)),
+                        _summary("🇬🇧英国 01 | 1X", (310, 320, 330, 315, 325)),
+                        _summary("🇰🇷韩国 01 | 1X", (340, 350, 360)),
+                    ],
+                )
+            return SimpleNamespace(
+                current="US-01",
+                current_verdict=StabilityVerdict(True, "5/5 稳定"),
+                verdict=StabilityVerdict(True, "5/5 稳定"),
+                summaries=[_summary("US-01", (150, 160))],
+            )
+
+    class _RunningProc:
+        def is_running(self):
+            return True
+
+        def is_runtime_stale(self, path=None):
+            return False
+
+        def mark_runtime_applied(self, path=None):
+            return True
+
+    class _FakeAPI:
+        def __init__(self, p):
+            pass
+
+        def reload_config(self, path: str):
+            pass
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(name="AI-MANUAL", type="fallback", current="US-01", candidates=["US-01"]),
+                "AI-GEMINI": ProxyGroup(
+                    name="AI-GEMINI",
+                    type="fallback",
+                    current="🇰🇷韩国 01 | IEPL 1.7X | CM",
+                    candidates=[
+                        "🇰🇷韩国 01 | IEPL 1.7X | CM",
+                        "🇬🇧英国 01 | 1X",
+                        "🇰🇷韩国 01 | 1X",
+                        "🇹🇼台湾 01 | 1X",
+                    ],
+                ),
+            }
+
+    class _FakeQuery:
+        def __init__(self, p):
+            self.api = _FakeAPI(p)
+
+        def switch_group(self, group: str, target: str):
+            switched.append((group, target))
+
+    monkeypatch.setattr(rebalance_mod, "ProbeService", _GeminiIEPLProbe)
+    monkeypatch.setattr(rebalance_mod, "RuntimeBackend", lambda p: _FakeBackend())
+    monkeypatch.setattr(rebalance_mod, "ProcessBackend", lambda p: _RunningProc())
+    monkeypatch.setattr(rebalance_mod, "APIBackend", _FakeAPI)
+    monkeypatch.setattr(rebalance_mod, "QueryService", _FakeQuery)
+
+    report = RebalanceService(paths).rebalance()
+    expected = [
+        "🇬🇧英国 01 | 1X",
+        "🇰🇷韩国 01 | 1X",
+        "🇰🇷韩国 01 | IEPL 1.7X | CM",
+        "🇹🇼台湾 01 | 1X",
+    ]
+    assert json.loads(ai_gemini_order_file(paths).read_text(encoding="utf-8")) == expected
+    assert list(report.gemini_ordered) == expected
+    assert report.gemini_switched_to == "🇬🇧英国 01 | 1X"
+    assert switched == [("AI-GEMINI", "🇬🇧英国 01 | 1X")]
+
+
+def test_probe_round_elimination_prefers_non_iepl_for_gemini():
+    from cproxy.services.probe import active_candidates_after_round
+
+    results = {
+        "🇰🇷韩国 01 | IEPL 1.7X | CM": {"delays": [180, 190], "failures": 0},
+        "🇬🇧英国 01 | IEPL 1.7X | CM": {"delays": [210, 220], "failures": 0},
+        "🇬🇧英国 01 | 1X": {"delays": [320, 330], "failures": 0},
+        "🇰🇷韩国 01 | 1X": {"delays": [340, 350], "failures": 0},
+    }
+    kept = active_candidates_after_round(results, current=None, prefer_non_iepl=True)
+    assert kept == {"🇬🇧英国 01 | 1X", "🇰🇷韩国 01 | 1X"}
+

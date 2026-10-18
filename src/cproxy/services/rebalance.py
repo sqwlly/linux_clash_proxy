@@ -20,7 +20,7 @@ from ..backend.runtime import (
     _load_ai_manual_order,
 )
 from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, runtime_file
-from .probe import ProbeService, ProbeSummary
+from .probe import ProbeService, ProbeSummary, is_iepl_node
 from .query import QueryService
 
 REBALANCE_PROFILE = "codex"
@@ -37,19 +37,42 @@ CHRONIC_PENALTY_SWITCH_THRESHOLD_MS = 80
 REBALANCE_TOP_K = 5
 
 
-def _smooth_rank_key(summary: ProbeSummary):
+def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
     """`rank_key` 基础上加重历史惩罚权重。
 
     rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
     这里把已叠加的惩罚还原成裸延迟，再按权重重新叠加，得到更稳的排序。
+    当 `prefer_non_iepl=True`（AI-GEMINI）时，在「本轮零失败且历史惩罚健康」的
+    第一梯队内，将非 IEPL（1X WebSocket）节点排在 IEPL（xtls-rprx-vision 中转对
+    Gemini 长思考 SSE 流存在 15s 空闲 / 50s 等待首包硬超时及 bad record MAC）之前；
+    本轮有失败或慢性丢包的节点仍按失效率垫后。
     """
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     weighted = penalty * HISTORY_PENALTY_WEIGHT
+    max_w = max_plus_p - penalty + weighted
+    avg_w = avg_plus_p - penalty + weighted
+    if not prefer_non_iepl:
+        return (
+            neg_success,
+            failures,
+            max_w,
+            avg_w,
+            penalty,
+            name,
+        )
+    is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
+    if is_healthy:
+        tier = 0 if not is_iepl_node(name) else 1
+    else:
+        tier = 2
+    iepl_tiebreak = 1 if is_iepl_node(name) else 0
     return (
+        tier,
         neg_success,
         failures,
-        max_plus_p - penalty + weighted,
-        avg_plus_p - penalty + weighted,
+        iepl_tiebreak,
+        max_w,
+        avg_w,
         penalty,
         name,
     )
@@ -98,7 +121,11 @@ class RebalanceService:
                 record_history=True,
             )
             gemini_ordered = [
-                summary.name for summary in sorted(gemini_report.summaries, key=_smooth_rank_key)
+                summary.name
+                for summary in sorted(
+                    gemini_report.summaries,
+                    key=lambda s: _smooth_rank_key(s, prefer_non_iepl=True),
+                )
             ]
         except (RuntimeError, KeyError, ValueError):
             gemini_report = None
@@ -202,7 +229,12 @@ class RebalanceService:
         best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
         if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
             return None
-        if current_verdict.stable:
+        migrating_gemini_off_iepl = (
+            group_name == AI_GEMINI_GROUP
+            and is_iepl_node(current_node)
+            and not is_iepl_node(best_candidate)
+        )
+        if current_verdict.stable and not migrating_gemini_off_iepl:
             cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
             cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
             best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0

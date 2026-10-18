@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 from .cli_args import CliArgumentParser, CliHelpFormatter
 from .names import normalize_name as normalize_name  # 再导出：既有 import 路径保持可用
-from .services.probe import ProbeReport, format_delay, stable_score
+from .services.probe import ProbeReport, format_delay, probe_rank_key, stable_score
 from .textwidth import display_width, pad_left, pad_right
 
 # `cproxy status` 按进程明细的默认行数。定义在此处是因为它属于 CLI 契约，
@@ -18,6 +18,7 @@ def build_probe_output(
     raw: bool,
     section_title: Callable[[str], str] = str,
 ) -> tuple[list[str], int]:
+    prefer_non_iepl = report.group == "AI-GEMINI" or report.profile == "gemini"
     if raw:
         lines = [
             f"GROUP\t{report.group}",
@@ -40,7 +41,9 @@ def build_probe_output(
             lines.append(f"SWITCH\t{report.group}\t{report.best.name if report.best else '-'}")
         if report.switch_requested and not report.switched:
             lines.append(f"SKIP_SWITCH\t{report.group}\t{report.skip_reason}")
-        for summary in sorted(report.summaries, key=lambda item: item.rank_key()):
+        for summary in sorted(
+            report.summaries, key=lambda item: probe_rank_key(item, prefer_non_iepl=prefer_non_iepl)
+        ):
             score = stable_score(summary, report.rounds, report.strategy)
             lines.append(
                 f"NODE\t{summary.name}\tsuccess={summary.success_count}/{report.rounds}"
@@ -82,6 +85,7 @@ def build_probe_output(
 
 
 def _probe_table_lines(report: ProbeReport) -> list[str]:
+    prefer_non_iepl = report.group == "AI-GEMINI" or report.profile == "gemini"
     headers = ("节点", "成功", "失败", "平均", "最大", "最小", "score")
     rows = [
         (
@@ -93,7 +97,9 @@ def _probe_table_lines(report: ProbeReport) -> list[str]:
             format_delay(summary.min_delay),
             str(stable_score(summary, report.rounds, report.strategy)),
         )
-        for summary in sorted(report.summaries, key=lambda item: item.rank_key())
+        for summary in sorted(
+            report.summaries, key=lambda item: probe_rank_key(item, prefer_non_iepl=prefer_non_iepl)
+        )
     ]
     widths = [
         max([display_width(headers[index]), *(display_width(row[index]) for row in rows)])

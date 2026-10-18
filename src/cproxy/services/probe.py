@@ -151,10 +151,22 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
         return current
 
 
+def is_iepl_node(name: str | None) -> bool:
+    return bool(name and "IEPL" in name.upper())
+
+
+def probe_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False) -> tuple[int, int, int, int, int, int, str]:
+    neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
+    iepl_tier = (1 if is_iepl_node(name) else 0) if prefer_non_iepl else 0
+    return (neg_success, failures, iepl_tier, max_plus_p, avg_plus_p, penalty, name)
+
+
 def active_candidates_after_round(
     results: dict[str, dict],
     current: str | None,
     history_penalties: dict[str, int] | None = None,
+    *,
+    prefer_non_iepl: bool = False,
 ) -> set[str]:
     penalties = history_penalties or {}
     summaries = [
@@ -167,7 +179,9 @@ def active_candidates_after_round(
         for n, d in results.items()
     ]
     keep = max(1, ceil(len(summaries) / 2))
-    active = {s.name for s in sorted(summaries, key=lambda s: s.rank_key())[:keep]}
+    active = {
+        s.name for s in sorted(summaries, key=lambda s: probe_rank_key(s, prefer_non_iepl=prefer_non_iepl))[:keep]
+    }
     if current and current in results:
         active.add(current)
     return active
@@ -212,11 +226,15 @@ def switch_skip_reason(
     current_verdict: StabilityVerdict,
     current_summary: ProbeSummary | None,
     strategy: ProbeStrategy,
+    *,
+    prefer_non_iepl: bool = False,
 ) -> str:
     if best is None:
         return "没有可切换的成功节点"
     if current == best.name:
         return "当前已是推荐稳定节点"
+    if prefer_non_iepl and is_iepl_node(current) and not is_iepl_node(best.name):
+        return ""
     if not current_verdict.stable or current_summary is None:
         return ""
     if best.avg_delay is None or current_summary.avg_delay is None:
@@ -235,12 +253,18 @@ def _preview_reason(
     current_verdict: StabilityVerdict,
     current_summary: ProbeSummary | None,
     strategy: ProbeStrategy,
+    *,
+    prefer_non_iepl: bool = False,
 ) -> str:
     if not verdict.stable:
         if not current_verdict.stable:
-            return switch_skip_reason(best, current, current_verdict, current_summary, strategy)
+            return switch_skip_reason(
+                best, current, current_verdict, current_summary, strategy, prefer_non_iepl=prefer_non_iepl
+            )
         return verdict.reason
-    return switch_skip_reason(best, current, current_verdict, current_summary, strategy)
+    return switch_skip_reason(
+        best, current, current_verdict, current_summary, strategy, prefer_non_iepl=prefer_non_iepl
+    )
 
 
 def _summary_payload(summary: ProbeSummary, rounds: int, strategy: ProbeStrategy) -> dict:
@@ -331,13 +355,19 @@ class ProbeService:
 
             if rnd < probe_rounds - 1 and len(active) > 1:
                 before = len(active)
-                active = active_candidates_after_round({n: results[n] for n in active}, current, penalties)
+                active = active_candidates_after_round(
+                    {n: results[n] for n in active},
+                    current,
+                    penalties,
+                    prefer_non_iepl=(group == "AI-GEMINI" or profile == "gemini"),
+                )
                 if show_progress:
                     progress.commit(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}")
 
         if show_progress:
             progress.commit("完成")
 
+        prefer_non_iepl = group == "AI-GEMINI" or profile == "gemini"
         summaries = tuple(
             ProbeSummary(
                 name=n,
@@ -348,11 +378,13 @@ class ProbeService:
             for n, d in results.items()
         )
         successful = [s for s in summaries if s.success_count > 0]
-        best = min(successful, key=lambda s: s.rank_key()) if successful else None
+        best = min(successful, key=lambda s: probe_rank_key(s, prefer_non_iepl=prefer_non_iepl)) if successful else None
         verdict = stability_verdict(best, probe_rounds, strategy)
         current_summary = next((s for s in summaries if s.name == current), None)
         current_verdict = stability_verdict(current_summary, probe_rounds, strategy)
-        preview = _preview_reason(best, verdict, current, current_verdict, current_summary, strategy)
+        preview = _preview_reason(
+            best, verdict, current, current_verdict, current_summary, strategy, prefer_non_iepl=prefer_non_iepl
+        )
 
         switched = False
         skip_reason = ""

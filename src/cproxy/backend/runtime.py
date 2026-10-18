@@ -412,6 +412,7 @@ def _collect_gemini_nodes(
     ordered: list[str] = []
     for code in AI_GEMINI_REGION_ORDER:
         ordered.extend(_prefer_non_iepl_nodes(buckets[code]))
+    ordered = _prefer_non_iepl_nodes(ordered)
     for name in reversed([str(item) for item in prefer or []]):
         if name in ordered:
             ordered.remove(name)
