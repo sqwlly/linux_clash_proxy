@@ -994,3 +994,87 @@ def test_download_subscription_rebuilds_request_between_attempts(tmp_path: Path,
     # 直连尝试拿到的必须是原始订阅站 host：若复用被 urllib 原地改写的
     # Request，第二次看到的会是代理地址 127.0.0.1:7890
     assert seen_hosts == ["sub.example.com", "sub.example.com"]
+
+
+def test_update_source_from_subscription_dedupe_is_idempotent_and_cleans_zombie_suffixes(tmp_path: Path):
+    """回归：上游订阅自带同名节点（如两条「🇯🇵日本 01 | 1X | 推荐」）时，连续多次刷新
+    不得把上一轮去重生成的 `#2` 误判为本地自建节点保留下来，从而滚雪球产出 `#2_`、`#2__`；
+    历史已落盘的 `#2_` 僵尸副本应在刷新时被清理，而真正的本地自建节点仍完整保留。"""
+    from cproxy.config import default_paths, read_config
+    from cproxy.services.refresh import update_source_from_subscription
+
+    class DupSubHandler(_SubscriptionHandler):
+        payload = """
+proxies:
+  - name: 🇯🇵日本 01 | 1X | 推荐
+    type: ss
+    server: jp1-a.example.com
+  - name: 🇯🇵日本 01 | 1X | 推荐
+    type: ss
+    server: jp1-b.example.com
+  - name: 🇺🇸美国 01 | 1X
+    type: ss
+    server: us1.example.com
+proxy-groups:
+  - name: CyberGuard
+    type: select
+    proxies:
+      - 🇯🇵日本 01 | 1X | 推荐
+      - 🇯🇵日本 01 | 1X | 推荐
+      - 🇺🇸美国 01 | 1X
+rules:
+  - MATCH,CyberGuard
+"""
+
+    paths = default_paths(tmp_path)
+    # 模拟本地既有自建节点，又残留了旧 bug 制造的 `#2_` 僵尸节点
+    _write_config(
+        paths,
+        """
+mixed-port: 7890
+proxies:
+  - name: 🇯🇵日本 01 | 1X | 推荐
+    type: ss
+    server: jp1-a.example.com
+  - name: 🇯🇵日本 01 | 1X | 推荐 #2
+    type: ss
+    server: jp1-b.example.com
+  - name: 🇯🇵日本 01 | 1X | 推荐 #2_
+    type: ss
+    server: jp1-b.example.com
+  - name: 自建-VLESS
+    type: vless
+    server: self.example.com
+proxy-groups:
+  - name: CyberGuard
+    type: select
+    proxies:
+      - 自建-VLESS
+      - 🇯🇵日本 01 | 1X | 推荐
+      - 🇯🇵日本 01 | 1X | 推荐 #2
+      - 🇯🇵日本 01 | 1X | 推荐 #2_
+rules:
+  - MATCH,CyberGuard
+""",
+    )
+
+    server, thread = _serve(DupSubHandler)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/sub"
+        update_source_from_subscription(paths, url)
+        update_source_from_subscription(paths, url)
+    finally:
+        server.shutdown()
+        thread.join()
+
+    merged = read_config(paths)
+    proxy_names = [p["name"] for p in merged["proxies"]]
+    assert proxy_names == [
+        "🇯🇵日本 01 | 1X | 推荐",
+        "🇯🇵日本 01 | 1X | 推荐 #2",
+        "🇺🇸美国 01 | 1X",
+        "自建-VLESS",
+    ]
+    group_members = merged["proxy-groups"][0]["proxies"]
+    assert "🇯🇵日本 01 | 1X | 推荐 #2_" not in group_members
+    assert "自建-VLESS" in group_members

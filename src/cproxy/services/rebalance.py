@@ -11,14 +11,19 @@ from dataclasses import dataclass
 
 from ..backend.api import APIBackend
 from ..backend.process import ProcessBackend
-from ..backend.runtime import AI_MANUAL_GROUP, RuntimeBackend
-from ..config import AppPaths, ai_manual_order_file
+from ..backend.runtime import AI_AUTO_GROUP, AI_MANUAL_GROUP, RuntimeBackend, _load_ai_manual_order
+from ..config import AppPaths, ai_manual_order_file, runtime_file
 from .probe import ProbeService, ProbeSummary
+from .query import QueryService
 
 REBALANCE_PROFILE = "codex"
 # 排序时对历史失败惩罚的加权倍数：跨多次探测的惩罚自然平滑单轮噪声，
 # 削弱「一轮 5/5、下一轮 1/5」的名次翻转。
 HISTORY_PENALTY_WEIGHT = 2.0
+# 逐轮折半淘汰（active_candidates_after_round）下，尾部候选只有 1~2 轮样本，
+# 几毫秒抖动就会让尾部名次每 30 分钟洗牌一次。若候选集合未变且前 TOP_K 名次
+# 完全一致，视为有效兜底序未变，保留原排序以避免无意义的快照膨胀与热重载。
+REBALANCE_TOP_K = 5
 
 
 def _smooth_rank_key(summary: ProbeSummary):
@@ -39,6 +44,12 @@ def _smooth_rank_key(summary: ProbeSummary):
     )
 
 
+def _should_keep_previous_order(previous: list[str], current: list[str]) -> bool:
+    if not previous or len(previous) != len(current) or set(previous) != set(current):
+        return False
+    return previous[:REBALANCE_TOP_K] == current[:REBALANCE_TOP_K]
+
+
 @dataclass(frozen=True)
 class RebalanceReport:
     ordered: tuple[str, ...]
@@ -46,6 +57,7 @@ class RebalanceReport:
     rerendered: bool
     hot_reloaded: bool
     reason: str = ""
+    switched_to: str | None = None
 
 
 class RebalanceService:
@@ -70,21 +82,67 @@ class RebalanceService:
                 reason="dry-run",
             )
 
-        order_path.parent.mkdir(parents=True, exist_ok=True)
-        order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+        previous_order = _load_ai_manual_order(self.paths)
+        order_updated = not _should_keep_previous_order(previous_order, ordered)
+        effective_order = ordered if order_updated else previous_order
+        if order_updated:
+            order_path.parent.mkdir(parents=True, exist_ok=True)
+            order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
 
+        target_runtime = runtime_file(self.paths)
+        before_bytes = target_runtime.read_bytes() if target_runtime.exists() else None
         runtime_path = RuntimeBackend(self.paths).render_runtime()
+        after_bytes = runtime_path.read_bytes() if runtime_path.exists() else None
+        runtime_changed = before_bytes != after_bytes
+
+        process = ProcessBackend(self.paths)
+        running = process.is_running()
+        is_stale = getattr(process, "is_runtime_stale", lambda _path=None: False)(runtime_path)
         hot_reloaded = False
-        if ProcessBackend(self.paths).is_running():
+        if running and (order_updated or runtime_changed or is_stale):
             try:
                 APIBackend(self.paths).reload_config(str(runtime_path))
                 hot_reloaded = True
             except Exception:
                 # 热重载失败留给下一轮 cproxy render/rebalance 兜底，不阻断
                 hot_reloaded = False
+            if hot_reloaded and hasattr(process, "mark_runtime_applied"):
+                process.mark_runtime_applied(runtime_path)
+
+        switched_to: str | None = None
+        if running and effective_order:
+            switched_to = self._switch_if_current_unstable(report, effective_order[0])
+
         return RebalanceReport(
-            ordered=tuple(ordered),
+            ordered=tuple(effective_order),
             order_path=str(order_path),
             rerendered=True,
             hot_reloaded=hot_reloaded,
+            switched_to=switched_to,
         )
+
+    def _switch_if_current_unstable(self, report, best_candidate: str) -> str | None:
+        """当前出口在多轮实测中已不稳定而榜首节点稳定时，主动切到榜首。
+
+        mihomo fallback 仅在 generate_204 超时（5000ms）时被动切换；对于「能通但丢包/
+        抖动不达标」的裂化节点，热重载还会保留原选中项。此处在非自动模式下主动切到
+        实测稳定的榜首叶子，闭合「探测出劣化 → 切走」回路。
+        """
+        current_verdict = getattr(report, "current_verdict", None)
+        best_verdict = getattr(report, "verdict", None)
+        if current_verdict is None or best_verdict is None:
+            return None
+        if current_verdict.stable or not best_verdict.stable:
+            return None
+        current_node = getattr(report, "current", None)
+        if not best_candidate or best_candidate == current_node:
+            return None
+        try:
+            query = QueryService(self.paths)
+            group_obj = query.api.get_groups().get(AI_MANUAL_GROUP)
+            if group_obj is not None and group_obj.current == AI_AUTO_GROUP:
+                return None
+            query.switch_group(AI_MANUAL_GROUP, best_candidate)
+            return best_candidate
+        except Exception:
+            return None

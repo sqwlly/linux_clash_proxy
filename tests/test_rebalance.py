@@ -199,3 +199,129 @@ def test_rebalance_dry_run_does_not_write(tmp_path, monkeypatch):
     assert report.rerendered is False
     assert report.reason == "dry-run"
     assert not ai_manual_order_file(paths).exists()
+
+
+def test_rebalance_marks_runtime_applied_and_switches_unstable_current(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.services.probe import StabilityVerdict
+
+    paths = _paths(tmp_path)
+    applied: list[Path] = []
+    reloaded: list[str] = []
+    switched: list[tuple[str, str]] = []
+
+    class _ProbeUnstableCurrent:
+        def __init__(self, p):
+            pass
+
+        def probe(self, **kwargs):
+            return SimpleNamespace(
+                current="slow",
+                current_verdict=StabilityVerdict(False, "失败 2 次"),
+                verdict=StabilityVerdict(True, "5/5 稳定"),
+                summaries=[
+                    _summary("slow", (500,), failures=2),
+                    _summary("stable", (100, 110)),
+                ],
+            )
+
+    class _RunningProc:
+        def is_running(self):
+            return True
+
+        def is_runtime_stale(self, path=None):
+            return False
+
+        def mark_runtime_applied(self, path=None):
+            applied.append(Path(path))
+            return True
+
+    class _FakeAPI:
+        def __init__(self, p):
+            pass
+
+        def reload_config(self, path: str):
+            reloaded.append(path)
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(
+                    name="AI-MANUAL", type="fallback", current="slow", candidates=["slow", "stable", "AI-AUTO"]
+                )
+            }
+
+    class _FakeQuery:
+        def __init__(self, p):
+            self.api = _FakeAPI(p)
+
+        def switch_group(self, group: str, target: str):
+            switched.append((group, target))
+
+    monkeypatch.setattr(rebalance_mod, "ProbeService", _ProbeUnstableCurrent)
+    monkeypatch.setattr(rebalance_mod, "RuntimeBackend", lambda p: _FakeBackend())
+    monkeypatch.setattr(rebalance_mod, "ProcessBackend", lambda p: _RunningProc())
+    monkeypatch.setattr(rebalance_mod, "APIBackend", _FakeAPI)
+    monkeypatch.setattr(rebalance_mod, "QueryService", _FakeQuery)
+
+    report = RebalanceService(paths).rebalance()
+    assert report.hot_reloaded is True
+    assert reloaded == ["/tmp/ignored-runtime.yaml"]
+    assert applied == [Path("/tmp/ignored-runtime.yaml")]
+    assert report.switched_to == "stable"
+    assert switched == [("AI-MANUAL", "stable")]
+
+
+def test_rebalance_suppresses_tail_noise_when_top_k_unchanged(tmp_path, monkeypatch):
+    """当候选集不变且前 REBALANCE_TOP_K(5) 名完全一致，仅第 6、7 名因单轮抖动互换时，
+    不应重写 ai-manual-order.json，也不触发无意义的热重载。"""
+    paths = _paths(tmp_path)
+    previous = ["N1", "N2", "N3", "N4", "N5", "N6", "N7"]
+    order_file = ai_manual_order_file(paths)
+    order_file.parent.mkdir(parents=True, exist_ok=True)
+    order_file.write_text(json.dumps(previous), encoding="utf-8")
+
+    runtime_path = paths.data_dir / "runtime.yaml"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text("same: true\n", encoding="utf-8")
+
+    class _ProbeTailSwap:
+        def __init__(self, p):
+            pass
+
+        def probe(self, **kwargs):
+            # N1..N5 顺序不变，仅尾部 N6 与 N7 延迟互换
+            return SimpleNamespace(
+                summaries=[
+                    _summary("N1", (100, 100)),
+                    _summary("N2", (110, 110)),
+                    _summary("N3", (120, 120)),
+                    _summary("N4", (130, 130)),
+                    _summary("N5", (140, 140)),
+                    _summary("N7", (200,)),
+                    _summary("N6", (205,)),
+                ]
+            )
+
+    reloaded: list[str] = []
+
+    class _NoChangeBackend:
+        def render_runtime(self):
+            return runtime_path
+
+    class _RunningProc:
+        def is_running(self):
+            return True
+
+        def is_runtime_stale(self, path=None):
+            return False
+
+    monkeypatch.setattr(rebalance_mod, "ProbeService", _ProbeTailSwap)
+    monkeypatch.setattr(rebalance_mod, "RuntimeBackend", lambda p: _NoChangeBackend())
+    monkeypatch.setattr(rebalance_mod, "ProcessBackend", lambda p: _RunningProc())
+    monkeypatch.setattr(rebalance_mod, "APIBackend", lambda p: SimpleNamespace(reload_config=reloaded.append))
+
+    report = RebalanceService(paths).rebalance()
+    assert list(report.ordered) == previous
+    assert json.loads(order_file.read_text(encoding="utf-8")) == previous
+    assert report.hot_reloaded is False
+    assert reloaded == []

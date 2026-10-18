@@ -324,7 +324,10 @@ def build_root_parser() -> ArgumentParser:
     migrate_parser = _add_command(subparsers, "migrate-from-legacy")
     migrate_parser.add_argument("legacy_root", help="旧仓库根目录")
 
-    _add_command(subparsers, "render")
+    render_parser = _add_command(subparsers, "render")
+    render_parser.add_argument(
+        "--apply", action="store_true", help="若运行配置落后于当前实例，热重载并同步指纹"
+    )
     tun_parser = _add_command(subparsers, "tun", json_output=True)
     tun_parser.add_argument(
         "action", nargs="?", default="status", choices=("status", "on", "off"), help="查询状态或保存 TUN 开关"

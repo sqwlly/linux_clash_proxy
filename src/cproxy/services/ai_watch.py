@@ -12,7 +12,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP
+from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
 from ..config import AppPaths, ai_watch_state_file, read_config
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
 from .probe import resolve_current_leaf
@@ -158,14 +158,26 @@ class AIWatchService:
         return result
 
     def _pick_next(self, groups: dict, group, current: str | None, cooldown: dict, now: float) -> str | None:
-        """从组候选里挑下一个可切叶子：跳过当前节点、冷却期节点与嵌套组（AI-AUTO 等）。"""
+        """从组候选里挑下一个可切叶子：跳过当前节点、冷却期节点与嵌套组（AI-AUTO 等）。
+
+        mihomo `/proxies` 对每个叶子节点也返回一条 `candidates=[]` 的条目，因此必须用
+        `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
+        `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
+        仅当所有非冷却叶子都被标死时才回退到首个可用候选。
+        """
+        fallback_leaf: str | None = None
         for cand in group.candidates:
             if not cand or cand == current:
                 continue
-            if cand in groups:
+            entry = groups.get(cand)
+            if entry is not None and entry.candidates:
                 continue
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
                 continue
+            if entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout"):
+                if fallback_leaf is None:
+                    fallback_leaf = str(cand)
+                continue
             return str(cand)
-        return None
+        return fallback_leaf

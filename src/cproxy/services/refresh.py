@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -195,6 +196,20 @@ def _rebuild_groups_with_new_nodes(local_groups: list, old_node_names: list[str]
     return rebuilt
 
 
+_DEDUPE_SUFFIX_RE = re.compile(r"^(.+) #\d+_*$")
+
+
+def _is_dedupe_artifact(name: str, merged_names: set[str]) -> bool:
+    """判断本地节点名是否为历史 `_dedupe_proxy_names` 派生的 `#2`/`#2_` 副本。
+
+    当上游订阅本身含重名节点时，上一轮刷新落盘的 `config.yaml` 会带有 `Foo #2`；
+    若在去重前对比，或历史已产生 `Foo #2_` 僵尸副本，直接把所有不在 `merged_names`
+    里的节点当成“用户手写自建节点”保留下来，会让下一轮去重把后缀继续垫成 `#2_`、`#2__`。
+    """
+    match = _DEDUPE_SUFFIX_RE.match(name)
+    return bool(match and match.group(1) in merged_names)
+
+
 def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加内容：
     - 附加节点：追加进 merged["proxies"]，并在同名组中按本地原有位置插回，
@@ -202,7 +217,8 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     - 附加分组：本地存在而订阅未提供的分组（自建分组、多订阅机场分组）
       整体追加到组列表末尾，其名称同样按本地位置插回同名组，保证主订阅
       组里挂的附加机场入口（如 "Mitce"）不随订阅更新丢失。
-    面板信息节点（名字随流量/到期日变化）不视为自建节点，任其随订阅更替。"""
+    面板信息节点（名字随流量/到期日变化）与历史重名去重副本（`#2`/`#2_`）
+    不视为自建节点，任其随订阅更替。"""
     local_proxies = [proxy for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
     merged_names = {
         str(proxy.get("name")) for proxy in merged.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
@@ -211,7 +227,11 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     extra_proxies: list = []
     for proxy in local_proxies:
         name = str(proxy["name"])
-        if name not in merged_names and not is_panel_info_node(name):
+        if (
+            name not in merged_names
+            and not is_panel_info_node(name)
+            and not _is_dedupe_artifact(name, merged_names)
+        ):
             extra_proxies.append(proxy)
             extra_names.add(name)
 
@@ -363,6 +383,9 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
         for key in SUBSCRIPTION_STRIP_KEYS | LOCAL_PREFERRED_KEYS:
             if key in existing:
                 merged[key] = existing[key]
+        # 先对新订阅自身去重（生成 `#2`），再比对本地附加节点，避免上一轮落盘的 `#2`
+        # 被误判成用户自建节点保留下来，进而滚雪球产生 `#2_`、`#2__`
+        _dedupe_proxy_names(merged)
         _preserve_local_extra_proxies(merged, existing)
     else:
         # nodelist 型订阅只提供 proxies：以本地配置为基础，仅替换节点并沿用

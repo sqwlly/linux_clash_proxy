@@ -33,7 +33,7 @@ from .geodata import check_country_mmdb
 from .install import auto_migrate_from_default_legacy, init_user_layout, is_placeholder_config
 from .logs import follow_lines, read_recent_lines
 from .output import STATUS_PROCESS_TOP_DEFAULT, normalize_name
-from .process import get_status, restart_process, start_process
+from .process import ProcessBackend, get_status, restart_process, start_process
 from .runtime import render_runtime
 from .security import validate_controller_security
 from .services.ipcheck import IpCheckService
@@ -1249,6 +1249,10 @@ def _run_bootstrap(subscription_url: str | None = None) -> int:
         runtime_path = render_runtime(paths)
         bootstrap_spinner.update("正在启动代理进程…")
         pid = start_process(paths)
+        process = ProcessBackend(paths)
+        if process.is_runtime_stale(runtime_path):
+            APIBackend(paths).reload_config(str(runtime_path))
+            process.mark_runtime_applied(runtime_path)
         bootstrap_spinner.update("正在校验运行状态…")
         snapshot = get_status(paths)
     if not snapshot.running:

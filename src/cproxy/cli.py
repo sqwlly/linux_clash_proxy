@@ -40,7 +40,7 @@ from .feedback import Spinner
 from .install import init_user_layout, migrate_from_legacy
 from .interactive import NotATerminalError, select_one
 from .output import build_probe_output, build_root_parser, normalize_name, render_command_overview
-from .process import ProcessOwnershipError, restart_process, start_process, stop_process
+from .process import ProcessBackend, ProcessOwnershipError, restart_process, start_process, stop_process
 from .proxyenv import proxy_env_lines, run_proxy_shell, run_with_proxy
 from .runtime import render_runtime
 from .services.ai_watch import VERDICT_LABELS, AIWatchService
@@ -144,8 +144,15 @@ def run(argv: list[str] | None = None) -> int:
             print(f"已迁移配置: {config_file}")
             return 0
         if args.command == "render":
-            runtime_path = render_runtime(default_paths())
+            paths = default_paths()
+            runtime_path = render_runtime(paths)
             print(f"已生成运行配置: {runtime_path}")
+            if getattr(args, "apply", False):
+                process = ProcessBackend(paths)
+                if process.is_running() and process.is_runtime_stale(runtime_path):
+                    APIBackend(paths).reload_config(str(runtime_path))
+                    process.mark_runtime_applied(runtime_path)
+                    print("已热重载运行配置")
             return 0
         if args.command == "tun":
             if args.action == "status" and args.apply:
@@ -334,6 +341,8 @@ def run(argv: list[str] | None = None) -> int:
             if rebalance_report.rerendered:
                 print(f"已写入稳定度排序: {rebalance_report.order_path}")
                 print("运行配置: " + ("已热重载" if rebalance_report.hot_reloaded else "已渲染（代理未运行）"))
+            if rebalance_report.switched_to:
+                print(f"出口切换: {rebalance_report.switched_to}")
             return 0
         if args.command == "ai-watch":
             watch_report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)

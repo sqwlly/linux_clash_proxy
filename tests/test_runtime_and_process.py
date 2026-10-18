@@ -879,3 +879,81 @@ rules:
     assert idx_ai < idx_pytorch < idx_match
     idx_subscription = rules.index("DOMAIN-SUFFIX,example.com,SSRDOG")
     assert idx_ai < idx_pytorch < idx_subscription
+
+
+def test_probe_history_trims_to_max_lines(tmp_path: Path, monkeypatch):
+    from cproxy.services import probe_history
+
+    monkeypatch.setattr(probe_history, "MAX_HISTORY_LINES", 5)
+    history_path = tmp_path / "probe_history.jsonl"
+    for i in range(8):
+        probe_history.record_probe_history(
+            history_path,
+            profile="codex",
+            strategy_name="conservative",
+            group="AI-MANUAL",
+            url="https://chatgpt.com",
+            rounds=5,
+            timeout_ms=8000,
+            current=f"node-{i}",
+            current_stable=True,
+            current_reason="ok",
+            best=f"node-{i}",
+            stable=True,
+            reason="ok",
+            switch_requested=False,
+            switched=False,
+            skip_reason="",
+            nodes=[{"name": f"node-{i}", "success": 5, "failures": 0}],
+        )
+
+    lines = history_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 5
+    rows = probe_history.load_history_rows(history_path, limit=10)
+    assert [row["current"] for row in rows] == ["node-3", "node-4", "node-5", "node-6", "node-7"]
+
+
+def test_cli_render_apply_reloads_when_stale(tmp_path: Path, monkeypatch, capsys):
+    from cproxy import cli as cli_mod
+    from cproxy.config import default_paths
+
+    paths = default_paths(tmp_path)
+    runtime_path = paths.data_dir / "runtime.yaml"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text("mixed-port: 7890\n", encoding="utf-8")
+
+    reloaded: list[str] = []
+    applied: list[Path] = []
+
+    class _FakeProc:
+        def __init__(self, p):
+            pass
+
+        def is_running(self):
+            return True
+
+        def is_runtime_stale(self, path=None):
+            return True
+
+        def mark_runtime_applied(self, path=None):
+            applied.append(Path(path))
+            return True
+
+    class _FakeAPI:
+        def __init__(self, p):
+            pass
+
+        def reload_config(self, path: str):
+            reloaded.append(path)
+
+    monkeypatch.setattr(cli_mod, "default_paths", lambda: paths)
+    monkeypatch.setattr(cli_mod, "render_runtime", lambda p: runtime_path)
+    monkeypatch.setattr(cli_mod, "ProcessBackend", _FakeProc)
+    monkeypatch.setattr(cli_mod, "APIBackend", _FakeAPI)
+
+    rc = cli_mod.run(["render", "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert reloaded == [str(runtime_path)]
+    assert applied == [runtime_path]
+    assert "已热重载运行配置" in out

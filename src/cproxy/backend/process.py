@@ -127,6 +127,14 @@ class ProcessBackend:
             return False
         return owner.runtime_hash != current_hash
 
+    def is_runtime_stale(self, runtime_path: Path | str | None = None) -> bool:
+        """当前运行实例记录的 runtime 指纹是否落后于磁盘文件。"""
+        owner = self._read_process_owner()
+        if owner is None:
+            return False
+        path = Path(runtime_path) if runtime_path is not None else Path(owner.runtime)
+        return self._runtime_is_stale(owner, self._file_fingerprint(path))
+
     def mark_runtime_applied(self, runtime_path: Path | str | None = None) -> bool:
         """把“运行实例已加载该 runtime 内容”同步进进程元数据。
 

@@ -25,10 +25,15 @@
 - `cproxy switch` 放行 `fallback` 组手动指定：mihomo 尊重手动选择直到节点挂，`AI-MANUAL` 与 `AI-AUTO` 均可在 fallback 下切换（顺带修掉 TUI「切换美/新」在自动模式被类型守卫拦下的隐患）
 - TUI / `ai-status` 的 AI 出口「模式」标签由「固定」改为「兜底」，如实反映故障转移语义；非自动池一支进一步细化为 `兜底 · 直连池`——出口是 mihomo 在 `AI-MANUAL` 的直连候选池里按列表顺序取第一个存活节点（池内顺序才体现用户意图，由 `ai-rebalance` 维护），用「手动」描述会让人以为节点被钉住（实测出现过韩国节点挂掉后自动落到新加坡）
 - `AI-MANUAL` 的 codex 候选池扩展韩/英：实测 `🇰🇷韩国 01 IEPL` 与 `🇬🇧英国 01 IEPL` 对 codex 稳定（5/5），纳入后 `ai-rebalance` 的 codex 稳定度排序随之覆盖，日本 TE 挂掉后可自动落到韩国 IEPL（仅进 codex 池，不污染 `AI-US`/`AI-SG` 自动池）
-- `ai-rebalance` 排序加重历史失败惩罚权重，平滑单轮 codex 探测噪声（削弱「一轮 5/5、下一轮 1/5」的名次翻转）
+- `ai-rebalance` 排序加重历史失败惩罚权重，平滑单轮 codex 探测噪声（削弱「一轮 5/5、下一轮 1/5」的名次翻转）；当候选集未变且前 5 名顺序完全一致时抑制尾部 1 轮样本抖动触发的无意义重写与热重载；若当前 `AI-MANUAL` 出口在多轮实测中已不稳定而榜首稳定，重排后主动切到榜首叶子
+- `cproxy render --apply`（及 `cproxy-refresh.service` 15 分钟定时任务与 `bootstrap`）：当磁盘 `runtime.yaml` 落后于运行实例时自动热重载并同步 `runtime_hash` 指纹，消除配置变更后 `status`/`doctor` 长期报「配置时效: 待刷新」的盲区
+- `probe_history.jsonl` 限制最多保留最近 200 条记录（原子截断），防止 30 分钟周期定时任务让探测历史无限膨胀
 
 ### 修复
 
+- `cproxy ai-watch` 看门狗无法选出替代节点（P0）：`APIBackend.get_groups()` 返回的 `/proxies` 字典中每个叶子节点也存在一条 `candidates=[]` 的条目，原 `_pick_next` 用 `if cand in groups: continue` 过滤嵌套组时把全部真实叶子一并跳过，导致 `_pick_next` 恒返 `None`；现改为用 `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），并优先跳过健康检查已标死/超时的叶子
+- 订阅刷新每日滚雪球产生 `#2_`、`#2__` 僵尸重名节点（P1）：`update_source_from_subscription` 原先在对新订阅执行 `_dedupe_proxy_names` 之前就调用 `_preserve_local_extra_proxies`，导致上一轮去重生成的 `Foo #2` 被误判为用户手写自建节点保留下来，随后再次去重被垫成 `Foo #2_`；现改为先对新订阅去重再比对本地附加节点，并在 `_preserve_local_extra_proxies` 中过滤历史去重副本后缀（自动清理残留的 `#2_` 僵尸节点）
+- `cproxy ai-rebalance` 热重载成功后同步调用 `mark_runtime_applied(runtime_path)`，修复每 30 分钟重排热重载后 `cproxy status` / `doctor` 误报「运行配置未跟随最近一次 render」的问题
 - `cproxy start` 的外来实例提示与 `cproxy incident` 的服务诊断此前指向系统级 legacy `clash-proxy.service`（该单元已随退役删除）。现改指真实生产单元——**用户级** `cproxy.service`（`systemctl --user ...`），同时移除 `start()` 中原用于拦截异构 legacy 服务的 `systemctl is-active` 预检，避免 `cproxy.service` active 时执行 `cproxy restart` / `ExecReload` 在 `stop()` 后被自身单元状态拦死；`restart()` 刻意仍只做 stop+start，以免 `ExecReload` 回头调 `systemctl --user restart` 自我递归
 - `ai-status` / TUI 的延迟不再把 mihomo 的**哨兵值**当真实延迟展示：`history` 里的 `5000` 是探测**超时**（本项目组配置不设 `timeout`，取 mihomo 默认 5000ms），`0` 是**未测得**。此前按毫秒渲染，会把「备用节点其实在超时」显示成 `5000ms · 正常`——读起来又快又健康，是比旧版显示 `─` 更糟的错误信息（生产实测 AI-US 的 history 为 `[5000, 861, 5000, 267]`）。现按三态渲染 `NNNms` / `超时` / `未测得`，且非 ok 时不再并排显示健康标记（避免「超时 · 正常」这种自相矛盾）；`--raw` / `--json` 仍保留原始数值供机器解析
 - `ai-status` 的连通性明细只在探测失败时显示：成功时的 `HTTP 401/403` 是「可达但需鉴权」，摆在「正常」后面会被读成故障码

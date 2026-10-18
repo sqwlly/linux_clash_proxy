@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 from ..config import AppPaths
 
 HISTORY_LOOKBACK = 20
+MAX_HISTORY_LINES = 200
 HISTORY_PENALTY_CAP_MS = 300
 HISTORY_FAILURE_PENALTY_MS = 75
 HISTORY_MISSED_ROUND_PENALTY_MS = 25
@@ -139,5 +141,21 @@ def record_probe_history(
         "skip_reason": skip_reason,
         "nodes": nodes,
     }
-    with history_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    entry_line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+    existing_lines: list[str] = []
+    if history_path.is_file():
+        try:
+            with history_path.open(encoding="utf-8") as fh:
+                existing_lines = [line if line.endswith("\n") else line + "\n" for line in fh if line.strip()]
+        except OSError:
+            existing_lines = []
+
+    if len(existing_lines) + 1 <= MAX_HISTORY_LINES:
+        with history_path.open("a", encoding="utf-8") as fh:
+            fh.write(entry_line)
+        return
+
+    trimmed = (existing_lines + [entry_line])[-MAX_HISTORY_LINES:]
+    tmp_path = history_path.with_suffix(".tmp")
+    tmp_path.write_text("".join(trimmed), encoding="utf-8")
+    os.replace(tmp_path, history_path)

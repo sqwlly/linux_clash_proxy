@@ -211,3 +211,26 @@ def test_watch_switch_failure_preserves_state(tmp_path, monkeypatch):
     assert not any(r.switched for r in report.results)
     state = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
     assert state["AI-MANUAL"]["fail_count"] == 2  # 保留计数，下一轮重试
+
+
+def test_pick_next_with_leaf_entries_in_groups_and_health_preference(tmp_path):
+    """回归：真实 mihomo GET /proxies 会把每个叶子节点也放进 groups（candidates=[]），
+    _pick_next 不能因 `cand in groups` 把所有叶子误判成嵌套组；同时优先跳到存活叶子。"""
+    svc = AIWatchService(_paths(tmp_path))
+    now = time.time()
+    groups = {
+        "AI-MANUAL": _group("AI-MANUAL", ["US-01", "DEAD-01", "TIMEOUT-01", "JP-01", "AI-AUTO"], "US-01"),
+        "AI-AUTO": _group("AI-AUTO", ["US-01", "JP-01"], "US-01"),
+        # 真实 mihomo 叶子条目：candidates=[]
+        "US-01": ProxyGroup(name="US-01", type="Shadowsocks", current="-", candidates=[], delay=180, alive=True),
+        "DEAD-01": ProxyGroup(name="DEAD-01", type="Shadowsocks", current="-", candidates=[], delay=None, alive=False),
+        "TIMEOUT-01": ProxyGroup(
+            name="TIMEOUT-01", type="Shadowsocks", current="-", candidates=[], delay=5000, alive=True
+        ),
+        "JP-01": ProxyGroup(name="JP-01", type="Shadowsocks", current="-", candidates=[], delay=210, alive=True),
+    }
+    group = groups["AI-MANUAL"]
+    # 跳过 DEAD-01（alive=False）与 TIMEOUT-01（delay=5000 超时），优先选健康叶子 JP-01
+    assert svc._pick_next(groups, group, "US-01", {}, now) == "JP-01"
+    # 当唯一健康叶子 JP-01 也在冷却期时，回退到首个非冷却叶子 DEAD-01，而非彻底返回 None
+    assert svc._pick_next(groups, group, "US-01", {"JP-01": now}, now) == "DEAD-01"
