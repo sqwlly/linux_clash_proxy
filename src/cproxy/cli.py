@@ -338,11 +338,19 @@ def run(argv: list[str] | None = None) -> int:
             print(f"稳定度排序（{len(rebalance_report.ordered)} 个节点）:")
             for index, name in enumerate(rebalance_report.ordered, start=1):
                 print(f"  {index}. {name}")
+            if rebalance_report.gemini_ordered:
+                print(f"AI-GEMINI 稳定度排序（{len(rebalance_report.gemini_ordered)} 个节点）:")
+                for index, name in enumerate(rebalance_report.gemini_ordered, start=1):
+                    print(f"  {index}. {name}")
             if rebalance_report.rerendered:
                 print(f"已写入稳定度排序: {rebalance_report.order_path}")
+                if rebalance_report.gemini_order_path:
+                    print(f"已写入 AI-GEMINI 排序: {rebalance_report.gemini_order_path}")
                 print("运行配置: " + ("已热重载" if rebalance_report.hot_reloaded else "已渲染（代理未运行）"))
             if rebalance_report.switched_to:
                 print(f"出口切换: {rebalance_report.switched_to}")
+            if rebalance_report.gemini_switched_to:
+                print(f"AI-GEMINI 出口切换: {rebalance_report.gemini_switched_to}")
             return 0
         if args.command == "ai-watch":
             watch_report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)

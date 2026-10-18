@@ -314,3 +314,45 @@ def test_normalize_agy_old_process_label():
     assert _normalize_process_label("/root/.local/bin/agy.1792306061959817128.old") == "/root/.local/bin/agy"
     assert _normalize_process_label("agy.1792306061959817128.old (deleted)") == "agy"
     assert _normalize_process_label("/usr/bin/curl") == "/usr/bin/curl"
+
+
+def test_watch_dual_endpoint_catches_cloudcode_failure_and_passive_fallback_drops_old_leaf(tmp_path, monkeypatch):
+    """验证：
+    1. AI-GEMINI 同时探测 generativelanguage 与 daily-cloudcode-pa，任一不通即累计失败并在第 2 轮切换；
+    2. 当 mihomo fallback 被动改变了活跃叶子（last_active != current），自动清理滞留在旧叶子的连接。
+    """
+    paths = _paths(tmp_path)
+    groups = _groups()
+    dropped_calls: list[tuple[str, str | None]] = []
+
+    class _TrackingQuery(_FakeQuery):
+        def _drop_stale_ai_connections(self, group: str, *, keep_leaf: str | None = None) -> int:
+            dropped_calls.append((group, keep_leaf))
+            return 1
+
+    def _verdict(p, url: str) -> str:
+        if "daily-cloudcode-pa.googleapis.com" in url:
+            return PROBE_DEAD
+        return PROBE_OK
+
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", _verdict)
+
+    svc1 = AIWatchService(paths)
+    svc1.query = _TrackingQuery(groups)
+    r1 = svc1.watch()
+    gemini1 = next(r for r in r1.results if r.group == "AI-GEMINI")
+    assert gemini1.verdict == PROBE_DEAD
+    assert not gemini1.switched
+    assert dropped_calls == []
+
+    # 模拟 mihomo fallback 在两轮巡检之间被动把 AI-MANUAL 从 US-01 切到了 JP-01
+    groups["AI-MANUAL"] = _group("AI-MANUAL", ["US-01", "JP-01", "AI-AUTO"], "JP-01")
+    svc2 = AIWatchService(paths)
+    q2 = _TrackingQuery(groups)
+    svc2.query = q2
+    r2 = svc2.watch()
+    gemini2 = next(r for r in r2.results if r.group == "AI-GEMINI")
+    assert gemini2.switched and gemini2.target == "GB-01"
+    assert ("AI-GEMINI", "GB-01") in q2.switches
+    # 被动切换的 AI-MANUAL 触发了旧叶子连接清理（keep_leaf="JP-01"）
+    assert dropped_calls == [("AI-MANUAL", "JP-01")]

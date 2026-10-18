@@ -52,6 +52,7 @@ def test_completes_enum_values(tmp_path):
         "chatgpt",
         "github",
         "claude",
+        "gemini",
     ]
     assert _candidates(paths, ["cproxy", "probe-stable-node", "--strategy", ""], 3) == [
         "conservative",

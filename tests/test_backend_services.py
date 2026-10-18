@@ -272,6 +272,12 @@ def test_switch_drops_agy_and_ai_manual_connections(tmp_path: Path):
                     current="Node A",
                     candidates=["Node A", "Node B"],
                 ),
+                "AI-GEMINI": ProxyGroup(
+                    name="AI-GEMINI",
+                    type="fallback",
+                    current="KR-01",
+                    candidates=["KR-01", "KR-02"],
+                ),
                 "CyberGuard": ProxyGroup(
                     name="CyberGuard",
                     type="select",
@@ -298,6 +304,11 @@ def test_switch_drops_agy_and_ai_manual_connections(tmp_path: Path):
                         "chains": ["🇯🇵日本 02", "CyberGuard"],
                         "metadata": {"process": "node", "host": "api2.cursor.sh"},
                     },
+                    {
+                        "id": "gemini-live",
+                        "chains": ["🇰🇷韩国 01 | IEPL", "AI-GEMINI"],
+                        "metadata": {"process": "agy", "host": "daily-cloudcode-pa.googleapis.com"},
+                    },
                 ]
             }
 
@@ -311,9 +322,22 @@ def test_switch_drops_agy_and_ai_manual_connections(tmp_path: Path):
     service = QueryService(paths)
     fake = FakeAPI()
     service.api = fake
+    # 切 AI-MANUAL：拆 AI-MANUAL 与泄露在 CyberGuard 的 agy 连接，但绝不误杀 AI-GEMINI 活跃流
     service.switch_group("AI-MANUAL", "Node B")
     assert fake.closed == ["ai-1", "agy-leak"]
     assert service.last_switch_from == "Node A"
+
+    # 切 AI-GEMINI：只拆 AI-GEMINI 连接，绝不误杀 AI-MANUAL（codex）连接
+    fake.closed.clear()
+    service.switch_group("AI-GEMINI", "KR-02")
+    assert fake.closed == ["gemini-live"]
+
+    # 被动 fallback 巡检（keep_leaf）：保留已在新叶子上的连接，只清旧叶子连接
+    fake.closed.clear()
+    service._drop_stale_ai_connections("AI-GEMINI", keep_leaf="🇰🇷韩国 01 | IEPL")
+    assert fake.closed == []
+    service._drop_stale_ai_connections("AI-GEMINI", keep_leaf="🇩🇪德国 01 | IEPL")
+    assert fake.closed == ["gemini-live"]
 
     fake.closed.clear()
     service.switch_group("CyberGuard", "US")

@@ -75,6 +75,11 @@ def ai_manual_order_file(paths: AppPaths) -> Path:
     return paths.state_dir / "ai-manual-order.json"
 
 
+def ai_gemini_order_file(paths: AppPaths) -> Path:
+    """cproxy ai-rebalance 持久化的 AI-GEMINI 稳定度排序（state 文件，非用户配置）。"""
+    return paths.state_dir / "ai-gemini-order.json"
+
+
 def ai_watch_state_file(paths: AppPaths) -> Path:
     """cproxy ai-watch 的看护状态（连续失败计数与冷却期，state 文件）。"""
     return paths.state_dir / "ai-watch.json"

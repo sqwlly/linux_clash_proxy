@@ -197,7 +197,7 @@ _COMMAND_HELP: dict[str, str] = {
 
 # 参数取值的单一来源：argparse 的 `choices=` 与 shell 补全（`completion.py`）
 # 共用，避免同一条枚举在两处各写一份而漂移。
-PROFILE_CHOICES = ("codex", "chatgpt", "github", "claude")
+PROFILE_CHOICES = ("codex", "chatgpt", "github", "claude", "gemini")
 STRATEGY_CHOICES = ("conservative", "balanced", "aggressive")
 TRAFFIC_ACTIONS = ("show", "collect", "audit")
 TRAFFIC_DIMENSIONS = ("node", "rule", "host", "process")

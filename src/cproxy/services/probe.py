@@ -35,7 +35,12 @@ PROFILES = {
     "chatgpt": {"url": "https://chatgpt.com", "strategy": "balanced"},
     "github": {"url": "https://github.com", "strategy": "balanced"},
     "claude": {"url": "https://claude.ai", "strategy": "conservative"},
+    "gemini": {"url": "https://generativelanguage.googleapis.com/v1beta/models", "strategy": "conservative"},
 }
+
+
+def default_group_for_profile(profile: str) -> str:
+    return "AI-GEMINI" if profile == "gemini" else DEFAULT_GROUP
 
 
 @dataclass(frozen=True)

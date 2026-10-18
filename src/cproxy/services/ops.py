@@ -12,7 +12,7 @@ from ..backend.process import SYSTEMD_SERVICE_NAME
 from ..backend.runtime import AI_STATUS_GROUPS, ai_exit_metrics
 from ..config import AppPaths
 from ..proxyenv import proxy_http_url
-from .probe import ProbeService
+from .probe import ProbeService, default_group_for_profile
 from .probe_history import load_history_rows, probe_history_file
 
 AI_HOST_KEYWORDS = (
@@ -71,7 +71,12 @@ def guard(
     profile: str = "codex",
     command: list[str] | None = None,
 ) -> int:
-    report = ProbeService(paths).probe(profile=profile, switch=True, show_progress=True)
+    report = ProbeService(paths).probe(
+        group=default_group_for_profile(profile),
+        profile=profile,
+        switch=True,
+        show_progress=True,
+    )
     if not report.switched and report.skip_reason and report.skip_reason != "当前已是推荐稳定节点":
         if not report.current_verdict.stable:
             print(f"警告: AI 出口不稳定 ({report.skip_reason})", file=sys.stderr)
@@ -152,7 +157,10 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
 
     probe_lines: list[str] = []
     try:
-        report = ProbeService(paths).probe(profile=profile)
+        report = ProbeService(paths).probe(
+            group=default_group_for_profile(profile),
+            profile=profile,
+        )
         probe_lines.append(f"STABLE\t{'true' if report.verdict.stable else 'false'}\t{report.verdict.reason}")
         if report.best:
             probe_lines.append(

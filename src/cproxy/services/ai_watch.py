@@ -164,16 +164,29 @@ def reap_stale_agy_processes(
     return reaped
 
 
-def _watch_url(paths: AppPaths, group: str) -> str:
-    """AI-MANUAL 用 ChatGPT Web URL，AI-GEMINI 用 Gemini API URL（均可被 config 覆盖）。
+DEFAULT_CLOUDCODE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
-    codex 无干净可测的语义失败信号，改用 chatgpt.com 首页（返回 200）做可达性判定，
-    而非 codex 的 POST 端点（GET 必返 4xx，会被语义分类永远判 ok，看门狗形同虚设）。
+
+def _watch_urls(paths: AppPaths, group: str) -> tuple[str, ...]:
+    """AI-MANUAL 测 ChatGPT Web + OpenAI API，AI-GEMINI 测 Gemini API + Cloud Code。
+
+    双端点看护：
+    - AI-GEMINI 同时覆盖 Gemini API（识别地区门禁）与 agy 实际连接的
+      `daily-cloudcode-pa.googleapis.com`（识别 Cloud Code 链路断流）；
+    - AI-MANUAL 同时覆盖 `chatgpt.com` 与 `api.openai.com/v1/models`。
     """
     config = read_config(paths)
     if group == AI_GEMINI_GROUP:
-        return str(config.get("ai-gemini-api-url") or DEFAULT_AI_PROBE_TARGETS[2][1])
-    return str(config.get("ai-chatgpt-url") or DEFAULT_AI_PROBE_TARGETS[0][1])
+        primary = str(config.get("ai-gemini-api-url") or DEFAULT_AI_PROBE_TARGETS[2][1])
+        secondary = str(config.get("ai-cloudcode-url") or DEFAULT_CLOUDCODE_URL)
+        return (primary, secondary) if primary != secondary else (primary,)
+    primary = str(config.get("ai-chatgpt-url") or DEFAULT_AI_PROBE_TARGETS[0][1])
+    secondary = str(config.get("ai-openai-api-url") or DEFAULT_AI_PROBE_TARGETS[1][1])
+    return (primary, secondary) if primary != secondary else (primary,)
+
+
+def _watch_url(paths: AppPaths, group: str) -> str:
+    return _watch_urls(paths, group)[0]
 
 
 def _load_state(paths: AppPaths) -> dict:
@@ -226,6 +239,16 @@ class AIWatchService:
             _save_state(self.paths, state)
         return report
 
+    def _probe_group_verdict(self, group: str) -> tuple[str, str]:
+        for url in _watch_urls(self.paths, group):
+            try:
+                verdict = ai_target_verdict(self.paths, url)
+            except Exception as exc:
+                return PROBE_DEAD, str(exc)
+            if verdict != PROBE_OK:
+                return verdict, VERDICT_LABELS.get(verdict, verdict)
+        return PROBE_OK, VERDICT_LABELS[PROBE_OK]
+
     def _watch_group(
         self,
         groups: dict,
@@ -236,15 +259,23 @@ class AIWatchService:
     ) -> WatchGroupResult:
         group_obj = groups.get(group)
         current = resolve_current_leaf(groups, group) if group_obj else None
-        try:
-            verdict = ai_target_verdict(self.paths, _watch_url(self.paths, group))
-        except Exception as exc:
-            verdict, detail = PROBE_DEAD, str(exc)
-        else:
-            detail = VERDICT_LABELS.get(verdict, verdict)
+        verdict, detail = self._probe_group_verdict(group)
 
         result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
         gs = _group_state(state, group)
+
+        # 若 mihomo fallback 被动切换了出口叶子，清理仍滞留在旧叶子上的陈旧长连接，
+        # 避免同一会话混用新旧出口 IP。
+        previous_active = gs.get("last_active")
+        if current:
+            if not dry_run and previous_active and previous_active != current:
+                drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
+                if callable(drop_fn):
+                    try:
+                        drop_fn(group, keep_leaf=current)
+                    except TypeError:
+                        drop_fn(group)
+            gs["last_active"] = current
 
         # 自动模式（AI-MANUAL 当前是 AI-AUTO）由自动池自身 fallback 兜底，看门狗不手动切，
         # 否则会把用户手动选的自动模式静默踢成固定叶子且无返回路径
@@ -276,6 +307,7 @@ class AIWatchService:
                     cooldown[current] = now
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
+                gs["last_active"] = target
                 result.switched = True
                 result.target = target
         return result

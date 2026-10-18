@@ -325,3 +325,124 @@ def test_rebalance_suppresses_tail_noise_when_top_k_unchanged(tmp_path, monkeypa
     assert json.loads(order_file.read_text(encoding="utf-8")) == previous
     assert report.hot_reloaded is False
     assert reloaded == []
+
+
+def test_render_gemini_respects_order_and_prefer(tmp_path):
+    from cproxy.config import ai_gemini_order_file
+
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+ai-gemini-prefer:
+  - 🇫🇷法国 01 | IEPL 1.7X | CM
+proxies:
+  - name: US-01
+  - name: SG-01
+  - name: 🇰🇷韩国 01 | 1X
+  - name: 🇩🇪德国 01 | IEPL 1.7X | CM
+  - name: 🇬🇧英国 01 | IEPL 1.7X | CM
+  - name: 🇫🇷法国 01 | IEPL 1.7X | CM
+proxy-groups:
+  - name: Auto
+    type: fallback
+    proxies: [US-01, SG-01]
+rules:
+  - MATCH,Auto
+"""
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "config.yaml").write_text(config, encoding="utf-8")
+    gemini_order = ai_gemini_order_file(paths)
+    gemini_order.parent.mkdir(parents=True, exist_ok=True)
+    gemini_order.write_text(
+        json.dumps(["🇩🇪德国 01 | IEPL 1.7X | CM", "🇬🇧英国 01 | IEPL 1.7X | CM", "🇰🇷韩国 01 | 1X"]),
+        encoding="utf-8",
+    )
+    RuntimeBackend(paths).render_runtime()
+    data = yaml.safe_load((paths.data_dir / "runtime.yaml").read_text(encoding="utf-8"))
+    gemini = next(g for g in data["proxy-groups"] if g["name"] == "AI-GEMINI")
+    assert gemini["proxies"] == [
+        "🇫🇷法国 01 | IEPL 1.7X | CM",
+        "🇩🇪德国 01 | IEPL 1.7X | CM",
+        "🇬🇧英国 01 | IEPL 1.7X | CM",
+        "🇰🇷韩国 01 | 1X",
+    ]
+
+
+def test_rebalance_orders_and_switches_ai_gemini(tmp_path, monkeypatch):
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.probe import StabilityVerdict
+
+    paths = _paths(tmp_path)
+    switched: list[tuple[str, str]] = []
+
+    class _DualGroupProbe:
+        def __init__(self, p):
+            pass
+
+        def probe(self, **kwargs):
+            group = kwargs.get("group")
+            if group == "AI-GEMINI":
+                return SimpleNamespace(
+                    current="KR-1X",
+                    current_verdict=StabilityVerdict(False, "失败 3 次"),
+                    verdict=StabilityVerdict(True, "5/5 稳定"),
+                    summaries=[
+                        _summary("KR-1X", (700,), failures=3),
+                        _summary("DE-IEPL", (180, 190)),
+                    ],
+                )
+            return SimpleNamespace(
+                current="US-01",
+                current_verdict=StabilityVerdict(True, "5/5 稳定"),
+                verdict=StabilityVerdict(True, "5/5 稳定"),
+                summaries=[
+                    _summary("US-01", (150, 160)),
+                    _summary("SG-01", (220, 230)),
+                ],
+            )
+
+    class _RunningProc:
+        def is_running(self):
+            return True
+
+        def is_runtime_stale(self, path=None):
+            return False
+
+        def mark_runtime_applied(self, path=None):
+            return True
+
+    class _FakeAPI:
+        def __init__(self, p):
+            pass
+
+        def reload_config(self, path: str):
+            pass
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(name="AI-MANUAL", type="fallback", current="US-01", candidates=["US-01", "SG-01"]),
+                "AI-GEMINI": ProxyGroup(
+                    name="AI-GEMINI", type="fallback", current="KR-1X", candidates=["KR-1X", "DE-IEPL"]
+                ),
+            }
+
+    class _FakeQuery:
+        def __init__(self, p):
+            self.api = _FakeAPI(p)
+
+        def switch_group(self, group: str, target: str):
+            switched.append((group, target))
+
+    monkeypatch.setattr(rebalance_mod, "ProbeService", _DualGroupProbe)
+    monkeypatch.setattr(rebalance_mod, "RuntimeBackend", lambda p: _FakeBackend())
+    monkeypatch.setattr(rebalance_mod, "ProcessBackend", lambda p: _RunningProc())
+    monkeypatch.setattr(rebalance_mod, "APIBackend", _FakeAPI)
+    monkeypatch.setattr(rebalance_mod, "QueryService", _FakeQuery)
+
+    report = RebalanceService(paths).rebalance()
+    assert json.loads(ai_gemini_order_file(paths).read_text(encoding="utf-8")) == ["DE-IEPL", "KR-1X"]
+    assert report.gemini_ordered == ("DE-IEPL", "KR-1X")
+    assert report.gemini_switched_to == "DE-IEPL"
+    assert switched == [("AI-GEMINI", "DE-IEPL")]

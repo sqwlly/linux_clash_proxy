@@ -163,11 +163,13 @@ class QueryService:
         assert group is not None
         return group
 
-    def _drop_stale_ai_connections(self, group_name: str) -> int:
+    def _drop_stale_ai_connections(self, group_name: str, *, keep_leaf: str | None = None) -> int:
         """切换 AI 出口后立刻掐掉旧 TCP，避免同一会话混用新旧出口 IP。
 
         Google Cloud Code / Gemini 会按请求 IP 做地区校验；mihomo 换组不会
-        自动拆掉已建立的长连接，必须显式关闭。
+        自动拆掉已建立的长连接，必须显式关闭。若指定 `keep_leaf`（被动 fallback
+        巡检场景），则保留已落在新叶子（`chains[0] == keep_leaf`）上的新连接，
+        只掐掉滞留在旧叶子上的陈旧连接。
         """
         if group_name not in AI_SWITCH_DROP_GROUPS:
             return 0
@@ -182,6 +184,10 @@ class QueryService:
         for item in connections:
             if not isinstance(item, dict) or not self._connection_follows_ai_switch(item, group_name):
                 continue
+            if keep_leaf:
+                chains = item.get("chains") or []
+                if isinstance(chains, list) and chains and str(chains[0]) == keep_leaf:
+                    continue
             conn_id = str(item.get("id") or "")
             if not conn_id:
                 continue
@@ -196,12 +202,18 @@ class QueryService:
     def _connection_follows_ai_switch(item: dict[str, Any], group_name: str) -> bool:
         chains = item.get("chains") or []
         chain_names = {str(part) for part in chains} if isinstance(chains, list) else set()
-        if group_name in chain_names or AI_MANUAL_GROUP in chain_names or AI_GEMINI_GROUP in chain_names:
+        if group_name == AI_GEMINI_GROUP:
+            return AI_GEMINI_GROUP in chain_names
+        if AI_GEMINI_GROUP in chain_names:
+            return False
+        if group_name in chain_names or AI_MANUAL_GROUP in chain_names:
             return True
         raw_metadata = item.get("metadata")
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
         process = str(metadata.get("process") or metadata.get("processPath") or "").lower()
         base = process.rsplit("/", 1)[-1].split()[0] if process else ""
+        if base.startswith("agy.") and base.endswith(".old"):
+            base = "agy"
         return base in AI_PROCESS_NAMES
 
     def list_connections(self) -> list[ConnectionEntry]:

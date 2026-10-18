@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from ..config import AppPaths, ai_manual_order_file, config_file, runtime_file
+from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, config_file, runtime_file
 from ..services.nodelist import (
     SUBSCRIPTION_REGION_ORDER,
     SWITCH_REGION_LABELS,
@@ -419,15 +419,24 @@ def _collect_gemini_nodes(
     return ordered
 
 
-def _load_ai_manual_order(paths: AppPaths) -> list[str]:
-    """读取 rebalance 持久化的稳定度排序；缺失/损坏时返回空列表（回退静态序）。"""
+def _load_order_file(path: Path) -> list[str]:
     try:
-        data = json.loads(ai_manual_order_file(paths).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     if not isinstance(data, list):
         return []
     return [str(item) for item in data if item]
+
+
+def _load_ai_manual_order(paths: AppPaths) -> list[str]:
+    """读取 rebalance 持久化的 AI-MANUAL 稳定度排序；缺失/损坏时返回空列表（回退静态序）。"""
+    return _load_order_file(ai_manual_order_file(paths))
+
+
+def _load_ai_gemini_order(paths: AppPaths) -> list[str]:
+    """读取 rebalance 持久化的 AI-GEMINI 稳定度排序；缺失/损坏时返回空列表（回退静态序）。"""
+    return _load_order_file(ai_gemini_order_file(paths))
 
 
 def _order_manual_candidates(leaves: list[str], prefer: list | None, order: list | None) -> list[str]:
@@ -665,10 +674,12 @@ class RuntimeBackend:
         gemini_prefer = data.get("ai-gemini-prefer")
         if not isinstance(gemini_prefer, list):
             gemini_prefer = []
-        gemini_proxies = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names, gemini_prefer)
-        if not gemini_proxies:
+        gemini_order = _load_ai_gemini_order(self.paths)
+        gemini_leaves = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names, gemini_prefer)
+        if not gemini_leaves:
             # 订阅缺少韩/台/欧等优选区时，退回日美新，避免 render 直接失败
-            gemini_proxies = list(jp_proxies) + list(us_proxies) + list(sg_proxies)
+            gemini_leaves = list(jp_proxies) + list(us_proxies) + list(sg_proxies)
+        gemini_proxies = _order_manual_candidates(gemini_leaves, gemini_prefer, gemini_order)
 
         groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
