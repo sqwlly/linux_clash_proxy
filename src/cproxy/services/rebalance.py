@@ -213,7 +213,8 @@ class RebalanceService:
             gemini_switched_to = self._switch_if_current_unstable(
                 gemini_report, effective_gemini_order[0], AI_GEMINI_GROUP
             )
-            if type(probe_service) is ProbeService:
+            current_gemini_leaf = gemini_switched_to or getattr(gemini_report, "current", None)
+            if type(probe_service) is ProbeService and is_iepl_node(current_gemini_leaf):
                 effective_gemini_order, gemini_switched_to = self._verify_gemini_stream_hold(
                     list(effective_gemini_order),
                     gemini_order_path,
@@ -317,14 +318,7 @@ class RebalanceService:
             and is_iepl_node(current_node)
             and is_healthy_non_iepl_summary(best_summary)
         )
-        migrating_gemini_off_congested_1x = (
-            group_name == AI_GEMINI_GROUP
-            and not is_iepl_node(current_node)
-            and is_iepl_node(best_candidate)
-            and cur_summary is not None
-            and not is_healthy_non_iepl_summary(cur_summary)
-        )
-        if current_verdict.stable and not (migrating_gemini_off_iepl or migrating_gemini_off_congested_1x):
+        if current_verdict.stable and not migrating_gemini_off_iepl:
             cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
             best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
             if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:

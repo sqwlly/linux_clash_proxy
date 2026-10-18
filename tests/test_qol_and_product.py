@@ -380,17 +380,21 @@ def test_provider_benchmark_scorecard(tmp_path: Path, monkeypatch) -> None:
     assert sc.grade in {"S", "A"}
 
 
-def test_congested_1x_does_not_beat_low_latency_iepl_for_gemini() -> None:
+def test_healthy_1x_preferred_over_iepl_for_gemini_unless_severely_degraded() -> None:
     from cproxy.services.probe import (
         ProbeSummary,
-        active_candidates_after_round,
         is_healthy_non_iepl_summary,
         probe_rank_key,
     )
 
-    congested_1x = ProbeSummary(
+    normal_ws_1x = ProbeSummary(
         name="🇬🇧英国 01 | 1X",
-        delays=(680, 770, 920),
+        delays=(580, 620, 680),
+        failures=0,
+    )
+    severely_degraded_1x = ProbeSummary(
+        name="🇫🇷法国 01 | 1X",
+        delays=(1200, 1350, 1900),
         failures=0,
     )
     fast_iepl = ProbeSummary(
@@ -398,31 +402,25 @@ def test_congested_1x_does_not_beat_low_latency_iepl_for_gemini() -> None:
         delays=(150, 155, 175),
         failures=0,
     )
-    healthy_1x = ProbeSummary(
-        name="🇰🇷韩国 01 | 1X",
-        delays=(280, 310, 340),
-        failures=0,
-    )
 
-    assert is_healthy_non_iepl_summary(congested_1x) is False
-    assert is_healthy_non_iepl_summary(healthy_1x) is True
-    # 晚高峰拥塞的 1X (>550ms) 不得压制 160ms 的 IEPL 节点
-    assert probe_rank_key(fast_iepl, prefer_non_iepl=True) < probe_rank_key(congested_1x, prefer_non_iepl=True)
-    # 真正健康低延迟的 1X (<=550ms) 仍优先于 IEPL
-    assert probe_rank_key(healthy_1x, prefer_non_iepl=True) < probe_rank_key(fast_iepl, prefer_non_iepl=True)
-    kept = active_candidates_after_round(
-        {
-            "🇬🇧英国 01 | 1X": {"delays": [680, 770, 920], "failures": 0},
-            "🇫🇷法国 01 | 1X": {"delays": [700, 780, 930], "failures": 0},
-            "🇩🇪德国 01 | 1X": {"delays": [710, 790, 940], "failures": 0},
-            "🇧🇷巴西 01 | 1X": {"delays": [720, 810, 950], "failures": 0},
-            "🇹🇼台湾 01 | 1X": {"delays": [730, 820, 960], "failures": 0},
-            "🇰🇷韩国 01 | IEPL 1.7X | CM": {"delays": [150, 155, 175], "failures": 0},
-        },
-        None,
-        prefer_non_iepl=True,
+    # 零丢包、平均 <=1100ms 的 1X WebSocket 节点对 Gemini 长流式连接远比 50s connIdle 断流的 IEPL 稳定
+    assert is_healthy_non_iepl_summary(normal_ws_1x) is True
+    assert is_healthy_non_iepl_summary(severely_degraded_1x) is False
+    assert probe_rank_key(normal_ws_1x, prefer_non_iepl=True) < probe_rank_key(fast_iepl, prefer_non_iepl=True)
+    assert probe_rank_key(fast_iepl, prefer_non_iepl=True) < probe_rank_key(severely_degraded_1x, prefer_non_iepl=True)
+
+
+def test_default_agy_log_dir_resolves_xdg_state_home(tmp_path: Path) -> None:
+    from cproxy.config import AppPaths
+    from cproxy.services.ai_watch import default_agy_log_dir
+
+    home = tmp_path / "root"
+    paths = AppPaths(
+        config_dir=home / ".config" / "cproxy",
+        data_dir=home / ".local" / "share" / "cproxy",
+        state_dir=home / ".local" / "state" / "cproxy",
     )
-    assert "🇰🇷韩国 01 | IEPL 1.7X | CM" in kept
+    assert default_agy_log_dir(paths) == home / ".gemini" / "antigravity-cli" / "log"
 
 
 def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_path: Path) -> None:
@@ -458,5 +456,6 @@ def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_p
     assert event_ts > 0
     assert "attempt 2" in reason
     assert "EOF" in reason
+
 
 

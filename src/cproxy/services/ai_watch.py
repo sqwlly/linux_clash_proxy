@@ -19,7 +19,7 @@ from pathlib import Path
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
 from ..config import AppPaths, ai_watch_state_file, read_config
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
-from .probe import resolve_current_leaf
+from .probe import is_iepl_node, resolve_current_leaf
 from .query import QueryService
 
 CONSECUTIVE_FAILURE_THRESHOLD = 2
@@ -224,7 +224,11 @@ AGY_LOG_WINDOW_SECONDS = 180.0
 
 
 def default_agy_log_dir(paths: AppPaths) -> Path:
-    return paths.state_dir.parent.parent / ".gemini" / "antigravity-cli" / "log"
+    if paths.state_dir.parent.name == "state" and paths.state_dir.parent.parent.name == ".local":
+        base = paths.state_dir.parent.parent.parent
+    else:
+        base = paths.state_dir.parent.parent
+    return base / ".gemini" / "antigravity-cli" / "log"
 
 
 def detect_recent_agy_retry_failure(
@@ -347,8 +351,12 @@ class AIWatchService:
         verdict, detail = self._probe_group_verdict(group)
 
         gs = _group_state(state, group)
+        previous_active = gs.get("last_active")
         log_triggered = False
         if group == AI_GEMINI_GROUP:
+            # 若节点已由外部切换或自动优选变更，旧节点上的重试报错不应归咎于新节点
+            if previous_active and current and previous_active != current:
+                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now)
             since_ts = float(gs.get("last_log_fail_ts") or 0.0)
             log_failed, log_ts, log_reason = detect_recent_agy_retry_failure(
                 self.agy_log_dir, now=now, since_ts=since_ts
@@ -364,7 +372,6 @@ class AIWatchService:
         # 若 mihomo fallback 被动切换了出口叶子，清理仍滞留在旧叶子上的陈旧长连接，
         # 避免同一会话混用新旧出口 IP；若旧叶子已被健康检查标死/超时，同步写入冷却期并把
         # fallback 的 `fixed` 指针更新到新叶子，防止旧叶子短暂回包后 mihomo 瞬间跳回造成乒乓抖动。
-        previous_active = gs.get("last_active")
         passive_dead_switch = False
         if current:
             if not dry_run and previous_active and previous_active != current:
@@ -422,6 +429,14 @@ class AIWatchService:
                 cooldown = gs.setdefault("cooldown", {})
                 if current:
                     cooldown[current] = now
+                if group == AI_GEMINI_GROUP:
+                    # 切换节点会主动掐断旧叶子长连接，客户端可能立刻打一条旧连接的 EOF 重试日志；
+                    # 推進 last_log_fail_ts 跳过切流瞬间的残余日志，避免下一轮误杀新节点。
+                    gs["last_log_fail_ts"] = max(
+                        float(gs.get("last_log_fail_ts") or 0.0),
+                        now + 2.0,
+                        time.time() + 2.0,
+                    )
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
                 gs["last_active"] = target
@@ -447,12 +462,19 @@ class AIWatchService:
         `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
         `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
         仅当所有非冷却叶子都被标死时才回退到首个可用候选。
+        对于 `AI-GEMINI`，优先选择非 IEPL（`1X` WebSocket）叶子，避免 `xtls-rprx-vision` IEPL
+        中转在 50 秒空闲窗口掐断长思考流式连接。
         """
         from .ban import is_node_banned, load_active_bans
 
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
-        for cand in group.candidates:
+        candidates = list(group.candidates)
+        if getattr(group, "name", "") == AI_GEMINI_GROUP:
+            non_iepl = [c for c in candidates if c and not is_iepl_node(str(c))]
+            iepl = [c for c in candidates if c and is_iepl_node(str(c))]
+            candidates = non_iepl + iepl
+        for cand in candidates:
             if not cand or cand == current:
                 continue
             if active_bans and is_node_banned(str(cand), active_bans):

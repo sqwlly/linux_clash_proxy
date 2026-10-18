@@ -222,14 +222,16 @@ def simulate_gemini_stream_hold(
                 pass
 
 
-NON_IEPL_HEALTHY_AVG_MS = 550
-NON_IEPL_HEALTHY_MAX_MS = 700
+NON_IEPL_HEALTHY_AVG_MS = 1100
+NON_IEPL_HEALTHY_MAX_MS = 1800
 
 
 def is_healthy_non_iepl_summary(summary: ProbeSummary | None) -> bool:
     if summary is None or is_iepl_node(summary.name):
         return False
     if summary.success_count <= 0 or summary.failures > 0:
+        return False
+    if summary.history_penalty_ms >= 200:
         return False
     if summary.avg_delay is None or summary.max_delay is None:
         return False
