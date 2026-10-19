@@ -231,6 +231,27 @@ def default_agy_log_dir(paths: AppPaths) -> Path:
     return base / ".gemini" / "antigravity-cli" / "log"
 
 
+_AGY_GLOG_TS_RE = re.compile(r"^I(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+")
+
+
+def _parse_glog_timestamp(line: str, local_now: time.struct_time) -> float | None:
+    m = _AGY_GLOG_TS_RE.match(line)
+    if not m:
+        return None
+    month, day, hour, minute, sec, usec = m.groups()
+    year = local_now.tm_year
+    if int(month) == 12 and local_now.tm_mon == 1:
+        year -= 1
+    try:
+        struct_t = time.strptime(
+            f"{year:04d}-{int(month):02d}-{int(day):02d} {int(hour):02d}:{int(minute):02d}:{int(sec):02d}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+        return time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
+    except ValueError:
+        return None
+
+
 def detect_recent_agy_retry_failure(
     log_dir: Path | None,
     *,
@@ -242,7 +263,9 @@ def detect_recent_agy_retry_failure(
 
     当同一台机器同时开启多个 agy 终端会话时，后台遥测（如 `listExperiments`）会不断刷新各
     日志文件的 mtime；若只看 `logs[-1]` 会漏掉另一会话里正在发生的连续 EOF 重试。
-    这里扫描全部近期更新过的 `cli-*.log`（最多取最近 10 个），返回最新的一次失败事件。
+    这里扫描全部近期更新过的 `cli-*.log`（最多取最近 10 个），返回最新的一次失败事件；
+    同时记录任一会话收到 `streamGenerateContent` `ResponseID` 的最新成功时间戳——若在失败事件
+    之后已有任一会话建连成功，说明当前出口节点本身存活，不因单会话滞后重试而切走全局节点。
     """
     if log_dir is None or not log_dir.is_dir():
         return False, since_ts, ""
@@ -257,6 +280,7 @@ def detect_recent_agy_retry_failure(
     local_now = time.localtime(ts_now)
     newest_ts = since_ts
     newest_reason = ""
+    newest_success_ts = 0.0
     found = False
 
     for log_path in reversed(logs[-10:]):
@@ -272,6 +296,9 @@ def detect_recent_agy_retry_failure(
         for line in reversed(tail.splitlines()):
             stripped = line.strip()
             if "streamGenerateContent" in stripped and "ResponseID:" in stripped:
+                ok_ts = _parse_glog_timestamp(stripped, local_now)
+                if ok_ts is not None and ok_ts > newest_success_ts:
+                    newest_success_ts = ok_ts
                 # 该会话在更晚时间点已成功收到 streamGenerateContent 响应头（正在流式输出或已完成），
                 # 绝不能因更早前的 attempt 失败日志而切节点掐断当前正在进行的流
                 break
@@ -285,8 +312,9 @@ def detect_recent_agy_retry_failure(
             if "stream reading error" in reason_lower:
                 break
             # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
-            # 仅当建连/请求阶段连续失败达到 attempt >= 3，或出现 xtls-rprx-vision 致命协议损坏（bad record MAC）时才介入。
-            if int(attempt) < 3 and "bad record mac" not in reason_lower:
+            # 单次请求的重试链（attempt 1..10）跨越约 7 分钟，仅在刚抵达 attempt == 3（或出现 bad record MAC）
+            # 时触发一次自愈，避免同一条长尾重试链的 attempt 4/6/8 每隔 3 分钟重复触发连环切节点。
+            if int(attempt) != 3 and "bad record mac" not in reason_lower:
                 continue
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
@@ -308,9 +336,9 @@ def detect_recent_agy_retry_failure(
                 found = True
             break
 
-    if found:
+    if found and newest_ts > newest_success_ts:
         return True, newest_ts, newest_reason
-    return False, since_ts, ""
+    return False, max(since_ts, newest_ts), ""
 
 
 def _promote_gemini_order_head(paths: AppPaths, target: str) -> None:
@@ -394,10 +422,19 @@ class AIWatchService:
                 self.agy_log_dir, now=now, since_ts=since_ts
             )
             if log_failed:
-                gs["last_log_fail_ts"] = log_ts
-                verdict = PROBE_DEAD
-                detail = f"agy_log_retry ({log_reason})"
-                log_triggered = True
+                on_healthy_1x = (
+                    verdict == PROBE_OK
+                    and bool(current)
+                    and "1X" in str(current).upper()
+                    and not is_iepl_node(current)
+                )
+                if not on_healthy_1x or "bad record mac" in log_reason.lower():
+                    gs["last_log_fail_ts"] = log_ts
+                    verdict = PROBE_DEAD
+                    detail = f"agy_log_retry ({log_reason})"
+                    log_triggered = True
+                else:
+                    gs["last_log_fail_ts"] = max(since_ts, log_ts)
 
         result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
 
@@ -415,12 +452,13 @@ class AIWatchService:
                 ):
                     gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True
-                drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
-                if callable(drop_fn):
-                    try:
-                        drop_fn(group, keep_leaf=current)
-                    except TypeError:
-                        drop_fn(group)
+                if group != AI_GEMINI_GROUP or is_iepl_node(previous_active):
+                    drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
+                    if callable(drop_fn):
+                        try:
+                            drop_fn(group, keep_leaf=current)
+                        except TypeError:
+                            drop_fn(group)
             gs["last_active"] = current
 
         # 自动模式（AI-MANUAL 当前是 AI-AUTO）由自动池自身 fallback 兜底，看门狗不手动切，
@@ -453,10 +491,18 @@ class AIWatchService:
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
-                # 切换故障节点时必须关闭滞留在旧叶子上的 HTTP/2 Multiplexed ClientConn（保留新叶子 keep_leaf），
-                # 否则 Go http2.Transport 会将后续重试继续复用到旧故障节点的 TCP 连接上，引发连环误判。
+                # 仅在 AI-MANUAL、地区封锁或 IEPL 故障节点切换时关闭旧连接；
+                # 当 AI-GEMINI 已在 1X WebSocket 节点上时，不强杀活跃 TCP 连接，防止掐断并发 agy 会话的流式输出。
+                should_drop = (
+                    group != AI_GEMINI_GROUP
+                    or verdict == PROBE_GEO_BLOCKED
+                    or is_iepl_node(current)
+                )
                 try:
-                    self.query.switch_group(group, target)
+                    try:
+                        self.query.switch_group(group, target, drop_connections=should_drop)
+                    except TypeError:
+                        self.query.switch_group(group, target)
                 except Exception:
                     # 切换失败（API 抖动等）：保留失败计数，下一轮重试，不让异常中断循环、丢状态
                     return result
@@ -500,6 +546,7 @@ class AIWatchService:
         冷却期内，优先回收最早进入冷却的存活 `1X` 叶子，绝不轻易回退到 50 秒必断流的 IEPL 节点。
         """
         from .ban import is_node_banned, load_active_bans
+        from .nodelist import match_region
 
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
@@ -507,7 +554,11 @@ class AIWatchService:
         is_gemini = getattr(group, "name", "") == AI_GEMINI_GROUP
         candidates = list(group.candidates)
         if is_gemini:
+            fast_regions = {"KR", "TW", "JP", "SG", "GB"}
             non_iepl = [c for c in candidates if c and not is_iepl_node(str(c))]
+            non_iepl.sort(
+                key=lambda c: 0 if (match_region(str(c)) in fast_regions or match_region(str(c)) is None) else 1
+            )
             iepl = [c for c in candidates if c and is_iepl_node(str(c))]
             candidates = non_iepl + iepl
         for idx, cand in enumerate(candidates):

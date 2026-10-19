@@ -22,11 +22,13 @@ from ..backend.runtime import (
     _load_ai_manual_order,
 )
 from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, read_config, runtime_file
+from .nodelist import match_region
 from .probe import ProbeService, ProbeSummary, is_healthy_non_iepl_summary, is_iepl_node
 from .query import QueryService
 
 REBALANCE_PROFILE = "codex"
 REBALANCE_GEMINI_PROFILE = "gemini"
+GEMINI_FAST_REGIONS = frozenset({"KR", "TW", "JP", "SG", "GB"})
 # 排序时对历史失败惩罚的加权倍数：跨多次探测的惩罚自然平滑单轮噪声，
 # 削弱「一轮 5/5、下一轮 1/5」的名次翻转。
 HISTORY_PENALTY_WEIGHT = 4.0
@@ -45,9 +47,9 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
     rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
     这里把已叠加的惩罚还原成裸延迟，再按权重重新叠加，得到更稳的排序。
     当 `prefer_non_iepl=True`（AI-GEMINI）时，仅当 1X WebSocket 节点「本轮零失败、
-    历史惩罚健康且延迟健康（avg<=550ms, max<=700ms）」时排在 IEPL 之前；若 1X 节点
-    因跨境 Cloudflare Anycast 拥塞出现 700ms~1900ms 高延迟，则与 IEPL 同台按真实延迟竞速，
-    避免把拥塞假活的 Cloudflare 1X 节点排在 150ms 专线前面。
+    历史惩罚健康且延迟健康」时排在 IEPL 之前；且在健康 1X 节点内部，亚太/英国低延迟区
+    （KR/TW/JP/SG/GB）始终优先于欧陆/南美高延迟区（DE/FR/BR），防止现役韩国节点在承载
+    大包上传时的瞬时探测抖动把 750~850ms 的德/法/巴节点顶上榜首。
     """
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     weighted = penalty * HISTORY_PENALTY_WEIGHT
@@ -63,13 +65,20 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
             name,
         )
     is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
+    healthy_non_iepl = is_healthy_non_iepl_summary(summary)
     if is_healthy:
-        tier = 0 if is_healthy_non_iepl_summary(summary) else 1
+        tier = 0 if healthy_non_iepl else 1
     else:
         tier = 2
-    iepl_tiebreak = 0 if is_healthy_non_iepl_summary(summary) else 1
+    iepl_tiebreak = 0 if healthy_non_iepl else 1
+    region_tier = (
+        0
+        if (not healthy_non_iepl or match_region(summary.name) in GEMINI_FAST_REGIONS or match_region(summary.name) is None)
+        else 1
+    )
     return (
         tier,
+        region_tier,
         neg_success,
         failures,
         iepl_tiebreak,
@@ -291,7 +300,11 @@ class RebalanceService:
             if not next_candidate:
                 break
             try:
-                query.switch_group(AI_GEMINI_GROUP, next_candidate)
+                should_drop = is_iepl_node(active_node)
+                try:
+                    query.switch_group(AI_GEMINI_GROUP, next_candidate, drop_connections=should_drop)
+                except TypeError:
+                    query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
             except Exception:
@@ -372,7 +385,12 @@ class RebalanceService:
                 return None
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
-            query.switch_group(group_name, best_candidate)
+            current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
+            should_drop = group_name != AI_GEMINI_GROUP or is_iepl_node(current_node)
+            try:
+                query.switch_group(group_name, best_candidate, drop_connections=should_drop)
+            except TypeError:
+                query.switch_group(group_name, best_candidate)
             return best_candidate
         except Exception:
             return None

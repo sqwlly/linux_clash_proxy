@@ -586,5 +586,80 @@ def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_f
     assert order_path.read_text(encoding="utf-8") == '["🇰🇷韩国 01 | 1X", "🇰🇷韩国 01 | IEPL 1.7X | CM"]'
 
 
+def test_gemini_multi_session_retry_loop_and_connection_preservation(tmp_path: Path, monkeypatch) -> None:
+    import os
+    import time
+    from datetime import datetime
 
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.services import ai_watch as ai_watch_mod
+    from cproxy.services.ai_watch import AIWatchService, detect_recent_agy_retry_failure
+    from cproxy.services.diagnostics import PROBE_OK
+    from cproxy.services.probe import ProbeSummary
+    from cproxy.services.rebalance import _smooth_rank_key
 
+    now_ts = time.time()
+    fail_str = datetime.fromtimestamp(now_ts - 10).strftime("%m%d %H:%M:%S")
+    ok_str = datetime.fromtimestamp(now_ts - 5).strftime("%m%d %H:%M:%S")
+
+    # 1. 同一请求的长尾重试（attempt 4..10）不应每隔 3 分钟重复触发连环切流
+    session_a = tmp_path / "cli-20261018_181938.log"
+    session_a.write_text(
+        f"I{fail_str}.100000 12345 run.go:395] Run: attempt 6 failed "
+        '(Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), '
+        "retrying in 60s...\n",
+        encoding="utf-8",
+    )
+    os.utime(session_a, (now_ts - 10, now_ts - 10))
+    hit_tail, _, _ = detect_recent_agy_retry_failure(tmp_path, now=now_ts, window_seconds=60.0)
+    assert hit_tail is False
+
+    # 2. 当会话 A 刚抵达 attempt 3，但并发会话 B 在更晚时间已成功拿到 ResponseID 时，证明当前节点存活，不切全局节点
+    session_a.write_text(
+        f"I{fail_str}.100000 12345 run.go:395] Run: attempt 3 failed "
+        '(Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), '
+        "retrying in 12s...\n",
+        encoding="utf-8",
+    )
+    session_b = tmp_path / "cli-20261018_204342.log"
+    session_b.write_text(
+        f"I{ok_str}.200000 54321 http_helpers.go:349] URL: "
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse "
+        "Trace: 0x9999 ResponseID: alive_on_kr\n",
+        encoding="utf-8",
+    )
+    os.utime(session_a, (now_ts - 10, now_ts - 10))
+    os.utime(session_b, (now_ts - 5, now_ts - 5))
+    hit_cross, _, _ = detect_recent_agy_retry_failure(tmp_path, now=now_ts, window_seconds=60.0)
+    assert hit_cross is False
+
+    # 3. 当 AI-GEMINI 已在健康的 1X 节点（如 🇰🇷韩国 01 | 1X）且主动探测 PROBE_OK 时，EOF 日志不误杀切走
+    session_b.unlink()
+    paths = _make_paths(tmp_path / "app")
+    groups = {
+        "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇰🇷韩国 01 | 1X", ["🇰🇷韩国 01 | 1X"]),
+        "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "🇰🇷韩国 01 | 1X", ["🇰🇷韩国 01 | 1X", "🇬🇧英国 01 | 1X"]),
+        "🇰🇷韩国 01 | 1X": ProxyGroup("🇰🇷韩国 01 | 1X", "VLESS", "-", [], delay=250, alive=True),
+        "🇬🇧英国 01 | 1X": ProxyGroup("🇬🇧英国 01 | 1X", "VLESS", "-", [], delay=380, alive=True),
+    }
+    switch_calls: list[tuple[str, str, bool]] = []
+
+    class _FakeQuery:
+        def __init__(self):
+            self.api = type("_API", (), {"get_groups": lambda _self: groups})()
+
+        def switch_group(self, group: str, target: str, *, drop_connections: bool = True) -> None:
+            switch_calls.append((group, target, drop_connections))
+
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda _p, _url: PROBE_OK)
+    svc = AIWatchService(paths, agy_log_dir=tmp_path)
+    svc.query = _FakeQuery()  # type: ignore[assignment]
+    report = svc.watch()
+    gemini_res = next(r for r in report.results if r.group == "AI-GEMINI")
+    assert gemini_res.switched is False
+    assert switch_calls == []
+
+    # 4. _smooth_rank_key 在健康 1X 节点中始终将亚太/英国（KR/GB）排在欧陆/南美（DE/FR/BR）之前
+    kr_loaded = ProbeSummary("🇰🇷韩国 01 | 1X", (520, 560, 580), 0)
+    br_idle = ProbeSummary("🇧🇷巴西 01 | 1X", (480, 490, 500), 0)
+    assert _smooth_rank_key(kr_loaded, prefer_non_iepl=True) < _smooth_rank_key(br_idle, prefer_non_iepl=True)
