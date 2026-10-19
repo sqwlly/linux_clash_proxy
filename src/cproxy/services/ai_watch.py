@@ -270,14 +270,23 @@ def detect_recent_agy_retry_failure(
             continue
 
         for line in reversed(tail.splitlines()):
-            m = _AGY_RETRY_FAIL_RE.match(line.strip())
+            stripped = line.strip()
+            if "streamGenerateContent" in stripped and "ResponseID:" in stripped:
+                # 该会话在更晚时间点已成功收到 streamGenerateContent 响应头（正在流式输出或已完成），
+                # 绝不能因更早前的 attempt 失败日志而切节点掐断当前正在进行的流
+                break
+            m = _AGY_RETRY_FAIL_RE.match(stripped)
             if not m:
                 continue
             month, day, hour, minute, sec, usec, attempt, reason = m.groups()
+            reason_lower = reason.lower()
+            # stream reading error: unexpected EOF 说明节点已成功建连、上传完 Prompt 并拿到 HTTP 200 ResponseID，
+            # 仅在超长思考/生成流式读取中途断流；此时节点本身可达，切走反而会落入高延迟兜底节点并打断其它活跃会话。
+            if "stream reading error" in reason_lower:
+                break
             # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
-            # 若在 attempt 1/2 时就强行切换节点，反而会打断正在重试的流造成正反馈雪崩；
-            # 仅当连续失败达到 attempt >= 3，或出现 xtls-rprx-vision 致命协议损坏（bad record MAC）时才介入。
-            if int(attempt) < 3 and "bad record mac" not in reason.lower():
+            # 仅当建连/请求阶段连续失败达到 attempt >= 3，或出现 xtls-rprx-vision 致命协议损坏（bad record MAC）时才介入。
+            if int(attempt) < 3 and "bad record mac" not in reason_lower:
                 continue
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
@@ -305,8 +314,10 @@ def detect_recent_agy_retry_failure(
 
 
 def _promote_gemini_order_head(paths: AppPaths, target: str) -> None:
-    """将刚切中的 AI-GEMINI 目标节点同步提升到 ai-gemini-order.json 首位，
+    """将刚切中的 AI-GEMINI 非 IEPL 目标节点同步提升到 ai-gemini-order.json 首位，
     防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
+    if not target or is_iepl_node(target):
+        return
     order_path = ai_gemini_order_file(paths)
     if not order_path.exists():
         return
@@ -404,14 +415,12 @@ class AIWatchService:
                 ):
                     gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True
-                # AI-GEMINI 候选池均在支持地区：若旧节点并非彻底断死，不强杀其它会话正在流式传输的连接
-                if group != AI_GEMINI_GROUP or passive_dead_switch:
-                    drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
-                    if callable(drop_fn):
-                        try:
-                            drop_fn(group, keep_leaf=current)
-                        except TypeError:
-                            drop_fn(group)
+                drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
+                if callable(drop_fn):
+                    try:
+                        drop_fn(group, keep_leaf=current)
+                    except TypeError:
+                        drop_fn(group)
             gs["last_active"] = current
 
         # 自动模式（AI-MANUAL 当前是 AI-AUTO）由自动池自身 fallback 兜底，看门狗不手动切，
@@ -444,14 +453,10 @@ class AIWatchService:
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
-                # AI-GEMINI 仅在地区门禁 (geo_blocked) 时强制掐旧连接；普通抖动采取平滑切流，
-                # 让新建/重试连接走新节点，绝不掐断其它终端正在正常流式输出的 SSE 连接。
-                should_drop = group != AI_GEMINI_GROUP or verdict == PROBE_GEO_BLOCKED
+                # 切换故障节点时必须关闭滞留在旧叶子上的 HTTP/2 Multiplexed ClientConn（保留新叶子 keep_leaf），
+                # 否则 Go http2.Transport 会将后续重试继续复用到旧故障节点的 TCP 连接上，引发连环误判。
                 try:
-                    try:
-                        self.query.switch_group(group, target, drop_connections=should_drop)
-                    except TypeError:
-                        self.query.switch_group(group, target)
+                    self.query.switch_group(group, target)
                 except Exception:
                     # 切换失败（API 抖动等）：保留失败计数，下一轮重试，不让异常中断循环、丢状态
                     return result
@@ -491,19 +496,21 @@ class AIWatchService:
         `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
         `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
         仅当所有非冷却叶子都被标死时才回退到首个可用候选。
-        对于 `AI-GEMINI`，优先选择非 IEPL（`1X` WebSocket）叶子，避免 `xtls-rprx-vision` IEPL
-        中转在 50 秒空闲窗口掐断长思考流式连接。
+        对于 `AI-GEMINI`，优先选择非 IEPL（`1X` WebSocket）叶子；若所有存活 `1X` 叶子均在
+        冷却期内，优先回收最早进入冷却的存活 `1X` 叶子，绝不轻易回退到 50 秒必断流的 IEPL 节点。
         """
         from .ban import is_node_banned, load_active_bans
 
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
+        cooled_healthy_non_iepl: list[tuple[float, int, str]] = []
+        is_gemini = getattr(group, "name", "") == AI_GEMINI_GROUP
         candidates = list(group.candidates)
-        if getattr(group, "name", "") == AI_GEMINI_GROUP:
+        if is_gemini:
             non_iepl = [c for c in candidates if c and not is_iepl_node(str(c))]
             iepl = [c for c in candidates if c and is_iepl_node(str(c))]
             candidates = non_iepl + iepl
-        for cand in candidates:
+        for idx, cand in enumerate(candidates):
             if not cand or cand == current:
                 continue
             if active_bans and is_node_banned(str(cand), active_bans):
@@ -511,12 +518,21 @@ class AIWatchService:
             entry = groups.get(cand)
             if entry is not None and entry.candidates:
                 continue
+            is_dead = entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout")
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
+                if is_gemini and not is_iepl_node(str(cand)) and not is_dead:
+                    cooled_healthy_non_iepl.append((float(ts), idx, str(cand)))
                 continue
-            if entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout"):
+            if is_dead:
                 if fallback_leaf is None:
                     fallback_leaf = str(cand)
                 continue
+            if is_gemini and is_iepl_node(str(cand)) and cooled_healthy_non_iepl:
+                cooled_healthy_non_iepl.sort()
+                return cooled_healthy_non_iepl[0][2]
             return str(cand)
+        if cooled_healthy_non_iepl:
+            cooled_healthy_non_iepl.sort()
+            return cooled_healthy_non_iepl[0][2]
         return fallback_leaf

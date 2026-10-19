@@ -41,7 +41,7 @@ def test_feature1_agy_log_retry_triggers_instant_first_attempt_failover(tmp_path
     lt = time.localtime(now_ts - 2.0)
     log_line = (
         f"I{lt.tm_mon:02d}{lt.tm_mday:02d} {lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}.123456 "
-        "99999 run.go:336] Run: attempt 1 failed (Post \"https://daily-cloudcode-pa.googleapis.com/"
+        "99999 run.go:336] Run: attempt 3 failed (Post \"https://daily-cloudcode-pa.googleapis.com/"
         "v1internal:streamGenerateContent?alt=sse\": EOF), retrying in 451ms...\n"
     )
     (log_dir / "cli-20261018.log").write_text(log_line, encoding="utf-8")
@@ -49,7 +49,7 @@ def test_feature1_agy_log_retry_triggers_instant_first_attempt_failover(tmp_path
     hit, event_ts, reason = detect_recent_agy_retry_failure(log_dir, now=now_ts)
     assert hit is True
     assert event_ts > 0
-    assert "attempt 1" in reason
+    assert "attempt 3" in reason
 
     groups = {
         "AI-MANUAL": ProxyGroup(name="AI-MANUAL", type="Fallback", current="US-01", candidates=["US-01", "SG-01"]),

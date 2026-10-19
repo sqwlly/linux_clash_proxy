@@ -262,6 +262,9 @@ def active_candidates_after_round(
         for n, d in results.items()
     ]
     keep = max(1, ceil(len(summaries) / 2))
+    if prefer_non_iepl:
+        healthy_non_iepl_count = sum(1 for s in summaries if is_healthy_non_iepl_summary(s))
+        keep = max(keep, healthy_non_iepl_count)
     active = {
         s.name for s in sorted(summaries, key=lambda s: probe_rank_key(s, prefer_non_iepl=prefer_non_iepl))[:keep]
     }

@@ -472,6 +472,119 @@ def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_p
     assert "attempt 3" in reason
     assert "EOF" in reason
 
+    # 若后续已收到 streamGenerateContent ResponseID（重试已恢复并正在流式输出），绝不误触发切流掐断活跃流
+    older_session_log.write_text(
+        f"I{ts_str}.100000 12345 run.go:395] Run: attempt 3 failed "
+        '(Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), '
+        "retrying in 12s...\n"
+        f"I{ts_str}.900000 12345 http_helpers.go:349] URL: "
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse "
+        "Trace: 0x1234 ResponseID: abcdef\n",
+        encoding="utf-8",
+    )
+    hit_recovered, _, _ = detect_recent_agy_retry_failure(
+        older_session_log.parent,
+        now=now_ts,
+        window_seconds=60.0,
+    )
+    assert hit_recovered is False
+
+    # stream reading error: unexpected EOF 说明节点已建连成功拿到 200 ResponseID，不触发切节点
+    older_session_log.write_text(
+        f"I{ts_str}.100000 12345 run.go:395] Run: attempt 3 failed "
+        "(stream reading error: unexpected EOF), retrying in 12s...\n",
+        encoding="utf-8",
+    )
+    hit_stream_eof, _, _ = detect_recent_agy_retry_failure(
+        older_session_log.parent,
+        now=now_ts,
+        window_seconds=60.0,
+    )
+    assert hit_stream_eof is False
+
+
+def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_fallback(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.ai_watch import AIWatchService, _promote_gemini_order_head
+    from cproxy.services.probe import ProbeSummary, StabilityVerdict, active_candidates_after_round
+    from cproxy.services.rebalance import RebalanceService
+
+    # 1. 5 个健康 1X + 6 个 IEPL（共 11 个）：折半淘汰不应把排在第 4/5 名的健康 1X 提前淘汰
+    results = {
+        "🇰🇷韩国 01 | 1X": {"delays": [250, 260], "failures": 0},
+        "🇬🇧英国 01 | 1X": {"delays": [380, 390], "failures": 0},
+        "🇩🇪德国 01 | 1X": {"delays": [720, 740], "failures": 0},
+        "🇫🇷法国 01 | 1X": {"delays": [760, 780], "failures": 0},
+        "🇧🇷巴西 01 | 1X": {"delays": [840, 860], "failures": 0},
+        "🇰🇷韩国 01 | IEPL 1.7X | CM": {"delays": [150, 160], "failures": 0},
+        "🇬🇧英国 01 | IEPL 1.7X | CM": {"delays": [180, 190], "failures": 0},
+    }
+    kept = active_candidates_after_round(results, current=None, prefer_non_iepl=True)
+    assert {
+        "🇰🇷韩国 01 | 1X",
+        "🇬🇧英国 01 | 1X",
+        "🇩🇪德国 01 | 1X",
+        "🇫🇷法国 01 | 1X",
+        "🇧🇷巴西 01 | 1X",
+    }.issubset(kept)
+
+    # 2. 当 AI-GEMINI 滞留在高延迟 🇫🇷法国 01 | 1X (780ms) 时，应自动迁回 🇰🇷韩国 01 | 1X (260ms)；
+    #    但若当前已在 🇬🇧英国 01 | 1X (350ms) 且与榜首差距 <180ms，保持 Sticky Active Head 不乱切。
+    fr_slow_report = SimpleNamespace(
+        current="🇫🇷法国 01 | 1X",
+        current_verdict=StabilityVerdict(True, "5/5 稳定"),
+        verdict=StabilityVerdict(True, "5/5 稳定"),
+        summaries=[
+            ProbeSummary("🇰🇷韩国 01 | 1X", (250, 260, 270, 255, 265), 0),
+            ProbeSummary("🇫🇷法国 01 | 1X", (760, 780, 790, 770, 800), 0),
+        ],
+    )
+    assert RebalanceService._should_switch_current(fr_slow_report, "🇰🇷韩国 01 | 1X", "AI-GEMINI") is True
+
+    gb_close_report = SimpleNamespace(
+        current="🇬🇧英国 01 | 1X",
+        current_verdict=StabilityVerdict(True, "5/5 稳定"),
+        verdict=StabilityVerdict(True, "5/5 稳定"),
+        summaries=[
+            ProbeSummary("🇰🇷韩国 01 | 1X", (260, 270, 280, 265, 275), 0),
+            ProbeSummary("🇬🇧英国 01 | 1X", (350, 360, 370, 355, 365), 0),
+        ],
+    )
+    assert RebalanceService._should_switch_current(gb_close_report, "🇰🇷韩国 01 | 1X", "AI-GEMINI") is False
+
+    # 3. _pick_next 在所有 1X 均处于冷却期时，优先回收最早冷却的存活 1X，绝不落入 50s 必断的 IEPL
+    paths = _make_paths(tmp_path)
+    svc = AIWatchService(paths)
+    now = 10_000.0
+    groups = {
+        "AI-GEMINI": ProxyGroup(
+            name="AI-GEMINI",
+            type="fallback",
+            current="🇬🇧英国 01 | 1X",
+            candidates=["🇰🇷韩国 01 | 1X", "🇬🇧英国 01 | 1X", "🇰🇷韩国 01 | IEPL 1.7X | CM"],
+        ),
+        "🇰🇷韩国 01 | 1X": ProxyGroup("🇰🇷韩国 01 | 1X", "VLESS", "-", [], delay=250, alive=True),
+        "🇬🇧英国 01 | 1X": ProxyGroup("🇬🇧英国 01 | 1X", "VLESS", "-", [], delay=380, alive=True),
+        "🇰🇷韩国 01 | IEPL 1.7X | CM": ProxyGroup("🇰🇷韩国 01 | IEPL 1.7X | CM", "VLESS", "-", [], delay=120, alive=True),
+    }
+    picked = svc._pick_next(
+        groups,
+        groups["AI-GEMINI"],
+        "🇬🇧英国 01 | 1X",
+        {"🇰🇷韩国 01 | 1X": now - 120.0},
+        now,
+    )
+    assert picked == "🇰🇷韩国 01 | 1X"
+
+    # 4. _promote_gemini_order_head 绝不把 IEPL 节点提拔到 ai-gemini-order.json 首位
+    order_path = ai_gemini_order_file(paths)
+    order_path.write_text('["🇰🇷韩国 01 | 1X", "🇰🇷韩国 01 | IEPL 1.7X | CM"]', encoding="utf-8")
+    _promote_gemini_order_head(paths, "🇰🇷韩国 01 | IEPL 1.7X | CM")
+    assert order_path.read_text(encoding="utf-8") == '["🇰🇷韩国 01 | 1X", "🇰🇷韩国 01 | IEPL 1.7X | CM"]'
+
 
 
 

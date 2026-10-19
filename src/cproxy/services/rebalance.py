@@ -73,8 +73,8 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
         neg_success,
         failures,
         iepl_tiebreak,
-        max_w,
         avg_w,
+        max_w,
         penalty,
         name,
     )
@@ -291,10 +291,7 @@ class RebalanceService:
             if not next_candidate:
                 break
             try:
-                try:
-                    query.switch_group(AI_GEMINI_GROUP, next_candidate, drop_connections=False)
-                except TypeError:
-                    query.switch_group(AI_GEMINI_GROUP, next_candidate)
+                query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
             except Exception:
@@ -333,7 +330,21 @@ class RebalanceService:
             and is_iepl_node(current_node)
             and is_healthy_non_iepl_summary(best_summary)
         )
-        if current_verdict.stable and not migrating_gemini_off_iepl:
+        migrating_gemini_off_slow = (
+            group_name == AI_GEMINI_GROUP
+            and cur_summary is not None
+            and best_summary is not None
+            and is_healthy_non_iepl_summary(best_summary)
+            and (
+                not is_healthy_non_iepl_summary(cur_summary)
+                or (
+                    cur_summary.avg_delay is not None
+                    and best_summary.avg_delay is not None
+                    and cur_summary.avg_delay - best_summary.avg_delay >= 180
+                )
+            )
+        )
+        if current_verdict.stable and not migrating_gemini_off_iepl and not migrating_gemini_off_slow:
             cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
             best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
             if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:
@@ -361,10 +372,7 @@ class RebalanceService:
                 return None
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
-            try:
-                query.switch_group(group_name, best_candidate, drop_connections=(group_name != AI_GEMINI_GROUP))
-            except TypeError:
-                query.switch_group(group_name, best_candidate)
+            query.switch_group(group_name, best_candidate)
             return best_candidate
         except Exception:
             return None
