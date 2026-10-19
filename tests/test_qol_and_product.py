@@ -879,3 +879,12 @@ def test_ws_cdn_server_optimization_and_apac_uk_tier_stability() -> None:
         summaries=[kr_loaded, gb_idle, us_1x],
     )
     assert RebalanceService._should_switch_current(manual_sticky_report, "🇬🇧英国 01 | 1X", "AI-MANUAL") is False
+
+    # 当 1X 节点带 80..199ms 历史惩罚但本轮 5/5 零失败（或 4/5 多数成功）时，仍必须排在 54s 断流的 IEPL 之前
+    from cproxy.services.rebalance import _smooth_rank_key
+
+    kr_1x_hist89 = ProbeSummary("🇰🇷韩国 01 | 1X", (500, 520, 540, 510, 530), 0, history_penalty_ms=89)
+    kr_1x_4of5 = ProbeSummary("🇬🇧英国 01 | 1X", (320, 340, 350, 330), 1, history_penalty_ms=40)
+    jp_iepl_hist71 = ProbeSummary("🇯🇵日本 01 | IEPL + UDP 1.7X | CM", (350, 360, 370, 380, 390), 0, history_penalty_ms=71)
+    assert _smooth_rank_key(kr_1x_hist89, prefer_non_iepl=True) < _smooth_rank_key(jp_iepl_hist71, prefer_non_iepl=True)
+    assert _smooth_rank_key(kr_1x_4of5, prefer_non_iepl=True) < _smooth_rank_key(jp_iepl_hist71, prefer_non_iepl=True)

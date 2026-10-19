@@ -491,7 +491,50 @@ class AIWatchService:
             return result
 
         if verdict == PROBE_OK:
-            if passive_dead_switch and not dry_run and group_obj is not None and current in group_obj.candidates:
+            if (
+                not dry_run
+                and group_obj is not None
+                and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+                and is_iepl_node(current)
+            ):
+                cooldown_map = gs.get("cooldown", {})
+                cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
+                cand_entry = groups.get(cand_1x) if cand_1x else None
+                cand_cooled = (
+                    cand_1x is not None
+                    and cand_1x in cooldown_map
+                    and now - float(cooldown_map[cand_1x]) < COOLDOWN_SECONDS
+                )
+                if (
+                    cand_1x is not None
+                    and not is_iepl_node(cand_1x)
+                    and not cand_cooled
+                    and cand_entry is not None
+                    and cand_entry.alive is True
+                    and delay_state(cand_entry.delay) != "timeout"
+                ):
+                    try:
+                        try:
+                            self.query.switch_group(group, cand_1x, drop_connections=True)
+                        except TypeError:
+                            self.query.switch_group(group, cand_1x)
+                        _promote_gemini_order_head(self.paths, cand_1x, group=group)
+                        gs["fail_node"] = None
+                        gs["fail_count"] = 0
+                        gs["last_active"] = cand_1x
+                        result.switched = True
+                        result.target = cand_1x
+                        result.detail = "migrated_off_iepl"
+                        return result
+                    except Exception:
+                        pass
+            if (
+                passive_dead_switch
+                and not dry_run
+                and group_obj is not None
+                and current in group_obj.candidates
+                and not is_iepl_node(current)
+            ):
                 api_switch = getattr(self.query.api, "switch_group", None)
                 if callable(api_switch):
                     try:

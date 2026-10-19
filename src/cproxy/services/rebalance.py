@@ -69,17 +69,29 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
             penalty,
             name,
         )
-    is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
     healthy_non_iepl = is_healthy_non_iepl_summary(summary)
-    if is_healthy:
-        tier = 0 if healthy_non_iepl else 1
-    else:
+    alive_non_iepl = (
+        not is_iepl_node(summary.name)
+        and summary.success_count > 0
+        and summary.success_count >= failures
+        and penalty < 200
+        and summary.avg_delay is not None
+        and summary.avg_delay <= 1350
+    )
+    is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
+    if healthy_non_iepl:
+        tier = 0
+    elif alive_non_iepl:
+        tier = 1
+    elif is_healthy:
         tier = 2
-    iepl_tiebreak = 0 if healthy_non_iepl else 1
+    else:
+        tier = 3
+    iepl_tiebreak = 0 if not is_iepl_node(summary.name) else 1
     reg = match_region(summary.name)
     region_tier = (
         0
-        if (not healthy_non_iepl or reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None))
+        if (not (healthy_non_iepl or alive_non_iepl) or reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None))
         else 1
     )
     return (
