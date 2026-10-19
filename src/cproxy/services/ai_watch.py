@@ -571,6 +571,7 @@ class AIWatchService:
         """
         from .ban import is_node_banned, load_active_bans
         from .nodelist import match_region
+        from .probe import GEMINI_FAST_REGIONS
 
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
@@ -578,10 +579,9 @@ class AIWatchService:
         is_gemini = getattr(group, "name", "") == AI_GEMINI_GROUP
         candidates = list(group.candidates)
         if is_gemini:
-            fast_regions = {"KR", "TW", "JP", "SG", "GB"}
             non_iepl = [c for c in candidates if c and not is_iepl_node(str(c))]
             non_iepl.sort(
-                key=lambda c: 0 if (match_region(str(c)) in fast_regions or match_region(str(c)) is None) else 1
+                key=lambda c: 0 if (match_region(str(c)) in GEMINI_FAST_REGIONS or match_region(str(c)) in ("OTHER", None)) else 1
             )
             iepl = [c for c in candidates if c and is_iepl_node(str(c))]
             candidates = non_iepl + iepl

@@ -23,12 +23,17 @@ from ..backend.runtime import (
 )
 from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, read_config, runtime_file
 from .nodelist import match_region
-from .probe import ProbeService, ProbeSummary, is_healthy_non_iepl_summary, is_iepl_node
+from .probe import (
+    GEMINI_FAST_REGIONS,
+    ProbeService,
+    ProbeSummary,
+    is_healthy_non_iepl_summary,
+    is_iepl_node,
+)
 from .query import QueryService
 
 REBALANCE_PROFILE = "codex"
 REBALANCE_GEMINI_PROFILE = "gemini"
-GEMINI_FAST_REGIONS = frozenset({"KR", "TW", "JP", "SG", "GB"})
 # 排序时对历史失败惩罚的加权倍数：跨多次探测的惩罚自然平滑单轮噪声，
 # 削弱「一轮 5/5、下一轮 1/5」的名次翻转。
 HISTORY_PENALTY_WEIGHT = 4.0
@@ -71,9 +76,10 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
     else:
         tier = 2
     iepl_tiebreak = 0 if healthy_non_iepl else 1
+    reg = match_region(summary.name)
     region_tier = (
         0
-        if (not healthy_non_iepl or match_region(summary.name) in GEMINI_FAST_REGIONS or match_region(summary.name) is None)
+        if (not healthy_non_iepl or reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None))
         else 1
     )
     return (
@@ -355,7 +361,8 @@ class RebalanceService:
             and (
                 not is_healthy_non_iepl_summary(cur_summary)
                 or (
-                    cur_summary.avg_delay is not None
+                    match_region(str(current_node or "")) not in GEMINI_FAST_REGIONS
+                    and cur_summary.avg_delay is not None
                     and best_summary.avg_delay is not None
                     and cur_summary.avg_delay - best_summary.avg_delay >= 180
                 )

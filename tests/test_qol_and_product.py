@@ -818,3 +818,47 @@ def test_multi_airport_subscription_import_compatibility(tmp_path: Path, monkeyp
     assert _is_stream_safe_gemini_leaf(paths, "🇰🇷 首尔 01") is True
     assert _is_stream_safe_gemini_leaf(paths, "[IPLC] 韓國 02") is False
 
+
+def test_ws_cdn_server_optimization_and_apac_uk_tier_stability() -> None:
+    from types import SimpleNamespace
+
+    from cproxy.backend.runtime import _optimize_ws_cdn_servers
+    from cproxy.services.probe import ProbeSummary, StabilityVerdict
+    from cproxy.services.rebalance import RebalanceService
+
+    proxies = [
+        {
+            "name": "🇰🇷韩国 01 | 1X",
+            "type": "vless",
+            "server": "cyberguard.cyberguard-u1s1.art",
+            "port": 443,
+            "servername": "cyberguard-u1s1.art",
+            "network": "ws",
+            "ws-opts": {"path": "/cgkr1", "headers": {"Host": "cgkr1.cyberguard-u1s1.art"}},
+        },
+        {
+            "name": "🇭🇰香港 01 | 1X | CMI 01",
+            "type": "vless",
+            "server": "ch-jp2.599789.xyz",
+            "port": 43229,
+            "servername": "cghk1.xn--download-ne4yj89e.com",
+            "network": "ws",
+            "ws-opts": {"path": "/cghk1", "headers": {"Host": "cghk1.xn--download-ne4yj89e.com"}},
+        },
+    ]
+    _optimize_ws_cdn_servers(proxies)
+    assert proxies[0]["server"] == "cgkr1.cyberguard-u1s1.art"
+    assert proxies[1]["server"] == "ch-jp2.599789.xyz"
+
+    # 当现役节点已在 GEMINI_FAST_REGIONS（如 🇰🇷韩国 01 | 1X）且健康时，即使承载大包上传导致探测延迟偏高 (613ms)，
+    # 也不应因与空闲 🇬🇧英国 01 | 1X (376ms) 差距 >=180ms 而每 30 分钟乒乓切走
+    kr_loaded = ProbeSummary("🇰🇷韩国 01 | 1X", (580, 620, 640), 0)
+    gb_idle = ProbeSummary("🇬🇧英国 01 | 1X", (360, 380, 390), 0)
+    kr_loaded_report = SimpleNamespace(
+        current="🇰🇷韩国 01 | 1X",
+        current_verdict=StabilityVerdict(True, "5/5 稳定"),
+        verdict=StabilityVerdict(True, "5/5 稳定"),
+        summaries=[gb_idle, kr_loaded],
+    )
+    assert RebalanceService._should_switch_current(kr_loaded_report, "🇬🇧英国 01 | 1X", "AI-GEMINI") is False
+

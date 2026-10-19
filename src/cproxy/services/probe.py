@@ -255,7 +255,7 @@ def probe_rank_key(
         from .nodelist import match_region
 
         reg = match_region(summary.name)
-        region_tier = 0 if (reg in GEMINI_FAST_REGIONS or reg is None) else 1
+        region_tier = 0 if (reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None)) else 1
     else:
         region_tier = 0
     return (neg_success, failures, iepl_tier, region_tier, max_plus_p, avg_plus_p, penalty, name)

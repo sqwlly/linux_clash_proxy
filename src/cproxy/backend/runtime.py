@@ -745,6 +745,43 @@ def _sanitize_dns_fallback_filter(data: dict) -> None:
         fallback_filter.pop("geosite", None)
 
 
+def _optimize_ws_cdn_servers(proxies: list | None) -> None:
+    """将 443 端口 Cloudflare WebSocket 节点的拥塞共享入口域名替换为节点独立 ws-opts.headers.Host。
+
+    部分机场（如 cyberguard.*）把全部 1X WebSocket 节点的 `server` 指向同一个旧优选域名
+    （解析到单一高丢包 IP `172.64.146.118`，实测大包上传仅 0.3 Mbps，导致 agy 2MB 上下文
+    POST 请求在 60s 上传超时被 Google 掐断报 EOF）；而节点自带的 `ws-opts.headers.Host`
+    （如 `cgkr1.cyberguard-u1s1.art`，属 `servername` 的合法子域）解析到正常双栈 Anycast 池，
+    上传吞吐提升约 10 倍（2.5~4.5 Mbps）。
+    仅在 `network == "ws"`、`port == 443`、`ws_host` 为 `servername` 子域且与 `server` 不同时替换，
+    不影响非 443 端口的国内中转（如 CMI 端口转发）或其它协议。
+    """
+    if not isinstance(proxies, list):
+        return
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        if str(proxy.get("network") or "").strip().lower() != "ws":
+            continue
+        try:
+            port = int(proxy.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if port != 443:
+            continue
+        server = str(proxy.get("server") or "").strip()
+        sni = str(proxy.get("servername") or proxy.get("sni") or "").strip().lower()
+        ws_opts = proxy.get("ws-opts")
+        headers = ws_opts.get("headers") if isinstance(ws_opts, dict) else None
+        ws_host = str(
+            (headers.get("Host") or headers.get("host") or "") if isinstance(headers, dict) else ""
+        ).strip()
+        if not server or not sni or not ws_host:
+            continue
+        if ws_host.lower() != server.lower() and ws_host.lower().endswith("." + sni):
+            proxy["server"] = ws_host
+
+
 class RuntimeBackend:
     def __init__(self, paths: AppPaths):
         self.paths = paths
@@ -796,6 +833,7 @@ class RuntimeBackend:
             data = yaml.safe_load(fh) or {}
 
         _sanitize_dns_fallback_filter(data)
+        _optimize_ws_cdn_servers(data.get("proxies"))
 
         # 关闭 tcp-concurrent：避免出站拨号前先在本机跑 DNS（223.5.5.5 + 1.1.1.1/8.8.8.8 fallback）
         # 造成每次新建 TLS 连接卡顿 4~5s，或把经默认池解析出的日本/香港边缘 IP 喂给韩国/新加坡 AI 节点。
