@@ -857,8 +857,7 @@ def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -
         if probe_tls:
             healthy_ips = _resolve_healthy_ws_cdn_ips(str(proxy.get("server") or ""), port, sni)
             if healthy_ips:
-                pick = (ws_idx + (ws_idx // 4)) % len(healthy_ips)
-                proxy["server"] = healthy_ips[pick]
+                proxy["server"] = healthy_ips[0]
         ws_idx += 1
 
 

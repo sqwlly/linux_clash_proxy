@@ -245,6 +245,7 @@ def is_dynamic_stream_fragile(name: str | None, paths: AppPaths | None = None, *
 
 
 def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float | None = None) -> None:
+    global _DYNAMIC_FRAGILE_CACHE
     if not name:
         return
     try:
@@ -275,11 +276,13 @@ def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float 
         tmp = state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(state_path)
+        _DYNAMIC_FRAGILE_CACHE = ("", -1, {})
     except Exception:
         pass
 
 
 def clear_stream_fragile_node(paths: AppPaths, name: str | None) -> None:
+    global _DYNAMIC_FRAGILE_CACHE
     if not name:
         return
     try:
@@ -300,6 +303,7 @@ def clear_stream_fragile_node(paths: AppPaths, name: str | None) -> None:
         tmp = state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
         tmp.replace(state_path)
+        _DYNAMIC_FRAGILE_CACHE = ("", -1, {})
     except Exception:
         pass
 
