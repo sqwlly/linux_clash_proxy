@@ -138,7 +138,13 @@ class RebalanceService:
             profile=REBALANCE_PROFILE,
             record_history=True,
         )
-        ordered = [summary.name for summary in sorted(report.summaries, key=_smooth_rank_key)]
+        ordered = [
+            summary.name
+            for summary in sorted(
+                report.summaries,
+                key=lambda s: _smooth_rank_key(s, prefer_non_iepl=True),
+            )
+        ]
         ordered = _deprioritize_high_multiplier(
             ordered,
             max_mult=max_mult,
@@ -348,20 +354,23 @@ class RebalanceService:
         if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
             return False
         cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
+        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+        cur_region = match_region(str(current_node or ""))
         migrating_gemini_off_iepl = (
-            group_name == AI_GEMINI_GROUP
+            is_managed_ai
             and is_iepl_node(current_node)
             and is_healthy_non_iepl_summary(best_summary)
         )
         migrating_gemini_off_slow = (
-            group_name == AI_GEMINI_GROUP
+            is_managed_ai
             and cur_summary is not None
             and best_summary is not None
             and is_healthy_non_iepl_summary(best_summary)
             and (
                 not is_healthy_non_iepl_summary(cur_summary)
                 or (
-                    match_region(str(current_node or "")) not in GEMINI_FAST_REGIONS
+                    cur_region not in GEMINI_FAST_REGIONS
+                    and cur_region not in ("OTHER", None)
                     and cur_summary.avg_delay is not None
                     and best_summary.avg_delay is not None
                     and cur_summary.avg_delay - best_summary.avg_delay >= 180
@@ -397,7 +406,7 @@ class RebalanceService:
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
             current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
-            should_drop = group_name != AI_GEMINI_GROUP or is_iepl_node(current_node)
+            should_drop = group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) or is_iepl_node(current_node)
             try:
                 query.switch_group(group_name, best_candidate, drop_connections=should_drop)
             except TypeError:

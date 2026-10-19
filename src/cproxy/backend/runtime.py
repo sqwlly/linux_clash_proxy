@@ -835,6 +835,11 @@ class RuntimeBackend:
         _sanitize_dns_fallback_filter(data)
         _optimize_ws_cdn_servers(data.get("proxies"))
 
+        # 若 dns.ipv6 关闭（或未显式开启），同步关闭顶层 ipv6，防止 mihomo 出站拨号对双栈 Cloudflare
+        # 优选域名尝试连接不可达的 IPv6 地址（[2606:4700:...]:443 network is unreachable）拖慢建连。
+        if not (isinstance(data.get("dns"), dict) and data["dns"].get("ipv6") is True):
+            data["ipv6"] = False
+
         # 关闭 tcp-concurrent：避免出站拨号前先在本机跑 DNS（223.5.5.5 + 1.1.1.1/8.8.8.8 fallback）
         # 造成每次新建 TLS 连接卡顿 4~5s，或把经默认池解析出的日本/香港边缘 IP 喂给韩国/新加坡 AI 节点。
         data["tcp-concurrent"] = False
@@ -933,6 +938,7 @@ class RuntimeBackend:
             for node_name in pool:
                 if node_name not in manual_leaves:
                     manual_leaves.append(node_name)
+        manual_leaves = _prefer_non_iepl_nodes(manual_leaves, _proxy_map(data.get("proxies")))
         extra_manual_nodes = filter_unbanned_nodes(
             _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, ("US", "JP", "SG", "KR", "GB")),
             active_bans,

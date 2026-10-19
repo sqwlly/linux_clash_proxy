@@ -230,7 +230,7 @@ def simulate_gemini_stream_hold(
 
 NON_IEPL_HEALTHY_AVG_MS = 1350
 NON_IEPL_HEALTHY_MAX_MS = 1800
-GEMINI_FAST_REGIONS = frozenset({"KR", "TW", "JP", "SG", "GB"})
+GEMINI_FAST_REGIONS = frozenset({"US", "KR", "TW", "JP", "SG", "GB"})
 
 
 def is_healthy_non_iepl_summary(summary: ProbeSummary | None) -> bool:
@@ -471,7 +471,7 @@ class ProbeService:
                     {n: results[n] for n in active},
                     current,
                     penalties,
-                    prefer_non_iepl=(group == "AI-GEMINI" or profile == "gemini"),
+                    prefer_non_iepl=(group in ("AI-GEMINI", "AI-MANUAL") or profile in ("gemini", "codex")),
                 )
                 if show_progress:
                     progress.commit(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}")
@@ -479,7 +479,7 @@ class ProbeService:
         if show_progress:
             progress.commit("完成")
 
-        prefer_non_iepl = group == "AI-GEMINI" or profile == "gemini"
+        prefer_non_iepl = group in ("AI-GEMINI", "AI-MANUAL") or profile in ("gemini", "codex")
         summaries = tuple(
             ProbeSummary(
                 name=n,

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
-from ..config import AppPaths, ai_gemini_order_file, ai_watch_state_file, read_config
+from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, ai_watch_state_file, read_config
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
 from .probe import is_iepl_node, resolve_current_leaf
 from .query import QueryService
@@ -341,12 +341,12 @@ def detect_recent_agy_retry_failure(
     return False, max(since_ts, newest_ts), ""
 
 
-def _promote_gemini_order_head(paths: AppPaths, target: str) -> None:
-    """将刚切中的 AI-GEMINI 非 IEPL 目标节点同步提升到 ai-gemini-order.json 首位，
+def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEMINI_GROUP) -> None:
+    """将刚切中的 AI 非 IEPL 目标节点同步提升到对应 order.json 首位，
     防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
     if not target or is_iepl_node(target):
         return
-    order_path = ai_gemini_order_file(paths)
+    order_path = ai_gemini_order_file(paths) if group == AI_GEMINI_GROUP else ai_manual_order_file(paths)
     if not order_path.exists():
         return
     try:
@@ -534,13 +534,14 @@ class AIWatchService:
                 if current:
                     cooldown[current] = now
                 if group == AI_GEMINI_GROUP:
-                    # 设 90s 切流静默保护窗，并同步更新 ai-gemini-order.json 首位防 render 重置
+                    # 设 90s 切流静默保护窗
                     gs["last_log_fail_ts"] = max(
                         float(gs.get("last_log_fail_ts") or 0.0),
                         now + 90.0,
                         time.time() + 90.0,
                     )
-                    _promote_gemini_order_head(self.paths, target)
+                if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
+                    _promote_gemini_order_head(self.paths, target, group=group)
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
                 gs["last_active"] = target
@@ -566,8 +567,8 @@ class AIWatchService:
         `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
         `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
         仅当所有非冷却叶子都被标死时才回退到首个可用候选。
-        对于 `AI-GEMINI`，优先选择非 IEPL（`1X` WebSocket）叶子；若所有存活 `1X` 叶子均在
-        冷却期内，优先回收最早进入冷却的存活 `1X` 叶子，绝不轻易回退到 50 秒必断流的 IEPL 节点。
+        对于 `AI-GEMINI` 与 `AI-MANUAL`，优先选择非 IEPL（`1X` WebSocket）叶子；若所有存活 `1X`
+        叶子均在冷却期内，优先回收最早进入冷却的存活 `1X` 叶子，绝不轻易回退到 50 秒必断流的 IEPL 节点。
         """
         from .ban import is_node_banned, load_active_bans
         from .nodelist import match_region
@@ -576,9 +577,11 @@ class AIWatchService:
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
         cooled_healthy_non_iepl: list[tuple[float, int, str]] = []
-        is_gemini = getattr(group, "name", "") == AI_GEMINI_GROUP
         candidates = list(group.candidates)
-        if is_gemini:
+        is_managed_ai = getattr(group, "name", "") in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and any(
+            c and is_iepl_node(str(c)) for c in candidates
+        )
+        if is_managed_ai:
             non_iepl = [c for c in candidates if c and not is_iepl_node(str(c))]
             non_iepl.sort(
                 key=lambda c: 0 if (match_region(str(c)) in GEMINI_FAST_REGIONS or match_region(str(c)) in ("OTHER", None)) else 1
@@ -596,14 +599,14 @@ class AIWatchService:
             is_dead = entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout")
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
-                if is_gemini and not is_iepl_node(str(cand)) and not is_dead:
+                if is_managed_ai and not is_iepl_node(str(cand)) and not is_dead:
                     cooled_healthy_non_iepl.append((float(ts), idx, str(cand)))
                 continue
             if is_dead:
                 if fallback_leaf is None:
                     fallback_leaf = str(cand)
                 continue
-            if is_gemini and is_iepl_node(str(cand)) and cooled_healthy_non_iepl:
+            if is_managed_ai and is_iepl_node(str(cand)) and cooled_healthy_non_iepl:
                 cooled_healthy_non_iepl.sort()
                 return cooled_healthy_non_iepl[0][2]
             return str(cand)

@@ -18,7 +18,7 @@ def build_probe_output(
     raw: bool,
     section_title: Callable[[str], str] = str,
 ) -> tuple[list[str], int]:
-    prefer_non_iepl = report.group == "AI-GEMINI" or report.profile == "gemini"
+    prefer_non_iepl = report.group in ("AI-GEMINI", "AI-MANUAL") or report.profile in ("gemini", "codex")
     if raw:
         lines = [
             f"GROUP\t{report.group}",
@@ -85,7 +85,7 @@ def build_probe_output(
 
 
 def _probe_table_lines(report: ProbeReport) -> list[str]:
-    prefer_non_iepl = report.group == "AI-GEMINI" or report.profile == "gemini"
+    prefer_non_iepl = report.group in ("AI-GEMINI", "AI-MANUAL") or report.profile in ("gemini", "codex")
     headers = ("节点", "成功", "失败", "平均", "最大", "最小", "score")
     rows = [
         (

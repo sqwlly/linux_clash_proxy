@@ -862,3 +862,20 @@ def test_ws_cdn_server_optimization_and_apac_uk_tier_stability() -> None:
     )
     assert RebalanceService._should_switch_current(kr_loaded_report, "🇬🇧英国 01 | 1X", "AI-GEMINI") is False
 
+    # 通用 AI 出口（AI-MANUAL：OpenAI/Codex/Claude）同样优先健康 1X 节点并在滞留 IEPL 时主动迁出
+    us_1x = ProbeSummary("🇺🇸美国 01 | 1X", (320, 330, 340), 0)
+    gb_iepl = ProbeSummary("🇬🇧英国 01 | IEPL 1.7X | CM", (180, 190, 200), 0)
+    manual_iepl_report = SimpleNamespace(
+        current="🇬🇧英国 01 | IEPL 1.7X | CM",
+        current_verdict=StabilityVerdict(True, "5/5 稳定"),
+        verdict=StabilityVerdict(True, "5/5 稳定"),
+        summaries=[gb_iepl, us_1x],
+    )
+    assert RebalanceService._should_switch_current(manual_iepl_report, "🇺🇸美国 01 | 1X", "AI-MANUAL") is True
+    manual_sticky_report = SimpleNamespace(
+        current="🇺🇸美国 01 | 1X",
+        current_verdict=StabilityVerdict(True, "5/5 稳定"),
+        verdict=StabilityVerdict(True, "5/5 稳定"),
+        summaries=[kr_loaded, gb_idle, us_1x],
+    )
+    assert RebalanceService._should_switch_current(manual_sticky_report, "🇬🇧英国 01 | 1X", "AI-MANUAL") is False
