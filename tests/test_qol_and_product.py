@@ -659,7 +659,18 @@ def test_gemini_multi_session_retry_loop_and_connection_preservation(tmp_path: P
     assert gemini_res.switched is False
     assert switch_calls == []
 
-    # 4. _smooth_rank_key 在健康 1X 节点中始终将亚太/英国（KR/GB）排在欧陆/南美（DE/FR/BR）之前
+    # 4. _smooth_rank_key 与 probe_rank_key 在健康 1X 节点中始终将亚太/英国（KR/GB）排在欧陆/南美（DE/FR/BR）之前
+    from cproxy.services.probe import is_healthy_non_iepl_summary, probe_rank_key
+    from cproxy.services.rebalance import _should_keep_previous_order
+
     kr_loaded = ProbeSummary("🇰🇷韩国 01 | 1X", (520, 560, 580), 0)
     br_idle = ProbeSummary("🇧🇷巴西 01 | 1X", (480, 490, 500), 0)
+    fr_slow = ProbeSummary("🇫🇷法国 01 | 1X", (761, 1648), 0)
     assert _smooth_rank_key(kr_loaded, prefer_non_iepl=True) < _smooth_rank_key(br_idle, prefer_non_iepl=True)
+    assert probe_rank_key(kr_loaded, prefer_non_iepl=True) < probe_rank_key(br_idle, prefer_non_iepl=True)
+    assert is_healthy_non_iepl_summary(fr_slow) is True
+
+    # 5. 前 2 名主备不变且前 5 名集合相同（仅第 3~5 名互换）时，不触发无意义热重载
+    prev_order = ["N1", "N2", "N3", "N4", "N5", "N6"]
+    curr_order = ["N1", "N2", "N5", "N3", "N4", "N6"]
+    assert _should_keep_previous_order(prev_order, curr_order) is True

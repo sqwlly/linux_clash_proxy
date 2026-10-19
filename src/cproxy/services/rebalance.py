@@ -92,7 +92,11 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
 def _should_keep_previous_order(previous: list[str], current: list[str]) -> bool:
     if not previous or len(previous) != len(current) or set(previous) != set(current):
         return False
-    return previous[:REBALANCE_TOP_K] == current[:REBALANCE_TOP_K]
+    if previous[:REBALANCE_TOP_K] == current[:REBALANCE_TOP_K]:
+        return True
+    # 逐轮折半淘汰下，第 3~5 名常仅有 2~4 轮样本；若前 2 名（主用+首选热备）顺序完全未变，
+    # 且前 TOP_K 候选集合一致（仅第 3~5 名内部互换），同样保留原排序，避免每 30 分钟触发无意义热重载。
+    return previous[:2] == current[:2] and set(previous[:REBALANCE_TOP_K]) == set(current[:REBALANCE_TOP_K])
 
 
 @dataclass(frozen=True)

@@ -369,6 +369,10 @@ class APIBackend:
                 continue
             chains = [str(part) for part in (item.get("chains") or [])]
             chain_set = set(chains)
+            leaf_upper = chains[0].upper() if chains else ""
+            on_gemini_1x = "AI-GEMINI" in chain_set and "1X" in leaf_upper and "IEPL" not in leaf_upper
+            if on_gemini_1x:
+                continue
             if isinstance(group_names, dict):
                 should_drop = any(
                     grp in chain_set and target not in chain_set

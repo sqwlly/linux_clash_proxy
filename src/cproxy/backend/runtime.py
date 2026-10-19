@@ -27,8 +27,8 @@ AI_REGION_JP = "🇯🇵 Japan"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
-# 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported）
-AI_GEMINI_REGION_ORDER = ("KR", "TW", "DE", "FR", "GB", "BR", "AE", "AU")
+# 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported；韩/台/英低延迟区排欧陆/南美前）
+AI_GEMINI_REGION_ORDER = ("KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU")
 AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP})
 # AI 面板（`cproxy ai-status` / `cproxy incident`）要展示的组，及展示顺序。
 # 单一来源：此前 cli_render 与 services.ops 各硬编码了一份同样的 5 元组。

@@ -222,8 +222,9 @@ def simulate_gemini_stream_hold(
                 pass
 
 
-NON_IEPL_HEALTHY_AVG_MS = 1100
+NON_IEPL_HEALTHY_AVG_MS = 1350
 NON_IEPL_HEALTHY_MAX_MS = 1800
+GEMINI_FAST_REGIONS = frozenset({"KR", "TW", "JP", "SG", "GB"})
 
 
 def is_healthy_non_iepl_summary(summary: ProbeSummary | None) -> bool:
@@ -238,10 +239,20 @@ def is_healthy_non_iepl_summary(summary: ProbeSummary | None) -> bool:
     return summary.avg_delay <= NON_IEPL_HEALTHY_AVG_MS and summary.max_delay <= NON_IEPL_HEALTHY_MAX_MS
 
 
-def probe_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False) -> tuple[int, int, int, int, int, int, str]:
+def probe_rank_key(
+    summary: ProbeSummary, *, prefer_non_iepl: bool = False
+) -> tuple[int, int, int, int, int, int, int, str]:
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
-    iepl_tier = (0 if is_healthy_non_iepl_summary(summary) else 1) if prefer_non_iepl else 0
-    return (neg_success, failures, iepl_tier, max_plus_p, avg_plus_p, penalty, name)
+    healthy_non_iepl = is_healthy_non_iepl_summary(summary)
+    iepl_tier = (0 if healthy_non_iepl else 1) if prefer_non_iepl else 0
+    if prefer_non_iepl and healthy_non_iepl:
+        from .nodelist import match_region
+
+        reg = match_region(summary.name)
+        region_tier = 0 if (reg in GEMINI_FAST_REGIONS or reg is None) else 1
+    else:
+        region_tier = 0
+    return (neg_success, failures, iepl_tier, region_tier, max_plus_p, avg_plus_p, penalty, name)
 
 
 def active_candidates_after_round(
@@ -499,7 +510,8 @@ class ProbeService:
                     query = QueryService(self.paths)
                     query.api = self.api
                     for grp, _target in reversed(path):
-                        query._drop_stale_ai_connections(grp, keep_leaf=best.name)
+                        if grp != "AI-GEMINI" or is_iepl_node(current):
+                            query._drop_stale_ai_connections(grp, keep_leaf=best.name)
                 except Exception:
                     pass
                 switched = True
