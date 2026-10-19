@@ -982,3 +982,93 @@ def test_airport_without_iepl_labels_protocol_and_dynamic_stream_fragility(tmp_p
     kept = active_candidates_after_round(round2_results, current=None, prefer_non_iepl=True)
     assert "🇸🇬 Singapore 01" in kept
 
+
+def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import os
+    import socket
+    import time
+    import yaml
+    from cproxy.backend import runtime as runtime_mod
+    from cproxy.backend.runtime import RuntimeBackend, _optimize_ws_cdn_servers
+    from cproxy.config import config_file, runtime_file
+    from cproxy.services.ai_watch import detect_recent_agy_retry_failure
+
+    # 1. 多 A 记录 CDN 域名存在 TLS 黑洞（104.21.87.131 超时 None，172.67.143.95 415ms）时，
+    #    _optimize_ws_cdn_servers(probe_tls=True) 自动将 server 钉选到健康 IP
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *_a, **_kw: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.21.87.131", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.67.143.95", port)),
+        ],
+    )
+    monkeypatch.setattr(
+        runtime_mod,
+        "_tls_handshake_latency_ms",
+        lambda ip, _port, _sni, timeout=1.5: None if ip == "104.21.87.131" else 415,
+    )
+    proxies = [
+        {
+            "name": "🇰🇷韩国 01 | 1X",
+            "type": "vless",
+            "server": "cyberguard.cyberguard-u1s1.art",
+            "port": 443,
+            "servername": "cyberguard-u1s1.art",
+            "network": "ws",
+            "ws-opts": {"path": "/cgkr1", "headers": {"Host": "cgkr1.cyberguard-u1s1.art"}},
+        }
+    ]
+    _optimize_ws_cdn_servers(proxies, probe_tls=True)
+    assert proxies[0]["server"] == "172.67.143.95"
+
+    # 2. render_runtime 在 googleapis.com 之前注入 DOMAIN,play.googleapis.com,REJECT，防止遥测日志占满 AI-GEMINI 上行
+    paths = _make_paths(tmp_path / "play-reject")
+    cfg = {
+        "mixed-port": 7890,
+        "proxies": [
+            {"name": "🇺🇸美国 01 | 1X", "type": "vless", "server": "1.1.1.1", "port": 443},
+            {"name": "🇸🇬新加坡 01 | 1X", "type": "vless", "server": "1.1.1.2", "port": 443},
+            {"name": "🇰🇷韩国 01 | 1X", "type": "vless", "server": "1.1.1.3", "port": 443},
+        ],
+        "proxy-groups": [{"name": "PROXY", "type": "select", "proxies": ["🇺🇸美国 01 | 1X"]}],
+        "rules": ["MATCH,PROXY"],
+    }
+    config_file(paths).write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    RuntimeBackend(paths).render_runtime()
+    rendered = yaml.safe_load(runtime_file(paths).read_text(encoding="utf-8"))
+    rules = rendered["rules"]
+    assert "DOMAIN,play.googleapis.com,REJECT" in rules
+    assert rules.index("DOMAIN,play.googleapis.com,REJECT") < rules.index(
+        "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI"
+    )
+
+    # 3. 并发多会话下：会话 A 正在发生 attempt 4 大包上传失败，即便会话 B 在 1 秒后有小包 sir_flash_lite
+    #    收到 ResponseID，detect_recent_agy_retry_failure 仍必须捕获会话 A 的严重失败（attempt == 4）
+    log_dir = tmp_path / "multi-agy-logs"
+    log_dir.mkdir()
+    now_ts = time.time()
+    lt_fail = time.localtime(now_ts - 5.0)
+    lt_ok = time.localtime(now_ts - 2.0)
+    log_a = log_dir / "cli-20261019_122739.log"
+    log_b = log_dir / "cli-20261018_204342.log"
+    log_a.write_text(
+        f"I{lt_fail.tm_mon:02d}{lt_fail.tm_mday:02d} {lt_fail.tm_hour:02d}:{lt_fail.tm_min:02d}:{lt_fail.tm_sec:02d}.100000 "
+        '110261 run.go:395] Run: attempt 4 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/'
+        'v1internal:streamGenerateContent?alt=sse": EOF), retrying in 23s\n',
+        encoding="utf-8",
+    )
+    log_b.write_text(
+        f"I{lt_ok.tm_mon:02d}{lt_ok.tm_mday:02d} {lt_ok.tm_hour:02d}:{lt_ok.tm_min:02d}:{lt_ok.tm_sec:02d}.500000 "
+        "1019535 http_helpers.go:349] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:"
+        "streamGenerateContent?alt=sse Trace: 0x123 ResponseID: abc\n",
+        encoding="utf-8",
+    )
+    os.utime(log_a, (now_ts - 5.0, now_ts - 5.0))
+    os.utime(log_b, (now_ts - 2.0, now_ts - 2.0))
+    failed, _ts, reason = detect_recent_agy_retry_failure(log_dir, now=now_ts)
+    assert failed is True
+    assert reason.startswith("attempt 4:")
+

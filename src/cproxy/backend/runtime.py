@@ -745,16 +745,87 @@ def _sanitize_dns_fallback_filter(data: dict) -> None:
         fallback_filter.pop("geosite", None)
 
 
-def _optimize_ws_cdn_servers(proxies: list | None) -> None:
-    """将 443 端口 Cloudflare WebSocket 节点的拥塞共享入口域名替换为节点独立 ws-opts.headers.Host。
+_WS_TLS_PROBE_CACHE: dict[tuple[str, int, str], tuple[float, int | None]] = {}
+_WS_TLS_CACHE_TTL = 600.0
 
-    部分机场（如 cyberguard.*）把全部 1X WebSocket 节点的 `server` 指向同一个旧优选域名
-    （解析到单一高丢包 IP `172.64.146.118`，实测大包上传仅 0.3 Mbps，导致 agy 2MB 上下文
-    POST 请求在 60s 上传超时被 Google 掐断报 EOF）；而节点自带的 `ws-opts.headers.Host`
-    （如 `cgkr1.cyberguard-u1s1.art`，属 `servername` 的合法子域）解析到正常双栈 Anycast 池，
-    上传吞吐提升约 10 倍（2.5~4.5 Mbps）。
-    仅在 `network == "ws"`、`port == 443`、`ws_host` 为 `servername` 子域且与 `server` 不同时替换，
-    不影响非 443 端口的国内中转（如 CMI 端口转发）或其它协议。
+
+def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 1.5) -> int | None:
+    import socket
+    import ssl
+    import time
+
+    now = time.time()
+    cache_key = (ip, port, sni)
+    cached = _WS_TLS_PROBE_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < _WS_TLS_CACHE_TTL:
+        return cached[1]
+    t0 = time.time()
+    sock: socket.socket | None = None
+    tls_sock: ssl.SSLSocket | None = None
+    latency: int | None = None
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        ctx = ssl.create_default_context()
+        tls_sock = ctx.wrap_socket(sock, server_hostname=sni or ip)
+        latency = max(1, round((time.time() - t0) * 1000))
+    except Exception:
+        latency = None
+    finally:
+        if tls_sock is not None:
+            try:
+                tls_sock.close()
+            except OSError:
+                pass
+        elif sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    _WS_TLS_PROBE_CACHE[cache_key] = (time.time(), latency)
+    return latency
+
+
+def _resolve_healthy_ws_cdn_ip(domain: str, port: int, sni: str) -> str | None:
+    """当 CDN 域名解析出多个 IPv4 A 记录且部分 IP 存在 TLS 黑洞（TCP 通但 ClientHello 超时）时，
+    优选可完成 TLS 握手的健康 IP，避免 mihomo 在 tcp-concurrent=false 下 50% 概率拨中黑洞 IP。"""
+    import ipaddress
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        ipaddress.ip_address(domain)
+        return None
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    ips = sorted({str(item[4][0]) for item in infos if item and len(item) >= 5 and item[4]})
+    if len(ips) < 2:
+        return None
+    with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
+        latencies = list(pool.map(lambda ip: (ip, _tls_handshake_latency_ms(ip, port, sni)), ips))
+    healthy = [(ms, ip) for ip, ms in latencies if ms is not None]
+    failed = [ip for ip, ms in latencies if ms is None]
+    if healthy and failed:
+        healthy.sort()
+        return healthy[0][1]
+    return None
+
+
+def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -> None:
+    """将 443 端口 Cloudflare WebSocket 节点的拥塞共享入口域名替换为节点独立 ws-opts.headers.Host，
+    并在启用 probe_tls 时自动剔除多 A 记录中 TLS 握手黑洞的 Anycast IP。
+
+    1. 部分机场（如 cyberguard.*）把全部 1X WebSocket 节点的 `server` 指向同一个旧优选域名
+       （解析到单一高丢包 IP `172.64.146.118`，实测大包上传仅 0.3 Mbps）；而节点自带的
+       `ws-opts.headers.Host`（如 `cgkr1.cyberguard-u1s1.art`，属 `servername` 的合法子域）
+       解析到双栈 Anycast 池。
+    2. 当 CDN 子域返回多个 Anycast IPv4（例如同时返回 `104.21.87.131` 与 `172.67.143.95`），且其中
+       某条 IP 被阻断（TCP SYN 能通但 TLS ClientHello 100% 超时黑洞）时，若不剔除黑洞 IP，mihomo
+       会有 50% 概率拨中死 IP 导致整节点被判 `alive=False` 或长请求 EOF。此时自动钉选可完成 TLS
+       握手的健康 IP。
     """
     if not isinstance(proxies, list):
         return
@@ -780,6 +851,10 @@ def _optimize_ws_cdn_servers(proxies: list | None) -> None:
             continue
         if ws_host.lower() != server.lower() and ws_host.lower().endswith("." + sni):
             proxy["server"] = ws_host
+        if probe_tls:
+            healthy_ip = _resolve_healthy_ws_cdn_ip(str(proxy.get("server") or ""), port, sni)
+            if healthy_ip:
+                proxy["server"] = healthy_ip
 
 
 class RuntimeBackend:
@@ -833,7 +908,10 @@ class RuntimeBackend:
             data = yaml.safe_load(fh) or {}
 
         _sanitize_dns_fallback_filter(data)
-        _optimize_ws_cdn_servers(data.get("proxies"))
+        _optimize_ws_cdn_servers(
+            data.get("proxies"),
+            probe_tls=not bool(os.environ.get("PYTEST_CURRENT_TEST")),
+        )
 
         # 若 dns.ipv6 关闭（或未显式开启），同步关闭顶层 ipv6，防止 mihomo 出站拨号对双栈 Cloudflare
         # 优选域名尝试连接不可达的 IPv6 地址（[2606:4700:...]:443 network is unreachable）拖慢建连。
@@ -988,6 +1066,10 @@ class RuntimeBackend:
             # 精确子域不够：agy 实际打 daily-cloudcode-pa.googleapis.com、
             # oauth2.googleapis.com、antigravity.google、antigravity-unleash.goog。
             f"DOMAIN-SUFFIX,google.com,{AI_GEMINI_GROUP}",
+            # 拦截 Google Clearcut 客户端遥测大包上传（agy 后台每 10s 向 play.googleapis.com/log
+            # 重试上传数 MB 缓冲日志，若走 AI-GEMINI 会占满单节点 WebSocket 上行带宽并引发
+            # streamGenerateContent 60~90s 上传超时 EOF）。
+            "DOMAIN,play.googleapis.com,REJECT",
             f"DOMAIN-SUFFIX,googleapis.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,googleusercontent.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,gstatic.com,{AI_GEMINI_GROUP}",

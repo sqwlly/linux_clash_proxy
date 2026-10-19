@@ -284,10 +284,8 @@ def detect_recent_agy_retry_failure(
         return False, since_ts, ""
 
     local_now = time.localtime(ts_now)
-    newest_ts = since_ts
-    newest_reason = ""
     newest_success_ts = 0.0
-    found = False
+    candidates: list[tuple[float, int, str]] = []
 
     for log_path in reversed(logs[-10:]):
         try:
@@ -320,8 +318,10 @@ def detect_recent_agy_retry_failure(
             # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
             # 单次请求的重试链（attempt 1..10）跨越约 7 分钟：
             # - attempt == 3 时对易断流节点立即自愈；
-            # - attempt == 4 时说明即便在常规/1X 节点上也已连续 4 次建连/发包失败，无论节点名称是否含 IEPL 均触发自愈。
-            if int(attempt) not in (3, 4) and "bad record mac" not in reason_lower:
+            # - attempt >= 4 时说明即便在常规/1X 节点上也已连续多次建连/发包失败，无论节点名称是否含 IEPL 均触发自愈，
+            #   且不被其它并发会话的小包监控请求（sir_flash_lite ResponseID）掩盖。
+            attempt_num = int(attempt)
+            if attempt_num not in (3, 4) and "bad record mac" not in reason_lower:
                 continue
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
@@ -334,18 +334,26 @@ def detect_recent_agy_retry_failure(
                 event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
             except ValueError:
                 continue
-            if event_ts <= newest_ts:
+            if event_ts <= since_ts:
                 break
             age = ts_now - event_ts
             if -5.0 <= age <= window_seconds:
-                newest_ts = event_ts
-                newest_reason = f"attempt {attempt}: {reason}"
-                found = True
+                candidates.append((event_ts, attempt_num, f"attempt {attempt_num}: {reason}"))
             break
 
-    if found and newest_ts > newest_success_ts:
-        return True, newest_ts, newest_reason
-    return False, max(since_ts, newest_ts), ""
+    max_seen_ts = max([since_ts] + [c[0] for c in candidates])
+    triggered = [
+        c
+        for c in candidates
+        if c[1] >= 4 or "bad record mac" in c[2].lower() or c[0] > newest_success_ts
+    ]
+    if triggered:
+        best = max(
+            triggered,
+            key=lambda c: (1 if (c[1] >= 4 or "bad record mac" in c[2].lower()) else 0, c[0]),
+        )
+        return True, best[0], best[2]
+    return False, max_seen_ts, ""
 
 
 def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEMINI_GROUP) -> None:
@@ -460,10 +468,13 @@ class AIWatchService:
                     verdict == PROBE_OK
                     and _is_stream_safe_gemini_leaf(self.paths, current)
                 )
-                is_severe_retry = (
-                    "bad record mac" in log_reason.lower()
-                    or log_reason.startswith("attempt 4:")
+                attempt_prefix = log_reason.split(":", 1)[0].strip()
+                severe_attempt = (
+                    attempt_prefix.startswith("attempt ")
+                    and attempt_prefix[8:].isdigit()
+                    and int(attempt_prefix[8:]) >= 4
                 )
+                is_severe_retry = "bad record mac" in log_reason.lower() or severe_attempt
                 if not on_healthy_safe_leaf or is_severe_retry:
                     gs["last_log_fail_ts"] = log_ts
                     verdict = PROBE_DEAD
