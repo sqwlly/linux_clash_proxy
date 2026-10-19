@@ -1024,8 +1024,8 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     _optimize_ws_cdn_servers(proxies, probe_tls=True)
     assert proxies[0]["server"] == "172.67.143.95"
 
-    # 2. render_runtime 在 googleapis.com 之前注入 DOMAIN,play.googleapis.com,REJECT，防止遥测日志占满 AI-GEMINI 上行
-    paths = _make_paths(tmp_path / "play-reject")
+    # 2. render_runtime 在 googleapis.com 之前注入 DOMAIN,play.googleapis.com,AI-AUTO，分流遥测流量避免占满 AI-GEMINI 且不触发客户端疯狂重试
+    paths = _make_paths(tmp_path / "play-offload")
     cfg = {
         "mixed-port": 7890,
         "proxies": [
@@ -1040,8 +1040,8 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     RuntimeBackend(paths).render_runtime()
     rendered = yaml.safe_load(runtime_file(paths).read_text(encoding="utf-8"))
     rules = rendered["rules"]
-    assert "DOMAIN,play.googleapis.com,REJECT" in rules
-    assert rules.index("DOMAIN,play.googleapis.com,REJECT") < rules.index(
+    assert "DOMAIN,play.googleapis.com,AI-AUTO" in rules
+    assert rules.index("DOMAIN,play.googleapis.com,AI-AUTO") < rules.index(
         "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI"
     )
 
@@ -1071,4 +1071,35 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     failed, _ts, reason = detect_recent_agy_retry_failure(log_dir, now=now_ts)
     assert failed is True
     assert reason.startswith("attempt 4:")
+
+    # 4. 动态 stream_fragile 的 1X WS 节点绝不排在静态 IEPL 节点之后，且探测通过后可清除
+    from cproxy.services.probe import (
+        ProbeSummary,
+        clear_stream_fragile_node,
+        is_iepl_node,
+        is_static_iepl_node,
+        probe_paths_context,
+        probe_rank_key,
+        record_stream_fragile_node,
+    )
+    from cproxy.services.rebalance import _smooth_rank_key
+
+    record_stream_fragile_node(paths, "🇰🇷韩国 01 | 1X")
+    assert is_iepl_node("🇰🇷韩国 01 | 1X", paths) is True
+    assert is_static_iepl_node("🇰🇷韩国 01 | 1X", paths) is False
+    assert is_static_iepl_node("🇰🇷韩国 01 | IEPL 1.7X | CM", paths) is True
+
+    kr_1x = ProbeSummary(name="🇰🇷韩国 01 | 1X", delays=(260, 280, 300), failures=0)
+    kr_iepl = ProbeSummary(name="🇰🇷韩国 01 | IEPL 1.7X | CM", delays=(150, 160, 170), failures=0)
+    with probe_paths_context(paths):
+        assert _smooth_rank_key(kr_1x, prefer_non_iepl=True) < _smooth_rank_key(
+            kr_iepl, prefer_non_iepl=True
+        )
+        assert probe_rank_key(kr_1x, prefer_non_iepl=True) < probe_rank_key(
+            kr_iepl, prefer_non_iepl=True
+        )
+    clear_stream_fragile_node(paths, "🇰🇷韩国 01 | 1X")
+    assert is_iepl_node("🇰🇷韩国 01 | 1X", paths) is False
+
+
 

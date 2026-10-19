@@ -29,7 +29,7 @@ AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
 # 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported；韩/台/英低延迟区排欧陆/南美前）
 AI_GEMINI_REGION_ORDER = ("KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU")
-AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP})
+AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_AUTO_GROUP})
 # AI 面板（`cproxy ai-status` / `cproxy incident`）要展示的组，及展示顺序。
 # 单一来源：此前 cli_render 与 services.ops 各硬编码了一份同样的 5 元组。
 AI_STATUS_GROUPS = (AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP, AI_GEMINI_GROUP)
@@ -785,50 +785,53 @@ def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 1.5
     return latency
 
 
-def _resolve_healthy_ws_cdn_ip(domain: str, port: int, sni: str) -> str | None:
-    """当 CDN 域名解析出多个 IPv4 A 记录且部分 IP 存在 TLS 黑洞（TCP 通但 ClientHello 超时）时，
-    优选可完成 TLS 握手的健康 IP，避免 mihomo 在 tcp-concurrent=false 下 50% 概率拨中黑洞 IP。"""
+def _resolve_healthy_ws_cdn_ips(domain: str, port: int, sni: str) -> list[str]:
+    """当 CDN 域名解析出多个 IPv4 A 记录时，探测并返回可完成 TLS 握手的健康 IP 列表（确定性排序）。"""
     import ipaddress
     import socket
     from concurrent.futures import ThreadPoolExecutor
 
     try:
         ipaddress.ip_address(domain)
-        return None
+        return []
     except ValueError:
         pass
     try:
         infos = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
     except OSError:
-        return None
+        return []
     ips = sorted({str(item[4][0]) for item in infos if item and len(item) >= 5 and item[4]})
     if len(ips) < 2:
-        return None
+        return []
     with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
         latencies = list(pool.map(lambda ip: (ip, _tls_handshake_latency_ms(ip, port, sni)), ips))
     healthy = [(ms, ip) for ip, ms in latencies if ms is not None]
-    failed = [ip for ip, ms in latencies if ms is None]
-    if healthy and failed:
-        healthy.sort()
-        return healthy[0][1]
-    return None
+    if not healthy:
+        return []
+    healthy.sort(key=lambda item: (0 if item[0] < 1200 else 1, 0 if item[1].startswith("172.67.") else 1, item[1], item[0]))
+    return [ip for _ms, ip in healthy]
+
+
+def _resolve_healthy_ws_cdn_ip(domain: str, port: int, sni: str) -> str | None:
+    """返回首个可完成 TLS 握手的健康 CDN Anycast IP。"""
+    healthy = _resolve_healthy_ws_cdn_ips(domain, port, sni)
+    return healthy[0] if healthy else None
 
 
 def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -> None:
     """将 443 端口 Cloudflare WebSocket 节点的拥塞共享入口域名替换为节点独立 ws-opts.headers.Host，
-    并在启用 probe_tls 时自动剔除多 A 记录中 TLS 握手黑洞的 Anycast IP。
+    并在启用 probe_tls 时自动剔除 TLS 黑洞 IP、将健康 Anycast IP 确定性分摊到各 WebSocket 节点。
 
     1. 部分机场（如 cyberguard.*）把全部 1X WebSocket 节点的 `server` 指向同一个旧优选域名
-       （解析到单一高丢包 IP `172.64.146.118`，实测大包上传仅 0.3 Mbps）；而节点自带的
-       `ws-opts.headers.Host`（如 `cgkr1.cyberguard-u1s1.art`，属 `servername` 的合法子域）
-       解析到双栈 Anycast 池。
-    2. 当 CDN 子域返回多个 Anycast IPv4（例如同时返回 `104.21.87.131` 与 `172.67.143.95`），且其中
-       某条 IP 被阻断（TCP SYN 能通但 TLS ClientHello 100% 超时黑洞）时，若不剔除黑洞 IP，mihomo
-       会有 50% 概率拨中死 IP 导致整节点被判 `alive=False` 或长请求 EOF。此时自动钉选可完成 TLS
-       握手的健康 IP。
+       （解析到单一高延迟 IP `172.64.146.118`）；而节点自带的 `ws-opts.headers.Host`
+       （如 `cgkr1.cyberguard-u1s1.art`，属 `servername` 的合法子域）解析到双栈 Anycast 池。
+    2. 当 CDN 子域返回多个 Anycast IPv4（例如同时返回 `104.21.87.131` 与 `172.67.143.95`）时，
+       自动过滤掉 TLS 握手超时的黑洞 IP，并将存活的健康 IP 按确定性顺序分摊钉选到各节点，
+       既消除 mihomo 每次建连的出站 DNS 阻塞与配置文件哈希抖动，又避免多组探测流量打在同一单点 IP 上触发 GFW 限流。
     """
     if not isinstance(proxies, list):
         return
+    ws_idx = 0
     for proxy in proxies:
         if not isinstance(proxy, dict):
             continue
@@ -852,9 +855,11 @@ def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -
         if ws_host.lower() != server.lower() and ws_host.lower().endswith("." + sni):
             proxy["server"] = ws_host
         if probe_tls:
-            healthy_ip = _resolve_healthy_ws_cdn_ip(str(proxy.get("server") or ""), port, sni)
-            if healthy_ip:
-                proxy["server"] = healthy_ip
+            healthy_ips = _resolve_healthy_ws_cdn_ips(str(proxy.get("server") or ""), port, sni)
+            if healthy_ips:
+                pick = (ws_idx + (ws_idx // 4)) % len(healthy_ips)
+                proxy["server"] = healthy_ips[pick]
+        ws_idx += 1
 
 
 class RuntimeBackend:
@@ -1066,10 +1071,10 @@ class RuntimeBackend:
             # 精确子域不够：agy 实际打 daily-cloudcode-pa.googleapis.com、
             # oauth2.googleapis.com、antigravity.google、antigravity-unleash.goog。
             f"DOMAIN-SUFFIX,google.com,{AI_GEMINI_GROUP}",
-            # 拦截 Google Clearcut 客户端遥测大包上传（agy 后台每 10s 向 play.googleapis.com/log
-            # 重试上传数 MB 缓冲日志，若走 AI-GEMINI 会占满单节点 WebSocket 上行带宽并引发
-            # streamGenerateContent 60~90s 上传超时 EOF）。
-            "DOMAIN,play.googleapis.com,REJECT",
+            # 分流 Google Clearcut 客户端遥测大包上传（agy 后台向 play.googleapis.com/log 上传缓冲日志，
+            # 若走 AI-GEMINI 会占满单节点 WebSocket 上行带宽；若直接 REJECT 则 agy 每 2.5s 死循环重试并刷爆日志；
+            # 改走 AI-AUTO 高带宽自动池即可瞬间返回 200 清空缓冲，且零占用 AI-GEMINI 带宽）。
+            f"DOMAIN,play.googleapis.com,{AI_AUTO_GROUP}",
             f"DOMAIN-SUFFIX,googleapis.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,googleusercontent.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,gstatic.com,{AI_GEMINI_GROUP}",

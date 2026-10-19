@@ -331,9 +331,11 @@ class APIBackend:
             parent_target, child_target = _restore_selector_targets(name, wanted, groups, snapshot)
             if parent_target is None:
                 continue
-            if group.current != parent_target:
+            is_fallback = str(group.type).lower() == "fallback"
+            if group.current != parent_target or (is_fallback and parent_target != "AI-AUTO"):
                 self.switch_group(name, parent_target)
-                restored[name] = parent_target
+                if group.current != parent_target:
+                    restored[name] = parent_target
             if child_target:
                 child = groups.get(parent_target)
                 if (
@@ -415,9 +417,14 @@ class APIBackend:
     def switch_group(self, group_name: str, target_name: str) -> None:
         self.request("PUT", f"/proxies/{quote(group_name, safe='')}", {"name": target_name})
 
-    def delay_test(self, target_name: str, url: str, timeout: int, *, request_timeout: int | None = None) -> dict[str, Any]:
+    def delay_test(self, target_name: str, url: str, timeout: int, *, request_timeout: float | None = None) -> dict[str, Any]:
         query = urlencode({"url": url, "timeout": timeout})
-        return self.request("GET", f"/proxies/{quote(target_name, safe='')}/delay?{query}", request_timeout=request_timeout)
+        effective_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else max(float(self.request_timeout()), timeout / 1000.0 + 2.0)
+        )
+        return self.request("GET", f"/proxies/{quote(target_name, safe='')}/delay?{query}", request_timeout=effective_timeout)
 
     def get_connections(self) -> dict[str, Any]:
         return self.request("GET", "/connections")

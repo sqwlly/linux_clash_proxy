@@ -279,6 +279,44 @@ def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float 
         pass
 
 
+def clear_stream_fragile_node(paths: AppPaths, name: str | None) -> None:
+    if not name:
+        return
+    try:
+        import json
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        if not state_path.exists():
+            return
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return
+        sf = loaded.get("stream_fragile")
+        if not isinstance(sf, dict) or str(name) not in sf:
+            return
+        sf.pop(str(name), None)
+        loaded["stream_fragile"] = sf
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(state_path)
+    except Exception:
+        pass
+
+
+def is_static_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
+    """判定节点是否为静态专线/裸 vision 易断流节点（名称含 IEPL/IPLC/内网专线，或底层协议为裸 TCP xtls-rprx-vision）。"""
+    if not name:
+        return False
+    upper = str(name).upper()
+    if any(kw in upper for kw in _IEPL_KEYWORDS):
+        return True
+    eff_paths = paths or _ACTIVE_PATHS
+    if eff_paths is not None and str(name) in _load_config_fragile_nodes(eff_paths):
+        return True
+    return False
+
+
 def is_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
     """判定节点是否为长连接易断流节点（兼容任意机场命名与无 IEPL 节点场景）：
     1. 名称含 IEPL / IPLC / 内网专线；
@@ -287,15 +325,11 @@ def is_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
     """
     if not name:
         return False
-    upper = str(name).upper()
-    if any(kw in upper for kw in _IEPL_KEYWORDS):
+    if is_static_iepl_node(name, paths):
         return True
     eff_paths = paths or _ACTIVE_PATHS
-    if eff_paths is not None:
-        if str(name) in _load_config_fragile_nodes(eff_paths):
-            return True
-        if is_dynamic_stream_fragile(name, eff_paths):
-            return True
+    if eff_paths is not None and is_dynamic_stream_fragile(name, eff_paths):
+        return True
     return False
 
 
@@ -367,8 +401,15 @@ NON_IEPL_HEALTHY_MAX_MS = 1800
 GEMINI_FAST_REGIONS = frozenset({"US", "KR", "TW", "JP", "SG", "GB"})
 
 
-def is_healthy_non_iepl_summary(summary: ProbeSummary | None) -> bool:
-    if summary is None or is_iepl_node(summary.name):
+def is_healthy_non_iepl_summary(
+    summary: ProbeSummary | None, *, ignore_dynamic_fragile: bool = False
+) -> bool:
+    if summary is None:
+        return False
+    if ignore_dynamic_fragile:
+        if is_static_iepl_node(summary.name):
+            return False
+    elif is_iepl_node(summary.name):
         return False
     if summary.success_count <= 0 or summary.failures > 0:
         return False
@@ -384,8 +425,16 @@ def probe_rank_key(
 ) -> tuple[int, int, int, int, int, int, int, str]:
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     healthy_non_iepl = is_healthy_non_iepl_summary(summary)
-    iepl_tier = (0 if healthy_non_iepl else 1) if prefer_non_iepl else 0
-    if prefer_non_iepl and healthy_non_iepl:
+    if prefer_non_iepl:
+        if healthy_non_iepl:
+            iepl_tier = 0
+        elif is_healthy_non_iepl_summary(summary, ignore_dynamic_fragile=True):
+            iepl_tier = 1
+        else:
+            iepl_tier = 2
+    else:
+        iepl_tier = 0
+    if prefer_non_iepl and iepl_tier < 2:
         from .nodelist import match_region
 
         reg = match_region(summary.name)
@@ -421,7 +470,7 @@ def active_candidates_after_round(
     }
     if prefer_non_iepl:
         for s in summaries:
-            if s.success_count > 0 and not is_iepl_node(s.name):
+            if s.success_count > 0 and not is_static_iepl_node(s.name):
                 active.add(s.name)
     if current and current in results:
         active.add(current)

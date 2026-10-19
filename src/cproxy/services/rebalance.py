@@ -27,8 +27,10 @@ from .probe import (
     GEMINI_FAST_REGIONS,
     ProbeService,
     ProbeSummary,
+    clear_stream_fragile_node,
     is_healthy_non_iepl_summary,
     is_iepl_node,
+    is_static_iepl_node,
     probe_paths_context,
     record_stream_fragile_node,
 )
@@ -53,10 +55,12 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
 
     rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
     这里把已叠加的惩罚还原成裸延迟，再按权重重新叠加，得到更稳的排序。
-    当 `prefer_non_iepl=True`（AI-GEMINI）时，仅当 1X WebSocket 节点「本轮零失败、
-    历史惩罚健康且延迟健康」时排在 IEPL 之前；且在健康 1X 节点内部，亚太/英国低延迟区
-    （KR/TW/JP/SG/GB）始终优先于欧陆/南美高延迟区（DE/FR/BR），防止现役韩国节点在承载
-    大包上传时的瞬时探测抖动把 750~850ms 的德/法/巴节点顶上榜首。
+    当 `prefer_non_iepl=True`（AI-GEMINI / AI-MANUAL）时：
+    - Tier 0: 零动态断流且本轮全通健康的非专线节点（healthy_non_iepl）
+    - Tier 1: 零动态断流且本轮多数成功的非专线节点（alive_non_iepl）
+    - Tier 2: 曾有动态重试记录但本身非静态 IEPL/裸 vision 的存活节点（防止 1X 节点偶发重试后跌到 50s 必断的 IEPL 之后）
+    - Tier 3: 静态 IEPL / 裸 vision 健康节点
+    - Tier 4: 其余劣化/超时节点
     """
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     weighted = penalty * HISTORY_PENALTY_WEIGHT
@@ -80,20 +84,33 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
         and summary.avg_delay is not None
         and summary.avg_delay <= 1350
     )
+    dynamic_non_static_iepl = (
+        not is_static_iepl_node(summary.name)
+        and summary.success_count > 0
+        and summary.success_count >= failures
+        and summary.avg_delay is not None
+        and summary.avg_delay <= 1500
+    )
     is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
     if healthy_non_iepl:
         tier = 0
     elif alive_non_iepl:
         tier = 1
-    elif is_healthy:
+    elif dynamic_non_static_iepl:
         tier = 2
-    else:
+    elif is_healthy:
         tier = 3
-    iepl_tiebreak = 0 if not is_iepl_node(summary.name) else 1
+    else:
+        tier = 4
+    iepl_tiebreak = 0 if not is_static_iepl_node(summary.name) else 1
     reg = match_region(summary.name)
     region_tier = (
         0
-        if (not (healthy_non_iepl or alive_non_iepl) or reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None))
+        if (
+            not (healthy_non_iepl or alive_non_iepl or dynamic_non_static_iepl)
+            or reg in GEMINI_FAST_REGIONS
+            or reg in ("OTHER", None)
+        )
         else 1
     )
     return (
@@ -275,7 +292,7 @@ class RebalanceService:
                 gemini_report, effective_gemini_order[0], AI_GEMINI_GROUP
             )
             current_gemini_leaf = gemini_switched_to or getattr(gemini_report, "current", None)
-            if type(probe_service) is ProbeService and is_iepl_node(current_gemini_leaf, self.paths):
+            if type(probe_service) is ProbeService and is_static_iepl_node(current_gemini_leaf, self.paths):
                 effective_gemini_order, gemini_switched_to = self._verify_gemini_stream_hold(
                     list(effective_gemini_order),
                     gemini_order_path,
@@ -325,6 +342,7 @@ class RebalanceService:
             tried.add(active_node)
             ok, _reason = simulate_gemini_stream_hold(proxy_port=proxy_port)
             if ok:
+                clear_stream_fragile_node(self.paths, active_node)
                 break
             record_stream_fragile_node(self.paths, active_node)
             if active_node in ordered:
@@ -335,7 +353,7 @@ class RebalanceService:
             if not next_candidate:
                 break
             try:
-                should_drop = is_iepl_node(active_node, self.paths)
+                should_drop = is_static_iepl_node(active_node, self.paths)
                 try:
                     query.switch_group(AI_GEMINI_GROUP, next_candidate, drop_connections=should_drop)
                 except TypeError:
@@ -377,7 +395,7 @@ class RebalanceService:
         cur_region = match_region(str(current_node or ""))
         migrating_gemini_off_iepl = (
             is_managed_ai
-            and is_iepl_node(current_node)
+            and is_static_iepl_node(current_node)
             and is_healthy_non_iepl_summary(best_summary)
         )
         migrating_gemini_off_slow = (
@@ -425,7 +443,7 @@ class RebalanceService:
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
             current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
-            should_drop = group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) or is_iepl_node(current_node)
+            should_drop = group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) or is_static_iepl_node(current_node, self.paths)
             try:
                 query.switch_group(group_name, best_candidate, drop_connections=should_drop)
             except TypeError:

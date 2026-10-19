@@ -23,6 +23,7 @@ from .probe import (
     STREAM_FRAGILE_TTL_SECONDS,
     is_dynamic_stream_fragile,
     is_iepl_node,
+    is_static_iepl_node,
     probe_paths_context,
     resolve_current_leaf,
 )
@@ -292,7 +293,7 @@ def detect_recent_agy_retry_failure(
             with log_path.open("rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 size = fh.tell()
-                fh.seek(max(0, size - 65536), os.SEEK_SET)
+                fh.seek(max(0, size - 262144), os.SEEK_SET)
                 tail = fh.read().decode("utf-8", errors="replace")
         except OSError:
             continue
@@ -499,7 +500,7 @@ class AIWatchService:
                 ):
                     gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True
-                if group != AI_GEMINI_GROUP or is_iepl_node(previous_active, self.paths):
+                if group != AI_GEMINI_GROUP or is_static_iepl_node(previous_active, self.paths):
                     drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
                     if callable(drop_fn):
                         try:
@@ -524,7 +525,7 @@ class AIWatchService:
                 not dry_run
                 and group_obj is not None
                 and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
-                and is_iepl_node(current, self.paths)
+                and is_static_iepl_node(current, self.paths)
                 and not current_already_cooled
             ):
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
@@ -536,7 +537,7 @@ class AIWatchService:
                 )
                 if (
                     cand_1x is not None
-                    and not is_iepl_node(cand_1x, self.paths)
+                    and not is_static_iepl_node(cand_1x, self.paths)
                     and not cand_cooled
                     and cand_entry is not None
                     and cand_entry.alive is True
@@ -562,7 +563,7 @@ class AIWatchService:
                 and not dry_run
                 and group_obj is not None
                 and current in group_obj.candidates
-                and not is_iepl_node(current, self.paths)
+                and not is_static_iepl_node(current, self.paths)
             ):
                 api_switch = getattr(self.query.api, "switch_group", None)
                 if callable(api_switch):
@@ -593,7 +594,7 @@ class AIWatchService:
                     group != AI_GEMINI_GROUP
                     or verdict == PROBE_GEO_BLOCKED
                     or log_triggered
-                    or is_iepl_node(current, self.paths)
+                    or is_static_iepl_node(current, self.paths)
                 )
                 try:
                     try:
@@ -651,8 +652,11 @@ class AIWatchService:
         `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
         `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
         仅当所有非冷却叶子都被标死时才回退到首个可用候选。
-        对于 `AI-GEMINI` 与 `AI-MANUAL`，优先选择非 IEPL（`1X` WebSocket）叶子；若所有存活 `1X`
-        叶子均在冷却期内，优先回收最早进入冷却的存活 `1X` 叶子，绝不轻易回退到 50 秒必断流的 IEPL 节点。
+        对于 `AI-GEMINI` 与 `AI-MANUAL`，按三层优先级挑选：
+        1. 零动态断流且非静态 IEPL 的干净节点（亚太/英国低延迟区优先）；
+        2. 曾有动态断流记录但非静态 IEPL 的节点（亚太/英国优先）；
+        3. 若所有非静态 IEPL 存活叶子均在冷却期内，优先回收最早进入冷却的存活非静态 IEPL 叶子，
+           绝不轻易回退到 50 秒必断流的静态 IEPL/裸 vision 节点。
         """
         from .ban import is_node_banned, load_active_bans
         from .nodelist import match_region
@@ -660,18 +664,26 @@ class AIWatchService:
 
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
-        cooled_healthy_non_iepl: list[tuple[float, int, str]] = []
+        cooled_healthy_non_iepl: list[tuple[int, float, int, str]] = []
         candidates = list(group.candidates)
         is_managed_ai = getattr(group, "name", "") in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and any(
-            c and is_iepl_node(str(c)) for c in candidates
+            c and is_iepl_node(str(c), self.paths) for c in candidates
         )
         if is_managed_ai:
-            non_iepl = [c for c in candidates if c and not is_iepl_node(str(c))]
-            non_iepl.sort(
+            clean_non_iepl = [c for c in candidates if c and not is_iepl_node(str(c), self.paths)]
+            clean_non_iepl.sort(
                 key=lambda c: 0 if (match_region(str(c)) in GEMINI_FAST_REGIONS or match_region(str(c)) in ("OTHER", None)) else 1
             )
-            iepl = [c for c in candidates if c and is_iepl_node(str(c))]
-            candidates = non_iepl + iepl
+            dynamic_non_static_iepl = [
+                c
+                for c in candidates
+                if c and is_iepl_node(str(c), self.paths) and not is_static_iepl_node(str(c), self.paths)
+            ]
+            dynamic_non_static_iepl.sort(
+                key=lambda c: 0 if (match_region(str(c)) in GEMINI_FAST_REGIONS or match_region(str(c)) in ("OTHER", None)) else 1
+            )
+            static_iepl = [c for c in candidates if c and is_static_iepl_node(str(c), self.paths)]
+            candidates = clean_non_iepl + dynamic_non_static_iepl + static_iepl
         for idx, cand in enumerate(candidates):
             if not cand or cand == current:
                 continue
@@ -683,18 +695,19 @@ class AIWatchService:
             is_dead = entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout")
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
-                if is_managed_ai and not is_iepl_node(str(cand)) and not is_dead:
-                    cooled_healthy_non_iepl.append((float(ts), idx, str(cand)))
+                if is_managed_ai and not is_static_iepl_node(str(cand), self.paths) and not is_dead:
+                    dyn_tier = 0 if not is_iepl_node(str(cand), self.paths) else 1
+                    cooled_healthy_non_iepl.append((dyn_tier, float(ts), idx, str(cand)))
                 continue
             if is_dead:
                 if fallback_leaf is None:
                     fallback_leaf = str(cand)
                 continue
-            if is_managed_ai and is_iepl_node(str(cand)) and cooled_healthy_non_iepl:
+            if is_managed_ai and is_static_iepl_node(str(cand), self.paths) and cooled_healthy_non_iepl:
                 cooled_healthy_non_iepl.sort()
-                return cooled_healthy_non_iepl[0][2]
+                return cooled_healthy_non_iepl[0][3]
             return str(cand)
         if cooled_healthy_non_iepl:
             cooled_healthy_non_iepl.sort()
-            return cooled_healthy_non_iepl[0][2]
+            return cooled_healthy_non_iepl[0][3]
         return fallback_leaf
