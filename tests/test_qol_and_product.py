@@ -888,3 +888,97 @@ def test_ws_cdn_server_optimization_and_apac_uk_tier_stability() -> None:
     jp_iepl_hist71 = ProbeSummary("🇯🇵日本 01 | IEPL + UDP 1.7X | CM", (350, 360, 370, 380, 390), 0, history_penalty_ms=71)
     assert _smooth_rank_key(kr_1x_hist89, prefer_non_iepl=True) < _smooth_rank_key(jp_iepl_hist71, prefer_non_iepl=True)
     assert _smooth_rank_key(kr_1x_4of5, prefer_non_iepl=True) < _smooth_rank_key(jp_iepl_hist71, prefer_non_iepl=True)
+
+
+def test_airport_without_iepl_labels_protocol_and_dynamic_stream_fragility(tmp_path: Path, monkeypatch) -> None:
+    import time
+
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import config_file
+    from cproxy.services import ai_watch as ai_watch_mod
+    from cproxy.services.ai_watch import AIWatchService, _is_stream_safe_gemini_leaf
+    from cproxy.services.diagnostics import PROBE_OK
+    from cproxy.services.probe import (
+        ProbeSummary,
+        active_candidates_after_round,
+        is_iepl_node,
+        probe_paths_context,
+    )
+    from cproxy.services.rebalance import _smooth_rank_key
+
+    paths = _make_paths(tmp_path / "no-iepl-airport")
+    cfg = {
+        "mixed-port": 7890,
+        "proxies": [
+            {"name": "🇯🇵日本 01 | TE", "type": "vless", "flow": "xtls-rprx-vision", "server": "1.1.1.1", "port": 443},
+            {"name": "🇯🇵日本 01 | 1X | 推荐", "type": "vless", "flow": "xtls-rprx-vision", "server": "1.1.1.2", "port": 443},
+            {"name": "🇯🇵 Tokyo 01", "type": "vless", "network": "ws", "server": "1.1.1.3", "port": 443},
+            {"name": "🇸🇬 Singapore 01", "type": "vless", "network": "ws", "server": "1.1.1.4", "port": 443},
+        ],
+    }
+    config_file(paths).write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+
+    # 1. 即便节点名称不含 IEPL（甚至含 1X），只要底层协议是裸 TCP xtls-rprx-vision，统一判为易断流节点
+    assert is_iepl_node("🇯🇵日本 01 | TE", paths) is True
+    assert is_iepl_node("🇯🇵日本 01 | 1X | 推荐", paths) is True
+    assert _is_stream_safe_gemini_leaf(paths, "🇯🇵日本 01 | 1X | 推荐") is False
+    assert is_iepl_node("🇯🇵 Tokyo 01", paths) is False
+    assert _is_stream_safe_gemini_leaf(paths, "🇯🇵 Tokyo 01") is True
+
+    # 2. 完全无 IEPL 标签的机场：当 🇯🇵 Tokyo 01 连续出现 attempt 4 流式重试失败时，
+    #    看门狗立即切往 🇸🇬 Singapore 01、断开陈旧连接，并把 🇯🇵 Tokyo 01 记入动态断流表（stream_fragile）
+    log_dir = tmp_path / "agy-logs"
+    log_dir.mkdir()
+    now_ts = time.time()
+    lt = time.localtime(now_ts - 2.0)
+    log_line = (
+        f"I{lt.tm_mon:02d}{lt.tm_mday:02d} {lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}.123456 "
+        '99999 run.go:395] Run: attempt 4 failed (Post "https://daily-cloudcode-pa.googleapis.com/'
+        'v1internal:streamGenerateContent?alt=sse": EOF), retrying in 20s...\n'
+    )
+    (log_dir / "cli-20261019.log").write_text(log_line, encoding="utf-8")
+
+    groups = {
+        "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇯🇵日本 01 | TE", ["🇯🇵日本 01 | TE", "🇸🇬 Singapore 01"]),
+        "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "🇯🇵 Tokyo 01", ["🇯🇵 Tokyo 01", "🇸🇬 Singapore 01"]),
+        "🇯🇵日本 01 | TE": ProxyGroup("🇯🇵日本 01 | TE", "VLESS", "-", [], delay=180, alive=True),
+        "🇯🇵 Tokyo 01": ProxyGroup("🇯🇵 Tokyo 01", "VLESS", "-", [], delay=200, alive=True),
+        "🇸🇬 Singapore 01": ProxyGroup("🇸🇬 Singapore 01", "VLESS", "-", [], delay=220, alive=True),
+    }
+    switches: list[tuple[str, str, bool]] = []
+
+    class _Query:
+        def __init__(self):
+            self.api = type("_API", (), {"get_groups": lambda _self: groups})()
+
+        def switch_group(self, grp: str, target: str, *, drop_connections: bool = True) -> None:
+            switches.append((grp, target, drop_connections))
+
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda _p, _u: PROBE_OK)
+    svc = AIWatchService(paths, agy_log_dir=log_dir)
+    svc.query = _Query()  # type: ignore[assignment]
+    report = svc.watch()
+
+    # AI-MANUAL 从裸 vision 的 🇯🇵日本 01 | TE 主动迁往 🇸🇬 Singapore 01；
+    # AI-GEMINI 因 attempt 4 连续失败从 🇯🇵 Tokyo 01 切往 🇸🇬 Singapore 01 并断开旧连接
+    assert ("AI-MANUAL", "🇸🇬 Singapore 01", True) in switches
+    assert ("AI-GEMINI", "🇸🇬 Singapore 01", True) in switches
+    assert is_iepl_node("🇯🇵 Tokyo 01", paths) is True
+
+    with probe_paths_context(paths):
+        tokyo_summary = ProbeSummary("🇯🇵 Tokyo 01", (180, 190, 200), 0)
+        sg_summary = ProbeSummary("🇸🇬 Singapore 01", (240, 250, 260), 0)
+        assert _smooth_rank_key(sg_summary, prefer_non_iepl=True) < _smooth_rank_key(
+            tokyo_summary, prefer_non_iepl=True
+        )
+
+    # 3. 逐轮筛选（active_candidates_after_round）绝不因第 2 轮偶发 1 次超时而把存活的非易断流节点提前淘汰
+    round2_results = {
+        "🇸🇬 Singapore 01": {"delays": [240], "failures": 1},
+        "🇯🇵日本 01 | IEPL": {"delays": [150, 160], "failures": 0},
+        "🇰🇷韩国 01 | IEPL": {"delays": [170, 180], "failures": 0},
+        "🇺🇸美国 01 | IEPL": {"delays": [190, 200], "failures": 0},
+    }
+    kept = active_candidates_after_round(round2_results, current=None, prefer_non_iepl=True)
+    assert "🇸🇬 Singapore 01" in kept
+

@@ -29,6 +29,8 @@ from .probe import (
     ProbeSummary,
     is_healthy_non_iepl_summary,
     is_iepl_node,
+    probe_paths_context,
+    record_stream_fragile_node,
 )
 from .query import QueryService
 
@@ -135,6 +137,10 @@ class RebalanceService:
         self.paths = paths
 
     def rebalance(self, dry_run: bool = False) -> RebalanceReport:
+        with probe_paths_context(self.paths):
+            return self._rebalance_impl(dry_run=dry_run)
+
+    def _rebalance_impl(self, dry_run: bool = False) -> RebalanceReport:
         cfg = read_config(self.paths)
         raw_max_mult = cfg.get("max-ai-multiplier") if isinstance(cfg, dict) else None
         try:
@@ -269,7 +275,7 @@ class RebalanceService:
                 gemini_report, effective_gemini_order[0], AI_GEMINI_GROUP
             )
             current_gemini_leaf = gemini_switched_to or getattr(gemini_report, "current", None)
-            if type(probe_service) is ProbeService and is_iepl_node(current_gemini_leaf):
+            if type(probe_service) is ProbeService and is_iepl_node(current_gemini_leaf, self.paths):
                 effective_gemini_order, gemini_switched_to = self._verify_gemini_stream_hold(
                     list(effective_gemini_order),
                     gemini_order_path,
@@ -320,6 +326,7 @@ class RebalanceService:
             ok, _reason = simulate_gemini_stream_hold(proxy_port=proxy_port)
             if ok:
                 break
+            record_stream_fragile_node(self.paths, active_node)
             if active_node in ordered:
                 ordered.remove(active_node)
                 ordered.append(active_node)
@@ -328,7 +335,7 @@ class RebalanceService:
             if not next_candidate:
                 break
             try:
-                should_drop = is_iepl_node(active_node)
+                should_drop = is_iepl_node(active_node, self.paths)
                 try:
                     query.switch_group(AI_GEMINI_GROUP, next_candidate, drop_connections=should_drop)
                 except TypeError:

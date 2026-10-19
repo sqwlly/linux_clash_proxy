@@ -158,14 +158,148 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
         return current
 
 
+from contextlib import contextmanager
+from typing import Iterator
+
 _IEPL_KEYWORDS = ("IEPL", "IPLC", "内网专线")
+STREAM_FRAGILE_TTL_SECONDS = 1800.0
+_ACTIVE_PATHS: AppPaths | None = None
+_CONFIG_FRAGILE_CACHE: tuple[str, int, frozenset[str]] = ("", -1, frozenset())
+_DYNAMIC_FRAGILE_CACHE: tuple[str, int, dict[str, float]] = ("", -1, {})
 
 
-def is_iepl_node(name: str | None) -> bool:
+@contextmanager
+def probe_paths_context(paths: AppPaths | None) -> Iterator[None]:
+    global _ACTIVE_PATHS
+    prev = _ACTIVE_PATHS
+    _ACTIVE_PATHS = paths
+    try:
+        yield
+    finally:
+        _ACTIVE_PATHS = prev
+
+
+def _load_config_fragile_nodes(paths: AppPaths) -> frozenset[str]:
+    global _CONFIG_FRAGILE_CACHE
+    try:
+        from ..backend.runtime import is_stream_fragile_proxy
+        from ..config import config_file, read_config
+
+        cfg_path = config_file(paths)
+        if not cfg_path.exists():
+            return frozenset()
+        mtime_ns = cfg_path.stat().st_mtime_ns
+        key = str(cfg_path)
+        if _CONFIG_FRAGILE_CACHE[0] == key and _CONFIG_FRAGILE_CACHE[1] == mtime_ns:
+            return _CONFIG_FRAGILE_CACHE[2]
+        cfg = read_config(paths)
+        fragile = frozenset(
+            str(p.get("name") or "")
+            for p in (cfg.get("proxies") or [])
+            if isinstance(p, dict) and p.get("name") and is_stream_fragile_proxy(p, str(p.get("name") or ""))
+        )
+        _CONFIG_FRAGILE_CACHE = (key, mtime_ns, fragile)
+        return fragile
+    except Exception:
+        return frozenset()
+
+
+def _load_dynamic_fragile_map(paths: AppPaths) -> dict[str, float]:
+    global _DYNAMIC_FRAGILE_CACHE
+    try:
+        import json
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        if not state_path.exists():
+            return {}
+        mtime_ns = state_path.stat().st_mtime_ns
+        key = str(state_path)
+        if _DYNAMIC_FRAGILE_CACHE[0] == key and _DYNAMIC_FRAGILE_CACHE[1] == mtime_ns:
+            return _DYNAMIC_FRAGILE_CACHE[2]
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        raw = data.get("stream_fragile") if isinstance(data, dict) else None
+        parsed = (
+            {str(k): float(v) for k, v in raw.items() if k and isinstance(v, (int, float))}
+            if isinstance(raw, dict)
+            else {}
+        )
+        _DYNAMIC_FRAGILE_CACHE = (key, mtime_ns, parsed)
+        return parsed
+    except Exception:
+        return {}
+
+
+def is_dynamic_stream_fragile(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
     if not name:
         return False
-    upper = name.upper()
-    return any(kw in upper for kw in _IEPL_KEYWORDS)
+    eff_paths = paths or _ACTIVE_PATHS
+    if eff_paths is None:
+        return False
+    fragile_map = _load_dynamic_fragile_map(eff_paths)
+    ts = fragile_map.get(str(name))
+    if ts is None:
+        return False
+    ts_now = time.time() if now is None else now
+    return (ts_now - float(ts)) < STREAM_FRAGILE_TTL_SECONDS
+
+
+def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float | None = None) -> None:
+    if not name:
+        return
+    try:
+        import json
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        data: dict = {}
+        if state_path.exists():
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+        ts_now = time.time() if now is None else now
+        sf = data.get("stream_fragile")
+        if not isinstance(sf, dict):
+            sf = {}
+        sf = {
+            str(k): float(v)
+            for k, v in sf.items()
+            if k and isinstance(v, (int, float)) and (ts_now - float(v)) < STREAM_FRAGILE_TTL_SECONDS
+        }
+        sf[str(name)] = ts_now
+        data["stream_fragile"] = sf
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(state_path)
+    except Exception:
+        pass
+
+
+def is_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
+    """判定节点是否为长连接易断流节点（兼容任意机场命名与无 IEPL 节点场景）：
+    1. 名称含 IEPL / IPLC / 内网专线；
+    2. 协议指纹为裸 TCP + xtls-rprx-vision（如不带 IEPL 标签的 `TE` / `推荐` / 专线节点）；
+    3. 动态实测断流记忆（近期在 Hold Probe 或真实 AI 长流中发生过断流 EOF / bad record MAC 的任意节点）。
+    """
+    if not name:
+        return False
+    upper = str(name).upper()
+    if any(kw in upper for kw in _IEPL_KEYWORDS):
+        return True
+    eff_paths = paths or _ACTIVE_PATHS
+    if eff_paths is not None:
+        if str(name) in _load_config_fragile_nodes(eff_paths):
+            return True
+        if is_dynamic_stream_fragile(name, eff_paths):
+            return True
+    return False
+
+
+is_stream_fragile_node = is_iepl_node
 
 
 def simulate_gemini_stream_hold(
@@ -285,6 +419,10 @@ def active_candidates_after_round(
     active = {
         s.name for s in sorted(summaries, key=lambda s: probe_rank_key(s, prefer_non_iepl=prefer_non_iepl))[:keep]
     }
+    if prefer_non_iepl:
+        for s in summaries:
+            if s.success_count > 0 and not is_iepl_node(s.name):
+                active.add(s.name)
     if current and current in results:
         active.add(current)
     return active
@@ -390,6 +528,31 @@ class ProbeService:
         self.api = APIBackend(paths)
 
     def probe(
+        self,
+        group: str = DEFAULT_GROUP,
+        profile: str = "codex",
+        strategy_name: str | None = None,
+        url: str | None = None,
+        rounds: int | None = None,
+        timeout: int = DEFAULT_TIMEOUT_MS,
+        switch: bool = False,
+        record_history: bool = False,
+        show_progress: bool = False,
+    ) -> ProbeReport:
+        with probe_paths_context(self.paths):
+            return self._probe_impl(
+                group=group,
+                profile=profile,
+                strategy_name=strategy_name,
+                url=url,
+                rounds=rounds,
+                timeout=timeout,
+                switch=switch,
+                record_history=record_history,
+                show_progress=show_progress,
+            )
+
+    def _probe_impl(
         self,
         group: str = DEFAULT_GROUP,
         profile: str = "codex",

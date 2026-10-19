@@ -19,7 +19,13 @@ from pathlib import Path
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
 from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, ai_watch_state_file, read_config
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
-from .probe import is_iepl_node, resolve_current_leaf
+from .probe import (
+    STREAM_FRAGILE_TTL_SECONDS,
+    is_dynamic_stream_fragile,
+    is_iepl_node,
+    probe_paths_context,
+    resolve_current_leaf,
+)
 from .query import QueryService
 
 CONSECUTIVE_FAILURE_THRESHOLD = 2
@@ -312,9 +318,10 @@ def detect_recent_agy_retry_failure(
             if "stream reading error" in reason_lower:
                 break
             # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
-            # 单次请求的重试链（attempt 1..10）跨越约 7 分钟，仅在刚抵达 attempt == 3（或出现 bad record MAC）
-            # 时触发一次自愈，避免同一条长尾重试链的 attempt 4/6/8 每隔 3 分钟重复触发连环切节点。
-            if int(attempt) != 3 and "bad record mac" not in reason_lower:
+            # 单次请求的重试链（attempt 1..10）跨越约 7 分钟：
+            # - attempt == 3 时对易断流节点立即自愈；
+            # - attempt == 4 时说明即便在常规/1X 节点上也已连续 4 次建连/发包失败，无论节点名称是否含 IEPL 均触发自愈。
+            if int(attempt) not in (3, 4) and "bad record mac" not in reason_lower:
                 continue
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
@@ -342,9 +349,9 @@ def detect_recent_agy_retry_failure(
 
 
 def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEMINI_GROUP) -> None:
-    """将刚切中的 AI 非 IEPL 目标节点同步提升到对应 order.json 首位，
+    """将刚切中的 AI 健康目标节点同步提升到对应 order.json 首位，
     防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
-    if not target or is_iepl_node(target):
+    if not target or is_dynamic_stream_fragile(target, paths):
         return
     order_path = ai_gemini_order_file(paths) if group == AI_GEMINI_GROUP else ai_manual_order_file(paths)
     if not order_path.exists():
@@ -352,6 +359,8 @@ def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEM
     try:
         data = json.loads(order_path.read_text(encoding="utf-8"))
         if not isinstance(data, list) or not data or data[0] == target:
+            return
+        if is_iepl_node(target, paths) and any(item and not is_iepl_node(str(item), paths) for item in data):
             return
         updated = [target] + [str(item) for item in data if item and str(item) != target]
         order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
@@ -362,17 +371,13 @@ def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEM
 def _is_stream_safe_gemini_leaf(paths: AppPaths, node_name: str | None) -> bool:
     """判断 AI-GEMINI 当前叶子是否为抗断流安全节点（1X / WebSocket / Hysteria2 / TUIC / SS 等非 IEPL/裸vision 节点）。
 
-    兼容不同机场命名：
-    1. 若名称含 `IEPL` / `IPLC` / `内网专线`，直接判为非安全；
-    2. 若名称显式含 `1X`，判为安全；
-    3. 否则查阅本地 `config.yaml` 的 `proxies` 协议字典：若能查到该节点且
-       `not is_stream_fragile_proxy(proxy_dict, node_name)`（如其它机场命名为 `🇰🇷 韩国 01` 的非易断流节点），
-       同样视为安全节点。
+    兼容不同机场命名（包括完全无 IEPL 节点、或全部为普通命名的机场）：
+    1. 若名称含 `IEPL` / `IPLC` / `内网专线`、或协议为裸 TCP `xtls-rprx-vision`、或有动态实测断流记录，直接判为非安全；
+    2. 查阅本地 `config.yaml` 的 `proxies` 协议字典：若能查到该节点且 `not is_stream_fragile_proxy(proxy_dict, node_name)`，视为安全节点；
+    3. 若名称显式含 `1X`，判为安全。
     """
-    if not node_name or is_iepl_node(node_name):
+    if not node_name or is_iepl_node(node_name, paths):
         return False
-    if "1X" in str(node_name).upper():
-        return True
     try:
         from ..backend.runtime import is_stream_fragile_proxy
 
@@ -382,6 +387,8 @@ def _is_stream_safe_gemini_leaf(paths: AppPaths, node_name: str | None) -> bool:
                 return not is_stream_fragile_proxy(proxy, node_name)
     except Exception:
         pass
+    if "1X" in str(node_name).upper():
+        return True
     return False
 
 
@@ -405,14 +412,15 @@ class AIWatchService:
             # 代理未运行：不探测、不写状态，返回空报告
             return report
 
-        state = _load_state(self.paths)
-        now = time.time()
-        for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
-            report.results.append(self._watch_group(groups, group, state, now, dry_run))
-        report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
-        if not dry_run:
-            _save_state(self.paths, state)
-        return report
+        with probe_paths_context(self.paths):
+            state = _load_state(self.paths)
+            now = time.time()
+            for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+                report.results.append(self._watch_group(groups, group, state, now, dry_run))
+            report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
+            if not dry_run:
+                _save_state(self.paths, state)
+            return report
 
     def _probe_group_verdict(self, group: str) -> tuple[str, str]:
         for url in _watch_urls(self.paths, group):
@@ -452,7 +460,11 @@ class AIWatchService:
                     verdict == PROBE_OK
                     and _is_stream_safe_gemini_leaf(self.paths, current)
                 )
-                if not on_healthy_safe_leaf or "bad record mac" in log_reason.lower():
+                is_severe_retry = (
+                    "bad record mac" in log_reason.lower()
+                    or log_reason.startswith("attempt 4:")
+                )
+                if not on_healthy_safe_leaf or is_severe_retry:
                     gs["last_log_fail_ts"] = log_ts
                     verdict = PROBE_DEAD
                     detail = f"agy_log_retry ({log_reason})"
@@ -476,7 +488,7 @@ class AIWatchService:
                 ):
                     gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True
-                if group != AI_GEMINI_GROUP or is_iepl_node(previous_active):
+                if group != AI_GEMINI_GROUP or is_iepl_node(previous_active, self.paths):
                     drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
                     if callable(drop_fn):
                         try:
@@ -491,13 +503,19 @@ class AIWatchService:
             return result
 
         if verdict == PROBE_OK:
+            cooldown_map = gs.get("cooldown", {})
+            current_already_cooled = (
+                current is not None
+                and current in cooldown_map
+                and now - float(cooldown_map[current]) < COOLDOWN_SECONDS
+            )
             if (
                 not dry_run
                 and group_obj is not None
                 and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
-                and is_iepl_node(current)
+                and is_iepl_node(current, self.paths)
+                and not current_already_cooled
             ):
-                cooldown_map = gs.get("cooldown", {})
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
                 cand_entry = groups.get(cand_1x) if cand_1x else None
                 cand_cooled = (
@@ -507,7 +525,7 @@ class AIWatchService:
                 )
                 if (
                     cand_1x is not None
-                    and not is_iepl_node(cand_1x)
+                    and not is_iepl_node(cand_1x, self.paths)
                     and not cand_cooled
                     and cand_entry is not None
                     and cand_entry.alive is True
@@ -533,7 +551,7 @@ class AIWatchService:
                 and not dry_run
                 and group_obj is not None
                 and current in group_obj.candidates
-                and not is_iepl_node(current)
+                and not is_iepl_node(current, self.paths)
             ):
                 api_switch = getattr(self.query.api, "switch_group", None)
                 if callable(api_switch):
@@ -558,12 +576,13 @@ class AIWatchService:
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
-                # 仅在 AI-MANUAL、地区封锁或 IEPL 故障节点切换时关闭旧连接；
-                # 当 AI-GEMINI 已在 1X WebSocket 节点上时，不强杀活跃 TCP 连接，防止掐断并发 agy 会话的流式输出。
+                # 仅在 AI-MANUAL、地区封锁、客户端真实重试报错或易断流节点切换时关闭旧连接；
+                # 当 AI-GEMINI 已在健康节点上被动切换时，不强杀活跃 TCP 连接，防止掐断并发 agy 会话的流式输出。
                 should_drop = (
                     group != AI_GEMINI_GROUP
                     or verdict == PROBE_GEO_BLOCKED
-                    or is_iepl_node(current)
+                    or log_triggered
+                    or is_iepl_node(current, self.paths)
                 )
                 try:
                     try:
@@ -576,6 +595,17 @@ class AIWatchService:
                 cooldown = gs.setdefault("cooldown", {})
                 if current:
                     cooldown[current] = now
+                    if log_triggered:
+                        sf = state.get("stream_fragile")
+                        if not isinstance(sf, dict):
+                            sf = {}
+                        sf = {
+                            str(k): float(v)
+                            for k, v in sf.items()
+                            if k and isinstance(v, (int, float)) and (now - float(v)) < STREAM_FRAGILE_TTL_SECONDS
+                        }
+                        sf[current] = now
+                        state["stream_fragile"] = sf
                 if group == AI_GEMINI_GROUP:
                     # 设 90s 切流静默保护窗
                     gs["last_log_fail_ts"] = max(
