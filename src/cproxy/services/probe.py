@@ -158,8 +158,14 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
         return current
 
 
+_IEPL_KEYWORDS = ("IEPL", "IPLC", "内网专线")
+
+
 def is_iepl_node(name: str | None) -> bool:
-    return bool(name and "IEPL" in name.upper())
+    if not name:
+        return False
+    upper = name.upper()
+    return any(kw in upper for kw in _IEPL_KEYWORDS)
 
 
 def simulate_gemini_stream_hold(

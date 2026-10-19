@@ -359,6 +359,32 @@ def _promote_gemini_order_head(paths: AppPaths, target: str) -> None:
         pass
 
 
+def _is_stream_safe_gemini_leaf(paths: AppPaths, node_name: str | None) -> bool:
+    """判断 AI-GEMINI 当前叶子是否为抗断流安全节点（1X / WebSocket / Hysteria2 / TUIC / SS 等非 IEPL/裸vision 节点）。
+
+    兼容不同机场命名：
+    1. 若名称含 `IEPL` / `IPLC` / `内网专线`，直接判为非安全；
+    2. 若名称显式含 `1X`，判为安全；
+    3. 否则查阅本地 `config.yaml` 的 `proxies` 协议字典：若能查到该节点且
+       `not is_stream_fragile_proxy(proxy_dict, node_name)`（如其它机场命名为 `🇰🇷 韩国 01` 的非易断流节点），
+       同样视为安全节点。
+    """
+    if not node_name or is_iepl_node(node_name):
+        return False
+    if "1X" in str(node_name).upper():
+        return True
+    try:
+        from ..backend.runtime import is_stream_fragile_proxy
+
+        cfg = read_config(paths)
+        for proxy in cfg.get("proxies") or []:
+            if isinstance(proxy, dict) and str(proxy.get("name") or "") == node_name:
+                return not is_stream_fragile_proxy(proxy, node_name)
+    except Exception:
+        pass
+    return False
+
+
 class AIWatchService:
     def __init__(
         self,
@@ -422,13 +448,11 @@ class AIWatchService:
                 self.agy_log_dir, now=now, since_ts=since_ts
             )
             if log_failed:
-                on_healthy_1x = (
+                on_healthy_safe_leaf = (
                     verdict == PROBE_OK
-                    and bool(current)
-                    and "1X" in str(current).upper()
-                    and not is_iepl_node(current)
+                    and _is_stream_safe_gemini_leaf(self.paths, current)
                 )
-                if not on_healthy_1x or "bad record mac" in log_reason.lower():
+                if not on_healthy_safe_leaf or "bad record mac" in log_reason.lower():
                     gs["last_log_fail_ts"] = log_ts
                     verdict = PROBE_DEAD
                     detail = f"agy_log_retry ({log_reason})"

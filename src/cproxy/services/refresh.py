@@ -243,17 +243,57 @@ def _subscription_account_credentials(proxies: list) -> set[str]:
     return {cred for cred, count in counts.items() if count >= 2} | panel_creds
 
 
+def _primary_select_group(config: dict) -> str | None:
+    """识别配置的主入口 select 组（优先取 MATCH 规则指向的 select 组）。"""
+    groups = [g for g in config.get("proxy-groups") or [] if isinstance(g, dict) and isinstance(g.get("name"), str)]
+    select_names = {
+        str(g["name"])
+        for g in groups
+        if str(g.get("type") or "").lower() in {"select", "selector"}
+    }
+    for rule in reversed(config.get("rules") or []):
+        text = str(rule).strip()
+        if text.upper().startswith(("MATCH,", "FINAL,")):
+            target = text.split(",", 1)[1].strip()
+            if target in select_names:
+                return target
+    for g in groups:
+        name = str(g["name"])
+        if name in select_names:
+            return name
+    return None
+
+
+def _detect_extra_sub_prefixes(existing: dict, merged_group_names: set[str], local_names: set[str]) -> set[str]:
+    """识别本地附加订阅前缀（含显式 `subscriptions:` 配置与满足 `{prefix}-{region}` / `{prefix} <node>` 约定的附加机场组）。"""
+    prefixes = {name for name, _, _ in _extra_subscriptions_from_config(existing)}
+    for group in existing.get("proxy-groups") or []:
+        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
+            continue
+        gname = group["name"]
+        if gname in merged_group_names or "-" not in gname:
+            continue
+        root = gname.split("-", 1)[0].strip()
+        if not root:
+            continue
+        leaf_members = [str(m) for m in (group.get("proxies") or []) if isinstance(m, str) and str(m) in local_names]
+        if leaf_members and all(m.startswith(f"{root} ") for m in leaf_members):
+            prefixes.add(root)
+    return prefixes
+
+
 def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     """完整型订阅覆盖 proxies/proxy-groups 时，保留本地手工添加的附加内容：
-    - 附加节点：追加进 merged["proxies"]，并在同名组中按本地原有位置插回，
-      防止每日订阅更新冲掉自建节点或改变其在 fallback 组中的优先级。
-    - 附加分组：本地存在而订阅未提供的分组（自建分组、多订阅机场分组）
-      整体追加到组列表末尾，其名称同样按本地位置插回同名组，保证主订阅
-      组里挂的附加机场入口（如 "Mitce"）不随订阅更新丢失。
-    面板信息节点（名字随流量/到期日变化）、历史重名去重副本（`#2`/`#2_`）与
-    持主订阅共享账户凭证但已下架的僵尸节点不视为自建节点，任其随订阅更替。"""
+    - 附加节点：追加进 merged["proxies"]，并在同名组（或换机场后的新主入口组）中插回，
+      防止每日订阅更新或更换主力机场冲掉自建节点与多订阅机场节点。
+    - 附加分组：本地存在而订阅未提供的真实附加分组（自建分组、多订阅机场分组）
+      整体追加到组列表末尾，其名称同样按本地位置插回主入口组，保证主订阅
+      组里挂的附加机场入口（如 "Mitce"）不随订阅更新或换机场丢失。
+    面板信息节点、历史重名去重副本（`#2`/`#2_`）、持主订阅共享账户凭证但已下架的僵尸节点、
+    以及换机场后旧主力机场遗留的分组均不视为自建内容，随订阅更替自动清理。"""
     local_proxies = [proxy for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
     merged_proxies = [proxy for proxy in merged.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")]
+    local_names = {str(proxy["name"]) for proxy in local_proxies}
     merged_names = {str(proxy["name"]) for proxy in merged_proxies}
 
     merged_group_names = {
@@ -261,37 +301,56 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         for group in merged.get("proxy-groups") or []
         if isinstance(group, dict) and isinstance(group.get("name"), str)
     }
-    extra_group_names: set[str] = set()
-    extra_groups: list = []
-    extra_group_member_names: set[str] = set()
-    for group in existing.get("proxy-groups") or []:
-        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
-            continue
-        if group["name"] not in merged_group_names:
-            extra_groups.append(group)
-            extra_group_names.add(group["name"])
-            for member in group.get("proxies") or []:
-                if isinstance(member, str) and member:
-                    extra_group_member_names.add(member)
-
+    extra_sub_prefixes = _detect_extra_sub_prefixes(existing, merged_group_names, local_names)
+    local_main_proxies = [
+        proxy
+        for proxy in local_proxies
+        if not any(str(proxy["name"]) == pfx or str(proxy["name"]).startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
+    ]
     sub_credentials = _subscription_account_credentials(merged_proxies) | _subscription_account_credentials(
-        [proxy for proxy in local_proxies if is_panel_info_node(str(proxy.get("name") or ""))]
+        local_main_proxies
     )
 
     extra_names: set[str] = set()
     extra_proxies: list = []
+    retired_main_names: set[str] = set()
     for proxy in local_proxies:
         name = str(proxy["name"])
-        if (
-            name not in merged_names
-            and not is_panel_info_node(name)
-            and not _is_dedupe_artifact(name, merged_names)
-        ):
-            cred = _proxy_credential(proxy)
-            if cred and cred in sub_credentials and name not in extra_group_member_names:
+        if name in merged_names:
+            continue
+        if is_panel_info_node(name) or _is_dedupe_artifact(name, merged_names):
+            retired_main_names.add(name)
+            continue
+        is_extra_sub_node = any(name == pfx or name.startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
+        cred = _proxy_credential(proxy)
+        if not is_extra_sub_node and cred and cred in sub_credentials:
+            retired_main_names.add(name)
+            continue
+        extra_proxies.append(proxy)
+        extra_names.add(name)
+
+    old_primary = _primary_select_group(existing)
+    new_primary = _primary_select_group(merged)
+
+    extra_group_names: set[str] = set()
+    extra_groups: list = []
+    for group in existing.get("proxy-groups") or []:
+        if not isinstance(group, dict) or not isinstance(group.get("name"), str):
+            continue
+        gname = group["name"]
+        if gname in merged_group_names:
+            continue
+        is_extra_sub_group = any(gname == pfx or gname.startswith(f"{pfx}-") for pfx in extra_sub_prefixes)
+        if not is_extra_sub_group:
+            if old_primary and new_primary and old_primary != new_primary and gname == old_primary:
                 continue
-            extra_proxies.append(proxy)
-            extra_names.add(name)
+            members = [str(m) for m in (group.get("proxies") or []) if isinstance(m, str) and m]
+            has_retired = any(m in retired_main_names for m in members)
+            has_custom = any(m in extra_names for m in members)
+            if has_retired and not has_custom:
+                continue
+        extra_groups.append(group)
+        extra_group_names.add(gname)
 
     if not extra_proxies and not extra_groups:
         return
@@ -310,14 +369,27 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
     for group in existing.get("proxy-groups") or []:
         if isinstance(group, dict) and isinstance(group.get("name"), str):
             local_group_members[group["name"]] = group.get("proxies") or []
+    if (
+        old_primary
+        and new_primary
+        and old_primary != new_primary
+        and old_primary in local_group_members
+        and new_primary not in local_group_members
+    ):
+        local_group_members[new_primary] = local_group_members[old_primary]
+        if isinstance(merged.get("subscriptions"), list):
+            for sub_item in merged["subscriptions"]:
+                if isinstance(sub_item, dict) and sub_item.get("attach-to") == old_primary:
+                    sub_item["attach-to"] = new_primary
+
     for group in merged.get("proxy-groups") or []:
         if not isinstance(group, dict) or not isinstance(group.get("name"), str):
             continue
-        members = local_group_members.get(group["name"])
-        if not isinstance(members, list):
+        local_members = local_group_members.get(group["name"])
+        if not isinstance(local_members, list):
             continue
         group_members: list = group.get("proxies") or []
-        for index, member in enumerate(members):
+        for index, member in enumerate(local_members):
             name = str(member)
             if name in member_extras and name not in group_members:
                 group_members.insert(min(index, len(group_members)), name)
@@ -400,6 +472,60 @@ def _read_subscription_response(response: Any) -> tuple[bytes, str | None]:
     return body, userinfo
 
 
+def _prune_stale_ai_state(paths: AppPaths, merged: dict) -> None:
+    """订阅更新后清理 ai-manual-order.json / ai-gemini-order.json / ai-watch.json 中已不存在的旧节点名。"""
+    import json
+
+    from ..config import ai_gemini_order_file, ai_manual_order_file, ai_watch_state_file
+
+    valid_names = {
+        str(proxy["name"])
+        for proxy in (merged.get("proxies") or [])
+        if isinstance(proxy, dict) and proxy.get("name")
+    }
+    if not valid_names:
+        return
+    for order_fn in (ai_manual_order_file, ai_gemini_order_file):
+        order_path = order_fn(paths)
+        if not order_path.exists():
+            continue
+        try:
+            items = json.loads(order_path.read_text(encoding="utf-8"))
+            if isinstance(items, list):
+                filtered = [str(item) for item in items if item and str(item) in valid_names]
+                if filtered != items:
+                    order_path.write_text(json.dumps(filtered, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+    watch_path = ai_watch_state_file(paths)
+    if watch_path.exists():
+        try:
+            state = json.loads(watch_path.read_text(encoding="utf-8"))
+            if isinstance(state, dict):
+                changed = False
+                for gs in state.values():
+                    if not isinstance(gs, dict):
+                        continue
+                    if gs.get("last_active") and str(gs["last_active"]) not in valid_names:
+                        gs["last_active"] = None
+                        changed = True
+                    if gs.get("fail_node") and str(gs["fail_node"]) not in valid_names:
+                        gs["fail_node"] = None
+                        gs["fail_count"] = 0
+                        changed = True
+                    cooldown = gs.get("cooldown")
+                    if isinstance(cooldown, dict):
+                        stale_keys = [k for k in cooldown if str(k) not in valid_names]
+                        for k in stale_keys:
+                            cooldown.pop(k, None)
+                            changed = True
+                if changed:
+                    watch_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+
 def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SUBSCRIPTION_TIMEOUT) -> Path:
     """下载订阅并合并进原始配置；订阅内容覆盖节点/规则，本地环境键保留。"""
     raw, userinfo = _download_subscription(paths, url, timeout)
@@ -433,24 +559,59 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
         _dedupe_proxy_names(merged)
         _preserve_local_extra_proxies(merged, existing)
     else:
-        # nodelist 型订阅只提供 proxies：以本地配置为基础，仅替换节点并沿用
-        # 本地分组模板重建成员，dns/mode/rules 等其余本地键全部保留，
+        # nodelist 型订阅只提供 proxies：以本地配置为基础，仅替换主订阅旧节点并沿用
+        # 本地分组模板重建成员，保留附加订阅节点/自建节点与 dns/mode/rules 等其余本地键，
         # 避免 config.yaml 丢失 proxy-groups/rules/dns 导致 render/校验失败。
-        old_node_names = [
-            str(proxy["name"]) for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+        local_proxies = [
+            proxy for proxy in existing.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
         ]
-        new_node_names = [
-            str(proxy["name"]) for proxy in data.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+        local_names = {str(proxy["name"]) for proxy in local_proxies}
+        extra_sub_prefixes = _detect_extra_sub_prefixes(existing, set(), local_names)
+        local_main_proxies = [
+            proxy
+            for proxy in local_proxies
+            if not any(str(proxy["name"]) == pfx or str(proxy["name"]).startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
         ]
+        local_sub_creds = _subscription_account_credentials(local_main_proxies)
+        new_proxies = [
+            proxy for proxy in data.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
+        ]
+        new_node_names = [str(proxy["name"]) for proxy in new_proxies]
         if not new_node_names:
             # 订阅未返回任何节点：直接落盘会把 url-test/fallback 组重建成
             # 空成员（非法配置），宁可失败交给上层回滚，也不产出坏 config。
             raise ValueError("nodelist 订阅未返回任何节点，已跳过合并")
+        new_name_set = set(new_node_names)
+        old_node_names: list[str] = []
+        preserved_local_proxies: list[dict] = []
+        for proxy in local_proxies:
+            pname = str(proxy["name"])
+            if pname in new_name_set:
+                old_node_names.append(pname)
+                continue
+            is_extra_sub = any(pname == pfx or pname.startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
+            if is_extra_sub:
+                preserved_local_proxies.append(proxy)
+                continue
+            cred = _proxy_credential(proxy)
+            if local_sub_creds and not is_panel_info_node(pname) and (not cred or cred not in local_sub_creds):
+                preserved_local_proxies.append(proxy)
+                continue
+            old_node_names.append(pname)
         merged = dict(existing)
-        merged["proxies"] = data.get("proxies") or []
-        merged["proxy-groups"] = _rebuild_groups_with_new_nodes(
-            existing.get("proxy-groups") or [], old_node_names, new_node_names
-        )
+        merged["proxies"] = list(new_proxies) + preserved_local_proxies
+        existing_groups = existing.get("proxy-groups") or []
+        if existing_groups:
+            merged["proxy-groups"] = _rebuild_groups_with_new_nodes(
+                existing_groups, old_node_names, new_node_names
+            )
+        else:
+            merged["proxy-groups"] = [
+                {"name": "Proxy", "type": "select", "proxies": ["Auto", *new_node_names, "DIRECT"]},
+                {"name": "Auto", "type": "url-test", "proxies": list(new_node_names), "url": TEST_URL, "interval": 300},
+            ]
+            if not merged.get("rules"):
+                merged["rules"] = ["GEOIP,CN,DIRECT,no-resolve", "MATCH,Proxy"]
     merged["subscription-url"] = url
     # 订阅可能自带重名节点；不处理会生成 mihomo 拒绝加载的配置
     _dedupe_proxy_names(merged)
@@ -459,6 +620,7 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(merged, fh, allow_unicode=True, sort_keys=False)
+    _prune_stale_ai_state(paths, merged)
     return path
 
 

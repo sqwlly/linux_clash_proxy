@@ -100,12 +100,13 @@ AI_REGION_CODE_BY_GROUP = {
 def is_stream_fragile_proxy(proxy: dict | None, name: str = "") -> bool:
     """判定节点在长连接 SSE 流（如 Gemini streamGenerateContent）下是否易断流。
 
-    除名字显式标 IEPL 外，部分机场不写 IEPL 标签但底层用裸 TCP + xtls-rprx-vision，
+    除名字显式标 IEPL / IPLC / 内网专线外，部分机场不写专线标签但底层用裸 TCP + xtls-rprx-vision，
     在 15~60s 工具执行空闲期极易被沿途专线网关静默掐断（EOF / bad record MAC）；
     而 ws / grpc 传输层或非 vision 节点在长连接保持上明显更稳。
     """
     node_name = str(name or (proxy or {}).get("name") or "")
-    if "IEPL" in node_name.upper():
+    upper_name = node_name.upper()
+    if any(kw in upper_name for kw in ("IEPL", "IPLC", "内网专线")):
         return True
     if not isinstance(proxy, dict):
         return False
@@ -840,8 +841,6 @@ class RuntimeBackend:
         jp_proxies = filter_unbanned_nodes(region_nodes["JP"], active_bans, keep_fallback=False)
         kr_proxies = filter_unbanned_nodes(region_nodes["KR"], active_bans, keep_fallback=False)
         gb_proxies = filter_unbanned_nodes(region_nodes["GB"], active_bans, keep_fallback=False)
-        if not us_proxies or not sg_proxies:
-            raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
         raw_max_mult = data.get("max-ai-multiplier")
         try:
             max_ai_mult = float(raw_max_mult) if raw_max_mult is not None else DEFAULT_MAX_AI_MULTIPLIER
@@ -854,11 +853,22 @@ class RuntimeBackend:
         gemini_order = _load_ai_gemini_order(self.paths)
         gemini_leaves = _collect_gemini_nodes(data.get("proxies"), group_map, extra_names, gemini_prefer)
         gemini_leaves = filter_unbanned_nodes(gemini_leaves, active_bans, keep_fallback=True)
+        # 兼容偏科机场：缺少 US 或 SG 任一地区（或仅含日/韩/台/欧节点）时，优雅借用其它可用 AI 地区池兜底
+        fallback_ai_pool = list(us_proxies or sg_proxies or jp_proxies or kr_proxies or gb_proxies or gemini_leaves)
+        if not us_proxies and fallback_ai_pool:
+            us_proxies = list(fallback_ai_pool)
+        if not sg_proxies and fallback_ai_pool:
+            sg_proxies = list(sg_proxies or jp_proxies or kr_proxies or gb_proxies or us_proxies)
+        if not us_proxies or not sg_proxies:
+            raise ValueError("未找到美国或新加坡节点，无法生成 AI 出口")
         if not gemini_leaves:
             # 订阅缺少韩/台/欧等优选区时，退回日美新，避免 render 直接失败
             gemini_leaves = list(jp_proxies) + list(us_proxies) + list(sg_proxies)
+        raw_extra_gemini = _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, AI_GEMINI_REGION_ORDER)
+        if not raw_extra_gemini:
+            raw_extra_gemini = _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, ("SG", "JP", "US"))
         extra_gemini_nodes = filter_unbanned_nodes(
-            _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, AI_GEMINI_REGION_ORDER),
+            raw_extra_gemini,
             active_bans,
             keep_fallback=False,
         )
@@ -880,7 +890,11 @@ class RuntimeBackend:
         manual_order = _load_ai_manual_order(self.paths)
         us_ordered = _order_manual_candidates(us_proxies, manual_prefer, manual_order, max_mult=max_ai_mult)
         sg_ordered = _order_manual_candidates(sg_proxies, manual_prefer, manual_order, max_mult=max_ai_mult)
-        manual_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies) + list(kr_proxies) + list(gb_proxies)
+        manual_leaves: list[str] = []
+        for pool in (us_proxies, jp_proxies, sg_proxies, kr_proxies, gb_proxies):
+            for node_name in pool:
+                if node_name not in manual_leaves:
+                    manual_leaves.append(node_name)
         extra_manual_nodes = filter_unbanned_nodes(
             _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, ("US", "JP", "SG", "KR", "GB")),
             active_bans,

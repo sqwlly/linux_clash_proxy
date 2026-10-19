@@ -674,3 +674,147 @@ def test_gemini_multi_session_retry_loop_and_connection_preservation(tmp_path: P
     prev_order = ["N1", "N2", "N3", "N4", "N5", "N6"]
     curr_order = ["N1", "N2", "N5", "N3", "N4", "N6"]
     assert _should_keep_previous_order(prev_order, curr_order) is True
+
+
+def test_multi_airport_subscription_import_compatibility(tmp_path: Path, monkeypatch) -> None:
+    import base64
+
+    from cproxy.config import ai_gemini_order_file, ai_manual_order_file, ai_watch_state_file, read_config
+    from cproxy.services import refresh as refresh_mod
+    from cproxy.services.ai_watch import _is_stream_safe_gemini_leaf
+    from cproxy.services.nodelist import match_region, parse_subscription_payload
+    from cproxy.services.probe import is_iepl_node
+    from cproxy.services.refresh import update_source_from_subscription
+
+    # 1. 繁体地名、城市名与数据中心三字码识别
+    assert match_region("🇰🇷 首尔 01") == "KR"
+    assert match_region("🇹🇼 台灣 Hinet 01") == "TW"
+    assert match_region("🇸🇬 獅城 BGP 02") == "SG"
+    assert match_region("🇺🇸 洛杉矶 LAX 01") == "US"
+    assert match_region("🇩🇪 法兰克福 01") == "DE"
+    assert match_region("🇬🇧 伦敦 01") == "GB"
+
+    # 2. vmess://、legacy ss://、hy2://、anytls:// 分享链接订阅解析
+    vmess_json = base64.b64encode(
+        json.dumps(
+            {
+                "v": "2",
+                "ps": "🇰🇷 首尔 VMess 01",
+                "add": "kr.example.com",
+                "port": "443",
+                "id": "11111111-2222-3333-4444-555555555555",
+                "aid": "0",
+                "net": "ws",
+                "path": "/ws",
+                "host": "kr.example.com",
+                "tls": "tls",
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
+    legacy_ss = base64.b64encode(b"aes-256-gcm:pass123@us.example.com:8388").decode("ascii")
+    share_lines = "\n".join(
+        [
+            f"vmess://{vmess_json}",
+            f"ss://{legacy_ss}#%F0%9F%87%BA%F0%9F%87%B8%20%E6%B4%9B%E6%9D%89%E7%9F%B6%2001",
+            "hy2://hypass@tw.example.com:443?sni=tw.example.com#%F0%9F%87%B9%F0%9F%87%BC%20%E5%8F%B0%E5%8C%97%2001",
+            "anytls://anypass@jp.example.com:443?sni=jp.example.com#%F0%9F%87%AF%F0%9F%87%B5%20%E4%B8%9C%E4%BA%AC%2001",
+        ]
+    )
+    parsed = parse_subscription_payload(base64.b64encode(share_lines.encode("utf-8")))
+    assert [p["type"] for p in parsed["proxies"]] == ["vmess", "ss", "hysteria2", "anytls"]
+    assert parsed["proxies"][0]["network"] == "ws"
+
+    # 3. 从机场 A (CyberGuard) 切换到机场 B (FlowerCloud/Proxy，且仅有 US/KR/TW 无 SG)：
+    #    - 彻底清理机场 A 的旧主组 CyberGuard 与共享 uuid_A 的旧节点
+    #    - 保留自建节点 Vultr 与附加订阅 Mitce，并自动迁移挂载到新主组 Proxy
+    #    - 自动清理 ai-gemini-order.json / ai-manual-order.json / ai-watch.json 中的机场 A 旧节点
+    #    - render_runtime 在缺少 SG 节点时不崩溃，且不带 "1X" 标签的 🇰🇷 首尔 01 被识别为抗断流安全叶子
+    paths = _make_paths(tmp_path / "switch")
+    uuid_a = "aaaa1111-2222-3333-4444-555555555555"
+    pw_b = "flowercloud-shared-pw"
+    write_cfg = {
+        "mixed-port": 7890,
+        "subscriptions": [{"name": "Mitce", "url": "https://mitce.example.com/sub", "attach-to": "CyberGuard"}],
+        "proxies": [
+            {"name": "🇭🇰香港 01 | IEPL", "type": "vless", "server": "hk.a.com", "port": 443, "uuid": uuid_a},
+            {"name": "🇰🇷韩国 01 | 1X", "type": "vless", "server": "kr.a.com", "port": 443, "uuid": uuid_a},
+            {"name": "🇺🇸美国 01 | 1X", "type": "vless", "server": "us.a.com", "port": 443, "uuid": uuid_a},
+            {"name": "🇯🇵日本 Vultr-Reality", "type": "vless", "server": "45.32.47.247", "port": 443, "uuid": "custom-uuid"},
+            {"name": "Mitce HK-1", "type": "hysteria2", "server": "hk.mitce.com", "port": 443, "password": "m-pw"},
+        ],
+        "proxy-groups": [
+            {
+                "name": "CyberGuard",
+                "type": "select",
+                "proxies": ["Auto", "🇭🇰香港 01 | IEPL", "🇰🇷韩国 01 | 1X", "🇯🇵日本 Vultr-Reality", "Mitce", "DIRECT"],
+            },
+            {"name": "Auto", "type": "url-test", "proxies": ["🇭🇰香港 01 | IEPL", "🇰🇷韩国 01 | 1X"]},
+            {"name": "Mitce-HK", "type": "url-test", "proxies": ["Mitce HK-1"]},
+            {"name": "Mitce", "type": "select", "proxies": ["Mitce-HK"]},
+        ],
+        "rules": ["MATCH,CyberGuard"],
+    }
+    config_file(paths).write_text(yaml.safe_dump(write_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    ai_gemini_order_file(paths).write_text(json.dumps(["🇰🇷韩国 01 | 1X", "🇰🇷 首尔 01"]), encoding="utf-8")
+    ai_manual_order_file(paths).write_text(json.dumps(["🇺🇸美国 01 | 1X", "🇺🇸 洛杉矶 LAX 01"]), encoding="utf-8")
+    ai_watch_state_file(paths).write_text(
+        json.dumps({"AI-GEMINI": {"last_active": "🇰🇷韩国 01 | 1X", "cooldown": {"🇰🇷韩国 01 | 1X": 123.0}}}),
+        encoding="utf-8",
+    )
+
+    airport_b_payload = {
+        "proxies": [
+            {"name": "🇰🇷 首尔 01", "type": "hysteria2", "server": "kr.b.com", "port": 443, "password": pw_b},
+            {"name": "[IPLC] 韓國 02", "type": "ss", "server": "kr2.b.com", "port": 8388, "password": pw_b},
+            {"name": "🇹🇼 台灣 Hinet 01", "type": "hysteria2", "server": "tw.b.com", "port": 443, "password": pw_b},
+            {"name": "🇺🇸 洛杉矶 LAX 01", "type": "vless", "server": "us.b.com", "port": 443, "uuid": pw_b, "network": "ws"},
+        ],
+        "proxy-groups": [
+            {
+                "name": "Proxy",
+                "type": "select",
+                "proxies": ["自动选择", "🇰🇷 首尔 01", "[IPLC] 韓國 02", "🇹🇼 台灣 Hinet 01", "🇺🇸 洛杉矶 LAX 01", "DIRECT"],
+            },
+            {
+                "name": "自动选择",
+                "type": "url-test",
+                "proxies": ["🇰🇷 首尔 01", "🇹🇼 台灣 Hinet 01", "🇺🇸 洛杉矶 LAX 01"],
+            },
+        ],
+        "rules": ["MATCH,Proxy"],
+    }
+    raw_b = yaml.safe_dump(airport_b_payload, allow_unicode=True, sort_keys=False).encode("utf-8")
+    monkeypatch.setattr(refresh_mod, "_download_subscription", lambda _p, _u, _t=10: (raw_b, None))
+
+    update_source_from_subscription(paths, "https://airport-b.example.com/sub")
+    merged = read_config(paths)
+    merged_names = [p["name"] for p in merged["proxies"]]
+    merged_groups = {g["name"]: g for g in merged["proxy-groups"]}
+
+    assert "🇭🇰香港 01 | IEPL" not in merged_names
+    assert "🇰🇷韩国 01 | 1X" not in merged_names
+    assert "CyberGuard" not in merged_groups
+    assert "🇯🇵日本 Vultr-Reality" in merged_names
+    assert "Mitce HK-1" in merged_names
+    assert "Mitce" in merged_groups
+    assert "🇯🇵日本 Vultr-Reality" in merged_groups["Proxy"]["proxies"]
+    assert "Mitce" in merged_groups["Proxy"]["proxies"]
+    assert merged["subscriptions"][0]["attach-to"] == "Proxy"
+
+    # 旧机场节点已从排序与看门狗状态文件中剔除
+    assert json.loads(ai_gemini_order_file(paths).read_text(encoding="utf-8")) == ["🇰🇷 首尔 01"]
+    assert json.loads(ai_manual_order_file(paths).read_text(encoding="utf-8")) == ["🇺🇸 洛杉矶 LAX 01"]
+    watch_state = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
+    assert watch_state["AI-GEMINI"]["last_active"] is None
+    assert watch_state["AI-GEMINI"]["cooldown"] == {}
+
+    # 缺少 SG 节点时 render_runtime 优雅回退，且 IPLC 排在非专线节点之后
+    runtime_path = RuntimeBackend(paths).render_runtime()
+    rendered = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    r_groups = {g["name"]: g["proxies"] for g in rendered["proxy-groups"]}
+    assert r_groups["AI-GEMINI"][0] == "🇰🇷 首尔 01"
+    assert r_groups["AI-GEMINI"].index("🇰🇷 首尔 01") < r_groups["AI-GEMINI"].index("[IPLC] 韓國 02")
+    assert is_iepl_node("[IPLC] 韓國 02") is True
+    assert _is_stream_safe_gemini_leaf(paths, "🇰🇷 首尔 01") is True
+    assert _is_stream_safe_gemini_leaf(paths, "[IPLC] 韓國 02") is False
+

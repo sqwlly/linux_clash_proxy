@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from urllib.parse import parse_qsl, unquote
 
 import yaml
 
-SUPPORTED_SCHEMES = ("vless", "hysteria2", "tuic", "trojan", "ss")
+SUPPORTED_SCHEMES = ("vless", "hysteria2", "hy2", "tuic", "trojan", "ss", "vmess", "anytls")
 
 # 订阅分组地区归纳顺序；节点名命中任一模式即归入该地区
 SUBSCRIPTION_REGION_ORDER = (
@@ -39,19 +40,35 @@ SWITCH_REGION_LABELS = {
     "OTHER": "其他",
 }
 REGION_PATTERNS: dict[str, tuple[str, ...]] = {
-    "HK": (r"🇭🇰", r"香港", r"\bHKG?\b", r"\bHK\d"),
-    "JP": (r"🇯🇵", r"日本", r"Japan", r"\bJPN?\b", r"\bJP\d"),
-    "KR": (r"🇰🇷", r"韩国", r"Korea", r"\bKOR?\b", r"\bKR\b", r"\bKR\d"),
-    "SG": (r"🇸🇬", r"新加坡", r"Singapore", r"\bSGP?\b", r"\bSG\d"),
-    "TW": (r"🇹🇼", r"台湾", r"Taiwan", r"\bTWN?\b", r"\bTW\d"),
-    "US": (r"🇺🇸", r"美国", r"United States", r"\bUSA?\b", r"\bUS\d"),
-    "AU": (r"🇦🇺", r"澳大利亚", r"Australia", r"\bAUS?\b", r"\bAU\d"),
-    "BR": (r"🇧🇷", r"巴西", r"Brazil", r"\bBRA?\b", r"\bBR\d"),
-    "AE": (r"🇦🇪", r"迪拜", r"Dubai", r"UAE", r"\bAE\b"),
-    "DE": (r"🇩🇪", r"德国", r"Germany", r"\bDEU?\b", r"\bDE\d"),
-    "FR": (r"🇫🇷", r"法国", r"France", r"\bFRA?\b", r"\bFR\d"),
-    "GB": (r"🇬🇧", r"英国", r"Britain", r"United Kingdom", r"\bUK\b", r"\bGB\d"),
-    "IN": (r"🇮🇳", r"印度", r"India", r"\bIND?\b", r"\bIN\d"),
+    "HK": (r"🇭🇰", r"香港", r"Hong\s*Kong", r"\bHKG?\b", r"\bHK\d"),
+    "JP": (r"🇯🇵", r"日本", r"东京", r"東京", r"大阪", r"Japan", r"Tokyo", r"Osaka", r"\bJPN?\b", r"\bJP\d"),
+    "KR": (r"🇰🇷", r"韩国", r"韓國", r"首尔", r"首爾", r"釜山", r"Korea", r"Seoul", r"\bKOR?\b", r"\bKR\b", r"\bKR\d"),
+    "SG": (r"🇸🇬", r"新加坡", r"狮城", r"獅城", r"Singapore", r"\bSGP?\b", r"\bSG\d"),
+    "TW": (
+        r"🇹🇼", r"台湾", r"台灣", r"台北", r"新北", r"彰化", r"高雄",
+        r"Taiwan", r"Taipei", r"Hinet", r"\bTWN?\b", r"\bTW\d",
+    ),
+    "US": (
+        r"🇺🇸", r"美国", r"美國", r"洛杉矶", r"圣何塞", r"硅谷", r"西雅图", r"纽约", r"芝加哥", r"达拉斯",
+        r"United States", r"America", r"Los Angeles", r"San Jose", r"Silicon Valley", r"Seattle",
+        r"\bUSA?\b", r"\bUS\d", r"\bLAX\b", r"\bSJC\b", r"\bSEA\b",
+    ),
+    "AU": (
+        r"🇦🇺", r"澳大利亚", r"澳洲", r"悉尼", r"雪梨", r"墨尔本",
+        r"Australia", r"Sydney", r"\bAUS?\b", r"\bAU\b", r"\bAU\d",
+    ),
+    "BR": (r"🇧🇷", r"巴西", r"圣保罗", r"聖保羅", r"Brazil", r"Sao Paulo", r"\bBRA?\b", r"\bBR\b", r"\bBR\d"),
+    "AE": (r"🇦🇪", r"迪拜", r"杜拜", r"阿联酋", r"阿聯酋", r"Dubai", r"UAE", r"\bAE\b"),
+    "DE": (
+        r"🇩🇪", r"德国", r"德國", r"法兰克福", r"法蘭克福", r"慕尼黑",
+        r"Germany", r"Frankfurt", r"\bDEU?\b", r"\bDE\b", r"\bDE\d",
+    ),
+    "FR": (r"🇫🇷", r"法国", r"法國", r"巴黎", r"France", r"Paris", r"\bFRA?\b", r"\bFR\b", r"\bFR\d"),
+    "GB": (
+        r"🇬🇧", r"英国", r"英國", r"伦敦", r"倫敦",
+        r"Britain", r"United Kingdom", r"London", r"England", r"\bUK\b", r"\bGBR?\b", r"\bGB\d",
+    ),
+    "IN": (r"🇮🇳", r"印度", r"孟买", r"India", r"Mumbai", r"\bIND?\b", r"\bIN\d"),
 }
 
 
@@ -205,9 +222,41 @@ def _parse_trojan(uri: str) -> dict:
     return proxy
 
 
+def _b64_decode_text(encoded: str) -> str:
+    padded = encoded.strip().replace("-", "+").replace("_", "/")
+    padded += "=" * (-len(padded) % 4)
+    return base64.b64decode(padded).decode("utf-8", errors="replace")
+
+
 def _parse_ss(uri: str) -> dict:
-    _s, userinfo, host, port, _n, _q = _split_share_uri(uri)
-    method, password = unquote(userinfo).split(":", 1)
+    _, rest = uri.split("://", 1)
+    if "#" in rest:
+        rest, _ = rest.split("#", 1)
+    if "?" in rest:
+        rest, _ = rest.split("?", 1)
+    rest = rest.split("/", 1)[0]
+    if "@" not in rest:
+        # Legacy base64: ss://BASE64(method:password@host:port)#name
+        try:
+            decoded_rest = _b64_decode_text(unquote(rest))
+        except Exception as exc:
+            raise ValueError(f"ss 分享链接解码失败: {uri[:48]}") from exc
+        if "@" not in decoded_rest:
+            raise ValueError(f"ss 分享链接缺少 @: {uri[:48]}")
+        userinfo, hostport = decoded_rest.rsplit("@", 1)
+    else:
+        userinfo, hostport = rest.rsplit("@", 1)
+        userinfo = unquote(userinfo)
+        if ":" not in userinfo:
+            # SIP002 base64 userinfo: ss://BASE64(method:password)@host:port#name
+            try:
+                userinfo = _b64_decode_text(userinfo)
+            except Exception as exc:
+                raise ValueError(f"ss 用户信息解码失败: {uri[:48]}") from exc
+    if ":" not in userinfo or ":" not in hostport:
+        raise ValueError(f"ss 分享链接格式非法: {uri[:48]}")
+    method, password = userinfo.split(":", 1)
+    host, port = hostport.rsplit(":", 1)
     return {
         "type": "ss",
         "server": host,
@@ -218,12 +267,77 @@ def _parse_ss(uri: str) -> dict:
     }
 
 
+def _parse_vmess(uri: str) -> tuple[str, dict]:
+    _, rest = uri.split("://", 1)
+    if "#" in rest:
+        rest, fallback_name = rest.split("#", 1)
+        fallback_name = unquote(fallback_name)
+    else:
+        fallback_name = ""
+    try:
+        payload = json.loads(_b64_decode_text(rest))
+    except Exception as exc:
+        raise ValueError(f"vmess 链接解码失败: {uri[:48]}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"vmess 负载不是 JSON 对象: {uri[:48]}")
+    name = str(payload.get("ps") or fallback_name or "").strip()
+    host = str(payload.get("add") or "").strip()
+    port = int(payload.get("port") or 0)
+    uuid_ = str(payload.get("id") or "").strip()
+    if not name or not host or port <= 0 or not uuid_:
+        raise ValueError(f"vmess 缺少必填字段: {uri[:48]}")
+    proxy: dict = {
+        "type": "vmess",
+        "server": host,
+        "port": port,
+        "uuid": uuid_,
+        "alterId": int(payload.get("aid") or 0),
+        "cipher": str(payload.get("scy") or "auto"),
+        "udp": True,
+    }
+    net = str(payload.get("net") or "tcp").lower()
+    if net != "tcp":
+        proxy["network"] = net
+    if net == "ws":
+        ws_opts: dict = {"path": str(payload.get("path") or "/")}
+        if payload.get("host"):
+            ws_opts["headers"] = {"Host": str(payload["host"])}
+        proxy["ws-opts"] = ws_opts
+    elif net == "grpc":
+        proxy["grpc-opts"] = {"grpc-service-name": str(payload.get("path") or "")}
+    tls_val = str(payload.get("tls") or "").lower()
+    if tls_val in ("tls", "true", "1"):
+        proxy["tls"] = True
+        sni = str(payload.get("sni") or payload.get("host") or "").strip()
+        if sni:
+            proxy["servername"] = sni
+    return name, proxy
+
+
+def _parse_anytls(uri: str) -> dict:
+    _s, userinfo, host, port, _n, q = _split_share_uri(uri)
+    proxy: dict = {
+        "type": "anytls",
+        "server": host,
+        "port": int(port),
+        "password": unquote(userinfo),
+        "udp": True,
+    }
+    if q.get("sni"):
+        proxy["sni"] = q["sni"]
+    if q.get("insecure") in ("1", "true"):
+        proxy["skip-cert-verify"] = True
+    return proxy
+
+
 _LINK_PARSERS = {
     "vless": _parse_vless,
     "hysteria2": _parse_hysteria2,
+    "hy2": _parse_hysteria2,
     "tuic": _parse_tuic,
     "trojan": _parse_trojan,
     "ss": _parse_ss,
+    "anytls": _parse_anytls,
 }
 
 
@@ -231,11 +345,16 @@ def parse_share_link(uri: str) -> tuple[str, dict] | None:
     """解析单条分享链接为 (节点名, mihomo proxy dict)；未知协议返回 None，
     已知协议但格式非法时抛 ValueError。"""
     scheme = uri.split("://", 1)[0].lower()
+    if scheme == "vmess":
+        return _parse_vmess(uri.strip())
     parser = _LINK_PARSERS.get(scheme)
     if parser is None:
         return None
     proxy = parser(uri.strip())
-    _s, _u, _h, _p, name, _q = _split_share_uri(uri.strip())
+    if "#" in uri:
+        name = unquote(uri.strip().split("#", 1)[1]).strip()
+    else:
+        name = ""
     if not name:
         raise ValueError(f"分享链接缺少节点名: {uri[:48]}")
     return name, proxy
