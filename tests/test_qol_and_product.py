@@ -1024,6 +1024,20 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     _optimize_ws_cdn_servers(proxies, probe_tls=True)
     assert proxies[0]["server"] == "172.67.143.95"
 
+    # 1b. 若下次 172.67.143.95 出现丢包（2 轮仅通 1 轮），而 104.21.87.131 恢复 2/2 全通，动态智能切换到 104.21.87.131
+    call_counts = {"172.67.143.95": 0, "104.21.87.131": 0}
+
+    def _mock_flaky_172(ip, _port, _sni, timeout=1.5):
+        call_counts[ip] = call_counts.get(ip, 0) + 1
+        if ip == "172.67.143.95":
+            return 400 if call_counts[ip] == 1 else None
+        return 410
+
+    monkeypatch.setattr(runtime_mod, "_tls_handshake_latency_ms", _mock_flaky_172)
+    proxies[0]["server"] = "cyberguard.cyberguard-u1s1.art"
+    _optimize_ws_cdn_servers(proxies, probe_tls=True)
+    assert proxies[0]["server"] == "104.21.87.131"
+
     # 2. render_runtime 在 googleapis.com 之前注入 DOMAIN,play.googleapis.com,AI-AUTO，分流遥测流量避免占满 AI-GEMINI 且不触发客户端疯狂重试
     paths = _make_paths(tmp_path / "play-offload")
     cfg = {

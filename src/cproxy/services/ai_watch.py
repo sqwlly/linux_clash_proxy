@@ -586,6 +586,12 @@ class AIWatchService:
             gs["fail_count"] = 1
 
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
+            try:
+                from ..backend.runtime import refresh_ws_cdn_ips_if_changed
+
+                refresh_ws_cdn_ips_if_changed(self.paths)
+            except Exception:
+                pass
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
                 # 仅在 AI-MANUAL、地区封锁、客户端真实重试报错或易断流节点切换时关闭旧连接；

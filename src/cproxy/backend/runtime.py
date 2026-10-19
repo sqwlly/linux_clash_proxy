@@ -746,7 +746,8 @@ def _sanitize_dns_fallback_filter(data: dict) -> None:
 
 
 _WS_TLS_PROBE_CACHE: dict[tuple[str, int, str], tuple[float, int | None]] = {}
-_WS_TLS_CACHE_TTL = 600.0
+_WS_CDN_IP_RANK_CACHE: dict[tuple[tuple[str, ...], int, str], tuple[float, list[str]]] = {}
+_WS_TLS_CACHE_TTL = 300.0
 
 
 def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 1.5) -> int | None:
@@ -785,10 +786,14 @@ def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 1.5
     return latency
 
 
-def _resolve_healthy_ws_cdn_ips(domain: str, port: int, sni: str) -> list[str]:
-    """当 CDN 域名解析出多个 IPv4 A 记录时，探测并返回可完成 TLS 握手的健康 IP 列表（确定性排序）。"""
+def _resolve_healthy_ws_cdn_ips(domain: str, port: int, sni: str, *, rounds: int = 2) -> list[str]:
+    """当 CDN 域名解析出多个 IPv4 A 记录时，通过多轮并发 TLS 握手动态评估成功率与延迟，
+    按（成功率↓、是否低于1200ms、平均延迟分桶↑、最大延迟分桶↑）返回健康 IP 列表。
+    当原最优 IP 发生丢包或黑洞时，自动无缝切换到当前最健康的备选 Anycast IP。
+    """
     import ipaddress
     import socket
+    import time
     from concurrent.futures import ThreadPoolExecutor
 
     try:
@@ -800,20 +805,62 @@ def _resolve_healthy_ws_cdn_ips(domain: str, port: int, sni: str) -> list[str]:
         infos = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
     except OSError:
         return []
-    ips = sorted({str(item[4][0]) for item in infos if item and len(item) >= 5 and item[4]})
+    ips = tuple(sorted({str(item[4][0]) for item in infos if item and len(item) >= 5 and item[4]}))
     if len(ips) < 2:
         return []
-    with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
-        latencies = list(pool.map(lambda ip: (ip, _tls_handshake_latency_ms(ip, port, sni)), ips))
-    healthy = [(ms, ip) for ip, ms in latencies if ms is not None]
-    if not healthy:
+    now = time.time()
+    rank_key = (ips, port, sni)
+    cached_rank = _WS_CDN_IP_RANK_CACHE.get(rank_key)
+    if cached_rank is not None and (now - cached_rank[0]) < _WS_TLS_CACHE_TTL:
+        return list(cached_rank[1])
+
+    samples_by_ip: dict[str, list[int]] = {ip: [] for ip in ips}
+    eff_rounds = max(1, int(rounds))
+    for r in range(eff_rounds):
+        if r > 0:
+            for ip in ips:
+                _WS_TLS_PROBE_CACHE.pop((ip, port, sni), None)
+        with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
+            latencies = list(pool.map(lambda ip: (ip, _tls_handshake_latency_ms(ip, port, sni)), ips))
+        for ip, ms in latencies:
+            if ms is not None:
+                samples_by_ip[ip].append(ms)
+
+    scored: list[tuple[tuple[int, int, int, int, str], str]] = []
+    for ip, samples in samples_by_ip.items():
+        if not samples:
+            continue
+        succ = len(samples)
+        max_ms = max(samples)
+        avg_ms = round(sum(samples) / succ)
+        sort_key = (-succ, 0 if max_ms < 1200 else 1, avg_ms // 100, max_ms // 100, ip)
+        scored.append((sort_key, ip))
+    if not scored:
         return []
-    healthy.sort(key=lambda item: (0 if item[0] < 1200 else 1, 0 if item[1].startswith("172.67.") else 1, item[1], item[0]))
-    return [ip for _ms, ip in healthy]
+    scored.sort(key=lambda item: item[0])
+    result = [ip for _k, ip in scored]
+    _WS_CDN_IP_RANK_CACHE[rank_key] = (time.time(), result)
+    return list(result)
+
+
+def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
+    """清空 CDN TLS 探测缓存并重新探测渲染；若最优 CDN Anycast IP 发生切换则立即热重载 mihomo。"""
+    _WS_TLS_PROBE_CACHE.clear()
+    _WS_CDN_IP_RANK_CACHE.clear()
+    rt_path = runtime_file(paths)
+    old_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
+    RuntimeBackend(paths).render_runtime()
+    new_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
+    if old_text and new_text and old_text != new_text:
+        from .process import ProcessBackend
+
+        ProcessBackend(paths).reload_if_running()
+        return True
+    return False
 
 
 def _resolve_healthy_ws_cdn_ip(domain: str, port: int, sni: str) -> str | None:
-    """返回首个可完成 TLS 握手的健康 CDN Anycast IP。"""
+    """返回当前最优的可完成 TLS 握手的健康 CDN Anycast IP。"""
     healthy = _resolve_healthy_ws_cdn_ips(domain, port, sni)
     return healthy[0] if healthy else None
 
@@ -831,6 +878,9 @@ def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -
     """
     if not isinstance(proxies, list):
         return
+    if probe_tls:
+        _WS_TLS_PROBE_CACHE.clear()
+        _WS_CDN_IP_RANK_CACHE.clear()
     ws_idx = 0
     for proxy in proxies:
         if not isinstance(proxy, dict):
