@@ -51,6 +51,7 @@ AI_DOMAINS = frozenset((
     "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
     "sora.com", "anthropic.com", "claude.ai", "claudeusercontent.com",
     "x.ai", "grok.com", "openai.azure.com", "githubcopilot.com",
+    "meta.ai", "llama.com", "meta.com",
     "challenges.cloudflare.com",
     "google.com", "googleapis.com", "googleusercontent.com", "gstatic.com",
     "google.dev", "appspot.com", "goog", "gemini.google.com", "aistudio.google.com",
@@ -1147,9 +1148,12 @@ class RuntimeBackend:
             f"DOMAIN-SUFFIX,anthropic.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,claude.ai,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,claudeusercontent.com,{AI_MANUAL_GROUP}",
-            # xAI / Azure OpenAI / GitHub Copilot
+            # xAI / Meta AI / Azure OpenAI / GitHub Copilot
             f"DOMAIN-SUFFIX,x.ai,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,grok.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,meta.ai,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,llama.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,meta.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,openai.azure.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,githubcopilot.com,{AI_MANUAL_GROUP}",
             # 人机验证与通用 AI 出口保持一致

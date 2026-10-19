@@ -809,6 +809,7 @@ proxy-groups:
 rules:
   - DOMAIN-SUFFIX,example.com,SSRDOG
   - DOMAIN-SUFFIX,anthropic.com,PROXY
+  - DOMAIN-SUFFIX,meta.ai,PROXY
   - DOMAIN-KEYWORD,claude,PROXY
   - DOMAIN-SUFFIX,cursor.sh,DIRECT
   - DOMAIN,safebrowsing.googleapis.com,DIRECT
@@ -858,12 +859,16 @@ rules:
 
     # 任意订阅商的 AI 冲突规则（不限 SSRDOG 组名）都应被清理
     assert "DOMAIN-SUFFIX,anthropic.com,PROXY" not in rules
+    assert "DOMAIN-SUFFIX,meta.ai,PROXY" not in rules
     assert "DOMAIN-KEYWORD,claude,PROXY" not in rules
 
     # AI 域名覆盖与下载直连规则应注入，且前移到订阅规则之前
     assert "DOMAIN-SUFFIX,claudeusercontent.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,sora.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,grok.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,meta.ai,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,llama.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,meta.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,openai.azure.com,AI-MANUAL" in rules
     assert "DOMAIN,cdn.auth0.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,challenges.cloudflare.com,AI-MANUAL" in rules
