@@ -1226,6 +1226,74 @@ def test_reap_idle_gemini_connections_and_preserve_inflight_streams(tmp_path: Pa
     _promote_gemini_order_head(paths, "🇫🇷法国 01 | 1X")
     assert json.loads(order_path.read_text(encoding="utf-8"))[0] == "🇫🇷法国 01 | 1X"
 
+    # Codex (AI-MANUAL, chatgpt.com) 正在上传 4MB 上下文或流式接收 SSE 时：
+    # 1. _drop_stale_ai_connections("AI-MANUAL") 绝不强杀活跃连接，仅关闭已闲置的轮询连接；
+    # 2. 当 5Mbps 上行被大包上传打满导致看门狗探针 5s 超时（PROBE_DEAD）时，has_active_ai_transfer 识别为
+    #    active_transfer_busy，不累加 fail_count 也不切节点断流。
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.services.ai_watch import AIWatchService, has_active_ai_transfer
+    from cproxy.services.diagnostics import PROBE_DEAD
+
+    codex_connections = [
+        {
+            "id": "codex-uploading-4mb",
+            "chains": ["🇰🇷韩国 01 | 1X", "AI-MANUAL"],
+            "upload": 4_050_000,
+            "download": 4_569,
+            "metadata": {"host": "chatgpt.com", "sourcePort": "44418"},
+        },
+        {
+            "id": "codex-streaming-sse",
+            "chains": ["🇰🇷韩国 01 | 1X", "AI-MANUAL"],
+            "upload": 3_280_000,
+            "download": 52_000,
+            "metadata": {"host": "chatgpt.com", "sourcePort": "52900"},
+        },
+        {
+            "id": "codex-ratelimit-idle",
+            "chains": ["🇰🇷韩国 01 | 1X", "AI-MANUAL"],
+            "upload": 2_400,
+            "download": 4_800,
+            "metadata": {"host": "chatgpt.com", "sourcePort": "38496"},
+        },
+    ]
+    fake_idle_map["44418"] = (320, 1_200)
+
+    class _CodexAPI:
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇰🇷韩国 01 | 1X", ["🇰🇷韩国 01 | 1X", "🇬🇧英国 01 | 1X"]),
+                "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "🇬🇧英国 01 | 1X", ["🇬🇧英国 01 | 1X"]),
+                "🇰🇷韩国 01 | 1X": ProxyGroup("🇰🇷韩国 01 | 1X", "VLESS", "-", [], delay=260, alive=True),
+                "🇬🇧英国 01 | 1X": ProxyGroup("🇬🇧英国 01 | 1X", "VLESS", "-", [], delay=250, alive=True),
+            }
+
+        def get_connections(self):
+            return {"connections": codex_connections}
+
+        def close_connection(self, cid: str):
+            closed.append(cid)
+
+    closed.clear()
+    q_codex = QueryService(paths)
+    q_codex.api = _CodexAPI()  # type: ignore[assignment]
+    dropped_codex = q_codex._drop_stale_ai_connections("AI-MANUAL", keep_leaf="🇬🇧英国 01 | 1X")
+    assert dropped_codex == 1
+    assert closed == ["codex-ratelimit-idle"]
+
+    assert has_active_ai_transfer(paths, _CodexAPI(), "AI-MANUAL", "🇰🇷韩国 01 | 1X") is True
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda _p, _u: PROBE_DEAD)
+    watch_svc = AIWatchService(paths, agy_log_dir=tmp_path / "empty-agy-logs")
+    watch_svc.query = q_codex
+    rep1 = watch_svc.watch()
+    rep2 = watch_svc.watch()
+    manual_r1 = next(r for r in rep1.results if r.group == "AI-MANUAL")
+    manual_r2 = next(r for r in rep2.results if r.group == "AI-MANUAL")
+    assert manual_r1.detail == "active_transfer_busy"
+    assert manual_r2.detail == "active_transfer_busy"
+    assert manual_r2.switched is False
+
+
 
 
 

@@ -158,6 +158,19 @@ class ProcessBackend:
             return False
         return True
 
+    def reload_if_running(self, runtime_path: Path | str | None = None) -> bool:
+        """若代理正在运行，热重载最新 runtime.yaml 并同步更新进程元数据指纹。"""
+        if not self.is_running():
+            return False
+        path = Path(runtime_path) if runtime_path is not None else runtime_file(self.paths)
+        if not path.exists():
+            return False
+        from .api import APIBackend
+
+        APIBackend(self.paths).reload_config(str(path))
+        self.mark_runtime_applied(path)
+        return True
+
     def _cleanup_process_state(self) -> None:
         pid_file(self.paths).unlink(missing_ok=True)
         process_meta_file(self.paths).unlink(missing_ok=True)

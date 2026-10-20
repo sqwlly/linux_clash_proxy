@@ -64,6 +64,16 @@ class WatchReport:
 _SS_LASTSND_RE = re.compile(r"\blastsnd:(\d+)\b")
 _SS_LASTRCV_RE = re.compile(r"\blastrcv:(\d+)\b")
 
+AI_STREAM_HOSTS = frozenset(
+    {
+        "daily-cloudcode-pa.googleapis.com",
+        "chatgpt.com",
+        "api.openai.com",
+        "api.anthropic.com",
+        "claude.ai",
+    }
+)
+
 
 def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[int, int]]:
     """通过 `ss -tnpi` 获取本地代理端口（默认 :7890）各客户端源端口的 `(lastsnd_ms, lastrcv_ms)`。"""
@@ -142,10 +152,11 @@ def reap_idle_gemini_connections(
     api,
     *,
     current_leaf: str | None = None,
+    manual_leaf: str | None = None,
     dry_run: bool = False,
 ) -> list[str]:
-    """主动清理 agy 连接池中闲置的 daily-cloudcode-pa.googleapis.com HTTP/2 连接，
-    防止下一轮长思考 streamGenerateContent 复用半衰期连接撞上 Cloudflare 94s 空闲超时。"""
+    """主动清理 agy / codex / claude 连接池中闲置的 AI HTTP/2 连接，
+    防止下一轮长思考或流式请求复用半衰期连接撞上 Cloudflare 94s 空闲超时。"""
     get_conns = getattr(api, "get_connections", None)
     close_conn = getattr(api, "close_connection", None)
     if not callable(get_conns) or not callable(close_conn):
@@ -168,7 +179,7 @@ def reap_idle_gemini_connections(
         raw_meta = item.get("metadata")
         meta = raw_meta if isinstance(raw_meta, dict) else {}
         host = str(meta.get("host") or "").lower()
-        if host != "daily-cloudcode-pa.googleapis.com":
+        if host not in AI_STREAM_HOSTS:
             continue
         src_port = str(meta.get("sourcePort") or "")
         if not src_port.isdigit():
@@ -179,8 +190,10 @@ def reap_idle_gemini_connections(
         except (TypeError, ValueError):
             continue
         chains = item.get("chains") or []
+        chain_set = {str(part) for part in chains} if isinstance(chains, list) else set()
         leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
-        on_stale_leaf = bool(current_leaf and leaf and leaf != current_leaf)
+        active_leaf = manual_leaf if AI_MANUAL_GROUP in chain_set and manual_leaf else current_leaf
+        on_stale_leaf = bool(active_leaf and leaf and leaf != active_leaf)
         candidates.append((conn_id, upload, download, src_port, on_stale_leaf))
 
     if not candidates:
@@ -218,6 +231,81 @@ def reap_idle_gemini_connections(
                     continue
             reaped.append(conn_id)
     return reaped
+
+
+def has_active_ai_transfer(
+    paths: AppPaths,
+    api,
+    group: str,
+    current_leaf: str | None = None,
+) -> bool:
+    """检测指定 AI 出口组当前是否正有大包上下文上传或活跃流式响应在进行中。
+
+    当 codex 多线程并发上传 3~9MB 上下文或 agy 上传 1~4MB 轨迹时，5Mbps 公网上行会被持续打满
+    20~45s（内核 Send-Q 堆积 1.5MB+），新发起的 5s 看门狗探针会排队超时而误判 `PROBE_DEAD`。
+    若当前叶子上的 AI 连接已上传 `>= 50KB` 且内核 TCP 套接字在最近 `15s` 内仍有真实数据收发
+    （`min(lastsnd_ms, lastrcv_ms) <= 15_000`），说明链路正在全力传输数据而非死节点，暂缓切流。
+    """
+    get_conns = getattr(api, "get_connections", None)
+    if not callable(get_conns):
+        return False
+    try:
+        payload = get_conns()
+    except Exception:
+        return False
+    connections = payload.get("connections") if isinstance(payload, dict) else []
+    if not isinstance(connections, list) or not connections:
+        return False
+
+    ports_to_check: list[tuple[str, int, int]] = []
+    for item in connections:
+        if not isinstance(item, dict) or not QueryService._connection_follows_ai_switch(item, group):
+            continue
+        chains = item.get("chains") or []
+        leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
+        if current_leaf and leaf and leaf != current_leaf:
+            continue
+        raw_meta = item.get("metadata")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        host = str(meta.get("host") or "").lower()
+        if host not in AI_STREAM_HOSTS:
+            continue
+        src_port = str(meta.get("sourcePort") or "")
+        if not src_port.isdigit():
+            continue
+        try:
+            upload = int(item.get("upload") or 0)
+            download = int(item.get("download") or 0)
+        except (TypeError, ValueError):
+            continue
+        if upload >= 50_000:
+            ports_to_check.append((src_port, upload, download))
+
+    if not ports_to_check:
+        return False
+
+    mixed_port = 7890
+    try:
+        cfg = read_config(paths)
+        if isinstance(cfg, dict) and cfg.get("mixed-port"):
+            mixed_port = int(cfg["mixed-port"])
+    except Exception:
+        mixed_port = 7890
+
+    idle_map = get_local_proxy_socket_idle_ms(mixed_port)
+    if not idle_map:
+        return False
+
+    for src_port, upload, download in ports_to_check:
+        timings = idle_map.get(src_port)
+        if timings is None:
+            continue
+        lastsnd_ms, lastrcv_ms = timings
+        if is_idle_completed_gemini_connection(upload, download, lastsnd_ms, lastrcv_ms):
+            continue
+        if min(lastsnd_ms, lastrcv_ms) <= 15_000:
+            return True
+    return False
 
 
 def _read_ppid_and_uid(proc_dir: Path) -> tuple[int | None, int | None]:
@@ -590,10 +678,13 @@ class AIWatchService:
                 report.results.append(self._watch_group(groups, group, state, now, dry_run))
             gemini_res = next((r for r in report.results if r.group == AI_GEMINI_GROUP), None)
             gemini_leaf = (gemini_res.target or gemini_res.current) if gemini_res else None
+            manual_res = next((r for r in report.results if r.group == AI_MANUAL_GROUP), None)
+            manual_leaf = (manual_res.target or manual_res.current) if manual_res else None
             report.reaped_connections = reap_idle_gemini_connections(
                 self.paths,
                 getattr(self.query, "api", None),
                 current_leaf=gemini_leaf,
+                manual_leaf=manual_leaf,
                 dry_run=dry_run,
             )
             report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
@@ -653,6 +744,18 @@ class AIWatchService:
                     log_triggered = True
                 else:
                     gs["last_log_fail_ts"] = max(since_ts, log_ts)
+
+        if (
+            verdict == PROBE_DEAD
+            and not log_triggered
+            and int(gs.get("busy_defer_count") or 0) < 4
+            and has_active_ai_transfer(self.paths, getattr(self.query, "api", None), group, current)
+        ):
+            gs["busy_defer_count"] = int(gs.get("busy_defer_count") or 0) + 1
+            verdict = PROBE_OK
+            detail = "active_transfer_busy"
+        elif verdict == PROBE_OK:
+            gs["busy_defer_count"] = 0
 
         result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
 
@@ -806,7 +909,8 @@ class AIWatchService:
                     except TypeError:
                         self.query.switch_group(group, target)
                 except Exception:
-                    # 切换失败（API 抖动等）：保留失败计数，下一轮重试，不让异常中断循环、丢状态
+                    # 切换失败（目标在 fallback 中 alive=False 或 API 抖动）：将目标记入冷却期避免下轮死循环重试同一节点
+                    gs.setdefault("cooldown", {})[target] = now
                     return result
                 cooldown = gs.setdefault("cooldown", {})
                 if current:

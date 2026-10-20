@@ -139,6 +139,16 @@ class QueryService:
         self.last_switch_from = group.current
 
         try:
+            if group_type == "fallback" and target_name != AI_AUTO_GROUP:
+                target_entry = groups.get(target_name)
+                delay_fn = getattr(self.api, "delay_test", None)
+                if target_entry is not None and target_entry.alive is False and callable(delay_fn):
+                    try:
+                        from ..backend.runtime import TEST_URL
+
+                        delay_fn(target_name, TEST_URL, 5000, request_timeout=6)
+                    except Exception:
+                        pass
             self.api.switch_group(group_name, target_name)
             updated_groups = self.api.get_groups()
             self.groups_snapshot = updated_groups
@@ -180,8 +190,8 @@ class QueryService:
         自动拆掉已建立的长连接，必须显式关闭。若指定 `keep_leaf`（被动 fallback
         巡检场景），则保留已落在新叶子（`chains[0] == keep_leaf`）上的新连接，
         只掐掉滞留在旧叶子上的陈旧连接。
-        对于 `AI-GEMINI`，若旧叶子为非静态 IEPL 的安全节点（如 1X WebSocket），
-        仅关闭闲置连接与后台轮询，绝不强杀正在等待模型思考或正在流式接收响应的活跃长连接。
+        对于 `AI-GEMINI` 与 `AI-MANUAL`，若旧叶子为非静态 IEPL 的安全节点（如 1X WebSocket），
+        仅关闭闲置连接与后台轮询，绝不强杀正在上传大包上下文、等待模型思考或正在流式接收响应的活跃长连接。
         """
         if group_name not in AI_SWITCH_DROP_GROUPS:
             return 0
@@ -201,20 +211,21 @@ class QueryService:
             leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
             if keep_leaf and leaf == keep_leaf:
                 continue
-            if group_name == AI_GEMINI_GROUP and leaf:
+            if group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and leaf:
                 upload = self._to_int(item.get("upload"))
                 download = self._to_int(item.get("download"))
                 raw_meta = item.get("metadata")
                 meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
                 host = str(meta.get("host") or "").lower()
                 src_port = str(meta.get("sourcePort") or "")
-                if upload >= 18_000 and host == "daily-cloudcode-pa.googleapis.com" and src_port.isdigit():
-                    from .ai_watch import (
-                        get_local_proxy_socket_idle_ms,
-                        is_idle_completed_gemini_connection,
-                    )
-                    from .probe import is_static_iepl_node
+                from .ai_watch import (
+                    AI_STREAM_HOSTS,
+                    get_local_proxy_socket_idle_ms,
+                    is_idle_completed_gemini_connection,
+                )
+                from .probe import is_static_iepl_node
 
+                if upload >= 18_000 and host in AI_STREAM_HOSTS and src_port.isdigit():
                     if not is_static_iepl_node(leaf, self.paths):
                         if socket_idle_map is None:
                             socket_idle_map = get_local_proxy_socket_idle_ms()

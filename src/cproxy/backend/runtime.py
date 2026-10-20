@@ -751,7 +751,7 @@ _WS_CDN_IP_RANK_CACHE: dict[tuple[tuple[str, ...], int, str], tuple[float, list[
 _WS_TLS_CACHE_TTL = 300.0
 
 
-def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 1.5) -> int | None:
+def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 2.5) -> int | None:
     import socket
     import ssl
     import time
@@ -827,8 +827,8 @@ def _ws_cdn_ip_log_penalties(
             return recent_errors, total_errors, active_ips
         size = lpath.stat().st_size
         with lpath.open("rb") as fh:
-            if size > 524288:
-                fh.seek(size - 524288)
+            if size > 2097152:
+                fh.seek(size - 2097152)
             tail_text = fh.read().decode("utf-8", errors="ignore")
         now_ts = datetime.now(timezone.utc).timestamp()
         for line in tail_text.splitlines():
@@ -935,7 +935,7 @@ def _resolve_healthy_ws_cdn_ips(
         return []
     min_total_err = min(total_errors.get(ip, 0) for ip in alive_ips)
 
-    scored: list[tuple[tuple[int, int, int, int, int, int, int, int, int, str], str]] = []
+    scored: list[tuple[tuple[int, int, int, int, int, int, int, int, int, int, str], str]] = []
     for ip in alive_ips:
         samples = samples_by_ip[ip]
         succ = len(samples)
@@ -945,19 +945,20 @@ def _resolve_healthy_ws_cdn_ips(
         tot_err = total_errors.get(ip, 0)
         is_active_healthy = (
             ip in active_ips
-            and succ == eff_rounds
-            and max_ms < 1200
+            and succ >= max(1, eff_rounds - 1)
+            and max_ms < 1800
             and rec_err < 3
-            and tot_err <= min_total_err + 10
+            and tot_err <= min_total_err + 5
         )
         prefer_non_104 = 0 if not ip.startswith("104.") else 1
         sort_key = (
             0 if rec_err < 3 else 1,
+            0 if tot_err <= min_total_err + 5 else 1,
+            0 if is_active_healthy else 1,
             -succ,
             rec_err // 3,
+            tot_err // 5,
             0 if max_ms < 1200 else 1,
-            0 if is_active_healthy else 1,
-            tot_err // 10,
             prefer_non_104,
             avg_ms // 100,
             max_ms // 100,
@@ -970,19 +971,41 @@ def _resolve_healthy_ws_cdn_ips(
     return list(result)
 
 
+def _extract_proxy_servers(raw_yaml: str) -> dict[str, str]:
+    if not raw_yaml:
+        return {}
+    try:
+        data = yaml.safe_load(raw_yaml)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, str] = {}
+    for proxy in data.get("proxies") or []:
+        if isinstance(proxy, dict) and proxy.get("name") and proxy.get("server"):
+            result[str(proxy["name"])] = str(proxy["server"])
+    return result
+
+
 def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
-    """清空 CDN TLS 探测缓存并重新探测渲染；若最优 CDN Anycast IP 发生切换则立即热重载 mihomo。"""
+    """清空 CDN TLS 探测缓存并重新探测渲染；仅当节点底层 CDN Anycast IP 真正发生切换时才热重载 mihomo。"""
     _WS_TLS_PROBE_CACHE.clear()
     _WS_CDN_IP_RANK_CACHE.clear()
     rt_path = runtime_file(paths)
     old_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
+    old_servers = _extract_proxy_servers(old_text)
     RuntimeBackend(paths).render_runtime()
     new_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
+    new_servers = _extract_proxy_servers(new_text)
+    if old_servers and new_servers and old_servers != new_servers:
+        from .process import ProcessBackend
+
+        ProcessBackend(paths).reload_if_running(rt_path)
+        return True
     if old_text and new_text and old_text != new_text:
         from .process import ProcessBackend
 
-        ProcessBackend(paths).reload_if_running()
-        return True
+        ProcessBackend(paths).mark_runtime_applied(rt_path)
     return False
 
 
