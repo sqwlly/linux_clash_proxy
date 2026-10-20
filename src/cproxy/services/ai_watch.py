@@ -457,9 +457,9 @@ class AIWatchService:
         previous_active = gs.get("last_active")
         log_triggered = False
         if group == AI_GEMINI_GROUP:
-            # 若节点已由外部切换或自动优选变更，设 90s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
+            # 若节点已由外部切换或自动优选变更，设 30s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
             if previous_active and current and previous_active != current:
-                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 90.0)
+                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 30.0)
             since_ts = float(gs.get("last_log_fail_ts") or 0.0)
             log_failed, log_ts, log_reason = detect_recent_agy_retry_failure(
                 self.agy_log_dir, now=now, since_ts=since_ts
@@ -653,11 +653,11 @@ class AIWatchService:
                         sf[current] = now
                         state["stream_fragile"] = sf
                 if group == AI_GEMINI_GROUP:
-                    # 设 90s 切流静默保护窗
+                    # 设 30s 切流静默保护窗
                     gs["last_log_fail_ts"] = max(
                         float(gs.get("last_log_fail_ts") or 0.0),
-                        now + 90.0,
-                        time.time() + 90.0,
+                        now + 30.0,
+                        time.time() + 30.0,
                     )
                 if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
                     _promote_gemini_order_head(self.paths, target, group=group)

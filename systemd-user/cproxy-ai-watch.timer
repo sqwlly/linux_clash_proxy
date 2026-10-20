@@ -3,9 +3,9 @@ Description=Periodically watch AI egress health
 
 [Timer]
 Unit=cproxy-ai-watch.service
-OnBootSec=1min
-OnUnitActiveSec=90s
-AccuracySec=5s
+OnBootSec=30s
+OnUnitActiveSec=20s
+AccuracySec=1s
 Persistent=true
 
 [Install]
