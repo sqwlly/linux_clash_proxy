@@ -1122,4 +1122,110 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     assert is_iepl_node("🇰🇷韩国 01 | 1X", paths) is False
 
 
+def test_reap_idle_gemini_connections_and_preserve_inflight_streams(tmp_path: Path, monkeypatch) -> None:
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services import ai_watch as ai_watch_mod
+    from cproxy.services.ai_watch import (
+        _is_stream_safe_gemini_leaf,
+        _promote_gemini_order_head,
+        reap_idle_gemini_connections,
+    )
+    from cproxy.services.probe import record_stream_fragile_node
+    from cproxy.services.query import QueryService
+
+    paths = _make_paths(tmp_path / "idle-reaper")
+
+    # 模拟本地 :7890 各连接的内核 TCP lastsnd / lastrcv (ms)：
+    # - 38496: 后台小包轮询 (upload=2242, download=4768)，已闲置 22s -> 应回收
+    # - 52690: sir_flash_lite 监控请求 (upload=15512, download=5973)，已闲置 12s -> 应回收
+    # - 44418: 新建连接正在等待 Gemini 长思考 (upload=318744, download=4291, lastsnd=68000, lastrcv=67996) -> 绝不误杀
+    # - 39082: 复用连接正在等待第二轮长思考 (upload=7229624, download=80856, lastsnd=55000, lastrcv=54800) -> 绝不误杀
+    # - 52900: 正在流式接收 SSE 响应 (upload=276224, download=44108, lastsnd=50, lastrcv=1350) -> 绝不误杀
+    # - 60610: 已完成 SSE 响应并在连接池闲置 42s (upload=320000, download=45000, lastsnd=42000, lastrcv=48000) -> 应回收
+    fake_idle_map = {
+        "38496": (22_000, 22_000),
+        "52690": (12_000, 14_200),
+        "44418": (68_000, 67_996),
+        "39082": (55_000, 54_800),
+        "52900": (50, 1_350),
+        "60610": (42_000, 48_000),
+    }
+    monkeypatch.setattr(ai_watch_mod, "get_local_proxy_socket_idle_ms", lambda _port=7890: fake_idle_map)
+
+    connections = [
+        {
+            "id": "poll-idle",
+            "chains": ["🇫🇷法国 01 | 1X", "AI-GEMINI"],
+            "upload": 2242,
+            "download": 4768,
+            "metadata": {"host": "daily-cloudcode-pa.googleapis.com", "sourcePort": "38496"},
+        },
+        {
+            "id": "monitor-idle",
+            "chains": ["🇫🇷法国 01 | 1X", "AI-GEMINI"],
+            "upload": 15512,
+            "download": 5973,
+            "metadata": {"host": "daily-cloudcode-pa.googleapis.com", "sourcePort": "52690"},
+        },
+        {
+            "id": "thinking-fresh",
+            "chains": ["🇫🇷法国 01 | 1X", "AI-GEMINI"],
+            "upload": 318744,
+            "download": 4291,
+            "metadata": {"host": "daily-cloudcode-pa.googleapis.com", "sourcePort": "44418"},
+        },
+        {
+            "id": "thinking-reused",
+            "chains": ["🇫🇷法国 01 | 1X", "AI-GEMINI"],
+            "upload": 7229624,
+            "download": 80856,
+            "metadata": {"host": "daily-cloudcode-pa.googleapis.com", "sourcePort": "39082"},
+        },
+        {
+            "id": "streaming-active",
+            "chains": ["🇫🇷法国 01 | 1X", "AI-GEMINI"],
+            "upload": 276224,
+            "download": 44108,
+            "metadata": {"host": "daily-cloudcode-pa.googleapis.com", "sourcePort": "52900"},
+        },
+        {
+            "id": "turn-done-idle",
+            "chains": ["🇫🇷法国 01 | 1X", "AI-GEMINI"],
+            "upload": 320000,
+            "download": 45000,
+            "metadata": {"host": "daily-cloudcode-pa.googleapis.com", "sourcePort": "60610"},
+        },
+    ]
+    closed: list[str] = []
+
+    class _FakeAPI:
+        def get_connections(self):
+            return {"connections": connections}
+
+        def close_connection(self, cid: str):
+            closed.append(cid)
+
+    reaped = reap_idle_gemini_connections(paths, _FakeAPI(), current_leaf="🇫🇷法国 01 | 1X")
+    assert reaped == ["poll-idle", "monitor-idle", "turn-done-idle"]
+    assert closed == ["poll-idle", "monitor-idle", "turn-done-idle"]
+
+    # 当 AI-GEMINI 从 🇫🇷法国 01 | 1X 切往 🇬🇧英国 01 | 1X 时，_drop_stale_ai_connections
+    # 只清理闲置连接，绝不强杀正在等待思考或正在流式接收响应的活跃连接
+    closed.clear()
+    q = QueryService(paths)
+    q.api = _FakeAPI()  # type: ignore[assignment]
+    dropped_count = q._drop_stale_ai_connections("AI-GEMINI", keep_leaf="🇬🇧英国 01 | 1X")
+    assert dropped_count == 3
+    assert closed == ["poll-idle", "monitor-idle", "turn-done-idle"]
+
+    # 即便 1X 节点曾记入 stream_fragile，_is_stream_safe_gemini_leaf 与 _promote_gemini_order_head 仍正常生效
+    record_stream_fragile_node(paths, "🇫🇷法国 01 | 1X")
+    assert _is_stream_safe_gemini_leaf(paths, "🇫🇷法国 01 | 1X") is True
+    order_path = ai_gemini_order_file(paths)
+    order_path.write_text('["🇬🇧英国 01 | 1X", "🇫🇷法国 01 | 1X"]', encoding="utf-8")
+    _promote_gemini_order_head(paths, "🇫🇷法国 01 | 1X")
+    assert json.loads(order_path.read_text(encoding="utf-8"))[0] == "🇫🇷法国 01 | 1X"
+
+
+
 

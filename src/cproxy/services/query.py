@@ -180,6 +180,8 @@ class QueryService:
         自动拆掉已建立的长连接，必须显式关闭。若指定 `keep_leaf`（被动 fallback
         巡检场景），则保留已落在新叶子（`chains[0] == keep_leaf`）上的新连接，
         只掐掉滞留在旧叶子上的陈旧连接。
+        对于 `AI-GEMINI`，若旧叶子为非静态 IEPL 的安全节点（如 1X WebSocket），
+        仅关闭闲置连接与后台轮询，绝不强杀正在等待模型思考或正在流式接收响应的活跃长连接。
         """
         if group_name not in AI_SWITCH_DROP_GROUPS:
             return 0
@@ -190,14 +192,41 @@ class QueryService:
         connections = payload.get("connections") if isinstance(payload, dict) else []
         if not isinstance(connections, list):
             return 0
+        socket_idle_map: dict[str, tuple[int, int]] | None = None
         dropped = 0
         for item in connections:
             if not isinstance(item, dict) or not self._connection_follows_ai_switch(item, group_name):
                 continue
-            if keep_leaf:
-                chains = item.get("chains") or []
-                if isinstance(chains, list) and chains and str(chains[0]) == keep_leaf:
-                    continue
+            chains = item.get("chains") or []
+            leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
+            if keep_leaf and leaf == keep_leaf:
+                continue
+            if group_name == AI_GEMINI_GROUP and leaf:
+                upload = self._to_int(item.get("upload"))
+                download = self._to_int(item.get("download"))
+                raw_meta = item.get("metadata")
+                meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+                host = str(meta.get("host") or "").lower()
+                src_port = str(meta.get("sourcePort") or "")
+                if upload >= 18_000 and host == "daily-cloudcode-pa.googleapis.com" and src_port.isdigit():
+                    from .ai_watch import (
+                        get_local_proxy_socket_idle_ms,
+                        is_idle_completed_gemini_connection,
+                    )
+                    from .probe import is_static_iepl_node
+
+                    if not is_static_iepl_node(leaf, self.paths):
+                        if socket_idle_map is None:
+                            socket_idle_map = get_local_proxy_socket_idle_ms()
+                        timings = socket_idle_map.get(src_port)
+                        if timings is not None and not is_idle_completed_gemini_connection(
+                            upload,
+                            download,
+                            timings[0],
+                            timings[1],
+                            on_stale_leaf=True,
+                        ):
+                            continue
             conn_id = str(item.get("id") or "")
             if not conn_id:
                 continue

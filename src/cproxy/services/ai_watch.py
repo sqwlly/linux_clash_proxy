@@ -58,6 +58,166 @@ class WatchGroupResult:
 class WatchReport:
     results: list[WatchGroupResult] = field(default_factory=list)
     reaped_pids: list[int] = field(default_factory=list)
+    reaped_connections: list[str] = field(default_factory=list)
+
+
+_SS_LASTSND_RE = re.compile(r"\blastsnd:(\d+)\b")
+_SS_LASTRCV_RE = re.compile(r"\blastrcv:(\d+)\b")
+
+
+def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[int, int]]:
+    """通过 `ss -tnpi` 获取本地代理端口（默认 :7890）各客户端源端口的 `(lastsnd_ms, lastrcv_ms)`。"""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["ss", "-tnpi", f"( sport = :{int(mixed_port)} )"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return {}
+    except Exception:
+        return {}
+
+    idle_map: dict[str, tuple[int, int]] = {}
+    pending_port: str | None = None
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("ESTAB"):
+            parts = line.split()
+            pending_port = None
+            if len(parts) >= 5:
+                peer_port = parts[4].rsplit(":", 1)[-1]
+                if peer_port.isdigit():
+                    pending_port = peer_port
+        elif pending_port is not None:
+            m_snd = _SS_LASTSND_RE.search(line)
+            m_rcv = _SS_LASTRCV_RE.search(line)
+            if m_snd is not None and m_rcv is not None:
+                idle_map[pending_port] = (int(m_snd.group(1)), int(m_rcv.group(1)))
+            pending_port = None
+    return idle_map
+
+
+def is_idle_completed_gemini_connection(
+    upload: int,
+    download: int,
+    lastsnd_ms: int,
+    lastrcv_ms: int,
+    *,
+    on_stale_leaf: bool = False,
+) -> bool:
+    """判定 daily-cloudcode-pa.googleapis.com 的 HTTP/2 连接是否已完成请求响应并处于连接池闲置状态。
+
+    1X WebSocket 节点（经 Cloudflare CDN 反代）存在约 94s 的下行空闲超时（proxy_read_timeout）。
+    agy 后台轮询（ListExperiments / loadCodeAssist / fetchAvailableModels / sir_flash_lite）与已结束的
+    streamGenerateContent 轮次会把 HTTP/2 连接留在连接池中闲置 20~60s；若重型思考轮次（需 45~75s 才返回
+    HTTP 200 响应头）复用了已闲置的连接，必定在思考中途撞上 94s 上限而报 `Post "...": EOF`。
+
+    安全边界（绝不误杀正在等待模型思考或流式输出的活跃连接）：
+    - 等待模型思考（HTTP 200 响应头未到达）时：
+      - 新连接：`download < 5800`（仅有 TLS 握手与初始 HTTP/2 SETTINGS）；
+      - 复用连接：`lastrcv_ms <= lastsnd_ms`（客户端上传完本轮 Prompt 在上一轮响应之后，且尚无本轮下行响应）。
+    - 已完成响应并闲置的连接：
+      1. 小包后台轮询或安全监控（`0 < upload < 18_000` 且 `download >= 4_000`）：双方向静默 `>= 6_000ms`；
+      2. 大包 `streamGenerateContent` 已完成轮次（`upload >= 18_000` 且 `download >= 6_000` 且 `lastrcv_ms - lastsnd_ms >= 400`）：
+         若滞留在已切走的旧叶子上则静默 `>= 10_000ms` 回收，若在当前叶子上则静默 `>= 35_000ms` 回收（保证下一轮获得满额 94s 预算）。
+    """
+    idle_ms = min(lastsnd_ms, lastrcv_ms)
+    if 0 < upload < 18_000:
+        return download >= 4_000 and idle_ms >= 6_000
+    if upload >= 18_000:
+        threshold_ms = 10_000 if on_stale_leaf else 35_000
+        return download >= 6_000 and (lastrcv_ms - lastsnd_ms) >= 400 and idle_ms >= threshold_ms
+    return False
+
+
+def reap_idle_gemini_connections(
+    paths: AppPaths,
+    api,
+    *,
+    current_leaf: str | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """主动清理 agy 连接池中闲置的 daily-cloudcode-pa.googleapis.com HTTP/2 连接，
+    防止下一轮长思考 streamGenerateContent 复用半衰期连接撞上 Cloudflare 94s 空闲超时。"""
+    get_conns = getattr(api, "get_connections", None)
+    close_conn = getattr(api, "close_connection", None)
+    if not callable(get_conns) or not callable(close_conn):
+        return []
+    try:
+        payload = get_conns()
+    except Exception:
+        return []
+    connections = payload.get("connections") if isinstance(payload, dict) else []
+    if not isinstance(connections, list) or not connections:
+        return []
+
+    candidates: list[tuple[str, int, int, str, bool]] = []
+    for item in connections:
+        if not isinstance(item, dict):
+            continue
+        conn_id = str(item.get("id") or "")
+        if not conn_id:
+            continue
+        raw_meta = item.get("metadata")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        host = str(meta.get("host") or "").lower()
+        if host != "daily-cloudcode-pa.googleapis.com":
+            continue
+        src_port = str(meta.get("sourcePort") or "")
+        if not src_port.isdigit():
+            continue
+        try:
+            upload = int(item.get("upload") or 0)
+            download = int(item.get("download") or 0)
+        except (TypeError, ValueError):
+            continue
+        chains = item.get("chains") or []
+        leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
+        on_stale_leaf = bool(current_leaf and leaf and leaf != current_leaf)
+        candidates.append((conn_id, upload, download, src_port, on_stale_leaf))
+
+    if not candidates:
+        return []
+
+    mixed_port = 7890
+    try:
+        cfg = read_config(paths)
+        if isinstance(cfg, dict) and cfg.get("mixed-port"):
+            mixed_port = int(cfg["mixed-port"])
+    except Exception:
+        mixed_port = 7890
+
+    idle_map = get_local_proxy_socket_idle_ms(mixed_port)
+    if not idle_map:
+        return []
+
+    reaped: list[str] = []
+    for conn_id, upload, download, src_port, on_stale_leaf in candidates:
+        timings = idle_map.get(src_port)
+        if timings is None:
+            continue
+        lastsnd_ms, lastrcv_ms = timings
+        if is_idle_completed_gemini_connection(
+            upload,
+            download,
+            lastsnd_ms,
+            lastrcv_ms,
+            on_stale_leaf=on_stale_leaf,
+        ):
+            if not dry_run:
+                try:
+                    close_conn(conn_id)
+                except Exception:
+                    continue
+            reaped.append(conn_id)
+    return reaped
 
 
 def _read_ppid_and_uid(proc_dir: Path) -> tuple[int | None, int | None]:
@@ -360,7 +520,7 @@ def detect_recent_agy_retry_failure(
 def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEMINI_GROUP) -> None:
     """将刚切中的 AI 健康目标节点同步提升到对应 order.json 首位，
     防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
-    if not target or is_dynamic_stream_fragile(target, paths):
+    if not target or is_static_iepl_node(target, paths):
         return
     order_path = ai_gemini_order_file(paths) if group == AI_GEMINI_GROUP else ai_manual_order_file(paths)
     if not order_path.exists():
@@ -369,7 +529,9 @@ def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEM
         data = json.loads(order_path.read_text(encoding="utf-8"))
         if not isinstance(data, list) or not data or data[0] == target:
             return
-        if is_iepl_node(target, paths) and any(item and not is_iepl_node(str(item), paths) for item in data):
+        if is_static_iepl_node(target, paths) and any(
+            item and not is_static_iepl_node(str(item), paths) for item in data
+        ):
             return
         updated = [target] + [str(item) for item in data if item and str(item) != target]
         order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
@@ -381,11 +543,11 @@ def _is_stream_safe_gemini_leaf(paths: AppPaths, node_name: str | None) -> bool:
     """判断 AI-GEMINI 当前叶子是否为抗断流安全节点（1X / WebSocket / Hysteria2 / TUIC / SS 等非 IEPL/裸vision 节点）。
 
     兼容不同机场命名（包括完全无 IEPL 节点、或全部为普通命名的机场）：
-    1. 若名称含 `IEPL` / `IPLC` / `内网专线`、或协议为裸 TCP `xtls-rprx-vision`、或有动态实测断流记录，直接判为非安全；
+    1. 若名称含 `IEPL` / `IPLC` / `内网专线`、或协议为裸 TCP `xtls-rprx-vision`，直接判为非安全；
     2. 查阅本地 `config.yaml` 的 `proxies` 协议字典：若能查到该节点且 `not is_stream_fragile_proxy(proxy_dict, node_name)`，视为安全节点；
     3. 若名称显式含 `1X`，判为安全。
     """
-    if not node_name or is_iepl_node(node_name, paths):
+    if not node_name or is_static_iepl_node(node_name, paths):
         return False
     try:
         from ..backend.runtime import is_stream_fragile_proxy
@@ -426,6 +588,14 @@ class AIWatchService:
             now = time.time()
             for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
                 report.results.append(self._watch_group(groups, group, state, now, dry_run))
+            gemini_res = next((r for r in report.results if r.group == AI_GEMINI_GROUP), None)
+            gemini_leaf = (gemini_res.target or gemini_res.current) if gemini_res else None
+            report.reaped_connections = reap_idle_gemini_connections(
+                self.paths,
+                getattr(self.query, "api", None),
+                current_leaf=gemini_leaf,
+                dry_run=dry_run,
+            )
             report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
             if not dry_run:
                 _save_state(self.paths, state)
