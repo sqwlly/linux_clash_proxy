@@ -1323,8 +1323,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     matrix = [
         # Loopback 已写完 4.27MB 但内核 Recv-Q 仍有 2.48MB 排队上行（即便 lastsnd=27s, lastrcv=17s）-> uploading
         ("codex-recvq-backlogged", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47334", 4_275_497, 3_947, (27_514, 17_016, 2_488_578, 0), "uploading"),
-        # 刚排空 Recv-Q 正在等待 gpt-6.1-sol 长思考返回 HTTP 200 头（download=3947 < 6000, idle=38s）-> thinking
-        ("codex-thinking-ttfb", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47335", 4_275_497, 3_947, (38_000, 37_500, 0, 0), "thinking"),
+        # 10.35MB 超大包上行 + gpt-6.1-sol 长思考已耗时 110s（download=3947 < 6000, idle=110s > 95s）-> 依然是 thinking，绝不误判为 idle_completed 强杀！
+        ("codex-thinking-ttfb", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47335", 10_350_000, 3_947, (110_000, 109_500, 0, 0), "thinking"),
         # agy 复用旧 HTTP/2 连接发起第二轮长思考（lastrcv=62s <= lastsnd=62.1s）-> thinking
         ("agy-reused-thinking", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "39082", 7_229_624, 80_856, (62_100, 62_000, 0, 0), "thinking"),
         # Send-Q 有未读 SSE 数据块 -> streaming
@@ -1332,7 +1332,7 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
         # 正常流式 SSE 收包中（:7890 向客户端发送 SSE lastsnd=800ms，客户端上次发包 lastrcv=4000ms）-> streaming
         ("claude-sse-active", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "api.anthropic.com", "52902", 180_000, 32_000, (800, 4_000, 0, 0), "streaming"),
         # 已完成大包轮次并在连接池静默 40s (lastrcv > lastsnd + 400ms, recv_q=0, send_q=0) -> idle_completed
-        ("codex-turn-done-idle", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "60611", 1_500_000, 64_000, (40_000, 42_000, 0, 0), "idle_completed"),
+        ("agy-turn-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "60611", 1_500_000, 64_000, (40_000, 42_000, 0, 0), "idle_completed"),
         # 小包后台轮询已完成并静默 8s -> idle_completed
         ("agy-poll-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "38497", 3_200, 5_100, (8_000, 8_200, 0, 0), "idle_completed"),
     ]
@@ -1444,8 +1444,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
         runtime_mod,
         "_ws_cdn_ip_log_penalties",
         lambda _ips, _port, paths=None: (
-            {"104.21.87.131": 0, "172.67.143.95": 0},
-            {"104.21.87.131": 69, "172.67.143.95": 0},
+            {"104.21.87.131": 0, "172.67.143.95": 3},
+            {"104.21.87.131": 50, "172.67.143.95": 13},
             {"172.67.143.95"},
         ),
     )
@@ -1458,6 +1458,47 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     )
     assert "172.64.146.118" not in ranked
     assert ranked[0] == "172.67.143.95"
+
+    # 4. 阶段 C：验证 Codex SQLite 重试日志自愈检测与仅 AI 排序变更免热重载不变量
+    import sqlite3
+    import time
+    from cproxy.backend.runtime import is_only_ai_group_order_change
+    from cproxy.services.ai_watch import detect_recent_codex_retry_failure, has_any_inflight_ai_connection
+
+    assert has_any_inflight_ai_connection(paths, q.api) is True
+    assert (
+        is_only_ai_group_order_change(
+            "proxies:\n  - name: A\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [A, B]\nrules: [MATCH,AI-MANUAL]\n",
+            "proxies:\n  - name: A\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [B, A]\nrules: [MATCH,AI-MANUAL]\n",
+        )
+        is True
+    )
+    assert (
+        is_only_ai_group_order_change(
+            "proxies:\n  - name: A\n    server: 1.1.1.1\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [A, B]\n",
+            "proxies:\n  - name: A\n    server: 1.1.1.2\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [B, A]\n",
+        )
+        is False
+    )
+
+    codex_dir = tmp_path / "codex-logs"
+    codex_dir.mkdir()
+    db_file = codex_dir / "logs_2.sqlite"
+    now_epoch = int(time.time())
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, level TEXT, target TEXT, feedback_log_body TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES (1, ?, 100000000, 'WARN', 'codex_core::responses_retry', "
+        "'stream disconnected - retrying sampling request (2/5 in 431ms)... retries=2 max_retries=5 sampling_error=stream disconnected before completion: error sending request')",
+        (now_epoch - 4,),
+    )
+    conn.commit()
+    conn.close()
+    c_failed, _cts, c_reason = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
+    assert c_failed is True
+    assert "error sending request" in c_reason
 
 
 

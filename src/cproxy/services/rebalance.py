@@ -273,14 +273,18 @@ class RebalanceService:
         is_stale = getattr(process, "is_runtime_stale", lambda _path=None: False)(runtime_path)
         hot_reloaded = False
         if running and (order_updated or gemini_order_updated or runtime_changed or is_stale):
-            try:
-                APIBackend(self.paths).reload_config(str(runtime_path))
-                hot_reloaded = True
-            except Exception:
-                # 热重载失败留给下一轮 cproxy render/rebalance 兜底，不阻断
-                hot_reloaded = False
-            if hot_reloaded and hasattr(process, "mark_runtime_applied"):
-                process.mark_runtime_applied(runtime_path)
+            from .ai_watch import has_any_inflight_ai_connection
+
+            api_instance = APIBackend(self.paths)
+            if not has_any_inflight_ai_connection(self.paths, api_instance):
+                try:
+                    api_instance.reload_config(str(runtime_path))
+                    hot_reloaded = True
+                except Exception:
+                    # 热重载失败留给下一轮 cproxy render/rebalance 兜底，不阻断
+                    hot_reloaded = False
+                if hot_reloaded and hasattr(process, "mark_runtime_applied"):
+                    process.mark_runtime_applied(runtime_path)
 
         switched_to: str | None = None
         if running and effective_order:
@@ -443,6 +447,10 @@ class RebalanceService:
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
             current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
+            from .ai_watch import has_active_ai_transfer
+
+            if has_active_ai_transfer(self.paths, getattr(query, "api", None), group_name, current_node):
+                return None
             should_drop = group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) or is_static_iepl_node(current_node, self.paths)
             try:
                 query.switch_group(group_name, best_candidate, drop_connections=should_drop)

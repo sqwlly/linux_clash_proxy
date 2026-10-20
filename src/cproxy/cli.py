@@ -155,14 +155,40 @@ def run(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "render":
             paths = default_paths()
+            apply_requested = bool(getattr(args, "apply", False))
+            old_text = ""
+            was_stale_before_render = False
+            process = ProcessBackend(paths) if apply_requested else None
+            if apply_requested and process is not None:
+                from .config import runtime_file as _rt_file
+
+                prev_rt = _rt_file(paths)
+                if prev_rt.exists():
+                    try:
+                        old_text = prev_rt.read_text(encoding="utf-8")
+                    except OSError:
+                        old_text = ""
+                if process.is_running():
+                    was_stale_before_render = process.is_runtime_stale(prev_rt)
             runtime_path = render_runtime(paths)
             print(f"已生成运行配置: {runtime_path}")
-            if getattr(args, "apply", False):
-                process = ProcessBackend(paths)
+            if apply_requested and process is not None:
                 if process.is_running() and process.is_runtime_stale(runtime_path):
-                    APIBackend(paths).reload_config(str(runtime_path))
-                    process.mark_runtime_applied(runtime_path)
-                    print("已热重载运行配置")
+                    from .backend.runtime import is_only_ai_group_order_change
+                    from .services.ai_watch import has_any_inflight_ai_connection
+
+                    new_text = ""
+                    try:
+                        new_text = Path(runtime_path).read_text(encoding="utf-8")
+                    except OSError:
+                        new_text = ""
+                    api = APIBackend(paths)
+                    if not was_stale_before_render and is_only_ai_group_order_change(old_text, new_text):
+                        process.mark_runtime_applied(runtime_path)
+                    elif not has_any_inflight_ai_connection(paths, api):
+                        api.reload_config(str(runtime_path))
+                        process.mark_runtime_applied(runtime_path)
+                        print("已热重载运行配置")
             return 0
         if args.command == "tun":
             if args.action == "status" and args.apply:

@@ -227,20 +227,19 @@ class QueryService:
                 from .probe import is_static_iepl_node
 
                 if upload >= 18_000 and host in AI_STREAM_HOSTS and src_port.isdigit():
-                    if not is_static_iepl_node(leaf, self.paths):
-                        if socket_idle_map is None:
-                            socket_idle_map = get_local_proxy_socket_idle_ms()
-                        unpacked = _unpack_socket_timings(socket_idle_map.get(src_port), src_port)
-                        if unpacked is not None and is_inflight_ai_connection(
-                            upload,
-                            download,
-                            unpacked[0],
-                            unpacked[1],
-                            on_stale_leaf=True,
-                            recv_q=unpacked[2],
-                            send_q=unpacked[3],
-                        ):
-                            continue
+                    if socket_idle_map is None:
+                        socket_idle_map = get_local_proxy_socket_idle_ms()
+                    unpacked = _unpack_socket_timings(socket_idle_map.get(src_port), src_port)
+                    if unpacked is not None and is_inflight_ai_connection(
+                        upload,
+                        download,
+                        unpacked[0],
+                        unpacked[1],
+                        on_stale_leaf=True,
+                        recv_q=unpacked[2],
+                        send_q=unpacked[3],
+                    ):
+                        continue
             conn_id = str(item.get("id") or "")
             if not conn_id:
                 continue

@@ -959,17 +959,17 @@ def _resolve_healthy_ws_cdn_ips(
             ip in active_ips
             and succ >= max(1, eff_rounds - 1)
             and max_ms < 1800
-            and rec_err < 3
+            and rec_err < 12
             and tot_err <= min_total_err + 5
         )
         prefer_non_104 = 0 if not ip.startswith("104.") else 1
         sort_key = (
-            0 if rec_err < 3 else 1,
+            0 if rec_err < 12 else 1,
             0 if tot_err <= min_total_err + 5 else 1,
             0 if is_active_healthy else 1,
             -succ,
-            rec_err // 3,
             tot_err // 5,
+            rec_err // 4,
             0 if max_ms < 1200 else 1,
             prefer_non_104,
             avg_ms // 100,
@@ -999,8 +999,46 @@ def _extract_proxy_servers(raw_yaml: str) -> dict[str, str]:
     return result
 
 
+def is_only_ai_group_order_change(old_text: str, new_text: str) -> bool:
+    """判断两次渲染的 runtime.yaml 是否仅在 AI 策略组的候选节点排序上有差异（节点定义、server IP、规则完全未变）。"""
+    if not old_text or not new_text or old_text == new_text:
+        return False
+    try:
+        old_cfg = yaml.safe_load(old_text)
+        new_cfg = yaml.safe_load(new_text)
+    except Exception:
+        return False
+    if not isinstance(old_cfg, dict) or not isinstance(new_cfg, dict):
+        return False
+    if set(old_cfg.keys()) != set(new_cfg.keys()):
+        return False
+    for k in old_cfg:
+        if k == "proxy-groups":
+            continue
+        if old_cfg.get(k) != new_cfg.get(k):
+            return False
+    old_groups = old_cfg.get("proxy-groups")
+    new_groups = new_cfg.get("proxy-groups")
+    if not isinstance(old_groups, list) or not isinstance(new_groups, list) or len(old_groups) != len(new_groups):
+        return False
+    for og, ng in zip(old_groups, new_groups):
+        if not isinstance(og, dict) or not isinstance(ng, dict):
+            return False
+        if og == ng:
+            continue
+        if og.get("name") != ng.get("name") or og.get("name") not in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+            return False
+        if {k: v for k, v in og.items() if k != "proxies"} != {k: v for k, v in ng.items() if k != "proxies"}:
+            return False
+        op = og.get("proxies") or []
+        np = ng.get("proxies") or []
+        if not isinstance(op, list) or not isinstance(np, list) or len(op) != len(np) or set(op) != set(np):
+            return False
+    return True
+
+
 def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
-    """清空 CDN TLS 探测缓存并重新探测渲染；仅当节点底层 CDN Anycast IP 真正发生切换时才热重载 mihomo。"""
+    """清空 CDN TLS 探测缓存并重新探测渲染；仅当节点底层 CDN Anycast IP 真正发生切换且无活跃 AI 传输时才热重载 mihomo。"""
     _WS_TLS_PROBE_CACHE.clear()
     _WS_CDN_IP_RANK_CACHE.clear()
     rt_path = runtime_file(paths)
@@ -1010,8 +1048,11 @@ def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
     new_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
     new_servers = _extract_proxy_servers(new_text)
     if old_servers and new_servers and old_servers != new_servers:
+        from ..services.ai_watch import has_any_inflight_ai_connection
         from .process import ProcessBackend
 
+        if has_any_inflight_ai_connection(paths):
+            return False
         ProcessBackend(paths).reload_if_running(rt_path)
         return True
     if old_text and new_text and old_text != new_text:

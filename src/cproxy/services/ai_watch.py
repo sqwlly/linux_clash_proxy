@@ -64,6 +64,12 @@ class WatchReport:
 _SS_LASTSND_RE = re.compile(r"\blastsnd:(\d+)\b")
 _SS_LASTRCV_RE = re.compile(r"\blastrcv:(\d+)\b")
 
+GEMINI_STREAM_HOSTS = frozenset(
+    {
+        "daily-cloudcode-pa.googleapis.com",
+    }
+)
+
 AI_STREAM_HOSTS = frozenset(
     {
         "daily-cloudcode-pa.googleapis.com",
@@ -173,9 +179,9 @@ def classify_ai_connection_lifecycle(
         if download < 6_000 or (lastrcv_ms - lastsnd_ms) < 400:
             if min(lastsnd_ms, lastrcv_ms) <= 5_000 and download < 6_000:
                 return "uploading"
-            if idle_ms <= 95_000:
+            if idle_ms <= 300_000:
                 return "thinking"
-            return "idle_completed"
+            return "stalled_thinking"
         if idle_ms < threshold_ms:
             return "streaming"
         return "idle_completed"
@@ -276,6 +282,10 @@ def reap_idle_gemini_connections(
         leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
         active_leaf = manual_leaf if AI_MANUAL_GROUP in chain_set and manual_leaf else current_leaf
         on_stale_leaf = bool(active_leaf and leaf and leaf != active_leaf)
+        # 在当前活跃叶子上，仅主动回收 Gemini HTTP/2 连接池与轻量化轮询（upload < 18KB），
+        # 绝不主动强杀活跃叶子上 codex / claude 的大包长连接（防止多步推理/工具调用间隙断流）
+        if not on_stale_leaf and host not in GEMINI_STREAM_HOSTS and upload >= 18_000:
+            continue
         candidates.append((conn_id, upload, download, src_port, on_stale_leaf))
 
     if not candidates:
@@ -395,6 +405,22 @@ def has_active_ai_transfer(
         ):
             return True
     return False
+
+
+def has_any_inflight_ai_connection(paths: AppPaths, api=None) -> bool:
+    """检测任意 AI 策略组（AI-MANUAL / AI-GEMINI）是否存在正在上传、模型思考或流式输出中的活跃连接。
+    用于拦截周期性 `cproxy render --apply` 与 `rebalance` 的破坏性 `PUT /configs?force=true` 热重载。
+    """
+    if api is None:
+        try:
+            from ..backend.api import APIBackend
+
+            api = APIBackend(paths)
+        except Exception:
+            return False
+    return has_active_ai_transfer(paths, api, AI_MANUAL_GROUP) or has_active_ai_transfer(
+        paths, api, AI_GEMINI_GROUP
+    )
 
 
 def _read_ppid_and_uid(proc_dir: Path) -> tuple[int | None, int | None]:
@@ -694,6 +720,102 @@ def detect_recent_agy_retry_failure(
     return False, max_seen_ts, ""
 
 
+_CODEX_RETRIES_RE = re.compile(r"\bretries=(\d+)\b")
+_CODEX_SAMPLING_ERR_RE = re.compile(r"\bsampling_error=(.+)$")
+_CODEX_CONN_ERR_RE = re.compile(r"\berror=(.+?)(?:\s+retry_delay=|$)")
+
+
+def default_codex_log_dir(paths: AppPaths) -> Path:
+    if paths.state_dir.parent.name == "state" and paths.state_dir.parent.parent.name == ".local":
+        base = paths.state_dir.parent.parent.parent
+    else:
+        base = paths.state_dir.parent.parent
+    return base / ".codex"
+
+
+def detect_recent_codex_retry_failure(
+    codex_dir: Path | None,
+    *,
+    now: float | None = None,
+    window_seconds: float = AGY_LOG_WINDOW_SECONDS,
+    since_ts: float = 0.0,
+) -> tuple[bool, float, str]:
+    """扫描近期活跃的 `~/.codex/logs_*.sqlite` 尾部，检测 Codex 是否刚出现流式断连或发包重试失败。
+
+    使用只读 URI 模式（`mode=ro`）与主键尾部窗口（`id > max(id) - 500`）做亚毫秒级查询，
+    绝不阻塞或争用正在运行的 codex 进程写锁；若在失败事件之后已有新的 `stream_events_utils`
+    成功事件，说明当前出口已恢复推流，不误切节点。
+    """
+    if codex_dir is None or not codex_dir.is_dir():
+        return False, since_ts, ""
+    import sqlite3
+
+    ts_now = time.time() if now is None else now
+    try:
+        dbs = sorted(codex_dir.glob("logs_*.sqlite"), key=lambda p: (p.stat().st_mtime, p.name))
+    except OSError:
+        return False, since_ts, ""
+    if not dbs:
+        return False, since_ts, ""
+
+    newest_success_ts = 0.0
+    candidates: list[tuple[float, int, str]] = []
+
+    for db_path in reversed(dbs[-2:]):
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT ts, ts_nanos, target, feedback_log_body FROM logs "
+                    "WHERE id > (SELECT coalesce(max(id), 0) - 500 FROM logs) "
+                    "AND target IN ('codex_core::responses_retry', 'codex_core::stream_events_utils') "
+                    "ORDER BY id DESC"
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+
+        for raw_ts, raw_nanos, target, body in rows:
+            try:
+                event_ts = float(raw_ts) + float(raw_nanos or 0) / 1_000_000_000.0
+            except (TypeError, ValueError):
+                continue
+            if target == "codex_core::stream_events_utils":
+                if event_ts > newest_success_ts:
+                    newest_success_ts = event_ts
+                continue
+            if target != "codex_core::responses_retry":
+                continue
+            if event_ts <= since_ts:
+                break
+            age = ts_now - event_ts
+            if not (-5.0 <= age <= window_seconds):
+                continue
+            text = str(body or "")
+            if "stream connection failed" in text:
+                m_err = _CODEX_CONN_ERR_RE.search(text)
+                err_msg = m_err.group(1).strip() if m_err else "stream connection failed"
+                candidates.append((event_ts, 5, f"retries 5: {err_msg}"))
+                break
+            m_ret = _CODEX_RETRIES_RE.search(text)
+            retries_num = int(m_ret.group(1)) if m_ret else 1
+            if retries_num >= 2:
+                m_serr = _CODEX_SAMPLING_ERR_RE.search(text)
+                err_msg = m_serr.group(1).strip() if m_serr else "stream disconnected"
+                candidates.append((event_ts, retries_num, f"retries {retries_num}: {err_msg}"))
+                break
+
+    max_seen_ts = max([since_ts] + [c[0] for c in candidates])
+    triggered = [c for c in candidates if c[0] > newest_success_ts]
+    if triggered:
+        best = max(triggered, key=lambda c: (c[1], c[0]))
+        return True, best[0], best[2]
+    return False, max_seen_ts, ""
+
+
 def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEMINI_GROUP) -> None:
     """将刚切中的 AI 健康目标节点同步提升到对应 order.json 首位，
     防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
@@ -746,11 +868,13 @@ class AIWatchService:
         paths: AppPaths,
         proc_root: Path = Path("/proc"),
         agy_log_dir: Path | None = None,
+        codex_log_dir: Path | None = None,
     ):
         self.paths = paths
         self.query = QueryService(paths)
         self.proc_root = proc_root
         self.agy_log_dir = default_agy_log_dir(paths) if agy_log_dir is None else agy_log_dir
+        self.codex_log_dir = default_codex_log_dir(paths) if codex_log_dir is None else codex_log_dir
 
     def watch(self, dry_run: bool = False) -> WatchReport:
         report = WatchReport()
@@ -833,6 +957,18 @@ class AIWatchService:
                     log_triggered = True
                 else:
                     gs["last_log_fail_ts"] = max(since_ts, log_ts)
+        elif group == AI_MANUAL_GROUP:
+            if previous_active and current and previous_active != current:
+                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 30.0)
+            since_ts = float(gs.get("last_log_fail_ts") or 0.0)
+            codex_failed, codex_ts, codex_reason = detect_recent_codex_retry_failure(
+                self.codex_log_dir, now=now, since_ts=since_ts
+            )
+            if codex_failed:
+                gs["last_log_fail_ts"] = codex_ts
+                verdict = PROBE_DEAD
+                detail = f"codex_log_retry ({codex_reason})"
+                log_triggered = True
 
         if (
             verdict == PROBE_DEAD
@@ -892,6 +1028,9 @@ class AIWatchService:
                 and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
                 and is_static_iepl_node(current, self.paths)
                 and not current_already_cooled
+                and not has_active_ai_transfer(
+                    self.paths, getattr(self.query, "api", None), group, current
+                )
             ):
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
                 cand_entry = groups.get(cand_1x) if cand_1x else None
@@ -1018,14 +1157,13 @@ class AIWatchService:
                         }
                         sf[current] = now
                         state["stream_fragile"] = sf
-                if group == AI_GEMINI_GROUP:
+                if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
                     # 设 30s 切流静默保护窗
                     gs["last_log_fail_ts"] = max(
                         float(gs.get("last_log_fail_ts") or 0.0),
                         now + 30.0,
                         time.time() + 30.0,
                     )
-                if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
                     _promote_gemini_order_head(self.paths, target, group=group)
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
