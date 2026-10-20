@@ -874,8 +874,10 @@ def _resolve_healthy_ws_cdn_ips(
     *,
     rounds: int = 3,
     paths: AppPaths | None = None,
+    extra_domains: tuple[str, ...] = (),
 ) -> list[str]:
-    """当 CDN 域名解析出多个 IPv4 A 记录时，结合多轮并发 TLS 握手与 mihomo 真实拨号超时日志动态评估，
+    """当 CDN 域名（含原 server 与 ws-opts.headers.Host）解析出多个 IPv4 A 记录时，
+    结合多轮并发 TLS 握手与 mihomo 真实拨号超时日志动态评估，
     按（近20m无超时突增、握手成功率↓、近20m错误分桶↑、最大延迟<1200ms、在用健康IP黏性、历史累计超时分桶↑、网段与延迟分桶↑）排序。
     既杜绝周期性刷新在双 Anycast IP 间来回横跳切回偶发黑洞 IP，又能在当前 IP 真正劣化时自动无缝故障转移。
     """
@@ -889,11 +891,24 @@ def _resolve_healthy_ws_cdn_ips(
         return []
     except ValueError:
         pass
-    try:
-        infos = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
-    except OSError:
-        return []
-    ips = tuple(sorted({str(item[4][0]) for item in infos if item and len(item) >= 5 and item[4]}))
+    resolved_ips: set[str] = set()
+    for candidate_domain in (domain, *extra_domains):
+        if not candidate_domain:
+            continue
+        try:
+            ipaddress.ip_address(candidate_domain)
+            resolved_ips.add(candidate_domain)
+            continue
+        except ValueError:
+            pass
+        try:
+            infos = socket.getaddrinfo(candidate_domain, port, socket.AF_INET, socket.SOCK_STREAM)
+            for item in infos:
+                if item and len(item) >= 5 and item[4]:
+                    resolved_ips.add(str(item[4][0]))
+        except OSError:
+            continue
+    ips = tuple(sorted(resolved_ips))
     if len(ips) < 2:
         return []
     now = time.time()
@@ -1022,11 +1037,13 @@ def _optimize_ws_cdn_servers(
         if ws_host.lower() != server.lower() and ws_host.lower().endswith("." + sni):
             proxy["server"] = ws_host
         if probe_tls:
+            target_domain = str(proxy.get("server") or "")
             healthy_ips = _resolve_healthy_ws_cdn_ips(
-                str(proxy.get("server") or ""),
+                target_domain,
                 port,
                 sni,
                 paths=paths,
+                extra_domains=(server,) if server and server.lower() != target_domain.lower() else (),
             )
             if healthy_ips:
                 proxy["server"] = healthy_ips[0]
