@@ -767,6 +767,12 @@ def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 2.5
     latency: int | None = None
     try:
         sock = socket.create_connection((ip, port), timeout=timeout)
+        try:
+            maxseg = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
+            if isinstance(maxseg, int) and 0 < maxseg < 500:
+                return None
+        except OSError:
+            pass
         ctx = ssl.create_default_context()
         tls_sock = ctx.wrap_socket(sock, server_hostname=sni or ip)
         latency = max(1, round((time.time() - t0) * 1000))
@@ -891,23 +897,29 @@ def _resolve_healthy_ws_cdn_ips(
         return []
     except ValueError:
         pass
-    resolved_ips: set[str] = set()
-    for candidate_domain in (domain, *extra_domains):
-        if not candidate_domain:
-            continue
-        try:
-            ipaddress.ip_address(candidate_domain)
-            resolved_ips.add(candidate_domain)
-            continue
-        except ValueError:
-            pass
-        try:
-            infos = socket.getaddrinfo(candidate_domain, port, socket.AF_INET, socket.SOCK_STREAM)
-            for item in infos:
-                if item and len(item) >= 5 and item[4]:
-                    resolved_ips.add(str(item[4][0]))
-        except OSError:
-            continue
+    def _resolve_domain_set(domains: tuple[str, ...]) -> set[str]:
+        found: set[str] = set()
+        for candidate_domain in domains:
+            if not candidate_domain:
+                continue
+            try:
+                ipaddress.ip_address(candidate_domain)
+                found.add(candidate_domain)
+                continue
+            except ValueError:
+                pass
+            try:
+                infos = socket.getaddrinfo(candidate_domain, port, socket.AF_INET, socket.SOCK_STREAM)
+                for item in infos:
+                    if item and len(item) >= 5 and item[4]:
+                        found.add(str(item[4][0]))
+            except OSError:
+                continue
+        return found
+
+    resolved_ips = _resolve_domain_set((domain,))
+    if len(resolved_ips) < 2 and extra_domains:
+        resolved_ips |= _resolve_domain_set(extra_domains)
     ips = tuple(sorted(resolved_ips))
     if len(ips) < 2:
         return []

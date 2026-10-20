@@ -303,7 +303,7 @@ def has_active_ai_transfer(
         lastsnd_ms, lastrcv_ms = timings
         if is_idle_completed_gemini_connection(upload, download, lastsnd_ms, lastrcv_ms):
             continue
-        if min(lastsnd_ms, lastrcv_ms) <= 15_000:
+        if min(lastsnd_ms, lastrcv_ms) <= 75_000:
             return True
     return False
 
