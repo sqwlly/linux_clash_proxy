@@ -220,8 +220,9 @@ class QueryService:
                 src_port = str(meta.get("sourcePort") or "")
                 from .ai_watch import (
                     AI_STREAM_HOSTS,
+                    _unpack_socket_timings,
                     get_local_proxy_socket_idle_ms,
-                    is_idle_completed_gemini_connection,
+                    is_inflight_ai_connection,
                 )
                 from .probe import is_static_iepl_node
 
@@ -229,13 +230,15 @@ class QueryService:
                     if not is_static_iepl_node(leaf, self.paths):
                         if socket_idle_map is None:
                             socket_idle_map = get_local_proxy_socket_idle_ms()
-                        timings = socket_idle_map.get(src_port)
-                        if timings is not None and not is_idle_completed_gemini_connection(
+                        unpacked = _unpack_socket_timings(socket_idle_map.get(src_port), src_port)
+                        if unpacked is not None and is_inflight_ai_connection(
                             upload,
                             download,
-                            timings[0],
-                            timings[1],
+                            unpacked[0],
+                            unpacked[1],
                             on_stale_leaf=True,
+                            recv_q=unpacked[2],
+                            send_q=unpacked[3],
                         ):
                             continue
             conn_id = str(item.get("id") or "")

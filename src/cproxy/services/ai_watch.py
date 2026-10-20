@@ -75,10 +75,15 @@ AI_STREAM_HOSTS = frozenset(
 )
 
 
+_LAST_SOCKET_QUEUE_MAP: dict[str, tuple[int, int]] = {}
+
+
 def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[int, int]]:
-    """通过 `ss -tnpi` 获取本地代理端口（默认 :7890）各客户端源端口的 `(lastsnd_ms, lastrcv_ms)`。"""
+    """通过 `ss -tnpi` 获取本地代理端口（默认 :7890）各客户端源端口的 `(lastsnd_ms, lastrcv_ms)`，
+    并同步记录各套接字的内核队列深度 `(recv_q_bytes, send_q_bytes)`。"""
     import subprocess
 
+    _LAST_SOCKET_QUEUE_MAP.clear()
     try:
         proc = subprocess.run(
             ["ss", "-tnpi", f"( sport = :{int(mixed_port)} )"],
@@ -94,6 +99,7 @@ def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[in
 
     idle_map: dict[str, tuple[int, int]] = {}
     pending_port: str | None = None
+    pending_queues: tuple[int, int] = (0, 0)
     for raw_line in proc.stdout.splitlines():
         line = raw_line.strip()
         if not line:
@@ -101,17 +107,101 @@ def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[in
         if line.startswith("ESTAB"):
             parts = line.split()
             pending_port = None
+            pending_queues = (0, 0)
             if len(parts) >= 5:
                 peer_port = parts[4].rsplit(":", 1)[-1]
                 if peer_port.isdigit():
                     pending_port = peer_port
+                    try:
+                        pending_queues = (max(0, int(parts[1])), max(0, int(parts[2])))
+                    except ValueError:
+                        pending_queues = (0, 0)
         elif pending_port is not None:
             m_snd = _SS_LASTSND_RE.search(line)
             m_rcv = _SS_LASTRCV_RE.search(line)
             if m_snd is not None and m_rcv is not None:
                 idle_map[pending_port] = (int(m_snd.group(1)), int(m_rcv.group(1)))
+                _LAST_SOCKET_QUEUE_MAP[pending_port] = pending_queues
             pending_port = None
     return idle_map
+
+
+def _unpack_socket_timings(
+    timings: tuple[int, ...] | None,
+    src_port: str = "",
+) -> tuple[int, int, int, int] | None:
+    if timings is None or len(timings) < 2:
+        return None
+    lastsnd_ms = int(timings[0])
+    lastrcv_ms = int(timings[1])
+    if len(timings) >= 4:
+        return lastsnd_ms, lastrcv_ms, max(0, int(timings[2])), max(0, int(timings[3]))
+    q = _LAST_SOCKET_QUEUE_MAP.get(src_port, (0, 0))
+    return lastsnd_ms, lastrcv_ms, q[0], q[1]
+
+
+def classify_ai_connection_lifecycle(
+    upload: int,
+    download: int,
+    lastsnd_ms: int,
+    lastrcv_ms: int,
+    *,
+    on_stale_leaf: bool = False,
+    recv_q: int = 0,
+    send_q: int = 0,
+) -> str:
+    """基于内核 TCP 队列深度 (Recv-Q/Send-Q)、双方向字节数与收发时序的确定性 AI 连接生命周期状态机。
+
+    返回值：
+    - `"uploading"`: 客户端已将请求写入本地代理但内核 Recv-Q 尚未排空，或正在持续发送请求体；
+    - `"thinking"`: 已上传完整上下文 (`upload >= 18KB`)，正在等待远端模型返回本轮 HTTP 200 响应体；
+    - `"streaming"`: 正在流式接收 SSE / WebSocket 响应（`Send-Q > 0` 或近期有下行数据包）；
+    - `"idle_completed"`: 请求响应已完整结束且双方向静默达到连接池老化回收阈值；
+    - `"idle_other"`: 其它未承载活跃大包轮次的轻量化/初建连接。
+    """
+    if recv_q > 0:
+        return "uploading"
+    if send_q > 0:
+        return "streaming"
+    idle_ms = min(lastsnd_ms, lastrcv_ms)
+    if 0 < upload < 18_000:
+        if download >= 4_000 and idle_ms >= 6_000:
+            return "idle_completed"
+        return "idle_other"
+    if upload >= 18_000:
+        threshold_ms = 10_000 if on_stale_leaf else 35_000
+        if download < 6_000 or (lastrcv_ms - lastsnd_ms) < 400:
+            if min(lastsnd_ms, lastrcv_ms) <= 5_000 and download < 6_000:
+                return "uploading"
+            if idle_ms <= 95_000:
+                return "thinking"
+            return "idle_completed"
+        if idle_ms < threshold_ms:
+            return "streaming"
+        return "idle_completed"
+    return "idle_other"
+
+
+def is_inflight_ai_connection(
+    upload: int,
+    download: int,
+    lastsnd_ms: int,
+    lastrcv_ms: int,
+    *,
+    on_stale_leaf: bool = False,
+    recv_q: int = 0,
+    send_q: int = 0,
+) -> bool:
+    """判定连接是否正处于上传、模型思考或流式输出阶段（严禁在切流或回收时关闭）。"""
+    return classify_ai_connection_lifecycle(
+        upload,
+        download,
+        lastsnd_ms,
+        lastrcv_ms,
+        on_stale_leaf=on_stale_leaf,
+        recv_q=recv_q,
+        send_q=send_q,
+    ) in ("uploading", "thinking", "streaming")
 
 
 def is_idle_completed_gemini_connection(
@@ -121,30 +211,22 @@ def is_idle_completed_gemini_connection(
     lastrcv_ms: int,
     *,
     on_stale_leaf: bool = False,
+    recv_q: int = 0,
+    send_q: int = 0,
 ) -> bool:
-    """判定 daily-cloudcode-pa.googleapis.com 的 HTTP/2 连接是否已完成请求响应并处于连接池闲置状态。
-
-    1X WebSocket 节点（经 Cloudflare CDN 反代）存在约 94s 的下行空闲超时（proxy_read_timeout）。
-    agy 后台轮询（ListExperiments / loadCodeAssist / fetchAvailableModels / sir_flash_lite）与已结束的
-    streamGenerateContent 轮次会把 HTTP/2 连接留在连接池中闲置 20~60s；若重型思考轮次（需 45~75s 才返回
-    HTTP 200 响应头）复用了已闲置的连接，必定在思考中途撞上 94s 上限而报 `Post "...": EOF`。
-
-    安全边界（绝不误杀正在等待模型思考或流式输出的活跃连接）：
-    - 等待模型思考（HTTP 200 响应头未到达）时：
-      - 新连接：`download < 5800`（仅有 TLS 握手与初始 HTTP/2 SETTINGS）；
-      - 复用连接：`lastrcv_ms <= lastsnd_ms`（客户端上传完本轮 Prompt 在上一轮响应之后，且尚无本轮下行响应）。
-    - 已完成响应并闲置的连接：
-      1. 小包后台轮询或安全监控（`0 < upload < 18_000` 且 `download >= 4_000`）：双方向静默 `>= 6_000ms`；
-      2. 大包 `streamGenerateContent` 已完成轮次（`upload >= 18_000` 且 `download >= 6_000` 且 `lastrcv_ms - lastsnd_ms >= 400`）：
-         若滞留在已切走的旧叶子上则静默 `>= 10_000ms` 回收，若在当前叶子上则静默 `>= 35_000ms` 回收（保证下一轮获得满额 94s 预算）。
-    """
-    idle_ms = min(lastsnd_ms, lastrcv_ms)
-    if 0 < upload < 18_000:
-        return download >= 4_000 and idle_ms >= 6_000
-    if upload >= 18_000:
-        threshold_ms = 10_000 if on_stale_leaf else 35_000
-        return download >= 6_000 and (lastrcv_ms - lastsnd_ms) >= 400 and idle_ms >= threshold_ms
-    return False
+    """判定 AI HTTP/2 连接是否已完成请求响应并处于连接池闲置状态。"""
+    return (
+        classify_ai_connection_lifecycle(
+            upload,
+            download,
+            lastsnd_ms,
+            lastrcv_ms,
+            on_stale_leaf=on_stale_leaf,
+            recv_q=recv_q,
+            send_q=send_q,
+        )
+        == "idle_completed"
+    )
 
 
 def reap_idle_gemini_connections(
@@ -213,16 +295,18 @@ def reap_idle_gemini_connections(
 
     reaped: list[str] = []
     for conn_id, upload, download, src_port, on_stale_leaf in candidates:
-        timings = idle_map.get(src_port)
-        if timings is None:
+        unpacked = _unpack_socket_timings(idle_map.get(src_port), src_port)
+        if unpacked is None:
             continue
-        lastsnd_ms, lastrcv_ms = timings
+        lastsnd_ms, lastrcv_ms, recv_q, send_q = unpacked
         if is_idle_completed_gemini_connection(
             upload,
             download,
             lastsnd_ms,
             lastrcv_ms,
             on_stale_leaf=on_stale_leaf,
+            recv_q=recv_q,
+            send_q=send_q,
         ):
             if not dry_run:
                 try:
@@ -297,13 +381,18 @@ def has_active_ai_transfer(
         return False
 
     for src_port, upload, download in ports_to_check:
-        timings = idle_map.get(src_port)
-        if timings is None:
+        unpacked = _unpack_socket_timings(idle_map.get(src_port), src_port)
+        if unpacked is None:
             continue
-        lastsnd_ms, lastrcv_ms = timings
-        if is_idle_completed_gemini_connection(upload, download, lastsnd_ms, lastrcv_ms):
-            continue
-        if min(lastsnd_ms, lastrcv_ms) <= 75_000:
+        lastsnd_ms, lastrcv_ms, recv_q, send_q = unpacked
+        if is_inflight_ai_connection(
+            upload,
+            download,
+            lastsnd_ms,
+            lastrcv_ms,
+            recv_q=recv_q,
+            send_q=send_q,
+        ):
             return True
     return False
 
@@ -770,6 +859,9 @@ class AIWatchService:
                     prev_entry is not None
                     and not prev_entry.candidates
                     and (prev_entry.alive is False or delay_state(prev_entry.delay) == "timeout")
+                    and not has_active_ai_transfer(
+                        self.paths, getattr(self.query, "api", None), group, previous_active
+                    )
                 ):
                     gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True

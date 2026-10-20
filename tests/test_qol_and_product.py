@@ -1294,6 +1294,173 @@ def test_reap_idle_gemini_connections_and_preserve_inflight_streams(tmp_path: Pa
     assert manual_r2.switched is False
 
 
+def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch) -> None:
+    """多会话并发状态机不变量仿真测试（验证机制级硬约束而非单点样本）：
+    1. In-Flight 零中断不变量：无论处于 Recv-Q 积压慢速上行、75s 模型长思考、连接池复用思考或 SSE 流式输出，
+       在看门狗巡检、被动回退与主动切流全周期内，任何非静态 IEPL 节点上的活跃连接绝不被 close_connection 关闭；
+    2. 闲置连接池确定性回收不变量：已完成响应并静默达到阈值的连接必然被清理，绝不带入下一轮撞 94s 超时；
+    3. CDN Anycast 与限速黑洞隔离不变量：回退域名（172.64.146.118）不污染主 Anycast 池，且历史零错误的在用 IP
+       （172.67.143.95）在大包拥塞 2/3 握手通过时绝不误切向历史高错误的 104.21.87.131。
+    """
+    import socket
+
+    from cproxy.backend import runtime as runtime_mod
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.backend.runtime import _resolve_healthy_ws_cdn_ips
+    from cproxy.services import ai_watch as ai_watch_mod
+    from cproxy.services.ai_watch import (
+        AIWatchService,
+        classify_ai_connection_lifecycle,
+        reap_idle_gemini_connections,
+    )
+    from cproxy.services.diagnostics import PROBE_DEAD, PROBE_OK
+    from cproxy.services.query import QueryService
+
+    paths = _make_paths(tmp_path / "stateful-sim")
+
+    # 阶段 A：连接生命周期状态机矩阵与不变量验证
+    # Format: (id, group, leaf, host, port, upload, download, (lastsnd_ms, lastrcv_ms, recv_q, send_q), expected_state)
+    matrix = [
+        # Loopback 已写完 4.27MB 但内核 Recv-Q 仍有 2.48MB 排队上行（即便 lastsnd=27s, lastrcv=17s）-> uploading
+        ("codex-recvq-backlogged", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47334", 4_275_497, 3_947, (27_514, 17_016, 2_488_578, 0), "uploading"),
+        # 刚排空 Recv-Q 正在等待 gpt-6.1-sol 长思考返回 HTTP 200 头（download=3947 < 6000, idle=38s）-> thinking
+        ("codex-thinking-ttfb", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47335", 4_275_497, 3_947, (38_000, 37_500, 0, 0), "thinking"),
+        # agy 复用旧 HTTP/2 连接发起第二轮长思考（lastrcv=62s <= lastsnd=62.1s）-> thinking
+        ("agy-reused-thinking", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "39082", 7_229_624, 80_856, (62_100, 62_000, 0, 0), "thinking"),
+        # Send-Q 有未读 SSE 数据块 -> streaming
+        ("agy-sendq-streaming", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "52901", 280_000, 48_000, (19_000, 19_000, 0, 16_384), "streaming"),
+        # 正常流式 SSE 收包中（:7890 向客户端发送 SSE lastsnd=800ms，客户端上次发包 lastrcv=4000ms）-> streaming
+        ("claude-sse-active", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "api.anthropic.com", "52902", 180_000, 32_000, (800, 4_000, 0, 0), "streaming"),
+        # 已完成大包轮次并在连接池静默 40s (lastrcv > lastsnd + 400ms, recv_q=0, send_q=0) -> idle_completed
+        ("codex-turn-done-idle", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "60611", 1_500_000, 64_000, (40_000, 42_000, 0, 0), "idle_completed"),
+        # 小包后台轮询已完成并静默 8s -> idle_completed
+        ("agy-poll-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "38497", 3_200, 5_100, (8_000, 8_200, 0, 0), "idle_completed"),
+    ]
+
+    idle_map: dict[str, tuple[int, ...]] = {}
+    conns: list[dict] = []
+    inflight_ids: set[str] = set()
+    reapable_ids: set[str] = set()
+
+    for cid, grp, leaf, host, port, up, down, timings, expected in matrix:
+        state = classify_ai_connection_lifecycle(
+            up, down, timings[0], timings[1], recv_q=timings[2], send_q=timings[3]
+        )
+        assert state == expected, f"{cid}: expected {expected}, got {state}"
+        if state in ("uploading", "thinking", "streaming"):
+            inflight_ids.add(cid)
+        elif state == "idle_completed":
+            reapable_ids.add(cid)
+        idle_map[port] = timings
+        conns.append(
+            {
+                "id": cid,
+                "chains": [leaf, grp],
+                "upload": up,
+                "download": down,
+                "metadata": {"host": host, "sourcePort": port},
+            }
+        )
+
+    monkeypatch.setattr(ai_watch_mod, "get_local_proxy_socket_idle_ms", lambda _port=7890: idle_map)
+    closed_history: list[str] = []
+
+    groups = {
+        "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇰🇷韩国 01 | 1X", ["🇰🇷韩国 01 | 1X", "🇸🇬新加坡 01 | 1X"]),
+        "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "🇬🇧英国 01 | 1X", ["🇬🇧英国 01 | 1X", "🇫🇷法国 01 | 1X"]),
+        "🇰🇷韩国 01 | 1X": ProxyGroup("🇰🇷韩国 01 | 1X", "VLESS", "-", [], delay=260, alive=True),
+        "🇸🇬新加坡 01 | 1X": ProxyGroup("🇸🇬新加坡 01 | 1X", "VLESS", "-", [], delay=290, alive=True),
+        "🇬🇧英国 01 | 1X": ProxyGroup("🇬🇧英国 01 | 1X", "VLESS", "-", [], delay=250, alive=True),
+        "🇫🇷法国 01 | 1X": ProxyGroup("🇫🇷法国 01 | 1X", "VLESS", "-", [], delay=240, alive=True),
+    }
+
+    class _SimAPI:
+        def get_groups(self):
+            return groups
+
+        def switch_group(self, grp: str, target: str):
+            g = groups[grp]
+            groups[grp] = ProxyGroup(g.name, g.type, target, g.candidates, alive=g.alive, delay=g.delay)
+
+        def get_connections(self):
+            return {"connections": list(conns)}
+
+        def close_connection(self, cid: str):
+            closed_history.append(cid)
+
+    q = QueryService(paths)
+    q.api = _SimAPI()  # type: ignore[assignment]
+    svc = AIWatchService(paths, agy_log_dir=tmp_path / "no-agy-logs")
+    svc.query = q
+
+    # 1. 模拟连续 3 轮上行满载导致旁路探针超时（PROBE_DEAD）：
+    #    - 节点切换次数必须为 0
+    #    - 所有 idle_completed 连接被精准回收，所有 inflight 连接零误杀
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda _p, _u: PROBE_DEAD)
+    for _ in range(3):
+        rep = svc.watch()
+        for res in rep.results:
+            assert res.switched is False
+            assert res.detail == "active_transfer_busy"
+    assert set(closed_history) == reapable_ids
+    assert inflight_ids.isdisjoint(closed_history)
+
+    # 2. 模拟用户或 rebalance 显式调用 switch_group 切换 AI-MANUAL 与 AI-GEMINI：
+    #    - 旧节点上正在 uploading / thinking / streaming 的连接依然零误杀！
+    closed_history.clear()
+    q.switch_group("AI-MANUAL", "🇸🇬新加坡 01 | 1X", drop_connections=True)
+    q.switch_group("AI-GEMINI", "🇫🇷法国 01 | 1X", drop_connections=True)
+    assert inflight_ids.isdisjoint(closed_history)
+
+    # 3. 阶段 B：验证 CDN Anycast 域名隔离与历史错误惩罚不变量
+    #    - 主域名 cgkr1.cyberguard-u1s1.art 解析到 (104.21.87.131, 172.67.143.95)
+    #    - extra_domains (cyberguard.cyberguard-u1s1.art -> 172.64.146.118) 在主域名有 >=2 个 IP 时绝不混入
+    #    - 172.67.143.95 处于在用状态且 0 错误（偶发 2/3 握手通过），104.21.87.131 有 69 次历史超时（3/3 握手通过）
+    #    - 结果必须稳定锁定在 172.67.143.95
+    runtime_mod._WS_TLS_PROBE_CACHE.clear()
+    runtime_mod._WS_CDN_IP_RANK_CACHE.clear()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *_a, **_kw: (
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.64.146.118", port))]
+            if host == "cyberguard.cyberguard-u1s1.art"
+            else [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.21.87.131", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.67.143.95", port)),
+            ]
+        ),
+    )
+    probe_seq = {"172.67.143.95": 0}
+
+    def _sim_tls(ip: str, _port: int, _sni: str, timeout: float = 2.5):
+        if ip == "172.67.143.95":
+            probe_seq[ip] += 1
+            return None if probe_seq[ip] == 2 else 390
+        return 350
+
+    monkeypatch.setattr(runtime_mod, "_tls_handshake_latency_ms", _sim_tls)
+    monkeypatch.setattr(
+        runtime_mod,
+        "_ws_cdn_ip_log_penalties",
+        lambda _ips, _port, paths=None: (
+            {"104.21.87.131": 0, "172.67.143.95": 0},
+            {"104.21.87.131": 69, "172.67.143.95": 0},
+            {"172.67.143.95"},
+        ),
+    )
+    ranked = _resolve_healthy_ws_cdn_ips(
+        "cgkr1.cyberguard-u1s1.art",
+        443,
+        "cyberguard-u1s1.art",
+        paths=paths,
+        extra_domains=("cyberguard.cyberguard-u1s1.art",),
+    )
+    assert "172.64.146.118" not in ranked
+    assert ranked[0] == "172.67.143.95"
+
+
+
 
 
 
