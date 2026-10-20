@@ -1260,10 +1260,10 @@ class RuntimeBackend:
             # 精确子域不够：agy 实际打 daily-cloudcode-pa.googleapis.com、
             # oauth2.googleapis.com、antigravity.google、antigravity-unleash.goog。
             f"DOMAIN-SUFFIX,google.com,{AI_GEMINI_GROUP}",
-            # 分流 Google Clearcut 客户端遥测大包上传（agy 后台向 play.googleapis.com/log 上传缓冲日志，
-            # 若走 AI-GEMINI 会占满单节点 WebSocket 上行带宽；若直接 REJECT 则 agy 每 2.5s 死循环重试并刷爆日志；
-            # 改走 AI-AUTO 高带宽自动池即可瞬间返回 200 清空缓冲，且零占用 AI-GEMINI 带宽）。
-            f"DOMAIN,play.googleapis.com,{AI_AUTO_GROUP}",
+            # 拦截 Google Clearcut 客户端遥测大包上传（5 个并发 agy 进程向 play.googleapis.com/log 持续上传
+            # 数十 MB 缓冲日志，会彻底吃满阿里云 ECS 1Mbps 出站公网带宽，导致 daily-cloudcode-pa.googleapis.com
+            # 的 1.3MB 上下文 POST 请求因上行饥饿超过 60s 被服务端 EOF 掐断；本地 REJECT 零公网带宽消耗）。
+            "DOMAIN,play.googleapis.com,REJECT",
             f"DOMAIN-SUFFIX,googleapis.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,googleusercontent.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,gstatic.com,{AI_GEMINI_GROUP}",

@@ -1060,8 +1060,8 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     RuntimeBackend(paths).render_runtime()
     rendered = yaml.safe_load(runtime_file(paths).read_text(encoding="utf-8"))
     rules = rendered["rules"]
-    assert "DOMAIN,play.googleapis.com,AI-AUTO" in rules
-    assert rules.index("DOMAIN,play.googleapis.com,AI-AUTO") < rules.index(
+    assert "DOMAIN,play.googleapis.com,REJECT" in rules
+    assert rules.index("DOMAIN,play.googleapis.com,REJECT") < rules.index(
         "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI"
     )
 
