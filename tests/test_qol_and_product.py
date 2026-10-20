@@ -1038,6 +1038,12 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     _optimize_ws_cdn_servers(proxies, probe_tls=True)
     assert proxies[0]["server"] == "104.21.87.131"
 
+    # 1c. 当双 IP 在本轮均 3/3 全通且延迟同分桶时，不因字典序 "104." < "172." 误切回偶发黑洞的 104.21.87.131
+    monkeypatch.setattr(runtime_mod, "_tls_handshake_latency_ms", lambda _ip, _port, _sni, timeout=1.5: 420)
+    proxies[0]["server"] = "cyberguard.cyberguard-u1s1.art"
+    _optimize_ws_cdn_servers(proxies, probe_tls=True)
+    assert proxies[0]["server"] == "172.67.143.95"
+
     # 2. render_runtime 在 googleapis.com 之前注入 DOMAIN,play.googleapis.com,AI-AUTO，分流遥测流量避免占满 AI-GEMINI 且不触发客户端疯狂重试
     paths = _make_paths(tmp_path / "play-offload")
     cfg = {

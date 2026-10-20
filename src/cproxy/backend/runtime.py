@@ -787,10 +787,97 @@ def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 1.5
     return latency
 
 
-def _resolve_healthy_ws_cdn_ips(domain: str, port: int, sni: str, *, rounds: int = 2) -> list[str]:
-    """当 CDN 域名解析出多个 IPv4 A 记录时，通过多轮并发 TLS 握手动态评估成功率与延迟，
-    按（成功率↓、是否低于1200ms、平均延迟分桶↑、最大延迟分桶↑）返回健康 IP 列表。
-    当原最优 IP 发生丢包或黑洞时，自动无缝切换到当前最健康的备选 Anycast IP。
+def _ws_cdn_ip_log_penalties(
+    ips: tuple[str, ...],
+    port: int,
+    paths: AppPaths | None = None,
+) -> tuple[dict[str, int], dict[str, int], set[str]]:
+    """从 mihomo 运行日志与当前 runtime.yaml 提取各候选 Anycast IP 的真实拨号超时统计与在用状态。
+
+    返回 `(recent_errors_20m, total_errors, active_ips)`：
+    - `recent_errors_20m`: 最近 20 分钟内该 IP 发生 `connect error` / `i/o timeout` 的次数；
+    - `total_errors`: 日志尾部（512KB）内该 IP 累计拨号错误次数；
+    - `active_ips`: 当前 `runtime.yaml` 中已钉选在用的 IP 集合。
+    """
+    from datetime import datetime, timezone
+
+    recent_errors: dict[str, int] = {ip: 0 for ip in ips}
+    total_errors: dict[str, int] = {ip: 0 for ip in ips}
+    active_ips: set[str] = set()
+    if paths is None:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return recent_errors, total_errors, active_ips
+        from ..config import default_paths
+
+        paths = default_paths()
+    try:
+        rt_path = runtime_file(paths)
+        if rt_path.exists():
+            rt_text = rt_path.read_text(encoding="utf-8", errors="ignore")
+            for ip in ips:
+                if ip in rt_text:
+                    active_ips.add(ip)
+    except OSError:
+        pass
+    try:
+        from ..config import log_file
+
+        lpath = log_file(paths)
+        if not lpath.exists():
+            return recent_errors, total_errors, active_ips
+        size = lpath.stat().st_size
+        with lpath.open("rb") as fh:
+            if size > 524288:
+                fh.seek(size - 524288)
+            tail_text = fh.read().decode("utf-8", errors="ignore")
+        now_ts = datetime.now(timezone.utc).timestamp()
+        for line in tail_text.splitlines():
+            if "connect error:" not in line and "i/o timeout" not in line:
+                continue
+            matched_ips = [
+                ip
+                for ip in ips
+                if f"error: {ip}:{port} connect error:" in line or f"dial tcp {ip}:{port}:" in line
+            ]
+            if not matched_ips:
+                continue
+            is_recent = False
+            if line.startswith('time="') and len(line) >= 31:
+                raw_ts = line[6:31]
+                try:
+                    # 截取秒级 ISO8601 如 2026-10-20T12:05:41+08:00 或带纳秒的时间戳
+                    ts_end = line.find('"', 6)
+                    iso_str = line[6:ts_end] if ts_end > 6 else raw_ts
+                    if "." in iso_str:
+                        head, tail = iso_str.split(".", 1)
+                        tz_idx = max(tail.find("+"), tail.find("-"), tail.find("Z"))
+                        if tz_idx >= 0:
+                            iso_str = head + "." + tail[: min(6, tz_idx)] + tail[tz_idx:]
+                    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                    if (now_ts - dt.timestamp()) <= 1200.0:
+                        is_recent = True
+                except ValueError:
+                    pass
+            for ip in matched_ips:
+                total_errors[ip] = total_errors.get(ip, 0) + 1
+                if is_recent:
+                    recent_errors[ip] = recent_errors.get(ip, 0) + 1
+    except OSError:
+        pass
+    return recent_errors, total_errors, active_ips
+
+
+def _resolve_healthy_ws_cdn_ips(
+    domain: str,
+    port: int,
+    sni: str,
+    *,
+    rounds: int = 3,
+    paths: AppPaths | None = None,
+) -> list[str]:
+    """当 CDN 域名解析出多个 IPv4 A 记录时，结合多轮并发 TLS 握手与 mihomo 真实拨号超时日志动态评估，
+    按（近20m无超时突增、握手成功率↓、近20m错误分桶↑、最大延迟<1200ms、在用健康IP黏性、历史累计超时分桶↑、网段与延迟分桶↑）排序。
+    既杜绝周期性刷新在双 Anycast IP 间来回横跳切回偶发黑洞 IP，又能在当前 IP 真正劣化时自动无缝故障转移。
     """
     import ipaddress
     import socket
@@ -827,17 +914,41 @@ def _resolve_healthy_ws_cdn_ips(domain: str, port: int, sni: str, *, rounds: int
             if ms is not None:
                 samples_by_ip[ip].append(ms)
 
-    scored: list[tuple[tuple[int, int, int, int, str], str]] = []
-    for ip, samples in samples_by_ip.items():
-        if not samples:
-            continue
+    recent_errors, total_errors, active_ips = _ws_cdn_ip_log_penalties(ips, port, paths=paths)
+    alive_ips = [ip for ip, samples in samples_by_ip.items() if samples]
+    if not alive_ips:
+        return []
+    min_total_err = min(total_errors.get(ip, 0) for ip in alive_ips)
+
+    scored: list[tuple[tuple[int, int, int, int, int, int, int, int, int, str], str]] = []
+    for ip in alive_ips:
+        samples = samples_by_ip[ip]
         succ = len(samples)
         max_ms = max(samples)
         avg_ms = round(sum(samples) / succ)
-        sort_key = (-succ, 0 if max_ms < 1200 else 1, avg_ms // 100, max_ms // 100, ip)
+        rec_err = recent_errors.get(ip, 0)
+        tot_err = total_errors.get(ip, 0)
+        is_active_healthy = (
+            ip in active_ips
+            and succ == eff_rounds
+            and max_ms < 1200
+            and rec_err < 3
+            and tot_err <= min_total_err + 10
+        )
+        prefer_non_104 = 0 if not ip.startswith("104.") else 1
+        sort_key = (
+            0 if rec_err < 3 else 1,
+            -succ,
+            rec_err // 3,
+            0 if max_ms < 1200 else 1,
+            0 if is_active_healthy else 1,
+            tot_err // 10,
+            prefer_non_104,
+            avg_ms // 100,
+            max_ms // 100,
+            ip,
+        )
         scored.append((sort_key, ip))
-    if not scored:
-        return []
     scored.sort(key=lambda item: item[0])
     result = [ip for _k, ip in scored]
     _WS_CDN_IP_RANK_CACHE[rank_key] = (time.time(), result)
@@ -866,7 +977,12 @@ def _resolve_healthy_ws_cdn_ip(domain: str, port: int, sni: str) -> str | None:
     return healthy[0] if healthy else None
 
 
-def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -> None:
+def _optimize_ws_cdn_servers(
+    proxies: list | None,
+    *,
+    probe_tls: bool = False,
+    paths: AppPaths | None = None,
+) -> None:
     """将 443 端口 Cloudflare WebSocket 节点的拥塞共享入口域名替换为节点独立 ws-opts.headers.Host，
     并在启用 probe_tls 时自动剔除 TLS 黑洞 IP、将健康 Anycast IP 确定性分摊到各 WebSocket 节点。
 
@@ -906,7 +1022,12 @@ def _optimize_ws_cdn_servers(proxies: list | None, *, probe_tls: bool = False) -
         if ws_host.lower() != server.lower() and ws_host.lower().endswith("." + sni):
             proxy["server"] = ws_host
         if probe_tls:
-            healthy_ips = _resolve_healthy_ws_cdn_ips(str(proxy.get("server") or ""), port, sni)
+            healthy_ips = _resolve_healthy_ws_cdn_ips(
+                str(proxy.get("server") or ""),
+                port,
+                sni,
+                paths=paths,
+            )
             if healthy_ips:
                 proxy["server"] = healthy_ips[0]
         ws_idx += 1
@@ -966,6 +1087,7 @@ class RuntimeBackend:
         _optimize_ws_cdn_servers(
             data.get("proxies"),
             probe_tls=not bool(os.environ.get("PYTEST_CURRENT_TEST")),
+            paths=self.paths,
         )
 
         # 若 dns.ipv6 关闭（或未显式开启），同步关闭顶层 ipv6，防止 mihomo 出站拨号对双栈 Cloudflare
