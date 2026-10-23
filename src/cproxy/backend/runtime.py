@@ -371,7 +371,16 @@ def _collect_ai_region_nodes(
     """
     extra_set = set(extra_names)
     proxy_by_name = _proxy_map(proxies)
-    buckets: dict[str, list[str]] = {"JP": [], "US": [], "SG": [], "KR": [], "GB": []}
+    buckets: dict[str, list[str]] = {
+        "JP": [],
+        "US": [],
+        "SG": [],
+        "KR": [],
+        "GB": [],
+        "TW": [],
+        "FR": [],
+        "DE": [],
+    }
     seen: dict[str, set[str]] = {code: set() for code in buckets}
 
     def add(code: str, name: str) -> None:
@@ -833,8 +842,8 @@ def _ws_cdn_ip_log_penalties(
             return recent_errors, total_errors, active_ips
         size = lpath.stat().st_size
         with lpath.open("rb") as fh:
-            if size > 2097152:
-                fh.seek(size - 2097152)
+            if size > 8388608:
+                fh.seek(size - 8388608)
             tail_text = fh.read().decode("utf-8", errors="ignore")
         now_ts = datetime.now(timezone.utc).timestamp()
         for line in tail_text.splitlines():
@@ -843,7 +852,11 @@ def _ws_cdn_ip_log_penalties(
             matched_ips = [
                 ip
                 for ip in ips
-                if f"error: {ip}:{port} connect error:" in line or f"dial tcp {ip}:{port}:" in line
+                if f"dial tcp {ip}:{port}:" in line
+                or (
+                    f"error: {ip}:{port} connect error:" in line
+                    and "context deadline exceeded" not in line
+                )
             ]
             if not matched_ips:
                 continue
@@ -963,15 +976,17 @@ def _resolve_healthy_ws_cdn_ips(
             and tot_err <= min_total_err + 5
         )
         prefer_non_104 = 0 if not ip.startswith("104.") else 1
+        has_majority_succ = 0 if succ >= max(1, eff_rounds - 1) else 1
         sort_key = (
             0 if rec_err < 12 else 1,
             0 if tot_err <= min_total_err + 5 else 1,
+            has_majority_succ,
+            prefer_non_104,
             0 if is_active_healthy else 1,
             -succ,
             tot_err // 5,
             rec_err // 4,
             0 if max_ms < 1200 else 1,
-            prefer_non_104,
             avg_ms // 100,
             max_ms // 100,
             ip,
@@ -1232,6 +1247,9 @@ class RuntimeBackend:
         jp_proxies = filter_unbanned_nodes(region_nodes["JP"], active_bans, keep_fallback=False)
         kr_proxies = filter_unbanned_nodes(region_nodes["KR"], active_bans, keep_fallback=False)
         gb_proxies = filter_unbanned_nodes(region_nodes["GB"], active_bans, keep_fallback=False)
+        tw_proxies = filter_unbanned_nodes(region_nodes["TW"], active_bans, keep_fallback=False)
+        fr_proxies = filter_unbanned_nodes(region_nodes["FR"], active_bans, keep_fallback=False)
+        de_proxies = filter_unbanned_nodes(region_nodes["DE"], active_bans, keep_fallback=False)
         raw_max_mult = data.get("max-ai-multiplier")
         try:
             max_ai_mult = float(raw_max_mult) if raw_max_mult is not None else DEFAULT_MAX_AI_MULTIPLIER
@@ -1282,13 +1300,27 @@ class RuntimeBackend:
         us_ordered = _order_manual_candidates(us_proxies, manual_prefer, manual_order, max_mult=max_ai_mult)
         sg_ordered = _order_manual_candidates(sg_proxies, manual_prefer, manual_order, max_mult=max_ai_mult)
         manual_leaves: list[str] = []
-        for pool in (us_proxies, jp_proxies, sg_proxies, kr_proxies, gb_proxies):
+        for pool in (
+            us_proxies,
+            jp_proxies,
+            sg_proxies,
+            kr_proxies,
+            gb_proxies,
+            tw_proxies,
+            fr_proxies,
+            de_proxies,
+        ):
             for node_name in pool:
                 if node_name not in manual_leaves:
                     manual_leaves.append(node_name)
         manual_leaves = _prefer_non_iepl_nodes(manual_leaves, _proxy_map(data.get("proxies")))
         extra_manual_nodes = filter_unbanned_nodes(
-            _collect_extra_ai_nodes(data.get("proxies"), group_map, extra_names, ("US", "JP", "SG", "KR", "GB")),
+            _collect_extra_ai_nodes(
+                data.get("proxies"),
+                group_map,
+                extra_names,
+                ("US", "JP", "SG", "KR", "GB", "TW", "FR", "DE"),
+            ),
             active_bans,
             keep_fallback=False,
         )

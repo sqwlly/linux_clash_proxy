@@ -1333,6 +1333,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
         ("claude-sse-active", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "api.anthropic.com", "52902", 180_000, 32_000, (800, 4_000, 0, 0), "streaming"),
         # 已完成大包轮次并在连接池静默 40s (lastrcv > lastsnd + 400ms, recv_q=0, send_q=0) -> idle_completed
         ("agy-turn-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "60611", 1_500_000, 64_000, (40_000, 42_000, 0, 0), "idle_completed"),
+        # WebSocket / HTTP2 20s 心跳 PING+PONG 同步回包（lastsnd == lastrcv == 10550ms, download >= 6000）-> idle_completed（不误判为 thinking 造成旧叶子僵尸残留）
+        ("codex-ws-ping-stale", "AI-MANUAL", "🇸🇬新加坡 01 | 1X", "chatgpt.com", "45368", 398_235, 218_662, (10_550, 10_550, 0, 0), "idle_completed"),
         # 小包后台轮询已完成并静默 8s -> idle_completed
         ("agy-poll-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "38497", 3_200, 5_100, (8_000, 8_200, 0, 0), "idle_completed"),
     ]
@@ -1499,6 +1501,24 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     c_failed, _cts, c_reason = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
     assert c_failed is True
     assert "error sending request" in c_reason
+
+    # 首次瞬时 retry_delay=5s 不误判切流；若随后 WebSocket 重连成功，则历史错误自动消解
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "INSERT INTO logs VALUES (2, ?, 200000000, 'INFO', 'codex_api::endpoint::responses_websocket', "
+        "'successfully connected to websocket')",
+        (now_epoch - 3,),
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES (3, ?, 300000000, 'WARN', 'codex_core::responses_retry', "
+        "'stream connection failed, retrying: error=Stream disconnected before completion: error sending request retry_delay=5s')",
+        (now_epoch - 2,),
+    )
+    conn.commit()
+    conn.close()
+    c_failed2, _cts2, _ = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
+    assert c_failed2 is False
+
 
 
 

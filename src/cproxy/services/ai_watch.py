@@ -176,12 +176,16 @@ def classify_ai_connection_lifecycle(
         return "idle_other"
     if upload >= 18_000:
         threshold_ms = 10_000 if on_stale_leaf else 35_000
-        if download < 6_000 or (lastrcv_ms - lastsnd_ms) < 400:
+        if download < 6_000 or (
+            abs(lastsnd_ms - lastrcv_ms) >= 50 and (lastrcv_ms - lastsnd_ms) < 400
+        ):
             if min(lastsnd_ms, lastrcv_ms) <= 5_000 and download < 6_000:
                 return "uploading"
             if idle_ms <= 300_000:
                 return "thinking"
             return "stalled_thinking"
+        if abs(lastsnd_ms - lastrcv_ms) < 50 and idle_ms >= 500:
+            return "idle_completed"
         if idle_ms < threshold_ms:
             return "streaming"
         return "idle_completed"
@@ -723,6 +727,7 @@ def detect_recent_agy_retry_failure(
 _CODEX_RETRIES_RE = re.compile(r"\bretries=(\d+)\b")
 _CODEX_SAMPLING_ERR_RE = re.compile(r"\bsampling_error=(.+)$")
 _CODEX_CONN_ERR_RE = re.compile(r"\berror=(.+?)(?:\s+retry_delay=|$)")
+_CODEX_RETRY_DELAY_RE = re.compile(r"\bretry_delay=(\d+(?:\.\d+)?)s\b")
 
 
 def default_codex_log_dir(paths: AppPaths) -> Path:
@@ -769,7 +774,12 @@ def detect_recent_codex_retry_failure(
                 cur.execute(
                     "SELECT ts, ts_nanos, target, feedback_log_body FROM logs "
                     "WHERE id > (SELECT coalesce(max(id), 0) - 500 FROM logs) "
-                    "AND target IN ('codex_core::responses_retry', 'codex_core::stream_events_utils') "
+                    "AND target IN ("
+                    "'codex_core::responses_retry', "
+                    "'codex_core::stream_events_utils', "
+                    "'codex_api::endpoint::responses_websocket', "
+                    "'codex_code_mode::timing'"
+                    ") "
                     "ORDER BY id DESC"
                 )
                 rows = cur.fetchall()
@@ -783,7 +793,11 @@ def detect_recent_codex_retry_failure(
                 event_ts = float(raw_ts) + float(raw_nanos or 0) / 1_000_000_000.0
             except (TypeError, ValueError):
                 continue
-            if target == "codex_core::stream_events_utils":
+            text = str(body or "")
+            if target in ("codex_core::stream_events_utils", "codex_code_mode::timing") or (
+                target == "codex_api::endpoint::responses_websocket"
+                and "successfully connected" in text
+            ):
                 if event_ts > newest_success_ts:
                     newest_success_ts = event_ts
                 continue
@@ -794,12 +808,26 @@ def detect_recent_codex_retry_failure(
             age = ts_now - event_ts
             if not (-5.0 <= age <= window_seconds):
                 continue
-            text = str(body or "")
             if "stream connection failed" in text:
                 m_err = _CODEX_CONN_ERR_RE.search(text)
                 err_msg = m_err.group(1).strip() if m_err else "stream connection failed"
-                candidates.append((event_ts, 5, f"retries 5: {err_msg}"))
-                break
+                m_delay = _CODEX_RETRY_DELAY_RE.search(text)
+                if m_delay:
+                    delay_s = float(m_delay.group(1))
+                    if delay_s < 8.0:
+                        retries_num = 1
+                    elif delay_s < 18.0:
+                        retries_num = 2
+                    elif delay_s < 35.0:
+                        retries_num = 3
+                    else:
+                        retries_num = 4
+                else:
+                    retries_num = 3
+                if retries_num >= 2:
+                    candidates.append((event_ts, retries_num, f"retries {retries_num}: {err_msg}"))
+                    break
+                continue
             m_ret = _CODEX_RETRIES_RE.search(text)
             retries_num = int(m_ret.group(1)) if m_ret else 1
             if retries_num >= 2:
@@ -959,16 +987,29 @@ class AIWatchService:
                     gs["last_log_fail_ts"] = max(since_ts, log_ts)
         elif group == AI_MANUAL_GROUP:
             if previous_active and current and previous_active != current:
-                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 30.0)
+                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 75.0)
             since_ts = float(gs.get("last_log_fail_ts") or 0.0)
             codex_failed, codex_ts, codex_reason = detect_recent_codex_retry_failure(
                 self.codex_log_dir, now=now, since_ts=since_ts
             )
             if codex_failed:
-                gs["last_log_fail_ts"] = codex_ts
-                verdict = PROBE_DEAD
-                detail = f"codex_log_retry ({codex_reason})"
-                log_triggered = True
+                on_healthy_safe_leaf = (
+                    verdict == PROBE_OK
+                    and _is_stream_safe_gemini_leaf(self.paths, current)
+                )
+                retry_prefix = codex_reason.split(":", 1)[0].strip()
+                severe_codex_retry = (
+                    retry_prefix.startswith("retries ")
+                    and retry_prefix[8:].isdigit()
+                    and int(retry_prefix[8:]) >= 3
+                )
+                if not on_healthy_safe_leaf or severe_codex_retry:
+                    gs["last_log_fail_ts"] = codex_ts
+                    verdict = PROBE_DEAD
+                    detail = f"codex_log_retry ({codex_reason})"
+                    log_triggered = True
+                else:
+                    gs["last_log_fail_ts"] = max(since_ts, codex_ts)
 
         if (
             verdict == PROBE_DEAD
@@ -1158,11 +1199,12 @@ class AIWatchService:
                         sf[current] = now
                         state["stream_fragile"] = sf
                 if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
-                    # 设 30s 切流静默保护窗
+                    # 设切流静默保护窗（Codex 死连接底层 HTTP 超时约 65s，设 75s 防止旧死连接滞后报错误杀新健康节点）
+                    silence_sec = 75.0 if group == AI_MANUAL_GROUP else 30.0
                     gs["last_log_fail_ts"] = max(
                         float(gs.get("last_log_fail_ts") or 0.0),
-                        now + 30.0,
-                        time.time() + 30.0,
+                        now + silence_sec,
+                        time.time() + silence_sec,
                     )
                     _promote_gemini_order_head(self.paths, target, group=group)
                 gs["fail_node"] = None
