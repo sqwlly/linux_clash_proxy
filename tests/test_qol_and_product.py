@@ -1323,6 +1323,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     matrix = [
         # Loopback 已写完 4.27MB 但内核 Recv-Q 仍有 2.48MB 排队上行（即便 lastsnd=27s, lastrcv=17s）-> uploading
         ("codex-recvq-backlogged", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47334", 4_275_497, 3_947, (27_514, 17_016, 2_488_578, 0), "uploading"),
+        # IEPL 死连接在内核 Recv-Q 积压 671KB 但双方向已卡死 180s（>60s）无任何字节收发 -> idle_completed（必须回收以防永久阻塞热重载与迁出）
+        ("agy-recvq-stalled-180s", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "53900", 139_621, 4_252, (180_675, 180_631, 671_996, 0), "idle_completed"),
         # 10.35MB 超大包上行 + gpt-6.1-sol 长思考已耗时 110s（download=3947 < 6000, idle=110s > 95s）-> 依然是 thinking，绝不误判为 idle_completed 强杀！
         ("codex-thinking-ttfb", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47335", 10_350_000, 3_947, (110_000, 109_500, 0, 0), "thinking"),
         # agy 复用旧 HTTP/2 连接发起第二轮长思考（lastrcv=62s <= lastsnd=62.1s）-> thinking

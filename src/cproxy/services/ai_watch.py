@@ -165,11 +165,11 @@ def classify_ai_connection_lifecycle(
     - `"idle_completed"`: 请求响应已完整结束且双方向静默达到连接池老化回收阈值；
     - `"idle_other"`: 其它未承载活跃大包轮次的轻量化/初建连接。
     """
-    if recv_q > 0:
-        return "uploading"
-    if send_q > 0:
-        return "streaming"
     idle_ms = min(lastsnd_ms, lastrcv_ms)
+    if recv_q > 0:
+        return "uploading" if idle_ms <= 60_000 else "idle_completed"
+    if send_q > 0:
+        return "streaming" if idle_ms <= 60_000 else "idle_completed"
     if 0 < upload < 18_000:
         if download >= 4_000 and idle_ms >= 6_000:
             return "idle_completed"
@@ -773,7 +773,7 @@ def detect_recent_codex_retry_failure(
                 cur = conn.cursor()
                 cur.execute(
                     "SELECT ts, ts_nanos, target, feedback_log_body FROM logs "
-                    "WHERE id > (SELECT coalesce(max(id), 0) - 500 FROM logs) "
+                    "WHERE id > (SELECT coalesce(max(id), 0) - 3000 FROM logs) "
                     "AND target IN ("
                     "'codex_core::responses_retry', "
                     "'codex_core::stream_events_utils', "
@@ -1159,12 +1159,19 @@ class AIWatchService:
             gs["fail_count"] = 1
 
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
+            cdn_reloaded = False
             try:
                 from ..backend.runtime import refresh_ws_cdn_ips_if_changed
 
-                refresh_ws_cdn_ips_if_changed(self.paths)
+                cdn_reloaded = bool(refresh_ws_cdn_ips_if_changed(self.paths))
             except Exception:
-                pass
+                cdn_reloaded = False
+            if cdn_reloaded:
+                cooldown_map = gs.get("cooldown")
+                if isinstance(cooldown_map, dict):
+                    for k in list(cooldown_map.keys()):
+                        if not is_static_iepl_node(str(k), self.paths):
+                            cooldown_map.pop(k, None)
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
                 # 仅在 AI-MANUAL、地区封锁、客户端真实重试报错或易断流节点切换时关闭旧连接；

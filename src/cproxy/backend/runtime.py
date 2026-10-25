@@ -955,6 +955,16 @@ def _resolve_healthy_ws_cdn_ips(
                 samples_by_ip[ip].append(ms)
 
     recent_errors, total_errors, active_ips = _ws_cdn_ip_log_penalties(ips, port, paths=paths)
+    # 若在用非 104.* IP 在近期日志中几乎无真实拨号超时（rec_err < 6），即使恰逢大包上行拥塞导致探针瞬时超时，
+    # 仍保留其存活资格，绝不因瞬时上行打满而误切向 104.* 黑洞网段
+    for ip in ips:
+        if (
+            not samples_by_ip.get(ip)
+            and ip in active_ips
+            and not ip.startswith("104.")
+            and recent_errors.get(ip, 0) < 6
+        ):
+            samples_by_ip[ip] = [450, 450]
     alive_ips = [ip for ip, samples in samples_by_ip.items() if samples]
     if not alive_ips:
         return []
@@ -970,13 +980,17 @@ def _resolve_healthy_ws_cdn_ips(
         tot_err = total_errors.get(ip, 0)
         is_active_healthy = (
             ip in active_ips
-            and succ >= max(1, eff_rounds - 1)
+            and (succ >= max(1, eff_rounds - 1) or (not ip.startswith("104.") and rec_err < 6))
             and max_ms < 1800
             and rec_err < 12
             and tot_err <= min_total_err + 5
         )
         prefer_non_104 = 0 if not ip.startswith("104.") else 1
-        has_majority_succ = 0 if succ >= max(1, eff_rounds - 1) else 1
+        has_majority_succ = (
+            0
+            if (succ >= max(1, eff_rounds - 1) or (ip in active_ips and not ip.startswith("104.") and rec_err < 6))
+            else 1
+        )
         sort_key = (
             0 if rec_err < 12 else 1,
             0 if tot_err <= min_total_err + 5 else 1,
@@ -1052,28 +1066,64 @@ def is_only_ai_group_order_change(old_text: str, new_text: str) -> bool:
     return True
 
 
+def _mihomo_in_memory_using_stale_104(paths: AppPaths, new_servers: dict[str, str]) -> bool:
+    """检测 mihomo 内存态是否仍滞留在已废弃的 104.* Anycast IP（晚于最近一次配置重载仍有 104.* 拨号报错）。"""
+    if not new_servers or any(str(ip).startswith("104.") for ip in new_servers.values()):
+        return False
+    try:
+        from ..config import log_file
+
+        lpath = log_file(paths)
+        if not lpath.exists():
+            return False
+        size = lpath.stat().st_size
+        with lpath.open("rb") as fh:
+            if size > 262144:
+                fh.seek(size - 262144)
+            tail = fh.read().decode("utf-8", errors="ignore")
+        for line in reversed(tail.splitlines()):
+            if "Start initial configuration in progress" in line:
+                return False
+            if "error: 104." in line and "connect error:" in line:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
-    """清空 CDN TLS 探测缓存并重新探测渲染；仅当节点底层 CDN Anycast IP 真正发生切换且无活跃 AI 传输时才热重载 mihomo。"""
+    """清空 CDN TLS 探测缓存并重新探测渲染；当节点底层 CDN Anycast IP 发生切换或运行实例落后于磁盘配置时热重载 mihomo。"""
+    from ..services.ai_watch import has_any_inflight_ai_connection
+    from .process import ProcessBackend
+
     _WS_TLS_PROBE_CACHE.clear()
     _WS_CDN_IP_RANK_CACHE.clear()
     rt_path = runtime_file(paths)
+    process = ProcessBackend(paths)
+    was_stale = process.is_runtime_stale(rt_path) if rt_path.exists() else False
     old_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
     old_servers = _extract_proxy_servers(old_text)
     RuntimeBackend(paths).render_runtime()
     new_text = rt_path.read_text(encoding="utf-8") if rt_path.exists() else ""
     new_servers = _extract_proxy_servers(new_text)
-    if old_servers and new_servers and old_servers != new_servers:
-        from ..services.ai_watch import has_any_inflight_ai_connection
-        from .process import ProcessBackend
-
-        if has_any_inflight_ai_connection(paths):
+    servers_changed = bool(old_servers and new_servers and old_servers != new_servers)
+    memory_drift_104 = _mihomo_in_memory_using_stale_104(paths, new_servers)
+    if servers_changed or was_stale or memory_drift_104:
+        recovering_from_104 = memory_drift_104 or any(
+            str(old_ip).startswith("104.") and not str(new_servers.get(name, "")).startswith("104.")
+            for name, old_ip in old_servers.items()
+        )
+        if not recovering_from_104 and has_any_inflight_ai_connection(paths):
             return False
-        ProcessBackend(paths).reload_if_running(rt_path)
-        return True
-    if old_text and new_text and old_text != new_text:
-        from .process import ProcessBackend
-
-        ProcessBackend(paths).mark_runtime_applied(rt_path)
+        return process.reload_if_running(rt_path)
+    if (
+        not was_stale
+        and old_text
+        and new_text
+        and old_text != new_text
+        and is_only_ai_group_order_change(old_text, new_text)
+    ):
+        process.mark_runtime_applied(rt_path)
     return False
 
 
