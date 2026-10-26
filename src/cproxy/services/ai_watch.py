@@ -17,7 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
-from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, ai_watch_state_file, read_config
+from ..config import (
+    AppPaths,
+    ai_gemini_order_file,
+    ai_manual_order_file,
+    ai_watch_state_file,
+    conn_activity_state_file,
+    read_config,
+)
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
 from .probe import (
     STREAM_FRAGILE_TTL_SECONDS,
@@ -144,6 +151,147 @@ def _unpack_socket_timings(
         return lastsnd_ms, lastrcv_ms, max(0, int(timings[2])), max(0, int(timings[3]))
     q = _LAST_SOCKET_QUEUE_MAP.get(src_port, (0, 0))
     return lastsnd_ms, lastrcv_ms, q[0], q[1]
+
+
+_MEM_CONN_ACTIVITY: dict[str, dict[str, float | int | str]] = {}
+
+
+def _load_conn_activity(paths: AppPaths | None) -> dict[str, dict[str, float | int | str]]:
+    if paths is None:
+        return dict(_MEM_CONN_ACTIVITY)
+    path = conn_activity_state_file(paths)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_conn_activity(paths: AppPaths | None, data: dict[str, dict[str, float | int | str]]) -> None:
+    _MEM_CONN_ACTIVITY.clear()
+    _MEM_CONN_ACTIVITY.update(data)
+    if paths is None:
+        return
+    path = conn_activity_state_file(paths)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def track_connections_idle_ms(
+    paths: AppPaths | None,
+    connections: list[dict],
+    *,
+    now: float | None = None,
+) -> dict[str, tuple[int, int]]:
+    """跨平台连接活跃时序跟踪器（Windows / Clash Verge 无 `ss` 环境下的平替实现）。
+
+    基于 `/connections` 快照的 `(upload, download)` 字节差分计算本地代理视角下的
+    `(lastsnd_ms, lastrcv_ms)`：
+    - 客户端上行 (`upload` 增长) 对应本地代理服务端 socket 的 `lastrcv` 刷新；
+    - 远端下行 (`download` 增长) 对应本地代理服务端 socket 的 `lastsnd` 刷新；
+    - 同一采样周期内若请求与响应均完成（`download >= 6000` 且下行增量 `>= 1KB`），
+      保持 `lastrcv` 早于 `lastsnd` 600ms，与内核 TCP 时序不变量完全对齐。
+    """
+    ts_now = time.time() if now is None else float(now)
+    prev_map = _load_conn_activity(paths)
+    next_map: dict[str, dict[str, float | int | str]] = {}
+    idle_by_port: dict[str, tuple[int, int]] = {}
+
+    for item in connections:
+        if not isinstance(item, dict):
+            continue
+        conn_id = str(item.get("id") or "")
+        if not conn_id:
+            continue
+        raw_meta = item.get("metadata")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        src_port = str(meta.get("sourcePort") or "")
+        if not src_port.isdigit():
+            continue
+        try:
+            upload = max(0, int(item.get("upload") or 0))
+            download = max(0, int(item.get("download") or 0))
+        except (TypeError, ValueError):
+            continue
+
+        prev = prev_map.get(conn_id)
+        if isinstance(prev, dict):
+            prev_up = int(prev.get("up") or 0)
+            prev_down = int(prev.get("down") or 0)
+            snd_ts = float(prev.get("snd_ts") or ts_now)
+            rcv_ts = float(prev.get("rcv_ts") or ts_now)
+            delta_up = upload - prev_up
+            delta_down = download - prev_down
+            if delta_up > 0 and delta_down > 0:
+                if download >= 6_000 and delta_down >= 1_024:
+                    snd_ts = ts_now
+                    rcv_ts = ts_now - 0.6
+                else:
+                    rcv_ts = ts_now
+                    snd_ts = min(snd_ts, ts_now - 0.2)
+            elif delta_up > 0:
+                rcv_ts = ts_now
+                if snd_ts > rcv_ts:
+                    snd_ts = ts_now - 0.2
+            elif delta_down > 0:
+                snd_ts = ts_now
+                if rcv_ts >= snd_ts - 0.5:
+                    rcv_ts = snd_ts - 0.6
+        else:
+            if download >= 4_000:
+                snd_ts = ts_now
+                rcv_ts = ts_now - 0.6
+            else:
+                rcv_ts = ts_now
+                snd_ts = ts_now - 0.2
+
+        next_map[conn_id] = {
+            "up": upload,
+            "down": download,
+            "snd_ts": snd_ts,
+            "rcv_ts": rcv_ts,
+            "port": src_port,
+        }
+        lastsnd_ms = max(0, round((ts_now - snd_ts) * 1000))
+        lastrcv_ms = max(0, round((ts_now - rcv_ts) * 1000))
+        idle_by_port[src_port] = (lastsnd_ms, lastrcv_ms)
+
+    _save_conn_activity(paths, next_map)
+    return idle_by_port
+
+
+def sample_connections_activity(
+    paths: AppPaths,
+    api=None,
+    *,
+    now: float | None = None,
+) -> dict[str, tuple[int, int]]:
+    """采样一次 `/connections` 并更新跨平台字节差分时序状态（供守护进程高频调用）。"""
+    if api is None:
+        try:
+            from ..backend.api import APIBackend
+
+            api = APIBackend(paths)
+        except Exception:
+            return {}
+    get_conns = getattr(api, "get_connections", None)
+    if not callable(get_conns):
+        return {}
+    try:
+        payload = get_conns()
+    except Exception:
+        return {}
+    connections = payload.get("connections") if isinstance(payload, dict) else []
+    if not isinstance(connections, list):
+        return {}
+    return track_connections_idle_ms(paths, connections, now=now)
 
 
 def classify_ai_connection_lifecycle(
@@ -305,6 +453,8 @@ def reap_idle_gemini_connections(
 
     idle_map = get_local_proxy_socket_idle_ms(mixed_port)
     if not idle_map:
+        idle_map = track_connections_idle_ms(paths, connections)
+    if not idle_map:
         return []
 
     reaped: list[str] = []
@@ -391,6 +541,8 @@ def has_active_ai_transfer(
         mixed_port = 7890
 
     idle_map = get_local_proxy_socket_idle_ms(mixed_port)
+    if not idle_map:
+        idle_map = track_connections_idle_ms(paths, connections)
     if not idle_map:
         return False
 
@@ -597,12 +749,20 @@ _AGY_RETRY_FAIL_RE = re.compile(
 AGY_LOG_WINDOW_SECONDS = 180.0
 
 
-def default_agy_log_dir(paths: AppPaths) -> Path:
+def _resolve_user_home_from_paths(paths: AppPaths) -> Path:
     if paths.state_dir.parent.name == "state" and paths.state_dir.parent.parent.name == ".local":
-        base = paths.state_dir.parent.parent.parent
-    else:
-        base = paths.state_dir.parent.parent
-    return base / ".gemini" / "antigravity-cli" / "log"
+        return paths.state_dir.parent.parent.parent
+    if (
+        paths.state_dir.parent.name == "state"
+        and paths.state_dir.parent.parent.name.lower() == "local"
+        and paths.state_dir.parent.parent.parent.name.lower() == "appdata"
+    ):
+        return paths.state_dir.parent.parent.parent.parent
+    return paths.state_dir.parent.parent
+
+
+def default_agy_log_dir(paths: AppPaths) -> Path:
+    return _resolve_user_home_from_paths(paths) / ".gemini" / "antigravity-cli" / "log"
 
 
 _AGY_GLOG_TS_RE = re.compile(r"^I(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+")
@@ -731,11 +891,7 @@ _CODEX_RETRY_DELAY_RE = re.compile(r"\bretry_delay=(\d+(?:\.\d+)?)s\b")
 
 
 def default_codex_log_dir(paths: AppPaths) -> Path:
-    if paths.state_dir.parent.name == "state" and paths.state_dir.parent.parent.name == ".local":
-        base = paths.state_dir.parent.parent.parent
-    else:
-        base = paths.state_dir.parent.parent
-    return base / ".codex"
+    return _resolve_user_home_from_paths(paths) / ".codex"
 
 
 def detect_recent_codex_retry_failure(

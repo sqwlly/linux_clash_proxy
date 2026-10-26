@@ -153,12 +153,13 @@ class RebalanceService:
     def __init__(self, paths: AppPaths):
         self.paths = paths
 
-    def rebalance(self, dry_run: bool = False) -> RebalanceReport:
+    def rebalance(self, dry_run: bool = False, *, external_only: bool = False) -> RebalanceReport:
         with probe_paths_context(self.paths):
-            return self._rebalance_impl(dry_run=dry_run)
+            return self._rebalance_impl(dry_run=dry_run, external_only=external_only)
 
-    def _rebalance_impl(self, dry_run: bool = False) -> RebalanceReport:
+    def _rebalance_impl(self, dry_run: bool = False, *, external_only: bool = False) -> RebalanceReport:
         cfg = read_config(self.paths)
+        is_external = external_only or bool(isinstance(cfg, dict) and cfg.get("verge-mode"))
         raw_max_mult = cfg.get("max-ai-multiplier") if isinstance(cfg, dict) else None
         try:
             max_mult = float(raw_max_mult) if raw_max_mult is not None else DEFAULT_MAX_AI_MULTIPLIER
@@ -262,29 +263,34 @@ class RebalanceService:
             gemini_order_path.parent.mkdir(parents=True, exist_ok=True)
             gemini_order_path.write_text(json.dumps(gemini_ordered, ensure_ascii=False), encoding="utf-8")
 
-        target_runtime = runtime_file(self.paths)
-        before_bytes = target_runtime.read_bytes() if target_runtime.exists() else None
-        runtime_path = RuntimeBackend(self.paths).render_runtime()
-        after_bytes = runtime_path.read_bytes() if runtime_path.exists() else None
-        runtime_changed = before_bytes != after_bytes
-
-        process = ProcessBackend(self.paths)
-        running = process.is_running()
-        is_stale = getattr(process, "is_runtime_stale", lambda _path=None: False)(runtime_path)
+        rerendered = False
         hot_reloaded = False
-        if running and (order_updated or gemini_order_updated or runtime_changed or is_stale):
-            from .ai_watch import has_any_inflight_ai_connection
+        if is_external:
+            running = True
+        else:
+            target_runtime = runtime_file(self.paths)
+            before_bytes = target_runtime.read_bytes() if target_runtime.exists() else None
+            runtime_path = RuntimeBackend(self.paths).render_runtime()
+            after_bytes = runtime_path.read_bytes() if runtime_path.exists() else None
+            runtime_changed = before_bytes != after_bytes
+            rerendered = True
 
-            api_instance = APIBackend(self.paths)
-            if not has_any_inflight_ai_connection(self.paths, api_instance):
-                try:
-                    api_instance.reload_config(str(runtime_path))
-                    hot_reloaded = True
-                except Exception:
-                    # 热重载失败留给下一轮 cproxy render/rebalance 兜底，不阻断
-                    hot_reloaded = False
-                if hot_reloaded and hasattr(process, "mark_runtime_applied"):
-                    process.mark_runtime_applied(runtime_path)
+            process = ProcessBackend(self.paths)
+            running = process.is_running()
+            is_stale = getattr(process, "is_runtime_stale", lambda _path=None: False)(runtime_path)
+            if running and (order_updated or gemini_order_updated or runtime_changed or is_stale):
+                from .ai_watch import has_any_inflight_ai_connection
+
+                api_instance = APIBackend(self.paths)
+                if not has_any_inflight_ai_connection(self.paths, api_instance):
+                    try:
+                        api_instance.reload_config(str(runtime_path))
+                        hot_reloaded = True
+                    except Exception:
+                        # 热重载失败留给下一轮 cproxy render/rebalance 兜底，不阻断
+                        hot_reloaded = False
+                    if hot_reloaded and hasattr(process, "mark_runtime_applied"):
+                        process.mark_runtime_applied(runtime_path)
 
         switched_to: str | None = None
         if running and effective_order:
@@ -306,8 +312,9 @@ class RebalanceService:
         return RebalanceReport(
             ordered=tuple(effective_order),
             order_path=str(order_path),
-            rerendered=True,
+            rerendered=rerendered,
             hot_reloaded=hot_reloaded,
+            reason="external-only" if is_external else "",
             switched_to=switched_to,
             gemini_ordered=tuple(effective_gemini_order),
             gemini_order_path=str(gemini_order_path) if effective_gemini_order else "",

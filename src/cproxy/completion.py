@@ -30,6 +30,7 @@ from .output import (
     STRATEGY_CHOICES,
     TRAFFIC_ACTIONS,
     TRAFFIC_DIMENSIONS,
+    VERGE_ACTIONS,
 )
 from .services.query import QueryService
 
@@ -56,6 +57,7 @@ _POSITIONAL_SOURCES: dict[str, tuple[str, ...]] = {
     "tun": ("tun-actions",),
     "snapshots": ("snapshots-actions",),
     "notify": ("notify-actions",),
+    "verge": ("verge-actions",),
 }
 
 # `--flag` 取值补什么
@@ -163,6 +165,8 @@ def _values_for(paths: AppPaths, source: str, prior_args: list[str]) -> list[str
         return list(RULE_ACTIONS)
     if source == "rule-types":
         return list(RULE_TYPE_CHOICES)
+    if source == "verge-actions":
+        return list(VERGE_ACTIONS)
     if source == "banned-patterns":
         from .services.ban import load_active_bans
 

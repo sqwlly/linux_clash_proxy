@@ -28,13 +28,24 @@ class AppPaths:
 def default_paths(home: Path | None = None) -> AppPaths:
     base_home = home or Path.home()
     if home is None:
-        config_home = Path(os.environ.get("XDG_CONFIG_HOME", base_home / ".config"))
-        data_home = Path(os.environ.get("XDG_DATA_HOME", base_home / ".local" / "share"))
-        state_home = Path(os.environ.get("XDG_STATE_HOME", base_home / ".local" / "state"))
-    else:
-        config_home = base_home / ".config"
-        data_home = base_home / ".local" / "share"
-        state_home = base_home / ".local" / "state"
+        if os.name == "nt" and not (base_home / ".config" / "cproxy").exists():
+            default_cfg_base = Path(os.environ.get("APPDATA", base_home / ".config"))
+            default_local_base = Path(os.environ.get("LOCALAPPDATA", base_home / ".local"))
+            config_home = Path(os.environ.get("XDG_CONFIG_HOME", default_cfg_base))
+            data_home = Path(os.environ.get("XDG_DATA_HOME", default_local_base / "share"))
+            state_home = Path(os.environ.get("XDG_STATE_HOME", default_local_base / "state"))
+        else:
+            config_home = Path(os.environ.get("XDG_CONFIG_HOME", base_home / ".config"))
+            data_home = Path(os.environ.get("XDG_DATA_HOME", base_home / ".local" / "share"))
+            state_home = Path(os.environ.get("XDG_STATE_HOME", base_home / ".local" / "state"))
+        config_dir = Path(os.environ.get("CPROXY_CONFIG_DIR", config_home / "cproxy"))
+        data_dir = Path(os.environ.get("CPROXY_DATA_DIR", data_home / "cproxy"))
+        state_dir = Path(os.environ.get("CPROXY_STATE_DIR", state_home / "cproxy"))
+        return AppPaths(config_dir=config_dir, data_dir=data_dir, state_dir=state_dir)
+
+    config_home = base_home / ".config"
+    data_home = base_home / ".local" / "share"
+    state_home = base_home / ".local" / "state"
     return AppPaths(
         config_dir=config_home / "cproxy",
         data_dir=data_home / "cproxy",
@@ -93,6 +104,11 @@ def node_bans_file(paths: AppPaths) -> Path:
 def custom_rules_file(paths: AppPaths) -> Path:
     """cproxy rule 持久化的用户自定义分流规则（state 文件）。"""
     return paths.state_dir / "custom-rules.json"
+
+
+def conn_activity_state_file(paths: AppPaths) -> Path:
+    """跨平台（Windows/无 ss 环境）通过 /connections 字节差分跟踪连接活跃时序的状态文件。"""
+    return paths.state_dir / "conn-activity.json"
 
 
 def load_yaml_file(path: Path) -> Any:

@@ -125,6 +125,162 @@ def _run_speed(args: Namespace) -> int:
         return 0
 
 
+def _print_verge_tick(tick_report, *, raw: bool = False) -> None:
+    watch_rep = tick_report.watch_report
+    reb_rep = tick_report.rebalance_report
+    if raw:
+        if watch_rep:
+            for item in watch_rep.results:
+                verdict = VERDICT_LABELS.get(item.verdict, item.verdict)
+                print(f"WATCH\t{item.group}\t{verdict}\t{item.current or '-'}\t{item.target or '-'}", flush=True)
+        if reb_rep:
+            print(
+                f"REBALANCE\tAI-MANUAL\t{reb_rep.switched_to or '-'}\t"
+                f"AI-GEMINI\t{reb_rep.gemini_switched_to or '-'}",
+                flush=True,
+            )
+        return
+
+    ts_label = time.strftime("%H:%M:%S", time.localtime(tick_report.timestamp))
+    if watch_rep and watch_rep.results:
+        parts: list[str] = []
+        for item in watch_rep.results:
+            verdict = VERDICT_LABELS.get(item.verdict, item.verdict)
+            seg = f"{item.group}={verdict}({item.current or '-'})"
+            if item.switched and item.target:
+                seg += f"->{item.target}"
+            parts.append(seg)
+        reaped_n = len(watch_rep.reaped_connections)
+        reap_suffix = f" · 回收闲置连接 {reaped_n}" if reaped_n else ""
+        print(f"[{ts_label}] 看护: {' | '.join(parts)}{reap_suffix}", flush=True)
+    if reb_rep:
+        sw_manual = f" -> {reb_rep.switched_to}" if reb_rep.switched_to else ""
+        sw_gemini = f" -> {reb_rep.gemini_switched_to}" if reb_rep.gemini_switched_to else ""
+        print(
+            f"[{ts_label}] 重排: AI-MANUAL({len(reb_rep.ordered)}){sw_manual} | "
+            f"AI-GEMINI({len(reb_rep.gemini_ordered)}){sw_gemini}",
+            flush=True,
+        )
+    for warn in tick_report.warnings:
+        print(f"[{ts_label}] 提示: {warn}", flush=True)
+
+
+def _run_verge(args: Namespace) -> int:
+    from .services.verge import (
+        VergeDaemonService,
+        export_verge_script,
+        init_verge_config,
+        install_verge_oneclick,
+    )
+
+    paths = default_paths()
+    action = getattr(args, "action", "once")
+    verge_dir = Path(args.verge_dir) if getattr(args, "verge_dir", None) else None
+
+    if action == "install":
+        rep = install_verge_oneclick(
+            paths,
+            controller=args.controller,
+            secret=args.secret,
+            mixed_port=args.mixed_port,
+            verge_dir=verge_dir,
+        )
+        if args.json:
+            emit_json("verge", rep)
+        elif args.raw:
+            print(
+                f"INSTALL\t{rep.config_path}\t{rep.controller}\t{rep.mixed_port}\t"
+                f"{rep.injected_script_path or rep.fallback_script_path or '-'}"
+            )
+        else:
+            print(_section_heading("Clash Verge 一键旁路集成已完成"))
+            print(f"旁路配置: {rep.config_path}")
+            print(f"控制器:   {rep.controller} (混合端口: {rep.mixed_port})")
+            if rep.injected_script_path:
+                print(f"脚本注入: 已直接写入 Clash Verge 全局扩展脚本 -> {rep.injected_script_path}")
+                if rep.chain_enabled:
+                    print("脚本挂载: 已在 profiles.yaml 的 chain 中自动启用全局 Script")
+            elif rep.fallback_script_path:
+                print(f"脚本导出: 未检测到本地 Clash Verge 目录，已导出至 -> {rep.fallback_script_path}")
+        return 0
+
+    if action == "init":
+        cfg_path, detected = init_verge_config(
+            paths,
+            controller=args.controller,
+            secret=args.secret,
+            mixed_port=args.mixed_port,
+            verge_dir=verge_dir,
+        )
+        if args.json:
+            emit_json(
+                "verge",
+                {
+                    "action": "init",
+                    "config_file": str(cfg_path),
+                    "external_controller": detected.controller,
+                    "mixed_port": detected.mixed_port,
+                    "secret_configured": bool(detected.secret),
+                    "source_dir": str(detected.source_dir) if detected.source_dir else None,
+                },
+            )
+        elif args.raw:
+            print(f"CONFIG\t{cfg_path}\t{detected.controller}\t{detected.mixed_port}")
+        else:
+            print(_section_heading("Clash Verge 旁路配置已就绪"))
+            print(f"配置文件: {cfg_path}")
+            print(f"控制器:   {detected.controller}")
+            print(f"混合端口: {detected.mixed_port}")
+            print(f"密钥状态: {'已配置' if detected.secret else '未设置（空）'}")
+            if detected.source_dir:
+                print(f"自动发现: {detected.source_dir}")
+        return 0
+
+    if action == "script":
+        out_path = Path(args.output) if args.output else None
+        script_text = export_verge_script(out_path)
+        if args.json:
+            emit_json(
+                "verge",
+                {
+                    "action": "script",
+                    "output": str(out_path) if out_path else None,
+                    "bytes": len(script_text.encode("utf-8")),
+                },
+            )
+        elif out_path is not None:
+            print(f"已导出 Clash Verge 全局扩展脚本: {out_path}")
+        else:
+            print(script_text, end="" if script_text.endswith("\n") else "\n")
+        return 0
+
+    svc = VergeDaemonService(paths)
+    if action == "once":
+        tick = svc.run_once(
+            run_rebalance=not getattr(args, "no_rebalance", False),
+            dry_run=args.dry_run,
+        )
+        if args.json:
+            emit_json("verge", tick, warnings=tick.warnings)
+        else:
+            _print_verge_tick(tick, raw=args.raw)
+        return 0
+
+    if not (args.raw or args.json):
+        print(_section_heading("Clash Verge 旁路守护进程已启动 (Ctrl-C 退出)"))
+        print(
+            f"采样间隔: {args.sample_interval}s · 看护间隔: {args.watch_interval}s · "
+            f"重排间隔: {args.rebalance_interval}s"
+        )
+    return svc.run_daemon(
+        watch_interval=args.watch_interval,
+        rebalance_interval=args.rebalance_interval,
+        sample_interval=args.sample_interval,
+        dry_run=args.dry_run,
+        on_tick=lambda tick: _print_verge_tick(tick, raw=args.raw),
+    )
+
+
 def run(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     # `__complete` 走早短路：不进 argparse，因此不会出现在任何 help/usage/choices 里，
@@ -379,7 +535,10 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "ai-rebalance":
             try:
                 # 各自独立的变量名：三种 report 类型不同，共用一个名字会让类型互相污染
-                rebalance_report = RebalanceService(default_paths()).rebalance(dry_run=args.dry_run)
+                rebalance_report = RebalanceService(default_paths()).rebalance(
+                    dry_run=args.dry_run,
+                    external_only=getattr(args, "external_only", False),
+                )
             except APIUnavailableError:
                 # 定时任务在代理未运行时无需报错：跳过本轮，下一轮再排
                 print("代理未运行，跳过稳定度重排")
@@ -519,6 +678,8 @@ def run(argv: list[str] | None = None) -> int:
                 raw=args.raw,
                 as_json=args.json,
             )
+        if args.command == "verge":
+            return _run_verge(args)
         if args.command == "benchmark":
             return _render_benchmark(
                 default_paths(),

@@ -161,6 +161,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("unban", "解除节点屏蔽并恢复候选资格"),
             ("rule", "管理免改 YAML 的自定义置顶分流规则"),
             ("flush", "精准掐断分裂出口或指定目标的活跃长连接"),
+            ("verge", "适配 Windows / Clash Verge 旁路调度与全局扩展脚本"),
         ),
     ),
     (
@@ -221,6 +222,7 @@ NOTIFY_ACTIONS = ("status", "set", "test", "clear")
 RULE_ACTIONS = ("list", "add", "remove")
 RULE_TYPE_CHOICES = ("suffix", "domain", "keyword", "cidr", "process")
 PROMPT_FORMAT_CHOICES = ("compact", "full", "tmux")
+VERGE_ACTIONS = ("install", "init", "script", "once", "daemon")
 
 # 命令名左对齐宽度：留出最长命令名（`migrate-from-legacy` 19 字符）的余量
 _COMMAND_NAME_WIDTH = 24
@@ -452,6 +454,11 @@ def build_root_parser() -> ArgumentParser:
 
     rebalance_parser = _add_command(subparsers, "ai-rebalance", raw=True)
     rebalance_parser.add_argument("--dry-run", action="store_true", help="只探测排序，不写文件、不重渲染")
+    rebalance_parser.add_argument(
+        "--external-only",
+        action="store_true",
+        help="旁路模式（如配合 Clash Verge）：只通过 API 探测与切换节点，不重渲染本地配置",
+    )
 
     watch_parser = _add_command(subparsers, "ai-watch", raw=True)
     watch_parser.add_argument("--dry-run", action="store_true", help="只探测判定，不切换、不写状态")
@@ -553,6 +560,25 @@ def build_root_parser() -> ArgumentParser:
         help="要断开的目标：ai、gemini、all、域名或进程名（省略则默认只清理分裂旧连接）",
     )
     flush_parser.add_argument("--stale", action="store_true", help="仅断开滞留在非当前出口节点上的分裂旧连接")
+
+    verge_parser = _add_command(subparsers, "verge", raw=True, json_output=True)
+    verge_parser.add_argument(
+        "action",
+        nargs="?",
+        default="once",
+        choices=VERGE_ACTIONS,
+        help="动作：install（一键注入脚本+生成配置）、init（生成配置）、script（输出扩展脚本）、once（单轮调度）、daemon（后台守护）",
+    )
+    verge_parser.add_argument("--verge-dir", help="手动指定 Clash Verge 配置目录（省略则自动探测）")
+    verge_parser.add_argument("--controller", help="External Controller 地址（如 127.0.0.1:9097）")
+    verge_parser.add_argument("--secret", help="External Controller 密钥")
+    verge_parser.add_argument("--mixed-port", type=int, help="Clash Verge 本地混合代理端口（默认 7897）")
+    verge_parser.add_argument("-o", "--output", help="与 script 一起使用：将 JS 脚本写入指定文件路径")
+    verge_parser.add_argument("--watch-interval", type=float, default=20.0, help="daemon 看门狗巡检间隔秒数（默认 20）")
+    verge_parser.add_argument("--rebalance-interval", type=float, default=1800.0, help="daemon 稳定度重排间隔秒数（默认 1800）")
+    verge_parser.add_argument("--sample-interval", type=float, default=3.0, help="daemon 连接时序采样间隔秒数（默认 3）")
+    verge_parser.add_argument("--no-rebalance", action="store_true", help="与 once 一起使用：只跑 ai-watch 不跑 rebalance")
+    verge_parser.add_argument("--dry-run", action="store_true", help="演练模式，不实际切换节点或关闭连接")
 
     _add_command(subparsers, "benchmark", raw=True, json_output=True)
 

@@ -223,12 +223,14 @@ class QueryService:
                     _unpack_socket_timings,
                     get_local_proxy_socket_idle_ms,
                     is_inflight_ai_connection,
+                    track_connections_idle_ms,
                 )
-                from .probe import is_static_iepl_node
 
                 if upload >= 18_000 and host in AI_STREAM_HOSTS and src_port.isdigit():
                     if socket_idle_map is None:
-                        socket_idle_map = get_local_proxy_socket_idle_ms()
+                        socket_idle_map = get_local_proxy_socket_idle_ms(self.runtime.mixed_port())
+                        if not socket_idle_map:
+                            socket_idle_map = track_connections_idle_ms(self.paths, connections)
                     unpacked = _unpack_socket_timings(socket_idle_map.get(src_port), src_port)
                     if unpacked is not None and is_inflight_ai_connection(
                         upload,
