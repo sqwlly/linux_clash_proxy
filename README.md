@@ -1,503 +1,110 @@
 # cproxy
 
-> 项目当前阶段、里程碑与下一步见 [STATUS.md](STATUS.md)。
+面向 AI 编程工具（Codex / Claude Code / Gemini / Antigravity / Cursor）与开发工作流的 **Mihomo 智能路由调度与代理管理工具**。
 
-`cproxy` 是面向用户级安装的 Mihomo CLI，**已是本机唯一生产入口**。旧的 `proxy.sh` 工作流已于 2026-09-11 停用、2026-10-17 从仓库删除（退役阶段 3）——退役条件与进度见 [STATUS.md](STATUS.md) 与 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
+支持两种运行形态：
+- **Linux 独立托管模式**：完整管理 Mihomo 进程、订阅拉取、配置渲染、TUN 透明代理与 `systemd --user` 自动化定时器。
+- **Windows / Clash Verge 旁路增强模式**：由 Clash Verge (Rev) 管理内核与界面，`cproxy` 自动注入全局扩展脚本并通过 External Controller API 提供后台看门狗、长连接防断流与节点稳定性优选。
 
-当前已经具备这些能力：
+---
 
-- 用户级目录初始化
-- 原始配置渲染为运行配置
-- 启动、停止、重启、状态查询
-- AI 路由状态查看与手动切换
-- 代理组、节点、延迟检查
-- 命令级代理环境注入
-- TUN 透明代理开关、状态与热重载
-- 运行配置自动快照与一键回滚
-- 一键刷新：订阅更新、重启、分组探测与失效自动切换
-- 从旧仓库目录迁移 `config.yaml`
+## 核心特性
 
-当前内部结构也已经完成第一版 backend 重构：
+- **AI 流量精细分流与地区防封锁**
+  - 自动构建 `AI-GEMINI`（针对 Google / Gemini / Cloud Code 自动优选韩、台、英、欧等合规低延迟地区）与 `AI-MANUAL`（针对 OpenAI / Codex / Claude / Copilot 优选美、日、新等主力节点）。
+  - 自动清洗机场订阅中的冲突 AI 规则，置顶注入 AI 域名与进程规则，开发下载源（PyPI / npm / PyTorch）与国内流量自动直连。
+- **长连接抗断流优选（Anti-EOF）**
+  - 自动识别在 15~60s 模型思考或工具执行空闲期易被网关掐断的节点（如 `IEPL` / `IPLC` 专线或裸 TCP `xtls-rprx-vision`），优先将 `1X`、`WebSocket`、`gRPC` 等长连接稳态节点排在首位，并将高倍率（`>= 3.0X`）节点自动沉底。
+- **语义级看门狗（`ai-watch`）**
+  - 突破传统 `generate_204` 仅测连通性的局限：每 20 秒对活跃出口做 AI 接口语义探测，精准捕获「节点能 ping 通但返回地区不支持（400/403）或 TLS 假死」，连续失败自动切往下一个健康节点。
+- **连接池治理与 In-Flight 零中断保护**
+  - 基于 TCP 队列/字节时序状态机实时识别 `uploading`（上下文上传）、`thinking`（模型长思考）、`streaming`（SSE 推流）与 `idle_completed`（已完成闲置）：
+  - **活跃保护**：在大包上传或流式生成期间严禁强杀连接或触发破坏性重载；
+  - **闲置回收**：自动清理已完成响应并静默老化的 HTTP/2 连接，防止下一轮对话复用半衰期连接撞上 50s~94s 超时断流。
+- **多轮实测重排（`ai-rebalance`）**
+  - 每 30 分钟执行多轮并发延迟探测，结合历史失败惩罚权重与 Gemini 15.5s SSE 保持验毒（Hold Probe），动态重排候选优先级。
 
-- `backend/api.py` 负责 Mihomo API
-- `backend/runtime.py` 负责 `runtime.yaml` 读取与渲染
-- `backend/process.py` 负责进程 ownership 与生命周期
-- `services/query.py` 负责 `API 优先 / runtime 回退`
-- `services/diagnostics.py` 负责 `test` 与 `test-group`
-
-## 安装
-
-正式入口优先用 `pipx`：
-
-```bash
-pipx install '/path/to/clash_proxy[tui]'
-```
-
-仓库内也提供了本地安装脚本：
-
-```bash
-./scripts/install.sh
-```
-
-这条脚本现在会在安装后自动尝试无参一键部署流程（等价于 `cproxy bootstrap`）。
-
-安装脚本会：
-
-- **root 下一律装到系统级 `/usr/local`**（先补齐声明的运行依赖，再替换项目本体：
-  默认以 `pip install --no-deps --editable` 装成可编辑模式，设 `CPROXY_EDITABLE=0`
-  时改为 `pip install --force-reinstall --no-deps` 装成正式副本——生产安装用后者），
-  刻意不用 `--user`：`systemd-user/cproxy.service` 硬编码 `/usr/local/bin/cproxy`，
-  而 PATH 里 `~/.local/bin` 排在它前面——同时存在两份副本时，交互命令与 systemd
-  服务会跑不同版本的代码
-- 默认安装 `Textual` TUI；只需要 CLI 时可设 `CPROXY_INSTALL_TUI=0`
-- 非 root 时优先 `pipx install --force --editable`，回退
-  `python3 -m pip install --user --editable`
-- 初始化用户级 `cproxy` 配置目录
-- 安装 GeoIP 数据到默认路径：优先复用已有用户级文件和仓库根目录遗留的 `Country.mmdb`（该文件已不入库），缺失时尝试从 meta-rules-dat 下载，仍失败则打印手动放置警告
-- 不安装也不刷新任何 legacy wrapper——相关脚本已随退役删除；脚本同样不会覆盖 pip 安装的
-  `cproxy` 真入口
-
-安装脚本**不会中断正在运行的代理**：
-
-- 代理进程由 mihomo 独立持有，`cproxy` 只是控制端——换掉 CLI 的代码不影响它
-- 脚本末尾的一键部署会调 `cproxy bootstrap`，其中的 `start` 是**幂等**的：
-  检测到代理已在运行就直接返回现有 PID，不会重启（`backend/process.py` 的
-  `start()` 以 `is_running()` 短路）
-- 配置层面同样支持热重载：`cproxy refresh` 经 Mihomo 的 `PUT /configs` 应用新
-  配置，长会话与长任务不中断，仅在 API 不可达时回退进程重启（见
-  [安全更新流程](#安全更新流程)）
-
-## GeoIP 数据
-
-`cproxy render` 会注入：
-
-- `GEOIP,CN,DIRECT,no-resolve`
-
-因此运行时依赖 `country.mmdb`。默认手动放置路径是：
-
-- `~/.local/share/cproxy/country.mmdb`
-
-这是因为 `cproxy start` 会用用户级数据目录作为 Mihomo 的 `-d` 工作目录。
-
-需要注意：
-
-- 在无代理或受限网络环境下，Mihomo 不一定能自动获取 `country.mmdb`
-- `./scripts/install.sh` 会优先复用仓库根目录的 `Country.mmdb`（本机遗留副本，已不入库），缺失时尝试从 meta-rules-dat 下载
-- 如果以上都不可用，先手动放到上面的默认路径，再执行 `cproxy test`
-
-常用可选配置项：
-
-- `program-path`
-  指定 `mihomo` 可执行文件路径
-- `api-timeout`
-  控制 Mihomo API 请求超时，默认 `2` 秒
-- `external-controller-tls`
-  配置后 `cproxy` 优先使用 HTTPS controller，例如 `127.0.0.1:9443`
-- `secret-systemd-credential`
-  从 systemd `$CREDENTIALS_DIRECTORY` 读取指定 credential 文件
-- `secret-file`
-  从本地文件读取 controller secret；优先级高于兼容用的 `secret`
-- `secret-keyring-service`
-  从 Python keyring 后端读取 controller secret，用户名默认 `controller`
-- `audit-journald`
-  为 `true` 时把操作审计同步写入 `systemd-cat`
-- `test-timeout`
-  控制 `test-group` 延迟检测超时
-- `connectivity-timeout`
-  控制 `test` 连通性检查超时
+---
 
 ## 快速开始
 
-首次使用：
+### 方式一：Windows + Clash Verge (Rev)（一键旁路模式）
+
+在已安装 Python（`>= 3.11`）和 Clash Verge (Rev) 的 Windows 机器上：
+
+1. **双击运行仓库根目录的 [`setup-windows-verge.bat`](setup-windows-verge.bat)**
+   脚本将自动完成以下全部操作：
+   - 安装 `cproxy` Python 包；
+   - 自动发现 Clash Verge 配置目录（`%APPDATA%\io.github.clash-verge-rev.clash-verge-rev`），读取控制器端口与密钥；
+   - 将 AI 策略拓扑脚本直接写入 Clash Verge 的 `profiles\Script.js` 并在 `profiles.yaml` 中自动挂载启用；
+   - 注册 Windows 登录无窗口后台自启任务（`cproxy-verge-daemon`）并立即拉起守护进程。
+2. 打开 Clash Verge 点击一次 **「订阅 (Profiles) → 刷新」** 即可生效。
+
+> 如需卸载后台自启任务，在 PowerShell 中运行：`.\setup-windows-verge.bat -Uninstall`
+
+---
+
+### 方式二：Linux 独立部署（托管模式）
 
 ```bash
-cproxy init
-```
+# 1. 安装 cproxy 与 Mihomo 地理数据
+CPROXY_EDITABLE=0 ./scripts/install.sh
 
-把你的节点配置写入：
+# 2. 使用机场订阅地址一键初始化并启动
+cproxy bootstrap --subscription-url 'https://your-airport.example.com/sub'
 
-- `~/.config/cproxy/config.yaml`
-
-然后执行：
-
-```bash
-cproxy render
-cproxy test
-cproxy start
-cproxy status
-cproxy ai-status
-```
-
-如果你已经有旧仓库配置，可直接迁移：
-
-```bash
-cproxy migrate-from-legacy /root/clash_proxy
-```
-
-如果你希望无参数一键完成初始化、自动迁移、渲染和启动：
-
-```bash
-cproxy bootstrap
-```
-
-没有旧配置时，也可直接从订阅完成初始化：
-
-```bash
-cproxy bootstrap --subscription-url 'https://example.invalid/subscription'
-```
-
-## TUN 透明代理（Linux）
-
-TUN 在网络层接管流量，不要求应用设置 `HTTP_PROXY`，仍按现有 Mihomo 规则和
-代理组分流。命令级代理和 mixed-port 继续可用。
-
-```bash
-cproxy tun status          # 同时查看本地开关、内核开关和 Linux 前置条件
-cproxy tun status --json
-cproxy tun on              # 保存配置并 render，下次启动或 refresh 时应用
-cproxy tun on --apply      # 保存并热重载已运行的 Mihomo，立即改变本机路由
-cproxy tun off --apply     # 关闭并热重载，撤销 Mihomo 的 TUN 接管
-```
-
-本地 `tun`、`dns` 配置在订阅更新时优先保留。保存前创建配置快照，写入采用
-同目录原子替换；渲染失败会恢复原始配置。`--apply` 要求 cproxy 管理的 Mihomo
-已经运行且 controller 可用，复用现有热重载与 Selector 选择恢复流程。
-热重载失败会返回非零退出码，并保留已保存的配置；请按错误提示检查状态和日志。
-
-首次开启会补齐以下默认值，保留已有的自定义字段：
-
-```yaml
-tun:
-  enable: true
-  device: cproxy-tun
-  stack: mixed
-  auto-route: true
-  auto-detect-interface: true
-  dns-hijack: [any:53, 'tcp://any:53']
-  auto-redirect: false
-  strict-route: false
-```
-
-同时启用内置 DNS；没有 DNS 模式或上游配置时补充 `fake-ip` 模式和数字 IP
-上游。`auto-redirect` 默认关闭，避免额外依赖 nftables；`strict-route` 默认
-关闭。需要自定义路由排除、协议栈或 DNS 时，编辑 `~/.config/cproxy/config.yaml`
-再应用。参数定义见 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
-
-Linux 需要可用的 `/dev/net/tun` 和 Mihomo 的 `CAP_NET_ADMIN`。容器还需宿主机
-允许对应设备和网络管理能力。普通用户的 systemd 服务不会凭空获得这些权限，
-尤其现有 unit 的 `NoNewPrivileges=yes` 会阻止通过文件 capability 新增权限。
-命令会检查可见的前置条件，不会自动提权或修改服务权限。配置开关与内核返回的
-开关也不能单独证明端到端接管成功；开启后应核对网卡、路由与不带代理环境变量的
-实际请求。远程服务器切换自动路由可能影响 SSH、容器网络或其他 VPN，应在有
-恢复通道时启用；可用 `cproxy tun off --apply` 关闭。
-
-## 用户级目录
-
-默认使用 XDG 用户目录：
-
-- 配置：`~/.config/cproxy/config.yaml`
-- 运行配置：`~/.local/share/cproxy/runtime.yaml`
-- PID：`~/.local/state/cproxy/cproxy.pid`
-- 日志：`~/.local/state/cproxy/cproxy.log`
-
-## 常用命令
-
-配置与进程：
-
-```bash
-cproxy init
-cproxy render
-cproxy start
-cproxy stop
-cproxy restart
-cproxy logs
-cproxy logs --lines 200
-cproxy status
-cproxy status --raw
-cproxy status --json
-cproxy doctor
-cproxy security-check
-cproxy support-bundle --output /tmp/cproxy-support.tar.gz
-```
-
-AI 路由控制：
-
-```bash
-cproxy list-groups
-cproxy group
-cproxy list-groups --raw
-cproxy list-nodes "AI 出口"
-cproxy list-nodes "AI-MANUAL" --raw
-cproxy current "AI-MANUAL"
-cproxy current "AI-MANUAL" --raw
-cproxy switch "AI-MANUAL" "AI-AUTO"
-cproxy ai-status
-cproxy ai-status --raw
-cproxy test-group "AI-AUTO"
-cproxy test-group "AI-AUTO" --raw
-```
-
-命令级代理：
-
-```bash
-cproxy proxy-env
-cproxy with-proxy curl https://chatgpt.com
-cproxy proxy-shell
-cproxy proxy-shell -- -c 'env | rg "PROXY"'
-```
-
-诊断与排障：
-
-```bash
-cproxy test
-cproxy test --json
-cproxy doctor --json
-```
-
-交互界面：
-
-```bash
-cproxy tui
-cproxy-tui
-cproxy completion bash --install
-```
-
-分组名与 `cproxy --help` 保持一致；完整命令清单见 `cproxy` 或 `cproxy --help`，shell 补全见 [USAGE.md](USAGE.md#shell-补全)。
-
-TUI 使用 Python/Textual 实现，不是单独的 Go/Bubble Tea 重写。当前页签覆盖概览、节点、提供方、连接、AI 路由、订阅、配置、代理环境和日志；耗时 API 操作在后台执行，连接全部断开、配置重启、丢弃未保存配置和 shell rc 写入/移除均需要二次确认。代理环境页只生成供父 shell 执行的 `export` / `unset`，不会伪装成已经修改当前终端。
-
-## 输出策略
-
-默认输出面向人类阅读：
-
-- `status`：`摘要 + 资源 + 流量 + 路径`
-- `ai-status`：三张表——`AI 出口`（通用 / 备用 / Gemini）、`连通性`、`候选池`
-- `list-groups`：`摘要 + 列表`
-- `list-nodes`：`摘要 + 列表`
-- `test-group`：`摘要 + 结果`
-- `test`：`摘要 + 结果`
-
-统一规则：
-
-- 默认输出优先给结论，再给明细
-- 区块标题统一使用 `摘要 / 资源 / 流量 / 路径 / 连通性 / AI 出口 / 候选池 / 列表 / 结果` 等固定词表（完整清单以各命令实际输出为准），
-  开启图标时（`CPROXY_ICONS=1` 或配置 `output-icons: true`）每个标题带 `▸` 前缀，
-  `status` 顶部另有一行 `◆ cproxy` 主标题。`status` 的流量区块带统计窗口限定词，
-  实际渲染为 `流量 (今日)`
-- `status` 的值列按显示宽度对齐，超长路径压缩为 `~` 与 `…/` 形式（不传 `--raw` 时）
-- `status` 的 `流量 (今日)` 区块内置「按进程」明细（`--top N`，`--no-process` 关闭）：
-  每个进程给出占总流量比例，以及按链路拆分的 `代理↓ / 代理↑ / 直连↓ / 直连↑`
-  四个字节列，便于直接定位"谁在消耗流量、谁在绕开代理"。用四列而非单个代理占比，
-  是因为低占比进程（如 0.1%）在百分比下几乎看不出量，拆成字节后
-  `0 B` 与 `324 MB` 的对比一目了然
-- `--raw` 仍保持脚本友好，不引入这些人类阅读区块
-- 自动化优先使用 `--json`；顶层包含 `schema_version`、`ok`、`warnings`、
-  `recommended_actions` 与 `data`。`--raw` 和 `--json` 互斥
-- 颜色默认开启；可用 `FORCE_COLOR=1` 或 `CPROXY_COLOR=always` 显式强制开启
-- 可用 `NO_COLOR=1` 或 `CPROXY_COLOR=never` 禁用颜色
-- `cproxy` 默认启用状态 icon；可用 `CPROXY_ICONS=0` 或 `output-icons: false` 关闭
-
-`cproxy` 也可以在配置里设置输出偏好：
-
-```yaml
-output-color: always   # auto / always / never
-output-icons: true
-```
-
-`test` 还会额外检查：
-
-- `~/.local/share/cproxy/country.mmdb` 是否存在
-
-脚本场景可显式加 `--raw`：
-
-```bash
-cproxy status --raw
-cproxy ai-status --raw
-cproxy list-groups --raw
-cproxy list-nodes "AI-MANUAL" --raw
-cproxy current "AI-MANUAL" --raw
-cproxy test-group "AI-AUTO" --raw
-```
-
-## 查询后端策略
-
-查询命令现在有明确的后端边界：
-
-- `current`：API 优先，API 不可达时回退 runtime
-- `list-groups`：API 优先，API 不可达时回退 runtime
-- `list-nodes`：API 优先，API 不可达时回退 runtime
-- `ai-status`：只依赖 API
-- `switch`：只依赖 API
-- `test-group`：只依赖 API
-
-这意味着：
-
-- `render` 后、`start` 前，`current/list-groups/list-nodes` 仍然可用
-- `ai-status/switch/test-group` 仍要求 Mihomo API 可访问
-- `ai-status` 会额外通过本地代理探测 `chatgpt.com`、`api.openai.com/v1/models` 与 Gemini API，失败只做 1 次轻量重试（单次 3 秒）；看门狗另用更宽的预算（8 秒 × 2 次），因为它误判会触发真实切换
-- `ai-status` 的三张表与 `status` 的摘要区都会展示通用出口（`AI-MANUAL`）与 Gemini 出口（`AI-GEMINI`）
-
-如需覆盖默认探测地址，可在 `config.yaml` 里配置：
-
-```yaml
-ai-chatgpt-url: https://chatgpt.com
-ai-openai-api-url: https://api.openai.com/v1/models
-ai-gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models
-ai-probe-timeout: 3   # 面板单次探测超时（留空则用默认 3 秒）
-```
-
-## AI 路由设计
-
-渲染时会自动注入：
-
-- `AI-US`
-- `AI-SG`
-- `AI-AUTO`
-- `AI-MANUAL`（ChatGPT / Claude / agy 非 Google 流量）
-- `AI-GEMINI`（Google / Gemini / Antigravity；fallback 优先韩台德法英巴东澳）
-
-默认 AI 规则覆盖：
-
-- `openai.com` / `chatgpt.com` / `oaistatic.com` / `oaiusercontent.com` → `AI-MANUAL`
-- `anthropic.com` / `claude.ai` → `AI-MANUAL`
-- `google.com` / `googleapis.com` / `googleusercontent.com` / `gstatic.com` / `google.dev` / `appspot.com` / `goog` / `gemini` / `antigravity` → `AI-GEMINI`（排在进程规则之前）
-- `PROCESS-NAME,agy` → `AI-MANUAL`：仅兜底非 Google 出站（github / playwright CDN 等）
-
-切换 `AI-MANUAL` / `AI-AUTO` / `AI-US` / `AI-SG` / `AI-GEMINI` 时会立刻断开相关旧连接（以及残留的 `agy` 连接），避免同一会话混用新旧出口 IP。Google Cloud Code 按请求 IP 做地区校验，换节点后需要新开 `agy` 对话。
-
-并且会在 `MATCH` 前补一条：
-
-- `GEOIP,CN,DIRECT,no-resolve`
-
-## 当前边界
-
-`proxy.sh` 工作流已于 2026-09-11 停用、2026-10-17 从仓库删除（退役阶段 3，仓库侧）；
-条件、Gate 状态与分阶段步骤见 [proxy.sh 退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)。
-日常使用与排障只看 `cproxy` 即可。
-
-另外，`cproxy` 只管理自己启动的 mihomo 进程：
-
-- `start` 会写入 PID 和 ownership 元数据
-- `stop/restart/status/test` 会校验该进程是否仍属于当前 `cproxy`
-- stale pidfile 不会再误杀无关进程
-
-## 生产入口识别
-
-生产入口是 **cproxy 用户级链路**：
-
-- 用户级服务：`systemd-user/cproxy.service`
-- 用户级路径：`~/.config/cproxy`、`~/.local/share/cproxy`、`~/.local/state/cproxy`
-- 定时任务：`cproxy-subscription.timer`（每日订阅更新）、`cproxy-refresh.timer`（周期性重渲染）、`cproxy-ai-watch.timer`（每 2 分钟语义探测 AI 出口，连续失败即切节点）、`cproxy-ai-rebalance.timer`（每 30 分钟按实测稳定度重排 `AI-MANUAL` 候选）
-
-legacy 侧（**已于 2026-10-17 退役**，不要再作为入口使用）：
-
-- 仓库内已无 legacy 代码：`proxy.sh`、`update_config.sh`、其 helper 脚本、legacy systemd 单元、
-  `scripts/install-system-commands.sh` 均已删除（详见 [退役计划](docs/plans/2026-07-18-proxy-sh-retirement.md)）
-- **系统侧也已清完**（2026-10-17）：`/etc/systemd/system/` 的 legacy 单元、三个 PATH wrapper
-  （`clash-proxy` / `clash-proxy-update` / `cproxy-update`）、`/usr/local/lib/clash-proxy/` payload、
-  `/etc/default/clash-proxy-command*`、`/etc/logrotate.d/clash_proxy` 及其 cron 行均已删除。
-  回滚路径 = `/root/legacy-system-backup-20261017.tar.gz`
-- 若机器上仍能看到 `clash-proxy` 之类命令，说明是更早的安装残留，可安全忽略或按上述备份方式清理
-
-只读确认：
-
-```bash
-systemctl --user is-active cproxy.service    # 预期 active
-```
-
-### legacy 命令对照（历史，供从旧入口迁移时参考）
-
-legacy 入口的子命令与 cproxy **绝大多数同名同义**——`status`、`switch`、`list-groups`、
-`list-nodes`、`current`、`probe-stable-node`、`ai-use`、`shadow-probe`、`shadow-history`、
-`guard`、`ai-connections`、`incident`、`test-group`、`proxy-env`、`with-proxy`、
-`proxy-shell` 等直接换成 `cproxy <同名>` 即可。只有两处映射不同：
-
-| legacy | cproxy 等价 |
-|---|---|
-| `clash-proxy import-subscription <url>` | `cproxy refresh`（订阅更新→渲染→热重载→探测） |
-| `clash-proxy menu` | `cproxy tui` |
-
-探测策略（`conservative` / `balanced` / `aggressive`）、场景预设（`codex` / `chatgpt` /
-`github` / `claude`）、评分口径与自动切换门槛等细节，由 `cproxy <命令> --help` 与
-[USAGE.md](USAGE.md) 覆盖——两套实现共用同一份逻辑，故此处不再重复。
-
-> 若 `cproxy status` 显示 `运行配置    待刷新`，确认它读的是
-> `~/.local/share/cproxy/runtime.yaml`；那是用户级入口的正常路径。
-
-## 安全更新流程
-
-生产入口以 **热重载** 作为生效边界，长会话与长任务不中断：
-
-1. 先确认入口：`systemctl --user is-active cproxy.service`。
-2. 只修改原始配置或订阅产物，不手工编辑 `runtime.yaml`。
-3. 更新订阅并应用：
-
-   ```bash
-   cproxy refresh
-   ```
-
-   它会依次完成：订阅更新（保留本地环境键；单个附加机场失败不影响主订阅与其它机场）
-   → render → 经 Mihomo `PUT /configs` 热重载（API 不可达才回退进程重启）→
-   分组探测与自动切换。加 `--raw` 得到机器可读输出；`--group <名>` 可重复指定要
-   探测并自动切换的分组。
-
-4. 需要回滚时：
-
-   ```bash
-   cproxy snapshots           # 列出快照
-   cproxy rollback [文件名]    # 省略文件名则回滚最近一份运行时快照
-   ```
-
-   render 与订阅更新在覆盖配置前各留一份快照（支持 SHA256 智能去重与 `cproxy snapshots compact` 分级压缩轮转）；运行中回滚会自动重启。
-
-每日订阅更新由用户级 `cproxy-subscription.timer` 触发（默认 04:00 + 随机延迟），
-`cproxy-refresh.timer` 作为周期性重渲染兜底，定义见
-[systemd-user/](/root/clash_proxy/systemd-user/)。
-
-> legacy 侧原先由 `clash-proxy-refresh.path` 监听 `/root/clash_proxy/config.yaml`
-> 变化触发刷新；该监听 2026-09-15 停掉，对应 unit 已随 2026-10-17 的退役阶段 3 从仓库删除。
-
-## Mihomo 热 reload
-
-2026-05-14 的历史评估结论是「热 reload 不宜作为生产方案」，理由是缺 CLI 级 reload
-参数、也没有失败回滚。**该结论已被取代**：
-
-- `mihomo -h` 确实没有 CLI 级 reload 参数，但 controller API 提供 `PUT /configs`。
-  `cproxy refresh` 正是经这条路应用新配置——长会话与长任务不中断。
-- 失败回滚改由快照承担：render 与订阅更新在覆盖配置前各留一份
-  （`cproxy snapshots` / `cproxy rollback`，支持 SHA256 智能去重与分级压缩轮转，运行中回滚自动重启）。
-- 仅当 API 不可达时才回退到进程重启。
-
-原评估记录见
-[docs/plans/2026-05-14-production-entry-and-reload-evaluation.md](/root/clash_proxy/docs/plans/2026-05-14-production-entry-and-reload-evaluation.md)，保留供追溯。
-
-## 用户级 systemd（生产入口）
-
-生产运行使用的用户级单元位于：
-
-- [cproxy.service](/root/clash_proxy/systemd-user/cproxy.service)
-- [cproxy-refresh.service](/root/clash_proxy/systemd-user/cproxy-refresh.service)
-- [cproxy-refresh.timer](/root/clash_proxy/systemd-user/cproxy-refresh.timer)
-- [install-systemd-user.sh](/root/clash_proxy/systemd-user/install-systemd-user.sh)
-- [generate-proxied-service.sh](/root/clash_proxy/systemd-user/generate-proxied-service.sh)
-
-安装：
-
-```bash
+# 3. 安装并启用用户级 systemd 守护服务与定时调度器
 ./systemd-user/install-systemd-user.sh
 ```
 
-启用后使用：
+查看运行状态与 AI 出口：
 
 ```bash
-systemctl --user status cproxy.service --no-pager -l
-systemctl --user status cproxy-refresh.timer --no-pager -l
+cproxy status
+cproxy ai-status
 ```
 
-## 相关文档
+---
 
-- [USAGE.md](/root/clash_proxy/USAGE.md)
-- [TROUBLESHOOTING.md](/root/clash_proxy/TROUBLESHOOTING.md)
-- [docs/plans/2026-04-09-cproxy-distribution-design.md](/root/clash_proxy/docs/plans/2026-04-09-cproxy-distribution-design.md)
-- [docs/plans/2026-04-09-cproxy-distribution-implementation.md](/root/clash_proxy/docs/plans/2026-04-09-cproxy-distribution-implementation.md)
-- [docs/plans/2026-05-14-production-entry-and-reload-evaluation.md](/root/clash_proxy/docs/plans/2026-05-14-production-entry-and-reload-evaluation.md)
+## 常用命令速查
+
+| 分类 | 命令 | 说明 |
+| :--- | :--- | :--- |
+| **状态与切换** | `cproxy status` | 查看代理运行状态、实时资源与按进程流量归因 |
+| | `cproxy ai-status` | 查看 `AI-MANUAL` / `AI-GEMINI` 当前出口、备用组与连通性 |
+| | `cproxy switch` | 交互式选择代理组与出口节点（也可传参 `cproxy switch <组> <节点>`） |
+| | `cproxy tui` | 启动终端可视化交互界面（TUI） |
+| **AI 调度控制** | `cproxy ai-use [codex\|gemini\|claude]` | 立即多轮探测并切换到最稳定的 AI 出口 |
+| | `cproxy ai-watch` | 执行一次 AI 出口语义健康巡检与闲置连接回收 |
+| | `cproxy ai-rebalance` | 多轮探测全部候选节点，按稳定度重排优先级 |
+| | `cproxy ban <关键词> --hours 24` | 临时或永久屏蔽故障节点 |
+| | `cproxy rule add <域名/进程> <策略>` | 免改 YAML 添加自定义置顶分流规则 |
+| **订阅与维护** | `cproxy refresh` | 更新订阅、重渲染配置、无感热重载并探测分组 |
+| | `cproxy snapshots` / `cproxy rollback` | 查看历史配置快照 / 一键回滚到上一份可用配置 |
+| | `cproxy tun on --apply` | 开启 Linux TUN 透明代理并热重载生效 |
+| **Clash Verge** | `cproxy verge install` | 自动对接 Clash Verge 并注入全局扩展脚本 |
+| | `cproxy verge daemon` | 启动 Clash Verge 旁路常驻调度守护进程 |
+| **诊断与排障** | `cproxy why <域名或URL>` | 追查目标域名/IP 命中的分流规则与实际出口链路 |
+| | `cproxy doctor` | 检查本地配置、内核与控制器状态并给出修复建议 |
+| | `cproxy traffic` | 查看按节点、规则、域名或进程统计的流量报表 |
+
+> 运行 `cproxy --help` 或 `cproxy <命令> --help` 查看完整参数；支持通过 `--json` 输出结构化 JSON，或通过 `--raw` 输出脚本友好的纯文本。
+
+---
+
+## 配置文件与目录说明
+
+| 平台 | 配置目录 (`config.yaml`) | 数据目录 (`runtime.yaml` / GeoIP) | 状态与日志目录 (`state`) |
+| :--- | :--- | :--- | :--- |
+| **Linux / macOS** | `~/.config/cproxy/` | `~/.local/share/cproxy/` | `~/.local/state/cproxy/` |
+| **Windows** | `%APPDATA%\cproxy\` | `%LOCALAPPDATA%\share\cproxy\` | `%LOCALAPPDATA%\state\cproxy\` |
+
+可通过环境变量 `CPROXY_CONFIG_DIR`、`CPROXY_DATA_DIR`、`CPROXY_STATE_DIR` 自定义目录路径。
+
+---
+
+## 进阶文档
+
+- **完整使用指南**：[USAGE.md](USAGE.md)
+- **故障排查手册**：[TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+- **项目演进与发布状态**：[STATUS.md](STATUS.md)
