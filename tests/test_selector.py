@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from argparse import Namespace
 
 import pytest
@@ -161,6 +162,7 @@ def test_window_honors_custom_limit():
 # --- 终端状态恢复 ---
 
 
+@pytest.mark.skipif(os.name == "nt", reason="termios/tty 仅支持 POSIX")
 def test_terminal_is_restored_even_on_exception(monkeypatch):
     """异常路径必须还原 termios，否则用户的终端会留在 cbreak 模式。"""
     restored: list[object] = []
@@ -659,6 +661,7 @@ def test_redraw_clears_previous_frame_before_writing(monkeypatch):
     assert payload.index("\033[J") < payload.index("beta")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="termios/tty 仅支持 POSIX")
 def test_selector_erases_its_frame_on_exit(monkeypatch):
     """select_one 退出时必须擦掉菜单，否则下一级会画在下面、看起来像回不去。"""
     writes: list[str] = []

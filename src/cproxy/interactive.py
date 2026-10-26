@@ -12,9 +12,11 @@ from __future__ import annotations
 import os
 import select
 import sys
-import termios
-import tty
 from collections.abc import Callable, Iterable, Sequence
+
+if os.name != "nt":
+    import termios
+    import tty
 
 from .cli_render import _display_width, _pad_left, _pad_right, _section_heading
 
@@ -48,7 +50,7 @@ class NotATerminalError(RuntimeError):
 
 
 def interactive_supported() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+    return os.name != "nt" and sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
 
 
 def select_one(

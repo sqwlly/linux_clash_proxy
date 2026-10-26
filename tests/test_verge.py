@@ -110,7 +110,9 @@ def test_export_verge_preprocess_script_and_node_execution(tmp_path):
             + "console.log(JSON.stringify(main(input)));\n",
             encoding="utf-8",
         )
-        res = subprocess.run(["node", str(harness)], capture_output=True, text=True, check=True, timeout=5)
+        res = subprocess.run(
+            ["node", str(harness)], capture_output=True, text=True, encoding="utf-8", check=True, timeout=5
+        )
         rendered = json.loads(res.stdout)
         groups = {g["name"]: g for g in rendered["proxy-groups"]}
         # 1X 非易断流节点必须排在 IEPL / 裸 vision 之前
