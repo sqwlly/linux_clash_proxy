@@ -165,17 +165,92 @@ def _print_verge_tick(tick_report, *, raw: bool = False) -> None:
         print(f"[{ts_label}] 提示: {warn}", flush=True)
 
 
+def _print_verge_status(rep, *, raw: bool = False) -> None:
+    if raw:
+        print(
+            f"EFFECTIVE\t{'true' if rep.overall_effective else 'false'}\t"
+            f"controller={'ok' if rep.controller_ok else 'fail'}\t"
+            f"topology={'ok' if rep.topology_ok else 'fail'}\t"
+            f"rules={'ok' if rep.rules_ok else 'fail'}\t"
+            f"daemon={'ok' if rep.daemon_ok else 'fail'}"
+        )
+        for eg in rep.egress:
+            iepl_tag = "iepl" if eg.is_iepl else "non_iepl"
+            print(
+                f"EGRESS\t{eg.group}\t{eg.current_group}\t{eg.leaf_node}\t"
+                f"{eg.delay_ms if eg.delay_ms is not None else '-'}\t{iepl_tag}\tconns={eg.active_connections}"
+            )
+        return
+
+    badge = "已全面生效 [✓]" if rep.overall_effective else "部分未生效 [✗]"
+    print(_section_heading(f"Clash Verge 旁路调度闭环核验: {badge}"))
+
+    c_mark = "[✓]" if rep.controller_ok else "[✗]"
+    print(f"1. 内核控制器 API: {c_mark} {rep.controller} (混合端口: {rep.mixed_port}, 内核: {rep.kernel_version})")
+
+    t_mark = "[✓]" if rep.topology_ok else "[✗]"
+    if rep.topology_ok:
+        print(f"2. 内存策略组拓扑: {t_mark} 已挂载 {', '.join(rep.groups_present)}")
+    else:
+        missing_str = ", ".join(rep.missing_groups) if rep.missing_groups else "全部缺失"
+        print(f"2. 内存策略组拓扑: {t_mark} 未挂载 ({missing_str})")
+
+    r_mark = "[✓]" if rep.rules_ok else "[✗]"
+    print(
+        f"3. 内存分流规则链: {r_mark} AI-MANUAL 规则 {rep.ai_manual_rules_count} 条 · "
+        f"AI-GEMINI 规则 {rep.ai_gemini_rules_count} 条"
+    )
+
+    d_mark = "[✓]" if rep.daemon_ok else "[✗]"
+    if rep.heartbeat_age_sec is not None:
+        pid_str = f"PID {rep.daemon_pid}" if rep.daemon_pid else "单次执行"
+        print(
+            f"4. 后台守护与遥测: {d_mark} {pid_str} · 最近心跳 {rep.heartbeat_age_sec}s 前 · "
+            f"累计看护 {rep.watch_runs} 次 / 切流 {rep.total_switches} 次 / 回收闲置连接 {rep.total_reaped_connections} 条"
+        )
+    else:
+        print(f"4. 后台守护与遥测: {d_mark} 尚无守护进程心跳记录")
+
+    if rep.egress:
+        print(_section_heading("当前 AI 出口实时状态"))
+        for eg in rep.egress:
+            if not eg.present:
+                print(f"  - {eg.group}: 未挂载")
+                continue
+            delay_str = f"{eg.delay_ms}ms" if eg.delay_ms and eg.delay_ms > 0 else "未测速"
+            line_tag = "专线/IEPL [风险]" if eg.is_iepl else "非专线独立 IP [安全]"
+            verdict_label = VERDICT_LABELS.get(eg.last_verdict, eg.last_verdict)
+            print(
+                f"  - {eg.group}: {eg.current_group} -> {eg.leaf_node} "
+                f"({delay_str}, {line_tag}, 活跃连接: {eg.active_connections}, 最近探测: {verdict_label})"
+            )
+
+    if rep.remedies:
+        print(_section_heading("修复建议"))
+        for idx, item in enumerate(rep.remedies, start=1):
+            print(f"  {idx}. {item}")
+
+
 def _run_verge(args: Namespace) -> int:
     from .services.verge import (
         VergeDaemonService,
+        check_verge_effectiveness,
         export_verge_script,
         init_verge_config,
         install_verge_oneclick,
     )
 
     paths = default_paths()
-    action = getattr(args, "action", "once")
+    action = getattr(args, "action", "status")
     verge_dir = Path(args.verge_dir) if getattr(args, "verge_dir", None) else None
+
+    if action == "status":
+        status_rep = check_verge_effectiveness(paths)
+        if args.json:
+            emit_json("verge", status_rep, warnings=status_rep.remedies)
+        else:
+            _print_verge_status(status_rep, raw=args.raw)
+        return 0 if status_rep.overall_effective else 1
 
     if action == "install":
         rep = install_verge_oneclick(

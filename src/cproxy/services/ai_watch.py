@@ -48,6 +48,7 @@ VERDICT_LABELS = {
     PROBE_OK: "ok",
     PROBE_GEO_BLOCKED: "geo_blocked",
     PROBE_DEAD: "dead",
+    "missing_group": "未挂载",
 }
 
 
@@ -1108,7 +1109,14 @@ class AIWatchService:
         dry_run: bool,
     ) -> WatchGroupResult:
         group_obj = groups.get(group)
-        current = resolve_current_leaf(groups, group) if group_obj else None
+        if group_obj is None:
+            return WatchGroupResult(
+                group=group,
+                current=None,
+                verdict="missing_group",
+                detail="策略组未挂载（请在 Clash Verge 刷新订阅或执行 cproxy render --apply）",
+            )
+        current = resolve_current_leaf(groups, group)
         verdict, detail = self._probe_group_verdict(group)
 
         gs = _group_state(state, group)

@@ -9,22 +9,26 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from ..backend.api import APIBackend, APIUnavailableError
-from ..config import AppPaths, config_file, load_yaml_file, read_config
+from ..config import AppPaths, config_file, load_yaml_file, read_config, verge_daemon_state_file
 from .ai_watch import AIWatchService, WatchReport, sample_connections_activity
+from .probe import is_iepl_node, resolve_current_leaf
 from .rebalance import RebalanceReport, RebalanceService
 
 DEFAULT_VERGE_CONTROLLER = "127.0.0.1:9097"
 DEFAULT_VERGE_MIXED_PORT = 7897
+REQUIRED_VERGE_GROUPS = ("AI-MANUAL", "AI-GEMINI", "AI-AUTO")
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,44 @@ class VergeInstallReport:
     injected_script_path: Path | None = None
     fallback_script_path: Path | None = None
     chain_enabled: bool = False
+
+
+@dataclass
+class VergeEgressStatus:
+    group: str
+    present: bool
+    current_group: str = "-"
+    leaf_node: str = "-"
+    delay_ms: int | None = None
+    alive: bool | None = None
+    is_iepl: bool = False
+    active_connections: int = 0
+    last_verdict: str = "-"
+
+
+@dataclass
+class VergeStatusReport:
+    overall_effective: bool
+    controller: str
+    mixed_port: int
+    controller_ok: bool
+    kernel_version: str = "-"
+    topology_ok: bool = False
+    groups_present: list[str] = field(default_factory=list)
+    missing_groups: list[str] = field(default_factory=list)
+    rules_ok: bool = False
+    ai_manual_rules_count: int = 0
+    ai_gemini_rules_count: int = 0
+    daemon_ok: bool = False
+    daemon_pid: int | None = None
+    daemon_pid_alive: bool = False
+    heartbeat_age_sec: float | None = None
+    watch_runs: int = 0
+    rebalance_runs: int = 0
+    total_switches: int = 0
+    total_reaped_connections: int = 0
+    egress: list[VergeEgressStatus] = field(default_factory=list)
+    remedies: list[str] = field(default_factory=list)
 
 
 def candidate_clash_verge_dirs(home: Path | None = None) -> list[Path]:
@@ -315,6 +357,82 @@ def install_verge_oneclick(
     )
 
 
+def _load_daemon_state(paths: AppPaths) -> dict[str, Any]:
+    path = verge_daemon_state_file(paths)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_daemon_state(paths: AppPaths, state: dict[str, Any]) -> None:
+    path = verge_daemon_state_file(paths)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _is_pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _record_daemon_heartbeat(
+    paths: AppPaths,
+    *,
+    now: float,
+    sampled_connections: int,
+    tick_report: VergeTickReport | None = None,
+) -> None:
+    state = _load_daemon_state(paths)
+    state["pid"] = os.getpid()
+    state["updated_at"] = now
+    state["last_sample_ts"] = now
+    state["sampled_connections"] = sampled_connections
+
+    watch_runs = int(state.get("watch_runs") or 0)
+    rebalance_runs = int(state.get("rebalance_runs") or 0)
+    total_switches = int(state.get("total_switches") or 0)
+    total_reaped = int(state.get("total_reaped_connections") or 0)
+    verdicts = dict(state.get("last_verdicts") or {})
+
+    if tick_report is not None:
+        if tick_report.watch_report is not None:
+            watch_runs += 1
+            state["last_watch_ts"] = now
+            total_reaped += len(tick_report.watch_report.reaped_connections or [])
+            for gr in tick_report.watch_report.results:
+                verdicts[gr.group] = gr.verdict
+                if gr.switched:
+                    total_switches += 1
+        if tick_report.rebalance_report is not None:
+            rebalance_runs += 1
+            state["last_rebalance_ts"] = now
+
+    state["watch_runs"] = watch_runs
+    state["rebalance_runs"] = rebalance_runs
+    state["total_switches"] = total_switches
+    state["total_reaped_connections"] = total_reaped
+    state["last_verdicts"] = verdicts
+    _save_daemon_state(paths, state)
+
+
 class VergeDaemonService:
     """Clash Verge 旁路守护进程：周期采样连接时序、执行语义看门狗与稳定度重排。"""
 
@@ -346,6 +464,12 @@ class VergeDaemonService:
                 report.warnings.append(str(exc))
             except Exception as exc:
                 report.warnings.append(f"rebalance 跳过: {exc}")
+        _record_daemon_heartbeat(
+            self.paths,
+            now=now,
+            sampled_connections=report.sampled_connections,
+            tick_report=report,
+        )
         return report
 
     def run_daemon(
@@ -371,12 +495,13 @@ class VergeDaemonService:
         try:
             while max_ticks is None or ticks < max_ticks:
                 now = time.time()
-                sample_connections_activity(self.paths, api, now=now)
+                idle_map = sample_connections_activity(self.paths, api, now=now)
 
                 due_watch = (now - last_watch_ts) >= watch_sec
                 due_rebalance = (now - last_rebalance_ts) >= rebalance_sec
+                tick_report: VergeTickReport | None = None
                 if due_watch or due_rebalance:
-                    tick_report = VergeTickReport(timestamp=now)
+                    tick_report = VergeTickReport(timestamp=now, sampled_connections=len(idle_map))
                     if due_watch:
                         tick_report.watch_report = AIWatchService(self.paths).watch(dry_run=dry_run)
                         last_watch_ts = now
@@ -392,6 +517,13 @@ class VergeDaemonService:
                     if on_tick is not None:
                         on_tick(tick_report)
 
+                _record_daemon_heartbeat(
+                    self.paths,
+                    now=now,
+                    sampled_connections=len(idle_map),
+                    tick_report=tick_report,
+                )
+
                 ticks += 1
                 if max_ticks is not None and ticks >= max_ticks:
                     break
@@ -399,3 +531,167 @@ class VergeDaemonService:
         except KeyboardInterrupt:
             return 0
         return 0
+
+
+def check_verge_effectiveness(
+    paths: AppPaths,
+    *,
+    max_heartbeat_age_sec: float = 90.0,
+    now: float | None = None,
+) -> VergeStatusReport:
+    """四层闭环校验：核实 Clash Verge 旁路调度系统是否在内核与守护进程中真正生效。"""
+    ts = time.time() if now is None else now
+    cfg = read_config(paths)
+    controller = str(cfg.get("external-controller") or DEFAULT_VERGE_CONTROLLER)
+    try:
+        mixed_port = int(cfg.get("mixed-port") or DEFAULT_VERGE_MIXED_PORT)
+    except (TypeError, ValueError):
+        mixed_port = DEFAULT_VERGE_MIXED_PORT
+
+    api = APIBackend(paths)
+    controller_ok = False
+    kernel_version = "-"
+    try:
+        ver_payload = api.version()
+        if isinstance(ver_payload, dict):
+            controller_ok = True
+            kernel_version = str(ver_payload.get("version") or ver_payload.get("meta") or "mihomo")
+    except Exception:
+        controller_ok = False
+
+    groups_present: list[str] = []
+    missing_groups: list[str] = list(REQUIRED_VERGE_GROUPS)
+    topology_ok = False
+    rules_ok = False
+    ai_manual_rules_count = 0
+    ai_gemini_rules_count = 0
+    egress_list: list[VergeEgressStatus] = []
+
+    daemon_state = _load_daemon_state(paths)
+    last_verdicts = dict(daemon_state.get("last_verdicts") or {})
+
+    if controller_ok:
+        try:
+            groups_map = api.get_groups()
+            groups_present = [g for g in REQUIRED_VERGE_GROUPS if g in groups_map]
+            missing_groups = [g for g in REQUIRED_VERGE_GROUPS if g not in groups_map]
+            topology_ok = len(missing_groups) == 0
+
+            # 统计当前活跃连接数
+            conn_counts: dict[str, int] = {"AI-MANUAL": 0, "AI-GEMINI": 0}
+            try:
+                conns_payload = api.get_connections()
+                raw_conns = conns_payload.get("connections") if isinstance(conns_payload, dict) else []
+                for c in raw_conns if isinstance(raw_conns, list) else []:
+                    if not isinstance(c, dict):
+                        continue
+                    chains = [str(x) for x in (c.get("chains") or [])]
+                    for gname in ("AI-MANUAL", "AI-GEMINI"):
+                        if gname in chains:
+                            conn_counts[gname] = conn_counts.get(gname, 0) + 1
+            except Exception:
+                pass
+
+            for gname in ("AI-MANUAL", "AI-GEMINI"):
+                gobj = groups_map.get(gname)
+                if gobj is None:
+                    egress_list.append(
+                        VergeEgressStatus(
+                            group=gname,
+                            present=False,
+                            last_verdict=str(last_verdicts.get(gname) or "missing_group"),
+                        )
+                    )
+                    continue
+                cur = gobj.current or "-"
+                leaf = resolve_current_leaf(groups_map, gname) or cur
+                leaf_obj = groups_map.get(leaf)
+                delay_ms = leaf_obj.delay if leaf_obj is not None else gobj.delay
+                alive = leaf_obj.alive if leaf_obj is not None else gobj.alive
+                egress_list.append(
+                    VergeEgressStatus(
+                        group=gname,
+                        present=True,
+                        current_group=cur,
+                        leaf_node=leaf,
+                        delay_ms=delay_ms,
+                        alive=alive,
+                        is_iepl=is_iepl_node(leaf) if leaf and leaf != "-" else False,
+                        active_connections=conn_counts.get(gname, 0),
+                        last_verdict=str(last_verdicts.get(gname) or "-"),
+                    )
+                )
+        except Exception:
+            pass
+
+        try:
+            rules_payload = api.get_rules()
+            raw_rules = rules_payload.get("rules") if isinstance(rules_payload, dict) else []
+            for r in raw_rules if isinstance(raw_rules, list) else []:
+                if not isinstance(r, dict):
+                    continue
+                proxy_target = str(r.get("proxy") or "")
+                if proxy_target == "AI-MANUAL":
+                    ai_manual_rules_count += 1
+                elif proxy_target == "AI-GEMINI":
+                    ai_gemini_rules_count += 1
+            rules_ok = ai_manual_rules_count > 0 and ai_gemini_rules_count > 0
+        except Exception:
+            rules_ok = False
+
+    raw_pid = daemon_state.get("pid")
+    daemon_pid = int(raw_pid) if isinstance(raw_pid, int) and raw_pid > 0 else None
+    updated_at = daemon_state.get("updated_at")
+    heartbeat_age_sec: float | None = None
+    if isinstance(updated_at, (int, float)) and updated_at > 0:
+        heartbeat_age_sec = max(0.0, ts - float(updated_at))
+    pid_alive = _is_pid_alive(daemon_pid)
+    heartbeat_fresh = heartbeat_age_sec is not None and heartbeat_age_sec <= max_heartbeat_age_sec
+    daemon_ok = bool(heartbeat_fresh and (pid_alive or heartbeat_age_sec <= 30.0))
+
+    remedies: list[str] = []
+    if not controller_ok:
+        remedies.append(
+            f"无法连接 Clash Verge 控制器 ({controller})：请确认 Clash Verge 已启动，"
+            "且 External Controller 地址/密钥一致（可运行 `cproxy verge install` 重新同步）。"
+        )
+    else:
+        if not topology_ok or not rules_ok:
+            remedies.append(
+                "内核内存中尚未挂载 AI-MANUAL / AI-GEMINI 策略组或分流规则："
+                "请在 Clash Verge 界面点击一次「订阅 (Profiles) -> 刷新」，或确认「脚本 (Script)」已启用。"
+            )
+        for eg in egress_list:
+            if eg.present and eg.is_iepl:
+                remedies.append(
+                    f"{eg.group} 当前叶子节点 ({eg.leaf_node}) 为专线/IEPL，可执行 `cproxy verge once` 切换至非专线独立 IP。"
+                )
+    if not daemon_ok:
+        remedies.append(
+            "旁路守护进程未运行或心跳超时：Windows 下可双击 `setup-windows-verge.bat` 或运行 `cproxy verge daemon` 启动后台看护。"
+        )
+
+    overall_effective = bool(controller_ok and topology_ok and rules_ok and daemon_ok)
+    return VergeStatusReport(
+        overall_effective=overall_effective,
+        controller=controller,
+        mixed_port=mixed_port,
+        controller_ok=controller_ok,
+        kernel_version=kernel_version,
+        topology_ok=topology_ok,
+        groups_present=groups_present,
+        missing_groups=missing_groups,
+        rules_ok=rules_ok,
+        ai_manual_rules_count=ai_manual_rules_count,
+        ai_gemini_rules_count=ai_gemini_rules_count,
+        daemon_ok=daemon_ok,
+        daemon_pid=daemon_pid,
+        daemon_pid_alive=pid_alive,
+        heartbeat_age_sec=round(heartbeat_age_sec, 1) if heartbeat_age_sec is not None else None,
+        watch_runs=int(daemon_state.get("watch_runs") or 0),
+        rebalance_runs=int(daemon_state.get("rebalance_runs") or 0),
+        total_switches=int(daemon_state.get("total_switches") or 0),
+        total_reaped_connections=int(daemon_state.get("total_reaped_connections") or 0),
+        egress=egress_list,
+        remedies=remedies,
+    )

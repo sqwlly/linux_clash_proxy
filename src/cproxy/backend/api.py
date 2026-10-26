@@ -446,3 +446,6 @@ class APIBackend:
 
     def update_rule_provider(self, name: str) -> None:
         self.request("PUT", f"/providers/rules/{quote(name, safe='')}")
+
+    def get_rules(self) -> dict[str, Any]:
+        return self.request("GET", "/rules")

@@ -112,12 +112,14 @@ WshShell.Run """$PythonwExe"" -m cproxy.cli verge daemon", 0, False
     Write-Host "    已写入用户登录自启脚本并拉起后台守护进程: $StartupVbs" -ForegroundColor Green
 }
 
-# 5. 执行一次初始状态检查
-Write-Host "==> [4/4] 正在验证与 Clash Verge 内核的连接状态..." -ForegroundColor Cyan
+# 5. 执行一次初始状态检查与四层闭环生效核验
+Write-Host "==> [4/4] 正在验证与 Clash Verge 内核的调度闭环状态..." -ForegroundColor Cyan
 & $PythonExe -m cproxy.cli verge once --no-rebalance
+& $PythonExe -m cproxy.cli verge status
 
 Write-Host ""
 Write-Host "==============================================================" -ForegroundColor Green
 Write-Host "  Windows + Clash Verge 调度机制一键部署完成！" -ForegroundColor Green
-Write-Host "  提示：在 Clash Verge 中点一次「订阅 -> 刷新」即可让新策略组生效。" -ForegroundColor Yellow
+Write-Host "  提示：若上方提示未挂载策略组，请在 Clash Verge 中点一次「订阅 -> 刷新」" -ForegroundColor Yellow
+Write-Host "        刷新后可随时运行 'cproxy verge' 查看四层闭环生效状态。" -ForegroundColor Yellow
 Write-Host "==============================================================" -ForegroundColor Green

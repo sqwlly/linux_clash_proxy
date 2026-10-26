@@ -111,6 +111,11 @@ def conn_activity_state_file(paths: AppPaths) -> Path:
     return paths.state_dir / "conn-activity.json"
 
 
+def verge_daemon_state_file(paths: AppPaths) -> Path:
+    """cproxy verge daemon 后台心跳与调度遥测状态文件。"""
+    return paths.state_dir / "verge-daemon.json"
+
+
 def load_yaml_file(path: Path) -> Any:
     """读 YAML。文件不存在返回 None。按路径 + 内容哈希缓存，写入后自动失效。"""
     try:

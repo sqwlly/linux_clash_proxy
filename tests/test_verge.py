@@ -26,6 +26,7 @@ from cproxy.services.probe import ProbeSummary, StabilityVerdict
 from cproxy.services.rebalance import RebalanceService
 from cproxy.services.verge import (
     VergeDaemonService,
+    check_verge_effectiveness,
     discover_clash_verge_config,
     export_verge_script,
     init_verge_config,
@@ -288,4 +289,116 @@ def test_install_verge_oneclick_auto_injects_script_and_enables_chain(tmp_path):
     updated_profiles = yaml.safe_load((verge_dir / "profiles.yaml").read_text(encoding="utf-8"))
     assert "Script" in updated_profiles["chain"]
     assert (verge_dir / "profiles.yaml.bak").exists()
+
+
+def test_ai_watch_reports_missing_group_when_topology_not_mounted(tmp_path, monkeypatch):
+    """回归保护：当 Clash Verge 尚未刷新订阅、内存中不存在 AI-MANUAL / AI-GEMINI 时，
+    ai-watch 必须返回 verdict='missing_group'，而不能误测默认代理报出虚假的 ok(-)。
+    """
+    paths = _paths(tmp_path)
+
+    class _FakeQuery:
+        def __init__(self, p):
+            self.api = SimpleNamespace(
+                get_groups=lambda: {"PROXY": ProxyGroup("PROXY", "select", "DIRECT", ["DIRECT"])},
+                get_connections=lambda: {"connections": []},
+            )
+
+    monkeypatch.setattr(ai_watch_mod, "QueryService", _FakeQuery)
+    report = ai_watch_mod.AIWatchService(paths).watch()
+    assert [r.verdict for r in report.results] == ["missing_group", "missing_group"]
+
+
+def test_check_verge_effectiveness_four_layer_verification(tmp_path, monkeypatch):
+    """验证 check_verge_effectiveness 四层闭环核验：
+    1. 控制器可达 + 2. 内存策略组拓扑挂载 + 3. 内存分流规则链挂载 + 4. 守护进程心跳新鲜。
+    """
+    paths = _paths(tmp_path)
+    init_verge_config(paths, controller="127.0.0.1:9097", secret="s", mixed_port=7897)
+
+    # 先模拟执行一轮守护心跳记录
+    monkeypatch.setattr(
+        "cproxy.services.verge.sample_connections_activity",
+        lambda p, api, now=None: {"50001": (100, 200)},
+    )
+    monkeypatch.setattr(
+        "cproxy.services.verge.AIWatchService.watch",
+        lambda self, dry_run=False: ai_watch_mod.WatchReport(
+            results=[
+                ai_watch_mod.WatchGroupResult(group="AI-MANUAL", current="🇺🇸美国-自动", verdict="ok", switched=True),
+                ai_watch_mod.WatchGroupResult(group="AI-GEMINI", current="🇰🇷韩国-自动", verdict="ok"),
+            ],
+            reaped_connections=["c-1", "c-2"],
+        ),
+    )
+    VergeDaemonService(paths).run_once(run_rebalance=False)
+
+    # 场景 A：内核已挂载 AI-MANUAL/AI-GEMINI/AI-AUTO 与分流规则 -> overall_effective = True
+    class _MountedAPI:
+        def __init__(self, p):
+            pass
+
+        def version(self):
+            return {"version": "v1.19.16"}
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇺🇸美国-自动", ["🇺🇸美国-自动", "AI-AUTO"]),
+                "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "🇰🇷韩国-自动", ["🇰🇷韩国-自动", "AI-AUTO"]),
+                "AI-AUTO": ProxyGroup("AI-AUTO", "url-test", "🇺🇸美国 01 | 1X", ["🇺🇸美国 01 | 1X"]),
+                "🇺🇸美国-自动": ProxyGroup("🇺🇸美国-自动", "url-test", "🇺🇸美国 01 | 1X", ["🇺🇸美国 01 | 1X"]),
+                "🇰🇷韩国-自动": ProxyGroup("🇰🇷韩国-自动", "url-test", "🇰🇷韩国 01 | 1X", ["🇰🇷韩国 01 | 1X"]),
+                "🇺🇸美国 01 | 1X": ProxyGroup("🇺🇸美国 01 | 1X", "ss", None, [], delay=142, alive=True),
+                "🇰🇷韩国 01 | 1X": ProxyGroup("🇰🇷韩国 01 | 1X", "ss", None, [], delay=68, alive=True),
+            }
+
+        def get_rules(self):
+            return {
+                "rules": [
+                    {"type": "DomainSuffix", "payload": "googleapis.com", "proxy": "AI-GEMINI"},
+                    {"type": "DomainSuffix", "payload": "openai.com", "proxy": "AI-MANUAL"},
+                    {"type": "DomainSuffix", "payload": "claude.ai", "proxy": "AI-MANUAL"},
+                ]
+            }
+
+        def get_connections(self):
+            return {
+                "connections": [
+                    {"id": "c1", "chains": ["🇰🇷韩国 01 | 1X", "🇰🇷韩国-自动", "AI-GEMINI"]},
+                ]
+            }
+
+    monkeypatch.setattr("cproxy.services.verge.APIBackend", _MountedAPI)
+    status_ok = check_verge_effectiveness(paths)
+    assert status_ok.overall_effective is True
+    assert status_ok.controller_ok is True
+    assert status_ok.topology_ok is True
+    assert status_ok.rules_ok is True
+    assert status_ok.daemon_ok is True
+    assert status_ok.ai_manual_rules_count == 2
+    assert status_ok.ai_gemini_rules_count == 1
+    assert status_ok.watch_runs == 1
+    assert status_ok.total_switches == 1
+    assert status_ok.total_reaped_connections == 2
+    assert status_ok.remedies == []
+    gemini_egress = next(e for e in status_ok.egress if e.group == "AI-GEMINI")
+    assert gemini_egress.leaf_node == "🇰🇷韩国 01 | 1X"
+    assert gemini_egress.is_iepl is False
+    assert gemini_egress.active_connections == 1
+
+    # 场景 B：Clash Verge 还没点「订阅 -> 刷新」，内存中无 AI 组和规则 -> overall_effective = False 且给出明确修复建议
+    class _UnmountedAPI(_MountedAPI):
+        def get_groups(self):
+            return {"PROXY": ProxyGroup("PROXY", "select", "DIRECT", ["DIRECT"])}
+
+        def get_rules(self):
+            return {"rules": [{"type": "Match", "payload": "", "proxy": "PROXY"}]}
+
+    monkeypatch.setattr("cproxy.services.verge.APIBackend", _UnmountedAPI)
+    status_unmounted = check_verge_effectiveness(paths)
+    assert status_unmounted.overall_effective is False
+    assert status_unmounted.controller_ok is True
+    assert status_unmounted.topology_ok is False
+    assert status_unmounted.rules_ok is False
+    assert any("订阅" in r and "刷新" in r for r in status_unmounted.remedies)
 

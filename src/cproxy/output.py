@@ -222,7 +222,7 @@ NOTIFY_ACTIONS = ("status", "set", "test", "clear")
 RULE_ACTIONS = ("list", "add", "remove")
 RULE_TYPE_CHOICES = ("suffix", "domain", "keyword", "cidr", "process")
 PROMPT_FORMAT_CHOICES = ("compact", "full", "tmux")
-VERGE_ACTIONS = ("install", "init", "script", "once", "daemon")
+VERGE_ACTIONS = ("status", "install", "init", "script", "once", "daemon")
 
 # 命令名左对齐宽度：留出最长命令名（`migrate-from-legacy` 19 字符）的余量
 _COMMAND_NAME_WIDTH = 24
@@ -565,9 +565,9 @@ def build_root_parser() -> ArgumentParser:
     verge_parser.add_argument(
         "action",
         nargs="?",
-        default="once",
+        default="status",
         choices=VERGE_ACTIONS,
-        help="动作：install（一键注入脚本+生成配置）、init（生成配置）、script（输出扩展脚本）、once（单轮调度）、daemon（后台守护）",
+        help="动作：status（四层闭环生效核验，默认）、install（一键注入脚本+生成配置）、init（生成配置）、script（输出扩展脚本）、once（单轮调度）、daemon（后台守护）",
     )
     verge_parser.add_argument("--verge-dir", help="手动指定 Clash Verge 配置目录（省略则自动探测）")
     verge_parser.add_argument("--controller", help="External Controller 地址（如 127.0.0.1:9097）")

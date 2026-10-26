@@ -39,6 +39,7 @@
    - 将 AI 策略拓扑脚本直接写入 Clash Verge 的 `profiles\Script.js` 并在 `profiles.yaml` 中自动挂载启用；
    - 注册 Windows 登录无窗口后台自启任务（`cproxy-verge-daemon`）并立即拉起守护进程。
 2. 打开 Clash Verge 点击一次 **「订阅 (Profiles) → 刷新」** 即可生效。
+3. 在终端随时运行 **`cproxy verge`**（等价于 `cproxy verge status`），四层闭环核验调度系统是否真正生效（控制器连通、内存策略组拓扑、内存分流规则链、后台守护心跳与累计切流/回收遥测）。
 
 > 如需卸载后台自启任务，在 PowerShell 中运行：`.\setup-windows-verge.bat -Uninstall`
 
@@ -82,7 +83,8 @@ cproxy ai-status
 | **订阅与维护** | `cproxy refresh` | 更新订阅、重渲染配置、无感热重载并探测分组 |
 | | `cproxy snapshots` / `cproxy rollback` | 查看历史配置快照 / 一键回滚到上一份可用配置 |
 | | `cproxy tun on --apply` | 开启 Linux TUN 透明代理并热重载生效 |
-| **Clash Verge** | `cproxy verge install` | 自动对接 Clash Verge 并注入全局扩展脚本 |
+| **Clash Verge** | `cproxy verge` (`status`) | 四层闭环核验调度系统在内核内存与后台守护中是否真正生效 |
+| | `cproxy verge install` | 自动对接 Clash Verge 并注入全局扩展脚本 |
 | | `cproxy verge daemon` | 启动 Clash Verge 旁路常驻调度守护进程 |
 | **诊断与排障** | `cproxy why <域名或URL>` | 追查目标域名/IP 命中的分流规则与实际出口链路 |
 | | `cproxy doctor` | 检查本地配置、内核与控制器状态并给出修复建议 |
