@@ -1463,6 +1463,47 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     assert "172.64.146.118" not in ranked
     assert ranked[0] == "172.67.143.95"
 
+    # logrotate 后未使用的 104.21.87.131 历史错误为 0，在用的 172.67.143.95 偶发 16 次旧错误（但近 20m rec_err=0）：
+    # 绝不因 tot_err 差异把健康在用的 172.67.143.95 切回 104.21.87.131 黑洞
+    runtime_mod._WS_TLS_PROBE_CACHE.clear()
+    runtime_mod._WS_CDN_IP_RANK_CACHE.clear()
+    monkeypatch.setattr(
+        runtime_mod,
+        "_ws_cdn_ip_log_penalties",
+        lambda _ips, _port, paths=None: (
+            {"104.21.87.131": 0, "172.67.143.95": 0},
+            {"104.21.87.131": 0, "172.67.143.95": 16},
+            {"172.67.143.95"},
+        ),
+    )
+    ranked_post_rotate = _resolve_healthy_ws_cdn_ips(
+        "cgkr1.cyberguard-u1s1.art",
+        443,
+        "cyberguard-u1s1.art",
+        paths=paths,
+    )
+    assert ranked_post_rotate[0] == "172.67.143.95"
+
+    # 密集主动探测窗口下在用 172.67.143.95 累计 rec_err=12，仍不得回退到 104.21.87.131 黑洞网段
+    runtime_mod._WS_TLS_PROBE_CACHE.clear()
+    runtime_mod._WS_CDN_IP_RANK_CACHE.clear()
+    monkeypatch.setattr(
+        runtime_mod,
+        "_ws_cdn_ip_log_penalties",
+        lambda _ips, _port, paths=None: (
+            {"104.21.87.131": 0, "172.67.143.95": 12},
+            {"104.21.87.131": 26, "172.67.143.95": 14},
+            {"104.21.87.131"},
+        ),
+    )
+    ranked_burst = _resolve_healthy_ws_cdn_ips(
+        "cgkr1.cyberguard-u1s1.art",
+        443,
+        "cyberguard-u1s1.art",
+        paths=paths,
+    )
+    assert ranked_burst[0] == "172.67.143.95"
+
     # 4. 阶段 C：验证 Codex SQLite 重试日志自愈检测与仅 AI 排序变更免热重载不变量
     import sqlite3
     import time
@@ -1520,6 +1561,26 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     conn.close()
     c_failed2, _cts2, _ = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
     assert c_failed2 is False
+
+    # 当 responses_websocket 连续 >=2 次出现 failed to connect to websocket: IO error: tls handshake eof 时，
+    # 无需等待 5 次重试耗尽即可立即触发自愈切流
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "INSERT INTO logs VALUES (4, ?, 400000000, 'ERROR', 'codex_api::endpoint::responses_websocket', "
+        "'failed to connect to websocket: IO error: tls handshake eof, url: wss://chatgpt.com/backend-api/codex/responses')",
+        (now_epoch - 2,),
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES (5, ?, 500000000, 'ERROR', 'codex_api::endpoint::responses_websocket', "
+        "'failed to connect to websocket: IO error: tls handshake eof, url: wss://chatgpt.com/backend-api/codex/responses')",
+        (now_epoch - 1,),
+    )
+    conn.commit()
+    conn.close()
+    c_failed3, _cts3, c_reason3 = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
+    assert c_failed3 is True
+    assert "tls handshake eof" in c_reason3
+
 
 
 

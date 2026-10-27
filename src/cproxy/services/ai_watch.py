@@ -945,6 +945,7 @@ def detect_recent_codex_retry_failure(
         except Exception:
             continue
 
+        ws_fail_events: list[tuple[float, str]] = []
         for raw_ts, raw_nanos, target, body in rows:
             try:
                 event_ts = float(raw_ts) + float(raw_nanos or 0) / 1_000_000_000.0
@@ -957,6 +958,17 @@ def detect_recent_codex_retry_failure(
             ):
                 if event_ts > newest_success_ts:
                     newest_success_ts = event_ts
+                continue
+            if (
+                target == "codex_api::endpoint::responses_websocket"
+                and "failed to connect to websocket:" in text
+            ):
+                if event_ts <= since_ts:
+                    continue
+                age = ts_now - event_ts
+                if -5.0 <= age <= window_seconds:
+                    ws_err = text.split(", url:", 1)[0].strip()
+                    ws_fail_events.append((event_ts, ws_err))
                 continue
             if target != "codex_core::responses_retry":
                 continue
@@ -992,6 +1004,12 @@ def detect_recent_codex_retry_failure(
                 err_msg = m_serr.group(1).strip() if m_serr else "stream disconnected"
                 candidates.append((event_ts, retries_num, f"retries {retries_num}: {err_msg}"))
                 break
+
+        valid_ws_fails = [item for item in ws_fail_events if item[0] > newest_success_ts]
+        if len(valid_ws_fails) >= 2:
+            latest_ws_ts, latest_ws_err = max(valid_ws_fails, key=lambda item: item[0])
+            ws_retries_num = max(3, min(5, len(valid_ws_fails)))
+            candidates.append((latest_ws_ts, ws_retries_num, f"retries {ws_retries_num}: {latest_ws_err}"))
 
     max_seen_ts = max([since_ts] + [c[0] for c in candidates])
     triggered = [c for c in candidates if c[0] > newest_success_ts]
@@ -1162,10 +1180,15 @@ class AIWatchService:
                     and _is_stream_safe_gemini_leaf(self.paths, current)
                 )
                 retry_prefix = codex_reason.split(":", 1)[0].strip()
+                reason_lower = codex_reason.lower()
                 severe_codex_retry = (
-                    retry_prefix.startswith("retries ")
-                    and retry_prefix[8:].isdigit()
-                    and int(retry_prefix[8:]) >= 3
+                    (
+                        retry_prefix.startswith("retries ")
+                        and retry_prefix[8:].isdigit()
+                        and int(retry_prefix[8:]) >= 3
+                    )
+                    or "tls handshake eof" in reason_lower
+                    or "failed to connect to websocket" in reason_lower
                 )
                 if not on_healthy_safe_leaf or severe_codex_retry:
                     gs["last_log_fail_ts"] = codex_ts
@@ -1233,9 +1256,6 @@ class AIWatchService:
                 and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
                 and is_static_iepl_node(current, self.paths)
                 and not current_already_cooled
-                and not has_active_ai_transfer(
-                    self.paths, getattr(self.query, "api", None), group, current
-                )
             ):
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
                 cand_entry = groups.get(cand_1x) if cand_1x else None
@@ -1334,8 +1354,13 @@ class AIWatchService:
                 cooldown_map = gs.get("cooldown")
                 if isinstance(cooldown_map, dict):
                     for k in list(cooldown_map.keys()):
-                        if not is_static_iepl_node(str(k), self.paths):
+                        if k != current and not is_static_iepl_node(str(k), self.paths):
                             cooldown_map.pop(k, None)
+                try:
+                    groups = self.query.api.get_groups()
+                    group_obj = groups.get(group) or group_obj
+                except Exception:
+                    pass
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
             if target is not None:
                 # 仅在 AI-MANUAL、地区封锁、客户端真实重试报错或易断流节点切换时关闭旧连接；

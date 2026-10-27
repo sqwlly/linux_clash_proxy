@@ -474,7 +474,9 @@ def active_candidates_after_round(
     }
     if prefer_non_iepl:
         for s in summaries:
-            if s.success_count > 0 and not is_static_iepl_node(s.name):
+            if not is_static_iepl_node(s.name) and (
+                s.success_count > 0 or (s.failures <= 1 and s.history_penalty_ms < 200)
+            ):
                 active.add(s.name)
     if current and current in results:
         active.add(current)

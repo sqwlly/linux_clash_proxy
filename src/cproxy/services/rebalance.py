@@ -87,7 +87,7 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
     dynamic_non_static_iepl = (
         not is_static_iepl_node(summary.name)
         and summary.success_count > 0
-        and summary.success_count >= failures
+        and (summary.success_count >= failures or summary.success_count >= 2)
         and summary.avg_delay is not None
         and summary.avg_delay <= 1500
     )
@@ -215,7 +215,33 @@ class RebalanceService:
 
         if ordered and not self._should_switch_current(report, ordered[0], AI_MANUAL_GROUP):
             cur_manual = getattr(report, "current", None)
-            if cur_manual and getattr(report, "current_verdict", None) is not None and cur_manual in ordered:
+            cur_manual_verdict = getattr(report, "current_verdict", None)
+            cur_manual_summary = next(
+                (s for s in getattr(report, "summaries", ()) or () if getattr(s, "name", None) == cur_manual),
+                None,
+            )
+            best_manual_summary = next(
+                (s for s in getattr(report, "summaries", ()) or () if getattr(s, "name", None) == ordered[0]),
+                None,
+            )
+            cur_manual_usable = bool(
+                cur_manual_verdict is not None
+                and (
+                    getattr(cur_manual_verdict, "stable", False)
+                    or cur_manual_summary is None
+                    or (
+                        getattr(cur_manual_summary, "success_count", 0) > 0
+                        and getattr(cur_manual_summary, "success_count", 0)
+                        >= getattr(best_manual_summary, "success_count", 0)
+                    )
+                )
+            )
+            if (
+                cur_manual
+                and cur_manual_usable
+                and cur_manual in ordered
+                and not (is_static_iepl_node(cur_manual, self.paths) and not is_static_iepl_node(ordered[0], self.paths))
+            ):
                 ordered = [cur_manual] + [n for n in ordered if n != cur_manual]
 
         if (
@@ -224,10 +250,39 @@ class RebalanceService:
             and not self._should_switch_current(gemini_report, gemini_ordered[0], AI_GEMINI_GROUP)
         ):
             cur_gemini = getattr(gemini_report, "current", None)
+            cur_gemini_verdict = getattr(gemini_report, "current_verdict", None)
+            cur_gemini_summary = next(
+                (s for s in getattr(gemini_report, "summaries", ()) or () if getattr(s, "name", None) == cur_gemini),
+                None,
+            )
+            best_gemini_summary = next(
+                (
+                    s
+                    for s in getattr(gemini_report, "summaries", ()) or ()
+                    if getattr(s, "name", None) == gemini_ordered[0]
+                ),
+                None,
+            )
+            cur_gemini_usable = bool(
+                cur_gemini_verdict is not None
+                and (
+                    getattr(cur_gemini_verdict, "stable", False)
+                    or cur_gemini_summary is None
+                    or (
+                        getattr(cur_gemini_summary, "success_count", 0) > 0
+                        and getattr(cur_gemini_summary, "success_count", 0)
+                        >= getattr(best_gemini_summary, "success_count", 0)
+                    )
+                )
+            )
             if (
                 cur_gemini
-                and getattr(gemini_report, "current_verdict", None) is not None
+                and cur_gemini_usable
                 and cur_gemini in gemini_ordered
+                and not (
+                    is_static_iepl_node(cur_gemini, self.paths)
+                    and not is_static_iepl_node(gemini_ordered[0], self.paths)
+                )
             ):
                 gemini_ordered = [cur_gemini] + [n for n in gemini_ordered if n != cur_gemini]
 
@@ -270,15 +325,21 @@ class RebalanceService:
         else:
             target_runtime = runtime_file(self.paths)
             before_bytes = target_runtime.read_bytes() if target_runtime.exists() else None
+            process = ProcessBackend(self.paths)
+            running = process.is_running()
+            was_stale_before_render = (
+                getattr(process, "is_runtime_stale", lambda _path=None: False)(target_runtime)
+                if running and target_runtime.exists()
+                else False
+            )
             runtime_path = RuntimeBackend(self.paths).render_runtime()
             after_bytes = runtime_path.read_bytes() if runtime_path.exists() else None
             runtime_changed = before_bytes != after_bytes
             rerendered = True
 
-            process = ProcessBackend(self.paths)
-            running = process.is_running()
             is_stale = getattr(process, "is_runtime_stale", lambda _path=None: False)(runtime_path)
             if running and (order_updated or gemini_order_updated or runtime_changed or is_stale):
+                from ..backend.runtime import is_only_ai_group_order_change
                 from .ai_watch import has_any_inflight_ai_connection
 
                 api_instance = APIBackend(self.paths)
@@ -291,6 +352,17 @@ class RebalanceService:
                         hot_reloaded = False
                     if hot_reloaded and hasattr(process, "mark_runtime_applied"):
                         process.mark_runtime_applied(runtime_path)
+                elif (
+                    not was_stale_before_render
+                    and before_bytes is not None
+                    and after_bytes is not None
+                    and hasattr(process, "mark_runtime_applied")
+                    and is_only_ai_group_order_change(
+                        before_bytes.decode("utf-8", errors="replace"),
+                        after_bytes.decode("utf-8", errors="replace"),
+                    )
+                ):
+                    process.mark_runtime_applied(runtime_path)
 
         switched_to: str | None = None
         if running and effective_order:
@@ -392,22 +464,38 @@ class RebalanceService:
         best_verdict = getattr(report, "verdict", None)
         if current_verdict is None or best_verdict is None:
             return False
-        if not best_verdict.stable:
-            return False
         current_node = getattr(report, "current", None)
         if not best_candidate or best_candidate == current_node:
             return False
         summaries = getattr(report, "summaries", ()) or ()
         best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
-        if best_summary is not None and getattr(best_summary, "failures", 0) > 0:
-            return False
         cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
+        cur_is_failing = cur_summary is not None and getattr(cur_summary, "success_count", 0) <= getattr(
+            cur_summary, "failures", 0
+        )
         is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+        migrating_off_static_iepl_with_majority_1x = (
+            is_managed_ai
+            and (is_static_iepl_node(current_node) or cur_is_failing)
+            and best_summary is not None
+            and not is_static_iepl_node(best_candidate)
+            and getattr(best_summary, "success_count", 0) >= 4
+            and getattr(best_summary, "success_count", 0) > getattr(best_summary, "failures", 0)
+            and (getattr(best_summary, "avg_delay", None) or 9999) <= 1350
+        )
+        if not best_verdict.stable and not migrating_off_static_iepl_with_majority_1x:
+            return False
+        if (
+            best_summary is not None
+            and getattr(best_summary, "failures", 0) > 0
+            and not migrating_off_static_iepl_with_majority_1x
+        ):
+            return False
         cur_region = match_region(str(current_node or ""))
         migrating_gemini_off_iepl = (
             is_managed_ai
-            and is_static_iepl_node(current_node)
-            and is_healthy_non_iepl_summary(best_summary)
+            and (is_static_iepl_node(current_node) or cur_is_failing)
+            and (is_healthy_non_iepl_summary(best_summary) or migrating_off_static_iepl_with_majority_1x)
         )
         migrating_gemini_off_slow = (
             is_managed_ai
@@ -456,7 +544,9 @@ class RebalanceService:
             current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
             from .ai_watch import has_active_ai_transfer
 
-            if has_active_ai_transfer(self.paths, getattr(query, "api", None), group_name, current_node):
+            if not is_static_iepl_node(current_node, self.paths) and has_active_ai_transfer(
+                self.paths, getattr(query, "api", None), group_name, current_node
+            ):
                 return None
             should_drop = group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) or is_static_iepl_node(current_node, self.paths)
             try:

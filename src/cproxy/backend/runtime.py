@@ -856,6 +856,7 @@ def _ws_cdn_ip_log_penalties(
                 or (
                     f"error: {ip}:{port} connect error:" in line
                     and "context deadline exceeded" not in line
+                    and "unexpected status:" not in line
                 )
             ]
             if not matched_ips:
@@ -957,12 +958,15 @@ def _resolve_healthy_ws_cdn_ips(
     recent_errors, total_errors, active_ips = _ws_cdn_ip_log_penalties(ips, port, paths=paths)
     # 若在用非 104.* IP 在近期日志中几乎无真实拨号超时（rec_err < 6），即使恰逢大包上行拥塞导致探针瞬时超时，
     # 仍保留其存活资格，绝不因瞬时上行打满而误切向 104.* 黑洞网段
+    max_104_total_err = max((total_errors.get(o, 0) for o in ips if o.startswith("104.")), default=0)
     for ip in ips:
         if (
             not samples_by_ip.get(ip)
-            and ip in active_ips
             and not ip.startswith("104.")
-            and recent_errors.get(ip, 0) < 6
+            and (
+                (ip in active_ips and recent_errors.get(ip, 0) < 16)
+                or (max_104_total_err >= 10 and total_errors.get(ip, 0) <= max_104_total_err)
+            )
         ):
             samples_by_ip[ip] = [450, 450]
     alive_ips = [ip for ip, samples in samples_by_ip.items() if samples]
@@ -983,20 +987,29 @@ def _resolve_healthy_ws_cdn_ips(
             and (succ >= max(1, eff_rounds - 1) or (not ip.startswith("104.") and rec_err < 6))
             and max_ms < 1800
             and rec_err < 12
-            and tot_err <= min_total_err + 5
+            and ((not ip.startswith("104.") and rec_err < 6) or tot_err <= min_total_err + 5)
         )
         prefer_non_104 = 0 if not ip.startswith("104.") else 1
         has_majority_succ = (
             0
-            if (succ >= max(1, eff_rounds - 1) or (ip in active_ips and not ip.startswith("104.") and rec_err < 6))
+            if (
+                succ >= max(1, eff_rounds - 1)
+                or (
+                    not ip.startswith("104.")
+                    and (
+                        (ip in active_ips and rec_err < 16)
+                        or (max_104_total_err >= 10 and tot_err <= max_104_total_err)
+                    )
+                )
+            )
             else 1
         )
         sort_key = (
-            0 if rec_err < 12 else 1,
-            0 if tot_err <= min_total_err + 5 else 1,
             has_majority_succ,
             prefer_non_104,
+            0 if rec_err < 12 else 1,
             0 if is_active_healthy else 1,
+            0 if tot_err <= min_total_err + 5 else 1,
             -succ,
             tot_err // 5,
             rec_err // 4,
