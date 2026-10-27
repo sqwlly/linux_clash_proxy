@@ -7,6 +7,7 @@ AI-GEMINI 的叶子按 `ProbeSummary.rank_key`（成功↑/失败↓/延迟↓/�
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 
 from ..backend.api import APIBackend
@@ -169,6 +170,25 @@ class RebalanceService:
         gemini_prefer = cfg.get("ai-gemini-prefer") if isinstance(cfg, dict) else None
 
         probe_service = ProbeService(self.paths)
+        if not dry_run and not is_external and type(probe_service) is ProbeService and not os.environ.get("PYTEST_CURRENT_TEST"):
+            from .ai_watch import has_any_inflight_ai_connection
+
+            prev_manual = _load_ai_manual_order(self.paths)
+            prev_gemini = _load_ai_gemini_order(self.paths)
+            if (
+                prev_manual
+                and not is_static_iepl_node(prev_manual[0], self.paths)
+                and has_any_inflight_ai_connection(self.paths)
+            ):
+                return RebalanceReport(
+                    ordered=tuple(prev_manual),
+                    order_path=str(ai_manual_order_file(self.paths)),
+                    rerendered=False,
+                    hot_reloaded=False,
+                    reason="deferred-inflight-ai-transfer",
+                    gemini_ordered=tuple(prev_gemini),
+                    gemini_order_path=str(ai_gemini_order_file(self.paths)) if prev_gemini else "",
+                )
         report = probe_service.probe(
             group=AI_MANUAL_GROUP,
             profile=REBALANCE_PROFILE,
@@ -380,6 +400,21 @@ class RebalanceService:
                     gemini_order_path,
                     gemini_switched_to,
                 )
+
+        try:
+            import time as _time
+
+            from ..config import ai_watch_state_file
+            from .ai_watch import _load_state as _load_watch_state
+            from .ai_watch import _save_state as _save_watch_state
+
+            if ai_watch_state_file(self.paths).exists():
+                w_state = _load_watch_state(self.paths)
+                w_state["last_rebalance_ts"] = _time.time()
+                w_state["rebalance_runs"] = int(w_state.get("rebalance_runs") or 0) + 1
+                _save_watch_state(self.paths, w_state)
+        except Exception:
+            pass
 
         return RebalanceReport(
             ordered=tuple(effective_order),

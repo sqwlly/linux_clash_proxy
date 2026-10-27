@@ -1581,6 +1581,97 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     assert c_failed3 is True
     assert "tls handshake eof" in c_reason3
 
+    # 当 HTTP POST /backend-api/codex/responses 返回 status=200 OK 时，自动消解先前的重试报错；
+    # 且当其它并发会话在安全 1X 节点上正在传输大包 (has_active_ai_transfer=True) 时，retry_delay=20s 不误杀正在上传的连接
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "INSERT INTO logs VALUES (6, ?, 600000000, 'DEBUG', 'codex_http_client::client', "
+        "'Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 OK')",
+        (now_epoch,),
+    )
+    conn.commit()
+    conn.close()
+    c_failed4, _cts4, _ = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch + 1))
+    assert c_failed4 is False
+
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "INSERT INTO logs VALUES (7, ?, 700000000, 'WARN', 'codex_core::responses_retry', "
+        "'stream connection failed; waiting to retry turn_id=t1 error=Connection failed: error sending request retry_delay=20s')",
+        (now_epoch + 1,),
+    )
+    conn.commit()
+    conn.close()
+    svc_codex_busy = AIWatchService(paths, agy_log_dir=tmp_path / "no-agy-logs", codex_log_dir=codex_dir)
+    svc_codex_busy.query = q
+    for _ in range(5):
+        rep_busy = svc_codex_busy.watch()
+        man_res = next(r for r in rep_busy.results if r.group == "AI-MANUAL")
+        assert man_res.switched is False
+        assert man_res.verdict == "ok"
+
+    # 近期双向帧同步的活跃连接（lastsnd == lastrcv == 1500ms < 10000ms）必须保持为 streaming，不可误判为 idle_completed
+    assert classify_ai_connection_lifecycle(398_235, 218_662, 1_500, 1_500, recv_q=0, send_q=0) == "streaming"
+
+    # 新建 TLS 握手/首包发送中的 Codex 连接（up=1542, down=0, idle=2980ms）在 1X 节点切流时不可被强杀
+    conns.append(
+        {
+            "id": "codex-tls-handshaking",
+            "chains": ["🇰🇷韩国 01 | 1X", "AI-MANUAL"],
+            "upload": 1_542,
+            "download": 0,
+            "metadata": {"host": "chatgpt.com", "sourcePort": "48460"},
+        }
+    )
+    idle_map["48460"] = (2_980, 2_980, 0, 0)
+    closed_history.clear()
+    q.switch_group("AI-MANUAL", "🇸🇬新加坡 01 | 1X", drop_connections=True)
+    assert "codex-tls-handshaking" not in closed_history
+
+    # _promote_gemini_order_head 支持 demote：把刚切中的目标提到首位，同时把刚故障的 1X 降到非 IEPL 分区末尾（静态 IEPL 仍垫底）
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.ai_watch import _promote_gemini_order_head
+
+    order_file = ai_gemini_order_file(paths)
+    order_file.write_text(
+        json.dumps(
+            [
+                "🇹🇼台湾 01 | 1X",
+                "🇺🇸美国 01 | 1X",
+                "🇩🇪德国 01 | 1X",
+                "🇫🇷法国 01 | 1X",
+                "🇬🇧英国 01 | IEPL 1.7X | CM",
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _promote_gemini_order_head(paths, "🇩🇪德国 01 | 1X", demote="🇹🇼台湾 01 | 1X")
+    assert json.loads(order_file.read_text(encoding="utf-8")) == [
+        "🇩🇪德国 01 | 1X",
+        "🇺🇸美国 01 | 1X",
+        "🇫🇷法国 01 | 1X",
+        "🇹🇼台湾 01 | 1X",
+        "🇬🇧英国 01 | IEPL 1.7X | CM",
+    ]
+
+    # _inject_openai_cloudflare_hosts 将 chatgpt.com / api.openai.com 固定映射到真实 Cloudflare Anycast IP 并为 VLESS 节点开启 ip-version: ipv4
+    from cproxy.backend.runtime import OPENAI_CLOUDFLARE_ANYCAST_IP, _inject_openai_cloudflare_hosts
+
+    sample_rt = {
+        "dns": {"enable": True},
+        "proxies": [{"name": "🇩🇪德国 01 | 1X", "type": "vless", "server": "172.67.143.95", "port": 443}],
+    }
+    _inject_openai_cloudflare_hosts(sample_rt)
+    assert sample_rt["hosts"]["chatgpt.com"] == OPENAI_CLOUDFLARE_ANYCAST_IP
+    assert sample_rt["hosts"]["+.chatgpt.com"] == OPENAI_CLOUDFLARE_ANYCAST_IP
+    assert sample_rt["hosts"]["api.openai.com"] == OPENAI_CLOUDFLARE_ANYCAST_IP
+    assert sample_rt["dns"]["use-hosts"] is True
+    assert sample_rt["proxies"][0]["ip-version"] == "ipv4"
+
+
+
+
 
 
 

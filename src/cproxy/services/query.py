@@ -225,23 +225,35 @@ class QueryService:
                     is_inflight_ai_connection,
                     track_connections_idle_ms,
                 )
+                from .probe import is_static_iepl_node
 
-                if upload >= 18_000 and host in AI_STREAM_HOSTS and src_port.isdigit():
+                if (
+                    (upload >= 18_000 or (0 < upload < 18_000 and download < 4_000))
+                    and host in AI_STREAM_HOSTS
+                    and src_port.isdigit()
+                ):
                     if socket_idle_map is None:
                         socket_idle_map = get_local_proxy_socket_idle_ms(self.runtime.mixed_port())
                         if not socket_idle_map:
                             socket_idle_map = track_connections_idle_ms(self.paths, connections)
                     unpacked = _unpack_socket_timings(socket_idle_map.get(src_port), src_port)
-                    if unpacked is not None and is_inflight_ai_connection(
-                        upload,
-                        download,
-                        unpacked[0],
-                        unpacked[1],
-                        on_stale_leaf=True,
-                        recv_q=unpacked[2],
-                        send_q=unpacked[3],
-                    ):
-                        continue
+                    if unpacked is not None:
+                        if (
+                            upload < 18_000
+                            and not is_static_iepl_node(leaf, self.paths)
+                            and (unpacked[2] > 0 or min(unpacked[0], unpacked[1]) <= 15_000)
+                        ):
+                            continue
+                        if is_inflight_ai_connection(
+                            upload,
+                            download,
+                            unpacked[0],
+                            unpacked[1],
+                            on_stale_leaf=True,
+                            recv_q=unpacked[2],
+                            send_q=unpacked[3],
+                        ):
+                            continue
             conn_id = str(item.get("id") or "")
             if not conn_id:
                 continue

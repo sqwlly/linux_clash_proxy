@@ -1204,6 +1204,41 @@ def _optimize_ws_cdn_servers(
         ws_idx += 1
 
 
+OPENAI_CLOUDFLARE_ANYCAST_IP = "172.64.155.209"
+OPENAI_DIRECT_HOSTS: dict[str, str] = {
+    "chatgpt.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
+    "*.chatgpt.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
+    "+.chatgpt.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
+    "api.openai.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
+    "+.openai.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
+}
+
+
+def _inject_openai_cloudflare_hosts(data: dict) -> None:
+    """将 OpenAI / ChatGPT 域名固定映射到真实 Cloudflare Anycast IPv4，并为 VLESS 节点开启 ip-version: ipv4。
+
+    部分机场（如 CyberGuard 的 1X WebSocket / 落地节点）在服务端内置了故障的 DNS 解锁劫持，
+    当 mihomo 以域名（AtypDomainName: chatgpt.com）拨号时会被落地机劫持到超时的解锁中转 IP，
+    导致 TLS ClientHello 卡死（_ssl.c:999: The handshake operation timed out）；
+    而在本地通过 hosts + ip-version: ipv4 将目标解析为真实 Cloudflare Anycast IP（172.64.155.209）
+    并以 AtypIPv4 发起连接（TLS SNI 仍保持 chatgpt.com），即可绕过故障的远端 DNS 劫持直连 Cloudflare 边缘。
+    """
+    hosts = data.get("hosts")
+    if not isinstance(hosts, dict):
+        hosts = {}
+    for domain, ip in OPENAI_DIRECT_HOSTS.items():
+        hosts.setdefault(domain, ip)
+    data["hosts"] = hosts
+    dns = data.get("dns")
+    if isinstance(dns, dict):
+        dns.setdefault("use-hosts", True)
+    proxies = data.get("proxies")
+    if isinstance(proxies, list):
+        for proxy in proxies:
+            if isinstance(proxy, dict) and str(proxy.get("type") or "").strip().lower() == "vless":
+                proxy.setdefault("ip-version", "ipv4")
+
+
 class RuntimeBackend:
     def __init__(self, paths: AppPaths):
         self.paths = paths
@@ -1260,6 +1295,7 @@ class RuntimeBackend:
             probe_tls=not bool(os.environ.get("PYTEST_CURRENT_TEST")),
             paths=self.paths,
         )
+        _inject_openai_cloudflare_hosts(data)
 
         # 若 dns.ipv6 关闭（或未显式开启），同步关闭顶层 ipv6，防止 mihomo 出站拨号对双栈 Cloudflare
         # 优选域名尝试连接不可达的 IPv6 地址（[2606:4700:...]:443 network is unreachable）拖慢建连。

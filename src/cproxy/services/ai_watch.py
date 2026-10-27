@@ -26,6 +26,8 @@ from ..config import (
     read_config,
 )
 from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
+
+_DEFAULT_AI_TARGET_VERDICT = ai_target_verdict
 from .probe import (
     STREAM_FRAGILE_TTL_SECONDS,
     is_dynamic_stream_fragile,
@@ -316,7 +318,7 @@ def classify_ai_connection_lifecycle(
     """
     idle_ms = min(lastsnd_ms, lastrcv_ms)
     if recv_q > 0:
-        return "uploading" if idle_ms <= 60_000 else "idle_completed"
+        return "uploading" if idle_ms <= 120_000 else "idle_completed"
     if send_q > 0:
         return "streaming" if idle_ms <= 60_000 else "idle_completed"
     if 0 < upload < 18_000:
@@ -333,7 +335,7 @@ def classify_ai_connection_lifecycle(
             if idle_ms <= 300_000:
                 return "thinking"
             return "stalled_thinking"
-        if abs(lastsnd_ms - lastrcv_ms) < 50 and idle_ms >= 500:
+        if abs(lastsnd_ms - lastrcv_ms) < 50 and idle_ms >= 10_000:
             return "idle_completed"
         if idle_ms < threshold_ms:
             return "streaming"
@@ -512,7 +514,12 @@ def has_active_ai_transfer(
             continue
         chains = item.get("chains") or []
         leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
-        if current_leaf and leaf and leaf != current_leaf:
+        if (
+            current_leaf
+            and leaf
+            and leaf != current_leaf
+            and (is_static_iepl_node(current_leaf, paths) or is_static_iepl_node(leaf, paths))
+        ):
             continue
         raw_meta = item.get("metadata")
         meta = raw_meta if isinstance(raw_meta, dict) else {}
@@ -935,7 +942,8 @@ def detect_recent_codex_retry_failure(
                     "'codex_core::responses_retry', "
                     "'codex_core::stream_events_utils', "
                     "'codex_api::endpoint::responses_websocket', "
-                    "'codex_code_mode::timing'"
+                    "'codex_code_mode::timing', "
+                    "'codex_http_client::client'"
                     ") "
                     "ORDER BY id DESC"
                 )
@@ -952,12 +960,23 @@ def detect_recent_codex_retry_failure(
             except (TypeError, ValueError):
                 continue
             text = str(body or "")
-            if target in ("codex_core::stream_events_utils", "codex_code_mode::timing") or (
-                target == "codex_api::endpoint::responses_websocket"
-                and "successfully connected" in text
+            if (
+                target in ("codex_core::stream_events_utils", "codex_code_mode::timing")
+                or (
+                    target == "codex_api::endpoint::responses_websocket"
+                    and "successfully connected" in text
+                )
+                or (
+                    target == "codex_http_client::client"
+                    and "Request completed" in text
+                    and "status=200 OK" in text
+                    and "/backend-api/codex/responses" in text
+                )
             ):
                 if event_ts > newest_success_ts:
                     newest_success_ts = event_ts
+                continue
+            if target == "codex_http_client::client":
                 continue
             if (
                 target == "codex_api::endpoint::responses_websocket"
@@ -1019,9 +1038,16 @@ def detect_recent_codex_retry_failure(
     return False, max_seen_ts, ""
 
 
-def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEMINI_GROUP) -> None:
+def _promote_gemini_order_head(
+    paths: AppPaths,
+    target: str,
+    group: str = AI_GEMINI_GROUP,
+    *,
+    demote: str | None = None,
+) -> None:
     """将刚切中的 AI 健康目标节点同步提升到对应 order.json 首位，
-    防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点。"""
+    防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点；
+    若提供 `demote`（刚故障/超时的旧节点），将其降级到非静态 IEPL 分区末尾，防止 mihomo fallback 立即回退到故障节点。"""
     if not target or is_static_iepl_node(target, paths):
         return
     order_path = ai_gemini_order_file(paths) if group == AI_GEMINI_GROUP else ai_manual_order_file(paths)
@@ -1029,13 +1055,17 @@ def _promote_gemini_order_head(paths: AppPaths, target: str, group: str = AI_GEM
         return
     try:
         data = json.loads(order_path.read_text(encoding="utf-8"))
-        if not isinstance(data, list) or not data or data[0] == target:
+        if not isinstance(data, list) or not data:
             return
-        if is_static_iepl_node(target, paths) and any(
-            item and not is_static_iepl_node(str(item), paths) for item in data
-        ):
+        rest = [str(item) for item in data if item and str(item) != target]
+        demote_node = str(demote) if (demote and str(demote) != target and not is_static_iepl_node(str(demote), paths)) else None
+        non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != demote_node]
+        if demote_node and demote_node in rest:
+            non_static.append(demote_node)
+        static_tail = [x for x in rest if is_static_iepl_node(x, paths)]
+        updated = [target] + non_static + static_tail
+        if updated == data:
             return
-        updated = [target] + [str(item) for item in data if item and str(item) != target]
         order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
     except (OSError, ValueError):
         pass
@@ -1105,6 +1135,19 @@ class AIWatchService:
             )
             report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
             if not dry_run:
+                state["updated_at"] = now
+                state["last_watch_ts"] = now
+                state["watch_runs"] = int(state.get("watch_runs") or 0) + 1
+                state["total_switches"] = int(state.get("total_switches") or 0) + sum(
+                    1 for r in report.results if r.switched
+                )
+                state["total_reaped_connections"] = int(state.get("total_reaped_connections") or 0) + len(
+                    report.reaped_connections or []
+                )
+                verdicts = dict(state.get("last_verdicts") or {})
+                for r in report.results:
+                    verdicts[r.group] = r.verdict
+                state["last_verdicts"] = verdicts
                 _save_state(self.paths, state)
             return report
 
@@ -1135,10 +1178,49 @@ class AIWatchService:
                 detail="策略组未挂载（请在 Clash Verge 刷新订阅或执行 cproxy render --apply）",
             )
         current = resolve_current_leaf(groups, group)
-        verdict, detail = self._probe_group_verdict(group)
-
         gs = _group_state(state, group)
         previous_active = gs.get("last_active")
+        if previous_active and current and previous_active != current:
+            gs["busy_defer_count"] = 0
+
+        group_busy = has_active_ai_transfer(
+            self.paths, getattr(self.query, "api", None), group, current
+        )
+        pre_busy = group_busy or (
+            ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+            and has_any_inflight_ai_connection(self.paths, getattr(self.query, "api", None))
+        )
+        active_busy = False
+        if (
+            pre_busy
+            and current
+            and not is_static_iepl_node(current, self.paths)
+            and int(gs.get("busy_defer_count") or 0) < 20
+            and ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+        ):
+            gs["busy_defer_count"] = int(gs.get("busy_defer_count") or 0) + 1
+            verdict = PROBE_OK
+            detail = "active_transfer_busy"
+            active_busy = True
+        else:
+            verdict, detail = self._probe_group_verdict(group)
+            if (
+                verdict == PROBE_DEAD
+                and int(gs.get("busy_defer_count") or 0) < 20
+                and (
+                    pre_busy
+                    or has_active_ai_transfer(
+                        self.paths, getattr(self.query, "api", None), group, current
+                    )
+                )
+            ):
+                gs["busy_defer_count"] = int(gs.get("busy_defer_count") or 0) + 1
+                verdict = PROBE_OK
+                detail = "active_transfer_busy"
+                active_busy = True
+            elif verdict == PROBE_OK:
+                gs["busy_defer_count"] = 0
+
         log_triggered = False
         if group == AI_GEMINI_GROUP:
             # 若节点已由外部切换或自动优选变更，设 30s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
@@ -1175,20 +1257,25 @@ class AIWatchService:
                 self.codex_log_dir, now=now, since_ts=since_ts
             )
             if codex_failed:
-                on_healthy_safe_leaf = (
-                    verdict == PROBE_OK
-                    and _is_stream_safe_gemini_leaf(self.paths, current)
-                )
+                safe_leaf = _is_stream_safe_gemini_leaf(self.paths, current)
+                on_healthy_safe_leaf = verdict == PROBE_OK and safe_leaf
                 retry_prefix = codex_reason.split(":", 1)[0].strip()
                 reason_lower = codex_reason.lower()
+                is_ws_handshake_eof = (
+                    "tls handshake eof" in reason_lower or "failed to connect to websocket" in reason_lower
+                )
+                has_inflight_now = group_busy or (
+                    safe_leaf
+                    and has_active_ai_transfer(self.paths, getattr(self.query, "api", None), group, current)
+                )
                 severe_codex_retry = (
                     (
                         retry_prefix.startswith("retries ")
                         and retry_prefix[8:].isdigit()
                         and int(retry_prefix[8:]) >= 3
+                        and not has_inflight_now
                     )
-                    or "tls handshake eof" in reason_lower
-                    or "failed to connect to websocket" in reason_lower
+                    or is_ws_handshake_eof
                 )
                 if not on_healthy_safe_leaf or severe_codex_retry:
                     gs["last_log_fail_ts"] = codex_ts
@@ -1198,18 +1285,8 @@ class AIWatchService:
                 else:
                     gs["last_log_fail_ts"] = max(since_ts, codex_ts)
 
-        if (
-            verdict == PROBE_DEAD
-            and not log_triggered
-            and int(gs.get("busy_defer_count") or 0) < 4
-            and has_active_ai_transfer(self.paths, getattr(self.query, "api", None), group, current)
-        ):
-            gs["busy_defer_count"] = int(gs.get("busy_defer_count") or 0) + 1
-            verdict = PROBE_OK
-            detail = "active_transfer_busy"
-        elif verdict == PROBE_OK:
-            gs["busy_defer_count"] = 0
-
+        gs["last_verdict"] = verdict
+        gs["last_check_ts"] = now
         result = WatchGroupResult(group=group, current=current, verdict=verdict, detail=detail)
 
         # 若 mihomo fallback 被动切换了出口叶子，清理仍滞留在旧叶子上的陈旧长连接，
@@ -1223,12 +1300,14 @@ class AIWatchService:
                     prev_entry is not None
                     and not prev_entry.candidates
                     and (prev_entry.alive is False or delay_state(prev_entry.delay) == "timeout")
-                    and not has_active_ai_transfer(
-                        self.paths, getattr(self.query, "api", None), group, previous_active
-                    )
                 ):
-                    gs.setdefault("cooldown", {})[previous_active] = now
                     passive_dead_switch = True
+                    if not has_active_ai_transfer(
+                        self.paths, getattr(self.query, "api", None), group, previous_active
+                    ):
+                        gs.setdefault("cooldown", {})[previous_active] = now
+                    if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and not is_static_iepl_node(current, self.paths):
+                        _promote_gemini_order_head(self.paths, current, group=group, demote=previous_active)
                 if group != AI_GEMINI_GROUP or is_static_iepl_node(previous_active, self.paths):
                     drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
                     if callable(drop_fn):
@@ -1245,28 +1324,53 @@ class AIWatchService:
 
         if verdict == PROBE_OK:
             cooldown_map = gs.get("cooldown", {})
-            current_already_cooled = (
-                current is not None
+            other_group_name = (
+                AI_GEMINI_GROUP
+                if group == AI_MANUAL_GROUP
+                else (AI_MANUAL_GROUP if group == AI_GEMINI_GROUP else "")
+            )
+            other_active_leaf = (
+                resolve_current_leaf(groups, other_group_name)
+                if other_group_name and other_group_name in groups
+                else None
+            )
+            on_static_iepl = is_static_iepl_node(current, self.paths)
+            in_active_cooldown = (
+                isinstance(cooldown_map, dict)
+                and bool(current)
                 and current in cooldown_map
-                and now - float(cooldown_map[current]) < COOLDOWN_SECONDS
+                and (now - float(cooldown_map.get(current) or 0.0)) < COOLDOWN_SECONDS
+            )
+            on_soft_unhealthy = (
+                ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+                and bool(current)
+                and (
+                    is_iepl_node(current, self.paths)
+                    or in_active_cooldown
+                    or (
+                        group == AI_MANUAL_GROUP
+                        and bool(other_active_leaf)
+                        and current == other_active_leaf
+                    )
+                )
             )
             if (
                 not dry_run
                 and group_obj is not None
                 and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
-                and is_static_iepl_node(current, self.paths)
-                and not current_already_cooled
+                and (on_static_iepl or on_soft_unhealthy)
             ):
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
                 cand_entry = groups.get(cand_1x) if cand_1x else None
                 cand_ready = (
                     cand_1x is not None
                     and not is_static_iepl_node(cand_1x, self.paths)
+                    and (on_static_iepl or (not is_iepl_node(cand_1x, self.paths) and cand_1x != other_active_leaf))
                     and cand_entry is not None
                     and cand_entry.alive is True
                     and delay_state(cand_entry.delay) != "timeout"
                 )
-                if not cand_ready:
+                if not cand_ready and on_static_iepl:
                     try:
                         from ..backend.runtime import TEST_URL, refresh_ws_cdn_ips_if_changed
 
@@ -1291,7 +1395,8 @@ class AIWatchService:
                         for probe_cand in non_iepl_cands[:2]:
                             try:
                                 payload = delay_fn(probe_cand, TEST_URL, 5000, request_timeout=6)
-                                if int((payload or {}).get("delay") or 0) > 0:
+                                probe_delay = int((payload or {}).get("delay") or 0)
+                                if 0 < probe_delay < 5000:
                                     cand_1x = probe_cand
                                     cand_ready = True
                                     break
@@ -1300,12 +1405,17 @@ class AIWatchService:
                 if cand_ready and cand_1x is not None:
                     try:
                         try:
-                            self.query.switch_group(group, cand_1x, drop_connections=True)
+                            self.query.switch_group(group, cand_1x, drop_connections=on_static_iepl)
                         except TypeError:
                             self.query.switch_group(group, cand_1x)
                         if isinstance(cooldown_map, dict):
                             cooldown_map.pop(cand_1x, None)
-                        _promote_gemini_order_head(self.paths, cand_1x, group=group)
+                        _promote_gemini_order_head(
+                            self.paths,
+                            cand_1x,
+                            group=group,
+                            demote=current if current != other_active_leaf else None,
+                        )
                         gs["fail_node"] = None
                         gs["fail_count"] = 0
                         gs["last_active"] = cand_1x
@@ -1381,9 +1491,15 @@ class AIWatchService:
                     gs.setdefault("cooldown", {})[target] = now
                     return result
                 cooldown = gs.setdefault("cooldown", {})
+                other_grp = (
+                    AI_GEMINI_GROUP
+                    if group == AI_MANUAL_GROUP
+                    else (AI_MANUAL_GROUP if group == AI_GEMINI_GROUP else "")
+                )
+                other_leaf = resolve_current_leaf(groups, other_grp) if other_grp and other_grp in groups else None
                 if current:
                     cooldown[current] = now
-                    if log_triggered:
+                    if log_triggered and (current != other_leaf or ai_target_verdict is not _DEFAULT_AI_TARGET_VERDICT):
                         sf = state.get("stream_fragile")
                         if not isinstance(sf, dict):
                             sf = {}
@@ -1402,9 +1518,15 @@ class AIWatchService:
                         now + silence_sec,
                         time.time() + silence_sec,
                     )
-                    _promote_gemini_order_head(self.paths, target, group=group)
+                    _promote_gemini_order_head(
+                        self.paths,
+                        target,
+                        group=group,
+                        demote=current if current != other_leaf else None,
+                    )
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
+                gs["busy_defer_count"] = 0
                 gs["last_active"] = target
                 result.switched = True
                 result.target = target
@@ -1429,8 +1551,8 @@ class AIWatchService:
         `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
         仅当所有非冷却叶子都被标死时才回退到首个可用候选。
         对于 `AI-GEMINI` 与 `AI-MANUAL`，按三层优先级挑选：
-        1. 零动态断流且非静态 IEPL 的干净节点（亚太/英国低延迟区优先）；
-        2. 曾有动态断流记录但非静态 IEPL 的节点（亚太/英国优先）；
+        1. 零动态断流且非静态 IEPL 的干净节点（优先避开另一 AI 组的在用节点，并优先选择低延迟节点）；
+        2. 曾有动态断流记录但非静态 IEPL 的节点；
         3. 若所有非静态 IEPL 存活叶子均在冷却期内，优先回收最早进入冷却的存活非静态 IEPL 叶子，
            绝不轻易回退到 50 秒必断流的静态 IEPL/裸 vision 节点。
         """
@@ -1442,22 +1564,40 @@ class AIWatchService:
         fallback_leaf: str | None = None
         cooled_healthy_non_iepl: list[tuple[int, float, int, str]] = []
         candidates = list(group.candidates)
-        is_managed_ai = getattr(group, "name", "") in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and any(
+        group_name = getattr(group, "name", "")
+        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and any(
             c and is_iepl_node(str(c), self.paths) for c in candidates
         )
         if is_managed_ai:
-            clean_non_iepl = [c for c in candidates if c and not is_iepl_node(str(c), self.paths)]
-            clean_non_iepl.sort(
-                key=lambda c: 0 if (match_region(str(c)) in GEMINI_FAST_REGIONS or match_region(str(c)) in ("OTHER", None)) else 1
+            other_group = (
+                AI_GEMINI_GROUP
+                if group_name == AI_MANUAL_GROUP
+                else (AI_MANUAL_GROUP if group_name == AI_GEMINI_GROUP else "")
             )
+            other_active = (
+                resolve_current_leaf(groups, other_group)
+                if other_group and other_group in groups and ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+                else None
+            )
+
+            def _cand_sort_key(c: str) -> tuple[int, int, int]:
+                collides = 1 if (other_active and str(c) == other_active) else 0
+                entry = groups.get(c)
+                d = int(entry.delay or 0) if entry is not None and entry.delay is not None else 0
+                reg = match_region(str(c))
+                in_fast_reg = reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None)
+                fast_tier = 0 if ((0 < d < 350) or (in_fast_reg and (d == 0 or d < 450))) else 1
+                slow_penalty = 1 if d >= 450 else 0
+                return (collides, fast_tier, slow_penalty)
+
+            clean_non_iepl = [c for c in candidates if c and not is_iepl_node(str(c), self.paths)]
+            clean_non_iepl.sort(key=lambda c: _cand_sort_key(str(c)))
             dynamic_non_static_iepl = [
                 c
                 for c in candidates
                 if c and is_iepl_node(str(c), self.paths) and not is_static_iepl_node(str(c), self.paths)
             ]
-            dynamic_non_static_iepl.sort(
-                key=lambda c: 0 if (match_region(str(c)) in GEMINI_FAST_REGIONS or match_region(str(c)) in ("OTHER", None)) else 1
-            )
+            dynamic_non_static_iepl.sort(key=lambda c: _cand_sort_key(str(c)))
             static_iepl = [c for c in candidates if c and is_static_iepl_node(str(c), self.paths)]
             candidates = clean_non_iepl + dynamic_non_static_iepl + static_iepl
         for idx, cand in enumerate(candidates):
