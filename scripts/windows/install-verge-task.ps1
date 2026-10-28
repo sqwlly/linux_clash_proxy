@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Windows + Clash Verge (Rev) 全自动一键安装与自启脚本。
 
@@ -21,15 +21,26 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$env:PYTHONIOENCODING = "utf-8"
 $TaskName = "cproxy-verge-daemon"
 $StartupDir = [Environment]::GetFolderPath("Startup")
 $StartupVbs = Join-Path $StartupDir "$TaskName.vbs"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 function Stop-ExistingVergeDaemon {
-    Get-CimInstance Win32_Process -Filter "Name LIKE 'python%.exe'" -ErrorAction SilentlyContinue |
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name LIKE 'python%.exe' OR Name = 'cproxy-daemon.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match "cproxy\.cli\s+verge\s+daemon" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 500
+}
+
+function Assert-NativeSuccess([string]$Step) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Step 失败，退出码: $LASTEXITCODE"
+    }
 }
 
 if ($Uninstall) {
@@ -53,7 +64,13 @@ if (-not $PyCmd) {
     Write-Error "未检测到 Python (>=3.11)，请先安装 Python 并勾选 Add Python to PATH。"
     exit 1
 }
-$PythonExe = $PyCmd.Source
+$PythonInfo = & $PyCmd.Source -c "import json,sys; print(json.dumps({'executable':sys.executable,'version':list(sys.version_info[:2])}))"
+Assert-NativeSuccess "Python 环境检测"
+$PythonInfo = $PythonInfo | ConvertFrom-Json
+if ($PythonInfo.version[0] -lt 3 -or ($PythonInfo.version[0] -eq 3 -and $PythonInfo.version[1] -lt 11)) {
+    throw "cproxy 需要 Python >= 3.11，当前为 $($PythonInfo.version -join '.')"
+}
+$PythonExe = $PythonInfo.executable
 $PythonDir = Split-Path -Parent $PythonExe
 $PythonwCandidate = Join-Path $PythonDir "pythonw.exe"
 if (Test-Path $PythonwCandidate) {
@@ -67,6 +84,7 @@ if (Test-Path $PythonwCandidate) {
 if (-not $SkipPipInstall -and (Test-Path (Join-Path $RepoRoot "pyproject.toml"))) {
     Write-Host "==> [1/4] 正在安装 cproxy Python 包..." -ForegroundColor Cyan
     & $PythonExe -m pip install --upgrade $RepoRoot
+    Assert-NativeSuccess "cproxy 安装"
 } else {
     Write-Host "==> [1/4] 跳过 pip 安装，使用现有 cproxy 环境..." -ForegroundColor Cyan
 }
@@ -79,14 +97,17 @@ if ($Secret) { $InstallArgs += @("--secret", $Secret) }
 if ($MixedPort -gt 0) { $InstallArgs += @("--mixed-port", "$MixedPort") }
 if ($VergeDir) { $InstallArgs += @("--verge-dir", $VergeDir) }
 & $PythonExe @InstallArgs
+Assert-NativeSuccess "Clash Verge 旁路集成"
 
 # 4. 注册开机自启并立即拉起后台无窗口守护进程
 Write-Host "==> [3/4] 正在注册后台常驻守护进程 ($TaskName)..." -ForegroundColor Cyan
 Stop-ExistingVergeDaemon
+$DaemonExe = Join-Path $PythonDir "cproxy-daemon.exe"
+Copy-Item -Path $PythonwExe -Destination $DaemonExe -Force
 
 $RegisteredTaskOk = $false
 try {
-    $Action = New-ScheduledTaskAction -Execute $PythonwExe -Argument "-m cproxy.cli verge daemon"
+    $Action = New-ScheduledTaskAction -Execute $DaemonExe -Argument "-m cproxy.cli verge daemon"
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $Settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -105,21 +126,35 @@ try {
     # 非管理员权限下若计划任务受限，自动回退到用户 Startup 启动文件夹 + 立即后台拉起
     $VbsContent = @"
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """$PythonwExe"" -m cproxy.cli verge daemon", 0, False
+WshShell.Run """$DaemonExe"" -m cproxy.cli verge daemon", 0, False
 "@
-    Set-Content -Path $StartupVbs -Value $VbsContent -Encoding UTF8
-    Start-Process -FilePath $PythonwExe -ArgumentList "-m cproxy.cli verge daemon" -WindowStyle Hidden
+    Set-Content -Path $StartupVbs -Value $VbsContent -Encoding Unicode
+    Start-Process -FilePath $DaemonExe -ArgumentList "-m cproxy.cli verge daemon" -WindowStyle Hidden
     Write-Host "    已写入用户登录自启脚本并拉起后台守护进程: $StartupVbs" -ForegroundColor Green
 }
 
-# 5. 执行一次初始状态检查与四层闭环生效核验
-Write-Host "==> [4/4] 正在验证与 Clash Verge 内核的调度闭环状态..." -ForegroundColor Cyan
-& $PythonExe -m cproxy.cli verge once --no-rebalance
+# 5. 执行一次初始状态检查与调度健康核验
+Write-Host "==> [4/4] 正在验证与 Clash Verge 内核的调度健康状态..." -ForegroundColor Cyan
+& $DaemonExe -m cproxy.cli verge once --no-rebalance
+Assert-NativeSuccess "首轮 AI 看护"
+$StatusReady = $false
+for ($Attempt = 0; $Attempt -lt 15; $Attempt++) {
+    & $PythonExe -m cproxy.cli verge status | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $StatusReady = $true
+        break
+    }
+    Start-Sleep -Seconds 2
+}
+if (-not $StatusReady) {
+    throw "Verge 状态核验在 30 秒内未通过"
+}
 & $PythonExe -m cproxy.cli verge status
+Assert-NativeSuccess "Verge 状态展示"
 
 Write-Host ""
 Write-Host "==============================================================" -ForegroundColor Green
 Write-Host "  Windows + Clash Verge 调度机制一键部署完成！" -ForegroundColor Green
 Write-Host "  提示：若上方提示未挂载策略组，请在 Clash Verge 中点一次「订阅 -> 刷新」" -ForegroundColor Yellow
-Write-Host "        刷新后可随时运行 'cproxy verge' 查看四层闭环生效状态。" -ForegroundColor Yellow
+Write-Host "        刷新后可随时运行 'cproxy verge' 查看调度健康状态。" -ForegroundColor Yellow
 Write-Host "==============================================================" -ForegroundColor Green

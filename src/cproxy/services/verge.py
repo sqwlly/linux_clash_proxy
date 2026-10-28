@@ -29,6 +29,10 @@ from .rebalance import RebalanceReport, RebalanceService
 DEFAULT_VERGE_CONTROLLER = "127.0.0.1:9097"
 DEFAULT_VERGE_MIXED_PORT = 7897
 REQUIRED_VERGE_GROUPS = ("AI-MANUAL", "AI-GEMINI", "AI-AUTO")
+AI_WATCH_GROUPS = ("AI-MANUAL", "AI-GEMINI")
+SWITCH_STORM_WINDOW_SEC = 600.0
+SWITCH_STORM_THRESHOLD = 6
+SWITCH_HISTORY_LIMIT = 120
 
 
 @dataclass(frozen=True)
@@ -90,9 +94,13 @@ class VergeStatusReport:
     daemon_pid: int | None = None
     daemon_pid_alive: bool = False
     heartbeat_age_sec: float | None = None
+    watch_ok: bool = False
+    last_watch_age_sec: float | None = None
     watch_runs: int = 0
     rebalance_runs: int = 0
     total_switches: int = 0
+    switches_last_10m: int = 0
+    switch_storm: bool = False
     total_reaped_connections: int = 0
     egress: list[VergeEgressStatus] = field(default_factory=list)
     remedies: list[str] = field(default_factory=list)
@@ -326,6 +334,11 @@ def install_verge_oneclick(
     verge_dir: Path | None = None,
 ) -> VergeInstallReport:
     """一键完成 Clash Verge 旁路配置初始化 + 全局扩展脚本自动注入。"""
+    detected = discover_clash_verge_config(verge_dir)
+    target_dir = verge_dir or detected.source_dir
+    if target_dir is None or not target_dir.is_dir():
+        raise RuntimeError("未检测到 Clash Verge 配置目录，请先启动 Clash Verge，或通过 --verge-dir 显式指定目录")
+
     cfg_path, detected = init_verge_config(
         paths,
         controller=controller,
@@ -336,14 +349,10 @@ def install_verge_oneclick(
     fallback_js = paths.config_dir / "clash-verge-script.js"
     export_verge_script(fallback_js)
 
-    injected_js: Path | None = None
-    chain_enabled = False
-    target_dir = verge_dir or detected.source_dir
-    if target_dir is not None and target_dir.is_dir():
-        try:
-            injected_js, chain_enabled = inject_verge_global_script(target_dir)
-        except OSError:
-            injected_js = None
+    try:
+        injected_js, chain_enabled = inject_verge_global_script(target_dir)
+    except OSError as exc:
+        raise RuntimeError(f"无法注入 Clash Verge 全局扩展脚本: {target_dir}: {exc}") from exc
 
     return VergeInstallReport(
         config_path=cfg_path,
@@ -432,6 +441,11 @@ def _record_daemon_heartbeat(
     total_switches = int(state.get("total_switches") or 0)
     total_reaped = int(state.get("total_reaped_connections") or 0)
     verdicts = dict(state.get("last_verdicts") or {})
+    switch_history = [
+        float(value)
+        for value in state.get("switch_timestamps", [])
+        if isinstance(value, (int, float)) and now - float(value) <= 86400.0
+    ]
 
     if tick_report is not None:
         if tick_report.watch_report is not None:
@@ -442,6 +456,7 @@ def _record_daemon_heartbeat(
                 verdicts[gr.group] = gr.verdict
                 if gr.switched:
                     total_switches += 1
+                    switch_history.append(now)
         if tick_report.rebalance_report is not None:
             rebalance_runs += 1
             state["last_rebalance_ts"] = now
@@ -449,6 +464,7 @@ def _record_daemon_heartbeat(
     state["watch_runs"] = watch_runs
     state["rebalance_runs"] = rebalance_runs
     state["total_switches"] = total_switches
+    state["switch_timestamps"] = switch_history[-SWITCH_HISTORY_LIMIT:]
     state["total_reaped_connections"] = total_reaped
     state["last_verdicts"] = verdicts
     _save_daemon_state(paths, state)
@@ -535,15 +551,17 @@ class VergeDaemonService:
                         except Exception as exc:
                             tick_report.warnings.append(str(exc))
                         last_rebalance_ts = now
-                    if on_tick is not None:
-                        on_tick(tick_report)
-
                 _record_daemon_heartbeat(
                     self.paths,
                     now=now,
                     sampled_connections=len(idle_map),
                     tick_report=tick_report,
                 )
+                if tick_report is not None and on_tick is not None:
+                    try:
+                        on_tick(tick_report)
+                    except Exception:
+                        pass
 
                 ticks += 1
                 if max_ticks is not None and ticks >= max_ticks:
@@ -560,7 +578,7 @@ def check_verge_effectiveness(
     max_heartbeat_age_sec: float = 90.0,
     now: float | None = None,
 ) -> VergeStatusReport:
-    """四层闭环校验：核实 Clash Verge 旁路调度系统是否在内核与守护进程中真正生效。"""
+    """核验 Clash Verge 控制面配置、守护状态、AI 探测健康与近期切流情况。"""
     ts = time.time() if now is None else now
     cfg = read_config(paths)
     controller = str(cfg.get("external-controller") or DEFAULT_VERGE_CONTROLLER)
@@ -666,9 +684,24 @@ def check_verge_effectiveness(
     heartbeat_age_sec: float | None = None
     if isinstance(updated_at, (int, float)) and updated_at > 0:
         heartbeat_age_sec = max(0.0, ts - float(updated_at))
+    last_watch_at = daemon_state.get("last_watch_ts")
+    last_watch_age_sec: float | None = None
+    if isinstance(last_watch_at, (int, float)) and last_watch_at > 0:
+        last_watch_age_sec = max(0.0, ts - float(last_watch_at))
     pid_alive = _is_pid_alive(daemon_pid)
     heartbeat_fresh = heartbeat_age_sec is not None and heartbeat_age_sec <= max_heartbeat_age_sec
     daemon_ok = bool(heartbeat_fresh and (pid_alive or heartbeat_age_sec <= 30.0))
+    watch_ok = bool(
+        last_watch_age_sec is not None
+        and last_watch_age_sec <= max_heartbeat_age_sec
+        and all(last_verdicts.get(group) == "ok" for group in AI_WATCH_GROUPS)
+    )
+    switches_last_10m = sum(
+        1
+        for value in daemon_state.get("switch_timestamps", [])
+        if isinstance(value, (int, float)) and ts - SWITCH_STORM_WINDOW_SEC <= float(value) <= ts + 5.0
+    )
+    switch_storm = switches_last_10m >= SWITCH_STORM_THRESHOLD
 
     remedies: list[str] = []
     if not controller_ok:
@@ -691,8 +724,20 @@ def check_verge_effectiveness(
         remedies.append(
             "旁路守护进程未运行或心跳超时：Windows 下可双击 `setup-windows-verge.bat` 或运行 `cproxy verge daemon` 启动后台看护。"
         )
+    elif not watch_ok:
+        remedies.append(
+            "AI 看护未通过或结果已过期：请运行 `cproxy verge once --no-rebalance --dry-run` 检查探测链路；"
+            "若所有节点同时失败，优先排查本机探测流量是否被 DIRECT 规则绕过代理。"
+        )
+    if switch_storm:
+        remedies.append(
+            f"近 10 分钟已切流 {switches_last_10m} 次，疑似切流风暴：请暂停自动调度并检查探测链路与节点健康，"
+            "避免持续中断现有 AI 会话。"
+        )
 
-    overall_effective = bool(controller_ok and topology_ok and rules_ok and daemon_ok)
+    overall_effective = bool(
+        controller_ok and topology_ok and rules_ok and daemon_ok and watch_ok and not switch_storm
+    )
     return VergeStatusReport(
         overall_effective=overall_effective,
         controller=controller,
@@ -709,9 +754,13 @@ def check_verge_effectiveness(
         daemon_pid=daemon_pid,
         daemon_pid_alive=pid_alive,
         heartbeat_age_sec=round(heartbeat_age_sec, 1) if heartbeat_age_sec is not None else None,
+        watch_ok=watch_ok,
+        last_watch_age_sec=round(last_watch_age_sec, 1) if last_watch_age_sec is not None else None,
         watch_runs=int(daemon_state.get("watch_runs") or 0),
         rebalance_runs=int(daemon_state.get("rebalance_runs") or 0),
         total_switches=int(daemon_state.get("total_switches") or 0),
+        switches_last_10m=switches_last_10m,
+        switch_storm=switch_storm,
         total_reaped_connections=int(daemon_state.get("total_reaped_connections") or 0),
         egress=egress_list,
         remedies=remedies,

@@ -230,28 +230,53 @@ def track_connections_idle_ms(
             prev_down = int(prev.get("down") or 0)
             snd_ts = float(prev.get("snd_ts") or ts_now)
             rcv_ts = float(prev.get("rcv_ts") or ts_now)
+            turn_ts = float(prev.get("turn_ts") or 0.0)
+            turn_down = int(prev.get("turn_down") if prev.get("turn_down") is not None else prev_down)
             delta_up = upload - prev_up
             delta_down = download - prev_down
+            if delta_up >= 2_000:
+                turn_ts = ts_now
+                turn_down = max(0, delta_down)
+            elif delta_down > 0:
+                turn_down += delta_down
+
+            in_active_turn = (
+                upload >= 18_000
+                and turn_ts > 0.0
+                and (ts_now - turn_ts) <= 180.0
+                and (turn_down < 16_000 or (ts_now - max(snd_ts, rcv_ts)) < 90.0)
+            )
             if delta_up > 0 and delta_down > 0:
-                if download >= 6_000 and delta_down >= 1_024:
+                if not in_active_turn and download >= 6_000 and delta_down >= 1_024:
                     snd_ts = ts_now
                     rcv_ts = ts_now - 0.6
                 else:
                     rcv_ts = ts_now
-                    snd_ts = min(snd_ts, ts_now - 0.2)
+                    snd_ts = ts_now - 0.2
             elif delta_up > 0:
                 rcv_ts = ts_now
-                if snd_ts > rcv_ts:
+                if in_active_turn or snd_ts > rcv_ts:
                     snd_ts = ts_now - 0.2
             elif delta_down > 0:
-                snd_ts = ts_now
-                if rcv_ts >= snd_ts - 0.5:
-                    rcv_ts = snd_ts - 0.6
+                if in_active_turn:
+                    rcv_ts = ts_now
+                    snd_ts = ts_now - 0.2
+                else:
+                    snd_ts = ts_now
+                    if rcv_ts >= snd_ts - 0.5:
+                        rcv_ts = snd_ts - 0.6
         else:
-            if download >= 4_000:
+            turn_down = download
+            if prev_map and upload >= 18_000:
+                turn_ts = ts_now
+                rcv_ts = ts_now
+                snd_ts = ts_now - 0.2
+            elif download >= 4_000:
+                turn_ts = 0.0
                 snd_ts = ts_now
                 rcv_ts = ts_now - 0.6
             else:
+                turn_ts = ts_now if upload > 0 else 0.0
                 rcv_ts = ts_now
                 snd_ts = ts_now - 0.2
 
@@ -260,10 +285,24 @@ def track_connections_idle_ms(
             "down": download,
             "snd_ts": snd_ts,
             "rcv_ts": rcv_ts,
+            "turn_ts": turn_ts,
+            "turn_down": turn_down,
             "port": src_port,
         }
         lastsnd_ms = max(0, round((ts_now - snd_ts) * 1000))
         lastrcv_ms = max(0, round((ts_now - rcv_ts) * 1000))
+        if 0 < upload < 18_000 and min(lastsnd_ms, lastrcv_ms) < 75_000:
+            lastsnd_ms = min(lastsnd_ms, 5_000)
+            lastrcv_ms = min(lastrcv_ms, 5_000)
+        elif (
+            upload >= 18_000
+            and turn_ts > 0.0
+            and (ts_now - turn_ts) <= 180.0
+            and (turn_down < 16_000 or min(lastsnd_ms, lastrcv_ms) < 90_000)
+        ):
+            if (lastrcv_ms - lastsnd_ms) >= 400 or abs(lastsnd_ms - lastrcv_ms) < 50:
+                lastsnd_ms = max(200, lastsnd_ms)
+                lastrcv_ms = max(0, lastsnd_ms - 200)
         idle_by_port[src_port] = (lastsnd_ms, lastrcv_ms)
 
     _save_conn_activity(paths, next_map)
@@ -750,9 +789,10 @@ def _group_state(state: dict, group: str) -> dict:
     return item
 
 
+_AGY_GLOG_PREFIX = r"^(?:(?:ERROR|WARNING):\s+logging\s+before\s+google\.Init:\s+)?[IWE](\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+"
 _AGY_RETRY_FAIL_RE = re.compile(
-    r"^I(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+\d+\s+run\.go:\d+\]\s+"
-    r"Run:\s+attempt\s+(\d+)\s+failed\s+\((.+?)\),\s+retrying\s+in\b"
+    _AGY_GLOG_PREFIX
+    + r"\d+\s+run\.go:\d+\]\s+Run:\s+attempt\s+(\d+)\s+failed\s+\((.+?)\),\s+retrying\s+in\b"
 )
 AGY_LOG_WINDOW_SECONDS = 180.0
 
@@ -773,7 +813,39 @@ def default_agy_log_dir(paths: AppPaths) -> Path:
     return _resolve_user_home_from_paths(paths) / ".gemini" / "antigravity-cli" / "log"
 
 
-_AGY_GLOG_TS_RE = re.compile(r"^I(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+")
+def _discover_agy_log_files(log_dir: Path | None) -> list[Path]:
+    if log_dir is None:
+        return []
+    search_dirs: list[Path] = []
+    if log_dir.is_dir():
+        search_dirs.append(log_dir)
+    if (
+        log_dir.name == "log"
+        and log_dir.parent.name == "antigravity-cli"
+        and not os.environ.get("PYTEST_CURRENT_TEST")
+    ):
+        home = log_dir.parent.parent.parent
+        for extra in (
+            home / "AppData" / "Roaming" / "Antigravity" / "logs",
+            home / ".config" / "Antigravity" / "logs",
+            home / "Library" / "Application Support" / "Antigravity" / "logs",
+        ):
+            if extra.is_dir() and extra not in search_dirs:
+                search_dirs.append(extra)
+    found: list[Path] = []
+    for d in search_dirs:
+        try:
+            found.extend(d.glob("cli-*.log"))
+            found.extend(d.glob("language_server*.log"))
+        except OSError:
+            continue
+    try:
+        return sorted(found, key=lambda p: (p.stat().st_mtime, p.name))
+    except OSError:
+        return found
+
+
+_AGY_GLOG_TS_RE = re.compile(_AGY_GLOG_PREFIX)
 
 
 def _parse_glog_timestamp(line: str, local_now: time.struct_time) -> float | None:
@@ -801,21 +873,17 @@ def detect_recent_agy_retry_failure(
     window_seconds: float = AGY_LOG_WINDOW_SECONDS,
     since_ts: float = 0.0,
 ) -> tuple[bool, float, str]:
-    """扫描所有近期活跃的 agy `cli-*.log` 尾部，检测 `run.go` 是否刚出现流式重试失败。
+    """扫描所有近期活跃的 agy `cli-*.log` 与 Antigravity IDE `language_server*.log` 尾部，
+    检测 `run.go` 是否刚出现流式重试失败。
 
-    当同一台机器同时开启多个 agy 终端会话时，后台遥测（如 `listExperiments`）会不断刷新各
-    日志文件的 mtime；若只看 `logs[-1]` 会漏掉另一会话里正在发生的连续 EOF 重试。
-    这里扫描全部近期更新过的 `cli-*.log`（最多取最近 10 个），返回最新的一次失败事件；
+    当同一台机器同时开启多个 agy 终端会话或桌面端 IDE 时，后台遥测（如 `listExperiments`）
+    会不断刷新各日志文件的 mtime；若只看 `logs[-1]` 会漏掉另一会话里正在发生的连续 EOF 重试。
+    这里扫描全部近期更新过的日志文件（最多取最近 10 个），返回最新的一次失败事件；
     同时记录任一会话收到 `streamGenerateContent` `ResponseID` 的最新成功时间戳——若在失败事件
     之后已有任一会话建连成功，说明当前出口节点本身存活，不因单会话滞后重试而切走全局节点。
     """
-    if log_dir is None or not log_dir.is_dir():
-        return False, since_ts, ""
     ts_now = time.time() if now is None else now
-    try:
-        logs = sorted(log_dir.glob("cli-*.log"), key=lambda p: (p.stat().st_mtime, p.name))
-    except OSError:
-        return False, since_ts, ""
+    logs = _discover_agy_log_files(log_dir)
     if not logs:
         return False, since_ts, ""
 
@@ -833,30 +901,34 @@ def detect_recent_agy_retry_failure(
         except OSError:
             continue
 
+        seen_fail_in_file = False
         for line in reversed(tail.splitlines()):
             stripped = line.strip()
             if "streamGenerateContent" in stripped and "ResponseID:" in stripped:
-                ok_ts = _parse_glog_timestamp(stripped, local_now)
-                if ok_ts is not None and ok_ts > newest_success_ts:
-                    newest_success_ts = ok_ts
-                # 该会话在更晚时间点已成功收到 streamGenerateContent 响应头（正在流式输出或已完成），
-                # 绝不能因更早前的 attempt 失败日志而切节点掐断当前正在进行的流
-                break
+                if not seen_fail_in_file:
+                    ok_ts = _parse_glog_timestamp(stripped, local_now)
+                    if ok_ts is not None and ok_ts > newest_success_ts:
+                        newest_success_ts = ok_ts
+                    # 该会话在更晚时间点已成功收到 streamGenerateContent 响应头（正在流式输出或已完成），
+                    # 绝不能因更早前的 attempt 失败日志而切节点掐断当前正在进行的流
+                    break
+                continue
             m = _AGY_RETRY_FAIL_RE.match(stripped)
             if not m:
                 continue
+            seen_fail_in_file = True
             month, day, hour, minute, sec, usec, attempt, reason = m.groups()
             reason_lower = reason.lower()
-            # stream reading error: unexpected EOF 说明节点已成功建连、上传完 Prompt 并拿到 HTTP 200 ResponseID，
-            # 仅在超长思考/生成流式读取中途断流；此时节点本身可达，切走反而会落入高延迟兜底节点并打断其它活跃会话。
-            if "stream reading error" in reason_lower:
+            attempt_num = int(attempt)
+            # stream reading error: unexpected EOF 在低重试次数（attempt <= 3）说明节点已建连成功，
+            # 仅单次长流中途断流，不切走以免打断其它活跃会话；但若连续达到 attempt >= 4 仍反复中途断流，必须自愈切流。
+            if "stream reading error" in reason_lower and attempt_num < 4:
                 break
             # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
             # 单次请求的重试链（attempt 1..10）跨越约 7 分钟：
             # - attempt == 3 时对易断流节点立即自愈；
             # - attempt >= 4 时说明即便在常规/1X 节点上也已连续多次建连/发包失败，无论节点名称是否含 IEPL 均触发自愈，
             #   且不被其它并发会话的小包监控请求（sir_flash_lite ResponseID）掩盖。
-            attempt_num = int(attempt)
             if attempt_num not in (3, 4) and "bad record mac" not in reason_lower:
                 continue
             year = local_now.tm_year
@@ -1334,7 +1406,9 @@ class AIWatchService:
                 if other_group_name and other_group_name in groups
                 else None
             )
-            on_static_iepl = is_static_iepl_node(current, self.paths)
+            from .nodelist import is_panel_info_node
+
+            on_static_iepl = is_static_iepl_node(current, self.paths) or is_panel_info_node(str(current or ""))
             in_active_cooldown = (
                 isinstance(cooldown_map, dict)
                 and bool(current)
@@ -1557,13 +1631,13 @@ class AIWatchService:
            绝不轻易回退到 50 秒必断流的静态 IEPL/裸 vision 节点。
         """
         from .ban import is_node_banned, load_active_bans
-        from .nodelist import match_region
+        from .nodelist import is_panel_info_node, match_region
         from .probe import GEMINI_FAST_REGIONS
 
         active_bans = load_active_bans(self.paths, now=now)
         fallback_leaf: str | None = None
         cooled_healthy_non_iepl: list[tuple[int, float, int, str]] = []
-        candidates = list(group.candidates)
+        candidates = [c for c in group.candidates if c and not is_panel_info_node(str(c))]
         group_name = getattr(group, "name", "")
         is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and any(
             c and is_iepl_node(str(c), self.paths) for c in candidates

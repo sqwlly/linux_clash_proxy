@@ -9,6 +9,7 @@ from . import __version__
 from .api import APIBackend, APIUnavailableError
 from .cli_render import (
     _accent,
+    _print_section,
     _render_ai_connections,
     _render_ai_status,
     _render_benchmark,
@@ -182,53 +183,50 @@ def _print_verge_status(rep, *, raw: bool = False) -> None:
             )
         return
 
-    badge = "已全面生效 [✓]" if rep.overall_effective else "部分未生效 [✗]"
-    print(_section_heading(f"Clash Verge 旁路调度闭环核验: {badge}"))
+    configured = rep.controller_ok and rep.topology_ok and rep.rules_ok and rep.daemon_ok
+    status = "正常" if rep.overall_effective else ("降级" if configured else "未就绪")
+    print(_section_heading(f"Clash Verge 旁路控制面 · {status}"))
+    print("运行模式    Windows Sidecar（由 Clash Verge 管理内核与 TUN）")
+    print(f"控制器      {rep.controller} · mihomo {rep.kernel_version}")
+    print(f"混合端口    {rep.mixed_port}")
 
-    c_mark = "[✓]" if rep.controller_ok else "[✗]"
-    print(f"1. 内核控制器 API: {c_mark} {rep.controller} (混合端口: {rep.mixed_port}, 内核: {rep.kernel_version})")
+    _print_section("AI 出口")
+    verdict_labels = {"ok": "健康", "dead": "异常", "geo_blocked": "地区受限", "missing_group": "未挂载"}
+    for eg in rep.egress:
+        if not eg.present:
+            print(f"{eg.group:<12} 未挂载")
+            continue
+        delay_str = f"{eg.delay_ms} ms" if eg.delay_ms and eg.delay_ms > 0 else "未测速"
+        line_tag = "专线/IEPL 风险" if eg.is_iepl else "非专线独立 IP"
+        verdict_label = verdict_labels.get(eg.last_verdict, eg.last_verdict)
+        print(f"{eg.group:<12} {eg.leaf_node}")
+        print(f"{'':<12} {verdict_label} · 延迟 {delay_str} · 活跃连接 {eg.active_connections} · {line_tag}")
+        if eg.current_group != eg.leaf_node:
+            print(f"{'':<12} 路由路径 {eg.current_group} -> {eg.leaf_node}")
 
-    t_mark = "[✓]" if rep.topology_ok else "[✗]"
-    if rep.topology_ok:
-        print(f"2. 内存策略组拓扑: {t_mark} 已挂载 {', '.join(rep.groups_present)}")
-    else:
-        missing_str = ", ".join(rep.missing_groups) if rep.missing_groups else "全部缺失"
-        print(f"2. 内存策略组拓扑: {t_mark} 未挂载 ({missing_str})")
+    _print_section("调度运行")
+    daemon_status = "运行中" if rep.daemon_ok else "未运行或心跳超时"
+    pid_str = f" · PID {rep.daemon_pid}" if rep.daemon_pid else ""
+    heartbeat_str = f"{rep.heartbeat_age_sec:.1f} 秒前" if rep.heartbeat_age_sec is not None else "无记录"
+    watch_age_str = f"{rep.last_watch_age_sec:.1f} 秒前" if rep.last_watch_age_sec is not None else "无记录"
+    watch_str = "正常" if rep.watch_ok else "异常或结果过期"
+    storm_str = " · 切流风暴" if rep.switch_storm else ""
+    print(f"守护进程    {daemon_status}{pid_str} · 心跳 {heartbeat_str}")
+    print(f"最近看护    {watch_age_str} · 结果 {watch_str} · 累计 {rep.watch_runs} 次")
+    print(f"稳定度重排  累计 {rep.rebalance_runs} 次")
+    print(f"节点切流    近 10 分钟 {rep.switches_last_10m} 次 · 累计 {rep.total_switches} 次{storm_str}")
+    print(f"连接回收    累计 {rep.total_reaped_connections} 条")
 
-    r_mark = "[✓]" if rep.rules_ok else "[✗]"
-    print(
-        f"3. 内存分流规则链: {r_mark} AI-MANUAL 规则 {rep.ai_manual_rules_count} 条 · "
-        f"AI-GEMINI 规则 {rep.ai_gemini_rules_count} 条"
-    )
-
-    d_mark = "[✓]" if rep.daemon_ok else "[✗]"
-    if rep.heartbeat_age_sec is not None:
-        pid_str = f"PID {rep.daemon_pid}" if rep.daemon_pid else "单次执行"
-        print(
-            f"4. 后台守护与遥测: {d_mark} {pid_str} · 最近心跳 {rep.heartbeat_age_sec}s 前 · "
-            f"累计看护 {rep.watch_runs} 次 / 切流 {rep.total_switches} 次 / 回收闲置连接 {rep.total_reaped_connections} 条"
-        )
-    else:
-        print(f"4. 后台守护与遥测: {d_mark} 尚无守护进程心跳记录")
-
-    if rep.egress:
-        print(_section_heading("当前 AI 出口实时状态"))
-        for eg in rep.egress:
-            if not eg.present:
-                print(f"  - {eg.group}: 未挂载")
-                continue
-            delay_str = f"{eg.delay_ms}ms" if eg.delay_ms and eg.delay_ms > 0 else "未测速"
-            line_tag = "专线/IEPL [风险]" if eg.is_iepl else "非专线独立 IP [安全]"
-            verdict_label = VERDICT_LABELS.get(eg.last_verdict, eg.last_verdict)
-            print(
-                f"  - {eg.group}: {eg.current_group} -> {eg.leaf_node} "
-                f"({delay_str}, {line_tag}, 活跃连接: {eg.active_connections}, 最近探测: {verdict_label})"
-            )
+    _print_section("配置检查")
+    topology_str = f"已挂载 {len(rep.groups_present)}/3" if rep.topology_ok else "缺失 " + ", ".join(rep.missing_groups)
+    rules_str = "正常" if rep.rules_ok else "未挂载"
+    print(f"策略组      {topology_str}")
+    print(f"分流规则    {rules_str} · AI-MANUAL {rep.ai_manual_rules_count} 条 · AI-GEMINI {rep.ai_gemini_rules_count} 条")
 
     if rep.remedies:
-        print(_section_heading("修复建议"))
+        _print_section("建议操作")
         for idx, item in enumerate(rep.remedies, start=1):
-            print(f"  {idx}. {item}")
+            print(f"{idx}. {item}")
 
 
 def _run_verge(args: Namespace) -> int:
@@ -356,7 +354,28 @@ def _run_verge(args: Namespace) -> int:
     )
 
 
+def _ensure_utf8_stdio() -> None:
+    """Windows 控制台默认 GBK (cp936) 编码无法直接打印国旗 Emoji（如 🇺🇸/🇨🇳）；
+    在 CLI 入口自动将 stdout/stderr 重配置为 UTF-8（replace 容错），避免抛出 UnicodeEncodeError。
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if enc != "utf8":
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def run(argv: list[str] | None = None) -> int:
+    _ensure_utf8_stdio()
     args_list = list(sys.argv[1:] if argv is None else argv)
     # `__complete` 走早短路：不进 argparse，因此不会出现在任何 help/usage/choices 里，
     # 也省掉构建 34 个子解析器的开销（shell 每按一次 <Tab> 都会调它一次）。

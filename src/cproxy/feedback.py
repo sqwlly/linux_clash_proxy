@@ -35,7 +35,8 @@ def _stderr_color_enabled() -> bool:
         return True
     if mode == "never" or os.environ.get("NO_COLOR"):
         return False
-    return sys.stderr.isatty()
+    isatty = getattr(sys.stderr, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
 
 
 def _terminal_columns(stream: object) -> int:
@@ -151,7 +152,7 @@ class ProgressLine:
         self._color = _stderr_color_enabled()
 
     def update(self, text: str) -> None:
-        if not self.live:
+        if not self.live or self._stream is None:
             return
         line = _truncate(str(text), _terminal_columns(self._stream) - 1)
         if self._color:
@@ -160,6 +161,8 @@ class ProgressLine:
         self._stream.flush()
 
     def commit(self, text: object) -> None:
+        if self._stream is None:
+            return
         if self.live:
             self._stream.write(_CLEAR_LINE)
         self._stream.write(f"{text}\n")

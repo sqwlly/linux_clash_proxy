@@ -136,6 +136,11 @@ def collect_leaf_candidates(
     visit(group_name, [], set())
     if not candidates:
         return [group_name], {group_name: []}
+    from .nodelist import is_panel_info_node
+
+    non_panel = [c for c in candidates if not is_panel_info_node(c)]
+    if non_panel:
+        candidates = non_panel
     return candidates, switch_paths
 
 

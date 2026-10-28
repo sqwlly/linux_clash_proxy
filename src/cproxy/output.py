@@ -567,7 +567,7 @@ def build_root_parser() -> ArgumentParser:
         nargs="?",
         default="status",
         choices=VERGE_ACTIONS,
-        help="动作：status（四层闭环生效核验，默认）、install（一键注入脚本+生成配置）、init（生成配置）、script（输出扩展脚本）、once（单轮调度）、daemon（后台守护）",
+        help="动作：status（控制面与调度健康核验，默认）、install（一键注入脚本+生成配置）、init（生成配置）、script（输出扩展脚本）、once（单轮调度）、daemon（后台守护）",
     )
     verge_parser.add_argument("--verge-dir", help="手动指定 Clash Verge 配置目录（省略则自动探测）")
     verge_parser.add_argument("--controller", help="External Controller 地址（如 127.0.0.1:9097）")

@@ -11,7 +11,7 @@ const STAGGERED_AUTO_INTERVALS = [317, 323, 331, 337, 347, 349, 353, 359];
 const AI_GEMINI_REGION_ORDER = ["KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU"];
 const AI_MANUAL_REGION_ORDER = ["US", "JP", "SG", "KR", "GB", "TW", "FR", "DE"];
 
-const PANEL_INFO_RE = /剩余流量|套餐到期|距离下次重置|官网|群组|导航|下次重置|到期时间|流量重置|Expire|Traffic|网址|公告|客服|频道/i;
+const PANEL_INFO_RE = /剩余流量|套餐到期|距离下次重置|官网|群组|导航|下次重置|到期时间|流量重置|重置剩余|过期时间|有效期|Expire|Traffic|网址|公告|客服|频道|\b\d+(?:\.\d+)?\s*[KMGTPE]i?B\s*(?:[|/]|of)\s*\d+(?:\.\d+)?\s*[KMGTPE]i?B\b/i;
 
 const REGION_PATTERNS = [
   ["HK", /香港|HK|Hong\s*Kong|🇭🇰/i],
@@ -20,7 +20,7 @@ const REGION_PATTERNS = [
   ["KR", /韩国|首尔|KR|Korea|🇰🇷/i],
   ["SG", /新加坡|狮城|SG|Singapore|🇸🇬/i],
   ["US", /美国|洛杉矶|圣何塞|硅谷|西雅图|芝加哥|达拉斯|纽约|US|United\s*States|America|🇺🇸/i],
-  ["GB", /英国|伦敦|GB|UK|United\s*Kingdom|Britain|🇬🇧/i],
+  ["GB", /英国|伦敦|(?<!\d\s*)(?<!\d)\bGB\b|\bUK\b|United\s*Kingdom|Britain|🇬🇧/i],
   ["DE", /德国|法兰克福|DE|Germany|🇩🇪/i],
   ["FR", /法国|巴黎|FR|France|🇫🇷/i],
   ["BR", /巴西|圣保罗|BR|Brazil|🇧🇷/i],

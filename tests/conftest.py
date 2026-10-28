@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -52,9 +53,14 @@ def build_ai_route_groups() -> dict:
 
 
 @pytest.fixture(autouse=True)
-def isolate_xdg_environment(monkeypatch):
+def isolate_xdg_environment(monkeypatch, tmp_path):
     for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
         monkeypatch.delenv(name, raising=False)
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     for name in ("NO_PROXY", "no_proxy"):
         monkeypatch.setenv(name, "127.0.0.1,localhost")
     monkeypatch.setenv("CPROXY_NO_SYSTEMD", "1")

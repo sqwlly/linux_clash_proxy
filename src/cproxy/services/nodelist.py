@@ -66,7 +66,7 @@ REGION_PATTERNS: dict[str, tuple[str, ...]] = {
     "FR": (r"🇫🇷", r"法国", r"法國", r"巴黎", r"France", r"Paris", r"\bFRA?\b", r"\bFR\b", r"\bFR\d"),
     "GB": (
         r"🇬🇧", r"英国", r"英國", r"伦敦", r"倫敦",
-        r"Britain", r"United Kingdom", r"London", r"England", r"\bUK\b", r"\bGBR?\b", r"\bGB\d",
+        r"Britain", r"United Kingdom", r"London", r"England", r"\bUK\b", r"(?<!\d\s)(?<!\d)\bGBR?\b", r"\bGB\d",
     ),
     "IN": (r"🇮🇳", r"印度", r"孟买", r"India", r"Mumbai", r"\bIND?\b", r"\bIN\d"),
 }
@@ -91,17 +91,29 @@ PANEL_INFO_NODE_MARKERS: tuple[str, ...] = (
 )
 
 
-def is_panel_info_node(name: str) -> bool:
-    """识别机场面板注入的信息节点（剩余流量/套餐到期等）。
+_PANEL_QUOTA_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*[KMGTPE]i?B\s*(?:[|/]|of)\s*\d+(?:\.\d+)?\s*[KMGTPE]i?B\b",
+    re.IGNORECASE,
+)
 
-    这类节点名携带动态数值（如“剩余流量：160.9 GB”），不能当可切换出口。
+
+def is_panel_info_node(name: str) -> bool:
+    """识别机场面板注入的信息节点（剩余流量/套餐到期/已用流量配额等）。
+
+    这类节点名携带动态数值（如“剩余流量：160.9 GB”或“99.35 GB | 200 GB”），不能当可切换出口。
     """
+    if not name:
+        return True
     lowered = name.lower()
-    return any(marker in lowered for marker in PANEL_INFO_NODE_MARKERS)
+    if any(marker in lowered for marker in PANEL_INFO_NODE_MARKERS):
+        return True
+    return bool(_PANEL_QUOTA_RE.search(name))
 
 
 def match_region(proxy_name: str) -> str:
-    """按节点名归纳地区，未命中返回 OTHER。"""
+    """按节点名归纳地区，未命中或面板信息节点返回 OTHER。"""
+    if is_panel_info_node(proxy_name):
+        return "OTHER"
     for region in SUBSCRIPTION_REGION_ORDER[:-1]:
         patterns = REGION_PATTERNS.get(region) or ()
         if any(re.search(pat, proxy_name, re.IGNORECASE) for pat in patterns):
