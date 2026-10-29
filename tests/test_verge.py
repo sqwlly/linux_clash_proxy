@@ -661,3 +661,76 @@ def test_scheduler_telemetry_perceives_ai_watch_and_systemd_timers(tmp_path, mon
     assert "systemd 定时器 2/2 活跃" in doc_check.detail
 
 
+def test_windows_agy_exe_old_process_matching_and_python_direct_rule_warning(tmp_path, monkeypatch):
+    """验证 Windows 自更新后的 `agy.exe.<ns>.old` 在规则、流量、进程识别中均被正确覆盖，
+    且当订阅局部脚本置顶 `PROCESS-NAME,python.exe,DIRECT` 时，`check_verge_effectiveness`
+    保持 `overall_effective=True` 并给出明确提示。"""
+    from cproxy.services.ai_watch import _STALE_AGY_EXE_RE
+    from cproxy.services.ops import _is_known_ai_process, _process_basename
+    from cproxy.services.query import QueryService
+
+    script_content = export_verge_script()
+    assert r"PROCESS-NAME-REGEX,^agy\\.exe\\.[0-9]+\\.old,AI-MANUAL" in script_content
+    assert (ROOT_DIR / "scripts" / "clash-verge-script.js").read_text(encoding="utf-8") == script_content
+
+    win_old_path = r"C:\Users\14767\AppData\Local\agy\bin\agy.exe.1793269750355348300.old"
+    assert _STALE_AGY_EXE_RE.search(win_old_path) is not None
+    assert _process_basename({"processPath": win_old_path}) == "agy"
+    assert _is_known_ai_process(_process_basename({"processPath": r"C:\Users\14767\AppData\Local\agy\bin\agy.exe"}))
+    assert QueryService._connection_follows_ai_switch(
+        {"chains": ["DIRECT"], "metadata": {"processPath": win_old_path}},
+        "AI-MANUAL",
+    )
+
+    paths = _paths(tmp_path)
+    init_verge_config(paths, controller="127.0.0.1:9097", secret="s", mixed_port=7897)
+    monkeypatch.setattr(
+        "cproxy.services.verge.sample_connections_activity",
+        lambda p, api, now=None: {},
+    )
+    monkeypatch.setattr(
+        "cproxy.services.verge.AIWatchService.watch",
+        lambda self, dry_run=False: ai_watch_mod.WatchReport(
+            results=[
+                ai_watch_mod.WatchGroupResult(group="AI-MANUAL", current="US-01", verdict="ok"),
+                ai_watch_mod.WatchGroupResult(group="AI-GEMINI", current="TW-01", verdict="ok"),
+            ]
+        ),
+    )
+    VergeDaemonService(paths).run_once(run_rebalance=False)
+
+    class _PreemptedRulesAPI:
+        def __init__(self, p):
+            pass
+
+        def version(self):
+            return {"version": "v1.19.23"}
+
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "US-01", ["US-01", "AI-AUTO"]),
+                "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "TW-01", ["TW-01"]),
+                "AI-AUTO": ProxyGroup("AI-AUTO", "fallback", "US-01", ["US-01"]),
+                "US-01": ProxyGroup("US-01", "anytls", None, [], delay=150, alive=True),
+                "TW-01": ProxyGroup("TW-01", "anytls", None, [], delay=95, alive=True),
+            }
+
+        def get_rules(self):
+            return {
+                "rules": [
+                    {"type": "ProcessName", "payload": "python.exe", "proxy": "DIRECT"},
+                    {"type": "DomainSuffix", "payload": "googleapis.com", "proxy": "AI-GEMINI"},
+                    {"type": "DomainSuffix", "payload": "openai.com", "proxy": "AI-MANUAL"},
+                ]
+            }
+
+        def get_connections(self):
+            return {"connections": []}
+
+    monkeypatch.setattr("cproxy.services.verge.APIBackend", _PreemptedRulesAPI)
+    rep = check_verge_effectiveness(paths)
+    assert rep.overall_effective is True
+    assert any("python.exe,DIRECT" in item for item in rep.remedies)
+
+
+

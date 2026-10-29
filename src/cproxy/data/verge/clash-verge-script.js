@@ -336,6 +336,7 @@ function main(config) {
     "PROCESS-NAME,agy,AI-MANUAL",
     "PROCESS-NAME,agy.exe,AI-MANUAL",
     "PROCESS-NAME-REGEX,^agy\\.[0-9]+\\.old,AI-MANUAL",
+    "PROCESS-NAME-REGEX,^agy\\.exe\\.[0-9]+\\.old,AI-MANUAL",
     "DOMAIN-SUFFIX,openai.com,AI-MANUAL",
     "DOMAIN-SUFFIX,chatgpt.com,AI-MANUAL",
     "DOMAIN-SUFFIX,oaistatic.com,AI-MANUAL",

@@ -51,8 +51,8 @@ def _process_basename(metadata: dict) -> str:
     raw = str(metadata.get("process") or metadata.get("processPath") or "").strip()
     if not raw:
         return "-"
-    base = raw.rsplit("/", 1)[-1].removesuffix(" (deleted)")
-    if base.startswith("agy.") and base.endswith(".old"):
+    base = raw.replace("\\", "/").rsplit("/", 1)[-1].removesuffix(" (deleted)")
+    if base.lower().startswith("agy.") and base.lower().endswith(".old"):
         return "agy"
     return base or "-"
 

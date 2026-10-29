@@ -313,6 +313,11 @@ def test_normalize_agy_old_process_label():
     assert _normalize_process_label("/root/.local/bin/agy.1792306061959817128.old (deleted)") == "/root/.local/bin/agy"
     assert _normalize_process_label("/root/.local/bin/agy.1792306061959817128.old") == "/root/.local/bin/agy"
     assert _normalize_process_label("agy.1792306061959817128.old (deleted)") == "agy"
+    assert (
+        _normalize_process_label(r"C:\Users\14767\AppData\Local\agy\bin\agy.exe.1793269750355348300.old")
+        == r"C:\Users\14767\AppData\Local\agy\bin\agy.exe"
+    )
+    assert _normalize_process_label("agy.exe.1793269750355348300.old") == "agy.exe"
     assert _normalize_process_label("/usr/bin/curl") == "/usr/bin/curl"
 
 

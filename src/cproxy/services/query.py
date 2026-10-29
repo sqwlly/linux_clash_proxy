@@ -277,7 +277,7 @@ class QueryService:
         raw_metadata = item.get("metadata")
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
         process = str(metadata.get("process") or metadata.get("processPath") or "").lower()
-        base = process.rsplit("/", 1)[-1].split()[0] if process else ""
+        base = process.replace("\\", "/").rsplit("/", 1)[-1].split()[0] if process else ""
         if base.startswith("agy.") and base.endswith(".old"):
             base = "agy"
         return base in AI_PROCESS_NAMES

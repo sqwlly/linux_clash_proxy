@@ -17,7 +17,7 @@ SAMPLE_RETENTION_DAYS = 90
 DIMENSIONS = ("node", "rule", "host", "process")
 
 _DELETED_SUFFIX_RE = re.compile(r"\s+\(deleted\)$")
-_AGY_OLD_BINARY_RE = re.compile(r"(^|/)agy\.\d+\.old$")
+_AGY_OLD_BINARY_RE = re.compile(r"(^|[\\/])(agy(?:\.exe)?)\.\d+\.old$", re.IGNORECASE)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS traffic_samples (
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS connections_seen (
 def _normalize_process_label(raw: str) -> str:
     """剥离内核 `(deleted)` 标记并将热更新产生的 `agy.<ts>.old` 归并回 `agy`。"""
     cleaned = _DELETED_SUFFIX_RE.sub("", raw.strip())
-    cleaned = _AGY_OLD_BINARY_RE.sub(r"\1agy", cleaned)
+    cleaned = _AGY_OLD_BINARY_RE.sub(r"\1\2", cleaned)
     return cleaned or "-"
 
 

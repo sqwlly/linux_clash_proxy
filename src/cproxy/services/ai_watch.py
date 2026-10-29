@@ -44,7 +44,7 @@ COOLDOWN_SECONDS = 10 * 60
 # 闲置超过 30 分钟的 `.old` 进程仍会每 ~15s 轮询 daily-cloudcode-pa.googleapis.com，
 # 抢占同账号流式配额导致活跃会话报 "There was a network issue connecting to the server"。
 STALE_AGY_IDLE_SECONDS = 30 * 60
-_STALE_AGY_EXE_RE = re.compile(r"(?:^|/)agy\.\d+\.old(?:\s+\(deleted\))?$")
+_STALE_AGY_EXE_RE = re.compile(r"(?:^|[\\/])agy(?:\.exe)?\.\d+\.old(?:\s+\(deleted\))?$", re.IGNORECASE)
 
 VERDICT_LABELS = {
     PROBE_OK: "ok",

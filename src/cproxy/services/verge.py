@@ -523,7 +523,7 @@ class VergeDaemonService:
                 report.warnings.append(f"rebalance 跳过: {exc}")
         _record_daemon_heartbeat(
             self.paths,
-            now=now,
+            now=time.time(),
             sampled_connections=report.sampled_connections,
             tick_report=report,
         )
@@ -561,8 +561,13 @@ class VergeDaemonService:
                     tick_report = VergeTickReport(timestamp=now, sampled_connections=len(idle_map))
                     if due_watch:
                         tick_report.watch_report = AIWatchService(self.paths).watch(dry_run=dry_run)
-                        last_watch_ts = now
+                        last_watch_ts = time.time()
                     if due_rebalance:
+                        _record_daemon_heartbeat(
+                            self.paths,
+                            now=time.time(),
+                            sampled_connections=len(idle_map),
+                        )
                         try:
                             tick_report.rebalance_report = RebalanceService(self.paths).rebalance(
                                 dry_run=dry_run,
@@ -570,10 +575,10 @@ class VergeDaemonService:
                             )
                         except Exception as exc:
                             tick_report.warnings.append(str(exc))
-                        last_rebalance_ts = now
+                        last_rebalance_ts = time.time()
                 _record_daemon_heartbeat(
                     self.paths,
-                    now=now,
+                    now=time.time(),
                     sampled_connections=len(idle_map),
                     tick_report=tick_report,
                 )
@@ -1123,6 +1128,7 @@ def check_verge_effectiveness(
     missing_groups: list[str] = list(REQUIRED_VERGE_GROUPS)
     topology_ok = False
     rules_ok = False
+    python_direct_preempts_ai = False
     ai_manual_rules_count = 0
     ai_gemini_rules_count = 0
     egress_list: list[VergeEgressStatus] = []
@@ -1191,14 +1197,26 @@ def check_verge_effectiveness(
         try:
             rules_payload = api.get_rules()
             raw_rules = rules_payload.get("rules") if isinstance(rules_payload, dict) else []
+            seen_ai_rule = False
             for r in raw_rules if isinstance(raw_rules, list) else []:
                 if not isinstance(r, dict):
                     continue
                 proxy_target = str(r.get("proxy") or "")
+                rtype = str(r.get("type") or "").lower().replace("-", "")
+                payload = str(r.get("payload") or "").strip().lower()
                 if proxy_target == "AI-MANUAL":
                     ai_manual_rules_count += 1
+                    seen_ai_rule = True
                 elif proxy_target == "AI-GEMINI":
                     ai_gemini_rules_count += 1
+                    seen_ai_rule = True
+                elif (
+                    not seen_ai_rule
+                    and proxy_target.upper() == "DIRECT"
+                    and rtype == "processname"
+                    and payload in ("python.exe", "python", "python3")
+                ):
+                    python_direct_preempts_ai = True
             rules_ok = ai_manual_rules_count > 0 and ai_gemini_rules_count > 0
         except Exception:
             rules_ok = False
@@ -1240,6 +1258,11 @@ def check_verge_effectiveness(
             remedies.append(
                 "内核内存中尚未挂载 AI-MANUAL / AI-GEMINI 策略组或分流规则："
                 "请在 Clash Verge 界面点击一次「订阅 (Profiles) -> 刷新」，或确认「脚本 (Script)」已启用。"
+            )
+        elif python_direct_preempts_ai:
+            remedies.append(
+                "检测到订阅局部脚本在 AI 规则前注入了 `PROCESS-NAME,python.exe,DIRECT`："
+                "后台 `cproxy-daemon.exe` 不受影响，但终端直接执行 `cproxy verge once` / `ai-watch` 探测会被强制直连超时。"
             )
         for eg in egress_list:
             if eg.present and eg.is_iepl:

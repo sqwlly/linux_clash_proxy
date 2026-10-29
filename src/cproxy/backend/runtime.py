@@ -62,7 +62,7 @@ AI_CONFLICT_KEYWORDS = frozenset((
     "claude", "claudeusercontent", "gemini", "copilot", "grok",
     "google", "antigravity",
 ))
-AI_PROCESS_NAMES = frozenset(("agy",))
+AI_PROCESS_NAMES = frozenset(("agy", "agy.exe"))
 
 
 def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
@@ -1486,7 +1486,9 @@ class RuntimeBackend:
             # agy 非 Google 出站（github / playwright CDN 等）仍走通用 AI 出口；
             # 热更新后旧会话的二进制名变成 agy.<timestamp>.old，用正则一并兜底
             f"PROCESS-NAME,agy,{AI_MANUAL_GROUP}",
+            f"PROCESS-NAME,agy.exe,{AI_MANUAL_GROUP}",
             f"PROCESS-NAME-REGEX,^agy\\.[0-9]+\\.old,{AI_MANUAL_GROUP}",
+            f"PROCESS-NAME-REGEX,^agy\\.exe\\.[0-9]+\\.old,{AI_MANUAL_GROUP}",
             # OpenAI
             f"DOMAIN-SUFFIX,openai.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,chatgpt.com,{AI_MANUAL_GROUP}",
