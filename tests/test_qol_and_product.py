@@ -1669,6 +1669,20 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     assert sample_rt["dns"]["use-hosts"] is True
     assert sample_rt["proxies"][0]["ip-version"] == "ipv4"
 
+    # 回环 HTTP/2 复用连接上 lastrcv_ms < lastsnd_ms 且差值 < 50ms（如 (55353, 55350)），或长上下文收到 ResponseID 后
+    # 进入 65s 工具调用生成静默期（upload=1.33MB, download=12.4KB, lastsnd=65000, lastrcv=92000），
+    # 或复用/多路复用过 fetchAvailableModels（upload=417KB, download=54.3KB, lastsnd=35813, lastrcv=36400），严禁误判为 idle_completed
+    assert classify_ai_connection_lifecycle(830_000, 52_000, 55_353, 55_350, recv_q=0, send_q=0) == "thinking"
+    assert classify_ai_connection_lifecycle(1_330_000, 12_400, 65_000, 92_000, recv_q=0, send_q=0) == "streaming"
+    assert classify_ai_connection_lifecycle(417_187, 54_334, 35_813, 36_400, recv_q=0, send_q=0) == "streaming"
+
+    # aicode.googleapis.com 与 antigravity-unleash.goog 纳入 AI_STREAM_HOSTS，闲置短连接自动回收
+    from cproxy.services.ai_watch import AI_STREAM_HOSTS
+
+    assert "aicode.googleapis.com" in AI_STREAM_HOSTS
+    assert "antigravity-unleash.goog" in AI_STREAM_HOSTS
+
+
 
 
 

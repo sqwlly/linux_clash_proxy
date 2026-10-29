@@ -1127,6 +1127,10 @@ def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
             for name, old_ip in old_servers.items()
         )
         if not recovering_from_104 and has_any_inflight_ai_connection(paths):
+            if not servers_changed and not memory_drift_104 and (
+                old_text == new_text or is_only_ai_group_order_change(old_text, new_text)
+            ):
+                process.mark_runtime_applied(rt_path)
             return False
         return process.reload_if_running(rt_path)
     if (

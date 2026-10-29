@@ -83,6 +83,8 @@ GEMINI_STREAM_HOSTS = frozenset(
 AI_STREAM_HOSTS = frozenset(
     {
         "daily-cloudcode-pa.googleapis.com",
+        "aicode.googleapis.com",
+        "antigravity-unleash.goog",
         "chatgpt.com",
         "api.openai.com",
         "api.anthropic.com",
@@ -365,16 +367,31 @@ def classify_ai_connection_lifecycle(
             return "idle_completed"
         return "idle_other"
     if upload >= 18_000:
-        threshold_ms = 10_000 if on_stale_leaf else 35_000
-        if download < 6_000 or (
-            abs(lastsnd_ms - lastrcv_ms) >= 50 and (lastrcv_ms - lastsnd_ms) < 400
+        if on_stale_leaf:
+            threshold_ms = 10_000
+        elif (
+            download < 30_000
+            or (lastrcv_ms - lastsnd_ms) >= 15_000
+            or (upload >= 350_000 and download < 60_000)
+        ):
+            threshold_ms = 120_000
+        else:
+            threshold_ms = 35_000
+        if (
+            download < 6_000
+            or lastrcv_ms < lastsnd_ms
+            or (abs(lastsnd_ms - lastrcv_ms) >= 50 and (lastrcv_ms - lastsnd_ms) < 400)
         ):
             if min(lastsnd_ms, lastrcv_ms) <= 5_000 and download < 6_000:
                 return "uploading"
             if idle_ms <= 300_000:
                 return "thinking"
             return "stalled_thinking"
-        if abs(lastsnd_ms - lastrcv_ms) < 50 and idle_ms >= 10_000:
+        if (
+            abs(lastsnd_ms - lastrcv_ms) < 50
+            and idle_ms >= 10_000
+            and (on_stale_leaf or (download >= 30_000 and upload < 500_000))
+        ):
             return "idle_completed"
         if idle_ms < threshold_ms:
             return "streaming"
@@ -1303,15 +1320,18 @@ class AIWatchService:
                 self.agy_log_dir, now=now, since_ts=since_ts
             )
             if log_failed:
-                on_healthy_safe_leaf = (
-                    verdict == PROBE_OK
-                    and _is_stream_safe_gemini_leaf(self.paths, current)
+                safe_leaf = _is_stream_safe_gemini_leaf(self.paths, current)
+                on_healthy_safe_leaf = verdict == PROBE_OK and safe_leaf
+                has_inflight_now = group_busy or (
+                    safe_leaf
+                    and has_active_ai_transfer(self.paths, getattr(self.query, "api", None), group, current)
                 )
                 attempt_prefix = log_reason.split(":", 1)[0].strip()
                 severe_attempt = (
                     attempt_prefix.startswith("attempt ")
                     and attempt_prefix[8:].isdigit()
                     and int(attempt_prefix[8:]) >= 4
+                    and not has_inflight_now
                 )
                 is_severe_retry = "bad record mac" in log_reason.lower() or severe_attempt
                 if not on_healthy_safe_leaf or is_severe_retry:
@@ -1585,8 +1605,8 @@ class AIWatchService:
                         sf[current] = now
                         state["stream_fragile"] = sf
                 if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
-                    # 设切流静默保护窗（Codex 死连接底层 HTTP 超时约 65s，设 75s 防止旧死连接滞后报错误杀新健康节点）
-                    silence_sec = 75.0 if group == AI_MANUAL_GROUP else 30.0
+                    # 设切流静默保护窗（Codex / agy 单轮底层 HTTP 超时约 65-75s，设 75s 防止旧连接滞后报错误杀新健康节点）
+                    silence_sec = 75.0
                     gs["last_log_fail_ts"] = max(
                         float(gs.get("last_log_fail_ts") or 0.0),
                         now + silence_sec,
