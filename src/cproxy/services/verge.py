@@ -21,7 +21,17 @@ from typing import Any
 import yaml
 
 from ..backend.api import APIBackend, APIUnavailableError
-from ..config import AppPaths, config_file, load_yaml_file, read_config, verge_daemon_state_file
+from ..config import (
+    AppPaths,
+    ai_gemini_order_file,
+    ai_manual_order_file,
+    ai_watch_state_file,
+    config_file,
+    default_paths,
+    load_yaml_file,
+    read_config,
+    verge_daemon_state_file,
+)
 from .ai_watch import AIWatchService, WatchReport, sample_connections_activity
 from .probe import is_iepl_node, resolve_current_leaf
 from .rebalance import RebalanceReport, RebalanceService
@@ -33,6 +43,12 @@ AI_WATCH_GROUPS = ("AI-MANUAL", "AI-GEMINI")
 SWITCH_STORM_WINDOW_SEC = 600.0
 SWITCH_STORM_THRESHOLD = 6
 SWITCH_HISTORY_LIMIT = 120
+USER_SYSTEMD_TIMERS = (
+    "cproxy-ai-watch.timer",
+    "cproxy-ai-rebalance.timer",
+    "cproxy-refresh.timer",
+    "cproxy-subscription.timer",
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +118,10 @@ class VergeStatusReport:
     switches_last_10m: int = 0
     switch_storm: bool = False
     total_reaped_connections: int = 0
+    scheduler_mode: str = "none"
+    active_timers: list[str] = field(default_factory=list)
+    installed_timers: list[str] = field(default_factory=list)
+    rebalance_age_sec: float | None = None
     egress: list[VergeEgressStatus] = field(default_factory=list)
     remedies: list[str] = field(default_factory=list)
 
@@ -572,6 +592,507 @@ class VergeDaemonService:
         return 0
 
 
+def _load_watch_telemetry_state(paths: AppPaths) -> tuple[dict[str, Any], float | None]:
+    path = ai_watch_state_file(paths)
+    if not path.exists():
+        return {}, None
+    try:
+        mtime = path.stat().st_mtime
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return (data if isinstance(data, dict) else {}), mtime
+    except Exception:
+        return {}, None
+
+
+def _parse_list_timers_output(stdout: str, now: float) -> dict[str, dict[str, Any]]:
+    import re
+    from datetime import datetime
+
+    ts_re = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+    known_units = set(USER_SYSTEMD_TIMERS) | {"clash-proxy-traffic-collector.timer"}
+    parsed: dict[str, dict[str, Any]] = {}
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        matched_unit = next((u for u in known_units if u in line), None)
+        if not matched_unit:
+            continue
+        timestamps = ts_re.findall(line)
+        next_in_sec: float | None = None
+        last_ago_sec: float | None = None
+        if len(timestamps) >= 2:
+            try:
+                next_dt = datetime.strptime(timestamps[0], "%Y-%m-%d %H:%M:%S")
+                next_in_sec = max(0.0, next_dt.timestamp() - now)
+            except ValueError:
+                pass
+            try:
+                last_dt = datetime.strptime(timestamps[1], "%Y-%m-%d %H:%M:%S")
+                last_ago_sec = max(0.0, now - last_dt.timestamp())
+            except ValueError:
+                pass
+        elif len(timestamps) == 1:
+            try:
+                dt = datetime.strptime(timestamps[0], "%Y-%m-%d %H:%M:%S")
+                if "left" in line and not line.startswith("n/a"):
+                    next_in_sec = max(0.0, dt.timestamp() - now)
+                else:
+                    last_ago_sec = max(0.0, now - dt.timestamp())
+            except ValueError:
+                pass
+        parsed[matched_unit] = {
+            "active": next_in_sec is not None or ("left" in line and not line.startswith("n/a")),
+            "next_in_sec": round(next_in_sec, 1) if next_in_sec is not None else None,
+            "last_ago_sec": round(last_ago_sec, 1) if last_ago_sec is not None else None,
+        }
+    return parsed
+
+
+def _probe_user_systemd_timers(paths: AppPaths) -> tuple[list[str], list[str]]:
+    """检查当前 paths 所属用户的 systemd user 目录下是否安装了 cproxy 定时器及其 active 状态。"""
+    import subprocess
+
+    user_systemd_dir = paths.config_dir.parent / "systemd" / "user"
+    installed = [t for t in USER_SYSTEMD_TIMERS if (user_systemd_dir / t).is_file()]
+    if not installed:
+        return [], []
+    if paths.config_dir != default_paths().config_dir:
+        return installed, []
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", *installed],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        lines = [ln.strip() for ln in (proc.stdout or "").splitlines()]
+        active = [
+            unit
+            for idx, unit in enumerate(installed)
+            if idx < len(lines) and lines[idx] == "active"
+        ]
+        return installed, active
+    except Exception:
+        return installed, []
+
+
+def _probe_systemd_timer_schedule(paths: AppPaths, now: float) -> dict[str, dict[str, Any]]:
+    """查询用户级与系统级 systemd timer 的上次触发与下次倒计时。"""
+    import subprocess
+
+    user_systemd_dir = paths.config_dir.parent / "systemd" / "user"
+    if not any((user_systemd_dir / t).is_file() for t in USER_SYSTEMD_TIMERS):
+        return {}
+    if paths.config_dir != default_paths().config_dir:
+        return {}
+    schedule: dict[str, dict[str, Any]] = {}
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "list-timers", "--all", "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            schedule.update(_parse_list_timers_output(proc.stdout, now))
+    except Exception:
+        pass
+    sys_timer = Path("/etc/systemd/system/clash-proxy-traffic-collector.timer")
+    if sys_timer.is_file():
+        try:
+            proc_sys = subprocess.run(
+                ["systemctl", "list-timers", "clash-proxy-traffic-collector.timer", "--all", "--no-pager"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if proc_sys.returncode == 0 and proc_sys.stdout:
+                schedule.update(_parse_list_timers_output(proc_sys.stdout, now))
+        except Exception:
+            pass
+    return schedule
+
+
+def collect_scheduler_telemetry(
+    paths: AppPaths,
+    *,
+    max_heartbeat_age_sec: float = 90.0,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """汇总调度与看护遥测：同时兼容 Windows `verge daemon` 与 Linux `systemd --user` 定时器 / `ai-watch`。"""
+    ts = time.time() if now is None else now
+    daemon_state = _load_daemon_state(paths)
+    watch_state, watch_mtime = _load_watch_telemetry_state(paths)
+    installed_timers, active_timers = _probe_user_systemd_timers(paths)
+
+    raw_pid = daemon_state.get("pid")
+    daemon_pid = int(raw_pid) if isinstance(raw_pid, int) and raw_pid > 0 else None
+    pid_alive = _is_pid_alive(daemon_pid)
+
+    daemon_updated = daemon_state.get("updated_at")
+    daemon_ts = float(daemon_updated) if isinstance(daemon_updated, (int, float)) and daemon_updated > 0 else None
+
+    watch_updated = watch_state.get("updated_at")
+    if isinstance(watch_updated, (int, float)) and watch_updated > 0:
+        watch_ts: float | None = float(watch_updated)
+    elif watch_mtime is not None and any(isinstance(watch_state.get(g), dict) for g in ("AI-MANUAL", "AI-GEMINI")):
+        watch_ts = float(watch_mtime)
+    else:
+        watch_ts = None
+
+    ts_candidates = [x for x in (daemon_ts, watch_ts) if x is not None]
+    updated_at = max(ts_candidates) if ts_candidates else None
+    heartbeat_age_sec: float | None = None
+    if updated_at is not None and updated_at > 0:
+        heartbeat_age_sec = max(0.0, ts - updated_at)
+
+    # 汇总各出口最近判定
+    last_verdicts: dict[str, str] = {}
+    for gname in ("AI-MANUAL", "AI-GEMINI"):
+        gs = watch_state.get(gname)
+        if isinstance(gs, dict):
+            gv = gs.get("last_verdict")
+            if isinstance(gv, str) and gv:
+                last_verdicts[gname] = gv
+            elif gs.get("last_active"):
+                last_verdicts[gname] = "ok" if int(gs.get("fail_count") or 0) == 0 else "dead"
+    w_verdicts = watch_state.get("last_verdicts")
+    if isinstance(w_verdicts, dict):
+        for k, v in w_verdicts.items():
+            if isinstance(v, str) and v:
+                last_verdicts[str(k)] = v
+    d_verdicts = daemon_state.get("last_verdicts")
+    if isinstance(d_verdicts, dict) and (watch_ts is None or (daemon_ts is not None and daemon_ts >= watch_ts)):
+        for k, v in d_verdicts.items():
+            if isinstance(v, str) and v:
+                last_verdicts[str(k)] = v
+    elif isinstance(d_verdicts, dict):
+        for k, v in d_verdicts.items():
+            if isinstance(v, str) and v and str(k) not in last_verdicts:
+                last_verdicts[str(k)] = v
+
+    # 汇总最近重排时间
+    reb_candidates: list[float] = []
+    for raw_reb in (daemon_state.get("last_rebalance_ts"), watch_state.get("last_rebalance_ts")):
+        if isinstance(raw_reb, (int, float)) and raw_reb > 0:
+            reb_candidates.append(float(raw_reb))
+    for order_fn in (ai_manual_order_file, ai_gemini_order_file):
+        p = order_fn(paths)
+        if p.exists():
+            try:
+                reb_candidates.append(float(p.stat().st_mtime))
+            except OSError:
+                pass
+    last_rebalance_ts = max(reb_candidates) if reb_candidates else None
+    rebalance_age_sec = max(0.0, ts - last_rebalance_ts) if last_rebalance_ts is not None else None
+
+    watch_runs = max(
+        int(daemon_state.get("watch_runs") or 0),
+        int(watch_state.get("watch_runs") or 0),
+        1 if watch_ts is not None else 0,
+    )
+    rebalance_runs = max(
+        int(daemon_state.get("rebalance_runs") or 0),
+        int(watch_state.get("rebalance_runs") or 0),
+        1 if reb_candidates else 0,
+    )
+    total_switches = max(
+        int(daemon_state.get("total_switches") or 0),
+        int(watch_state.get("total_switches") or 0),
+    )
+    total_reaped = max(
+        int(daemon_state.get("total_reaped_connections") or 0),
+        int(watch_state.get("total_reaped_connections") or 0),
+    )
+
+    if pid_alive or (daemon_ts is not None and not installed_timers):
+        scheduler_mode = "verge-daemon"
+    elif installed_timers:
+        scheduler_mode = "systemd-timer"
+    elif watch_ts is not None:
+        scheduler_mode = "ai-watch"
+    else:
+        scheduler_mode = "none"
+
+    timers_ok = bool(installed_timers and "cproxy-ai-watch.timer" in active_timers)
+    heartbeat_fresh = heartbeat_age_sec is not None and heartbeat_age_sec <= max_heartbeat_age_sec
+    daemon_ok = bool(heartbeat_fresh and (pid_alive or timers_ok or heartbeat_age_sec <= 60.0))
+    configured = bool(
+        scheduler_mode != "none"
+        or bool(read_config(paths).get("verge-mode"))
+        or bool(reb_candidates)
+    )
+
+    timer_schedule = _probe_systemd_timer_schedule(paths, ts) if configured else {}
+    manual_order_count = 0
+    gemini_order_count = 0
+    try:
+        m_path = ai_manual_order_file(paths)
+        if m_path.exists():
+            m_list = json.loads(m_path.read_text(encoding="utf-8"))
+            if isinstance(m_list, list):
+                manual_order_count = len(m_list)
+        g_path = ai_gemini_order_file(paths)
+        if g_path.exists():
+            g_list = json.loads(g_path.read_text(encoding="utf-8"))
+            if isinstance(g_list, list):
+                gemini_order_count = len(g_list)
+    except Exception:
+        pass
+
+    v_parts = [
+        f"{'通用' if g == 'AI-MANUAL' else 'Gemini'}={last_verdicts[g]}"
+        for g in ("AI-MANUAL", "AI-GEMINI")
+        if g in last_verdicts
+    ]
+    watch_summary = ", ".join(v_parts) if v_parts else "就绪"
+    if total_switches or total_reaped:
+        watch_summary += f" · 切流 {total_switches} / 回收 {total_reaped}"
+
+    rebalance_summary = (
+        f"通用 {manual_order_count} 节点 · Gemini {gemini_order_count} 节点"
+        if (manual_order_count or gemini_order_count)
+        else "等待首轮测速"
+    )
+
+    def _task_entry(
+        name: str,
+        unit: str,
+        interval: str,
+        fallback_active: bool,
+        fallback_last_sec: float | None,
+        fallback_period_sec: float | None,
+        summary_text: str,
+    ) -> dict[str, Any]:
+        sched_item = timer_schedule.get(unit, {})
+        is_act = bool(sched_item.get("active") or (unit in active_timers) or fallback_active)
+        last_sec = sched_item.get("last_ago_sec")
+        if last_sec is None or (
+            fallback_last_sec is not None and fallback_last_sec < float(last_sec)
+        ):
+            last_sec = round(fallback_last_sec, 1) if fallback_last_sec is not None else None
+        next_sec = sched_item.get("next_in_sec")
+        if next_sec is None and is_act and last_sec is not None and fallback_period_sec is not None:
+            next_sec = round(max(0.0, fallback_period_sec - float(last_sec)), 1)
+        return {
+            "name": name,
+            "unit": unit,
+            "interval": interval,
+            "active": is_act,
+            "last_ago_sec": last_sec,
+            "next_in_sec": next_sec,
+            "summary": summary_text,
+        }
+
+    rt_age: float | None = None
+    try:
+        from ..config import runtime_file as _rt_f
+
+        rt_p = _rt_f(paths)
+        if rt_p.exists():
+            rt_age = max(0.0, ts - rt_p.stat().st_mtime)
+    except Exception:
+        pass
+
+    sub_age: float | None = None
+    try:
+        from ..config import subscription_info_file as _sub_f
+
+        sub_p = _sub_f(paths)
+        if sub_p.exists():
+            sub_age = max(0.0, ts - sub_p.stat().st_mtime)
+    except Exception:
+        pass
+
+    traffic_age: float | None = None
+    try:
+        from ..config import traffic_db_file as _tdb_f
+
+        tdb_p = _tdb_f(paths)
+        if tdb_p.exists():
+            traffic_age = max(0.0, ts - tdb_p.stat().st_mtime)
+    except Exception:
+        pass
+
+    sys_collector_installed = Path("/etc/systemd/system/clash-proxy-traffic-collector.timer").is_file()
+    sys_collector_active = bool(
+        timer_schedule.get("clash-proxy-traffic-collector.timer", {}).get("active")
+        or (scheduler_mode == "verge-daemon" and daemon_ok)
+    )
+
+    tasks: list[dict[str, Any]] = [
+        _task_entry(
+            "ai-watch",
+            "cproxy-ai-watch.timer",
+            "20s",
+            daemon_ok,
+            heartbeat_age_sec,
+            20.0,
+            watch_summary,
+        ),
+        _task_entry(
+            "ai-rebalance",
+            "cproxy-ai-rebalance.timer",
+            "30m",
+            scheduler_mode == "verge-daemon" and daemon_ok,
+            rebalance_age_sec,
+            1800.0,
+            rebalance_summary,
+        ),
+    ]
+    if installed_timers or scheduler_mode == "systemd-timer":
+        tasks.extend(
+            [
+                _task_entry(
+                    "refresh",
+                    "cproxy-refresh.timer",
+                    "15m",
+                    False,
+                    rt_age,
+                    900.0,
+                    "运行配置定时同步",
+                ),
+                _task_entry(
+                    "subscription",
+                    "cproxy-subscription.timer",
+                    "每日 04:00",
+                    False,
+                    sub_age,
+                    None,
+                    "订阅与套餐余量更新",
+                ),
+            ]
+        )
+        if sys_collector_installed or "clash-proxy-traffic-collector.timer" in timer_schedule:
+            tasks.append(
+                _task_entry(
+                    "traffic-collector",
+                    "clash-proxy-traffic-collector.timer",
+                    "30s",
+                    sys_collector_active,
+                    traffic_age,
+                    30.0,
+                    "进程与域名流量入库",
+                )
+            )
+    elif scheduler_mode == "verge-daemon":
+        tasks.append(
+            _task_entry(
+                "conn-sampler",
+                "verge-daemon-sampler",
+                "3s",
+                daemon_ok,
+                heartbeat_age_sec,
+                3.0,
+                f"跟踪活跃连接 {int(daemon_state.get('sampled_connections') or 0)} 条",
+            )
+        )
+
+    return {
+        "configured": configured,
+        "scheduler_mode": scheduler_mode,
+        "daemon_ok": daemon_ok,
+        "daemon_pid": daemon_pid,
+        "daemon_pid_alive": pid_alive,
+        "installed_timers": installed_timers,
+        "active_timers": active_timers,
+        "updated_at": updated_at,
+        "heartbeat_age_sec": round(heartbeat_age_sec, 1) if heartbeat_age_sec is not None else None,
+        "rebalance_age_sec": round(rebalance_age_sec, 1) if rebalance_age_sec is not None else None,
+        "watch_runs": watch_runs,
+        "rebalance_runs": rebalance_runs,
+        "total_switches": total_switches,
+        "total_reaped_connections": total_reaped,
+        "last_verdicts": last_verdicts,
+        "tasks": tasks,
+    }
+
+
+def collect_ai_egress_deep_status(
+    paths: AppPaths,
+    groups_map: dict[str, Any] | None = None,
+    scheduler: dict[str, Any] | None = None,
+    now: float | None = None,
+) -> dict[str, dict[str, Any]]:
+    """收集 AI-MANUAL 与 AI-GEMINI 的深度状态：看护判定、线路安全性、活跃连接数、顺位备选与冷却数。"""
+    from .ai_watch import COOLDOWN_SECONDS
+
+    ts = time.time() if now is None else now
+    sched = scheduler if scheduler is not None else collect_scheduler_telemetry(paths, now=ts)
+    last_verdicts = dict(sched.get("last_verdicts") or {})
+    watch_state, _ = _load_watch_telemetry_state(paths)
+
+    conn_counts: dict[str, int] = {"AI-MANUAL": 0, "AI-GEMINI": 0}
+    try:
+        conns_payload = APIBackend(paths).get_connections()
+        raw_conns = conns_payload.get("connections") if isinstance(conns_payload, dict) else []
+        for c in raw_conns if isinstance(raw_conns, list) else []:
+            if not isinstance(c, dict):
+                continue
+            chains = [str(x) for x in (c.get("chains") or [])]
+            for gname in ("AI-MANUAL", "AI-GEMINI"):
+                if gname in chains:
+                    conn_counts[gname] = conn_counts.get(gname, 0) + 1
+    except Exception:
+        pass
+
+    details: dict[str, dict[str, Any]] = {}
+    for gname in ("AI-MANUAL", "AI-GEMINI"):
+        gobj = (groups_map or {}).get(gname)
+        if gobj is None:
+            continue
+        leaf = resolve_current_leaf(groups_map or {}, gname) or str(getattr(gobj, "current", "") or "-")
+        iepl = is_iepl_node(leaf, paths) if leaf and leaf != "-" else False
+        gs = watch_state.get(gname) if isinstance(watch_state.get(gname), dict) else {}
+        cooldown_map = gs.get("cooldown") if isinstance(gs, dict) and isinstance(gs.get("cooldown"), dict) else {}
+        active_cooldowns = sum(
+            1
+            for k, v in cooldown_map.items()
+            if isinstance(v, (int, float)) and (ts - float(v)) < COOLDOWN_SECONDS
+        )
+        cooled_set = {
+            str(k)
+            for k, v in cooldown_map.items()
+            if isinstance(v, (int, float)) and (ts - float(v)) < COOLDOWN_SECONDS
+        }
+        raw_cands = list(getattr(gobj, "candidates", None) or [])
+        leaf_cands = [
+            str(c)
+            for c in raw_cands
+            if c
+            and str(c) != "AI-AUTO"
+            and not (groups_map and str(c) in groups_map and getattr(groups_map[str(c)], "candidates", None))
+        ]
+        next_standby = [
+            c
+            for c in leaf_cands
+            if c != leaf and c not in cooled_set and not is_iepl_node(c, paths)
+        ]
+        if len(next_standby) < 2:
+            for c in leaf_cands:
+                if c != leaf and c not in next_standby:
+                    next_standby.append(c)
+                if len(next_standby) >= 2:
+                    break
+
+        details[gname] = {
+            "group": gname,
+            "leaf": leaf,
+            "verdict": str(last_verdicts.get(gname) or "ok" if sched.get("configured") else "-"),
+            "is_iepl": iepl,
+            "line_label": "专线/IEPL [风险]" if iepl else "1X 独立 IP [安全]",
+            "active_connections": conn_counts.get(gname, 0),
+            "next_candidates": next_standby[:2],
+            "pool_size": len(leaf_cands),
+            "cooldown_count": active_cooldowns,
+        }
+    return details
+
+
 def check_verge_effectiveness(
     paths: AppPaths,
     *,
@@ -606,8 +1127,12 @@ def check_verge_effectiveness(
     ai_gemini_rules_count = 0
     egress_list: list[VergeEgressStatus] = []
 
-    daemon_state = _load_daemon_state(paths)
-    last_verdicts = dict(daemon_state.get("last_verdicts") or {})
+    telemetry = collect_scheduler_telemetry(
+        paths,
+        max_heartbeat_age_sec=max_heartbeat_age_sec,
+        now=ts,
+    )
+    last_verdicts = dict(telemetry.get("last_verdicts") or {})
 
     if controller_ok:
         try:
@@ -678,19 +1203,20 @@ def check_verge_effectiveness(
         except Exception:
             rules_ok = False
 
-    raw_pid = daemon_state.get("pid")
-    daemon_pid = int(raw_pid) if isinstance(raw_pid, int) and raw_pid > 0 else None
-    updated_at = daemon_state.get("updated_at")
-    heartbeat_age_sec: float | None = None
-    if isinstance(updated_at, (int, float)) and updated_at > 0:
-        heartbeat_age_sec = max(0.0, ts - float(updated_at))
-    last_watch_at = daemon_state.get("last_watch_ts")
+    daemon_state = _load_daemon_state(paths)
+    daemon_ok = bool(telemetry["daemon_ok"])
+    daemon_pid = telemetry["daemon_pid"]
+    pid_alive = bool(telemetry["daemon_pid_alive"])
+    heartbeat_age_sec = telemetry["heartbeat_age_sec"]
+    scheduler_mode = str(telemetry["scheduler_mode"])
+    installed_timers = list(telemetry["installed_timers"])
+    active_timers = list(telemetry["active_timers"])
+    rebalance_age_sec = telemetry["rebalance_age_sec"]
+
+    last_watch_at = daemon_state.get("last_watch_ts") or telemetry.get("updated_at")
     last_watch_age_sec: float | None = None
     if isinstance(last_watch_at, (int, float)) and last_watch_at > 0:
         last_watch_age_sec = max(0.0, ts - float(last_watch_at))
-    pid_alive = _is_pid_alive(daemon_pid)
-    heartbeat_fresh = heartbeat_age_sec is not None and heartbeat_age_sec <= max_heartbeat_age_sec
-    daemon_ok = bool(heartbeat_fresh and (pid_alive or heartbeat_age_sec <= 30.0))
     watch_ok = bool(
         last_watch_age_sec is not None
         and last_watch_age_sec <= max_heartbeat_age_sec
@@ -721,9 +1247,16 @@ def check_verge_effectiveness(
                     f"{eg.group} 当前叶子节点 ({eg.leaf_node}) 为专线/IEPL，可执行 `cproxy verge once` 切换至非专线独立 IP。"
                 )
     if not daemon_ok:
-        remedies.append(
-            "旁路守护进程未运行或心跳超时：Windows 下可双击 `setup-windows-verge.bat` 或运行 `cproxy verge daemon` 启动后台看护。"
-        )
+        if installed_timers:
+            remedies.append(
+                "调度定时器未运行或看护心跳超时：请执行 "
+                "`systemctl --user enable --now cproxy-ai-watch.timer cproxy-ai-rebalance.timer`。"
+            )
+        else:
+            remedies.append(
+                "旁路守护进程未运行或心跳超时：Windows 下可双击 `setup-windows-verge.bat` "
+                "或运行 `cproxy verge daemon` 启动后台看护。"
+            )
     elif not watch_ok:
         remedies.append(
             "AI 看护未通过或结果已过期：请运行 `cproxy verge once --no-rebalance --dry-run` 检查探测链路；"
@@ -753,15 +1286,19 @@ def check_verge_effectiveness(
         daemon_ok=daemon_ok,
         daemon_pid=daemon_pid,
         daemon_pid_alive=pid_alive,
-        heartbeat_age_sec=round(heartbeat_age_sec, 1) if heartbeat_age_sec is not None else None,
+        heartbeat_age_sec=heartbeat_age_sec,
         watch_ok=watch_ok,
         last_watch_age_sec=round(last_watch_age_sec, 1) if last_watch_age_sec is not None else None,
-        watch_runs=int(daemon_state.get("watch_runs") or 0),
-        rebalance_runs=int(daemon_state.get("rebalance_runs") or 0),
-        total_switches=int(daemon_state.get("total_switches") or 0),
+        watch_runs=int(telemetry["watch_runs"]),
+        rebalance_runs=int(telemetry["rebalance_runs"]),
+        total_switches=int(telemetry["total_switches"]),
         switches_last_10m=switches_last_10m,
         switch_storm=switch_storm,
-        total_reaped_connections=int(daemon_state.get("total_reaped_connections") or 0),
+        total_reaped_connections=int(telemetry["total_reaped_connections"]),
+        scheduler_mode=scheduler_mode,
+        active_timers=active_timers,
+        installed_timers=installed_timers,
+        rebalance_age_sec=rebalance_age_sec,
         egress=egress_list,
         remedies=remedies,
     )

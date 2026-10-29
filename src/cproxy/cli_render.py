@@ -964,6 +964,96 @@ def _render_subscription_info(entries: list[tuple[str, SubscriptionUsage]]) -> N
     _render_kv([(label, _format_subscription_usage(usage)) for label, usage in entries])
 
 
+def _format_sched_duration(seconds: object, *, suffix: str) -> str:
+    if not isinstance(seconds, (int, float)):
+        return "-"
+    sec = max(0, int(round(float(seconds))))
+    if sec < 60:
+        return f"{sec}s {suffix}"
+    if sec < 3600:
+        m, s = divmod(sec, 60)
+        return f"{m}m {s:02d}s {suffix}" if m < 10 and s else f"{m}m {suffix}"
+    h, rem = divmod(sec, 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m {suffix}" if m else f"{h}h {suffix}"
+
+
+def _format_egress_watch_rows(egress_info: dict | None) -> list[tuple[str, str]]:
+    if not egress_info:
+        return []
+    verdict = str(egress_info.get("verdict") or "-")
+    if verdict == "ok":
+        v_badge = _style("● ok", ANSI_GREEN)
+    elif verdict in ("dead", "geo_blocked"):
+        v_badge = _style(f"○ {verdict}", ANSI_RED)
+    else:
+        v_badge = _style(f"? {verdict}", ANSI_DIM)
+
+    is_iepl = bool(egress_info.get("is_iepl"))
+    line_label = str(egress_info.get("line_label") or ("专线/IEPL [风险]" if is_iepl else "1X 独立 IP [安全]"))
+    line_badge = _style(line_label, ANSI_YELLOW if is_iepl else ANSI_GREEN)
+    conns = int(egress_info.get("active_connections") or 0)
+    watch_line = f"{v_badge}  ·  {line_badge}  ·  活跃连接 {conns}"
+
+    next_cands = [normalize_name(str(c)) for c in (egress_info.get("next_candidates") or []) if c]
+    standby_text = " → ".join(next_cands) if next_cands else "无可用备选"
+    pool_size = int(egress_info.get("pool_size") or 0)
+    cooled = int(egress_info.get("cooldown_count") or 0)
+    cooled_str = _style(f"冷却 {cooled}", ANSI_YELLOW) if cooled > 0 else f"冷却 {cooled}"
+    standby_line = f"{standby_text}  {_style(f'(候选池 {pool_size} · {cooled_str})', ANSI_DIM)}"
+    return [
+        ("├─ 看护", watch_line),
+        ("└─ 备选", standby_line),
+    ]
+
+
+def _render_scheduler_section(scheduler: dict) -> None:
+    """「调度系统」区块：以对齐矩阵展示全部后台定时任务/守护回路的周期、上次运行、下次触发与最近结果。"""
+    if not scheduler.get("configured"):
+        return
+    tasks = scheduler.get("tasks") or []
+    mode = scheduler.get("scheduler_mode")
+    if mode == "systemd-timer":
+        mode_tag = "systemd 定时器"
+    elif scheduler.get("daemon_pid"):
+        mode_tag = f"旁路守护 PID {scheduler['daemon_pid']}"
+    else:
+        mode_tag = "看门狗"
+
+    if tasks:
+        active_n = sum(1 for t in tasks if t.get("active"))
+        total_n = len(tasks)
+        print()
+        _print_section(f"调度系统 ({active_n}/{total_n} 运行中 · {mode_tag})")
+        headers = ["任务", "状态", "周期", "上次运行", "下次触发", "最近结果"]
+        rows: list[list[TableCell]] = []
+        for task in tasks:
+            is_act = bool(task.get("active"))
+            state_cell = _status_cell("运行中" if is_act else "未运行")
+            last_str = _format_sched_duration(task.get("last_ago_sec"), suffix="前")
+            next_str = _format_sched_duration(task.get("next_in_sec"), suffix="后") if is_act else "-"
+            rows.append(
+                [
+                    (str(task.get("name") or "-"), (ANSI_BOLD,)),
+                    state_cell,
+                    (str(task.get("interval") or "-"), (ANSI_CYAN,)),
+                    (last_str, ()),
+                    (next_str, (ANSI_GREEN,) if is_act and next_str != "-" else (ANSI_DIM,)),
+                    (str(task.get("summary") or "-"), ()),
+                ]
+            )
+        _render_table(headers, rows, aligns=["l", "l", "l", "r", "r", "l"])
+        return
+
+    daemon_ok = bool(scheduler.get("daemon_ok"))
+    state_badge = _status_label("正常" if daemon_ok else "失败")
+    age = scheduler.get("heartbeat_age_sec")
+    watch_val = f"{age}s 前" if age is not None else "尚无记录"
+    print()
+    _print_section(f"调度系统 ({mode_tag})")
+    _render_kv([("看护状态", state_badge), ("AI 看护", watch_val)])
+
+
 def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, json_output: bool = False) -> int:
     paths = default_paths()
     # 慢点集中在这段收集（systemctl 探测 + AI 路由 API），延迟 spinner 只在真慢时出现；
@@ -975,10 +1065,11 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
         api_text = "不可访问"
         ai_mode = "-"
         ai_summary = "-"
-
         gemini_summary = "-"
+        groups_map: dict = {}
         try:
-            route = _resolve_ai_route(QueryService(paths).get_ai_status_groups())
+            groups_map = QueryService(paths).get_ai_status_groups()
+            route = _resolve_ai_route(groups_map)
             api_text = "可访问"
             ai_mode = str(route["mode_label"])
             ai_summary = str(route["active_summary"])
@@ -986,6 +1077,18 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
                 gemini_summary = str(route["gemini_summary"])
         except APIUnavailableError:
             pass
+        try:
+            from .services.verge import collect_ai_egress_deep_status, collect_scheduler_telemetry
+
+            scheduler = collect_scheduler_telemetry(paths)
+            egress_details = (
+                collect_ai_egress_deep_status(paths, groups_map=groups_map, scheduler=scheduler)
+                if api_text == "可访问" and groups_map
+                else {}
+            )
+        except Exception:
+            scheduler = {"configured": False}
+            egress_details = {}
 
     recommended_actions: list[str] = []
     warnings: list[str] = []
@@ -1033,6 +1136,8 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
                 },
                 "traffic_today": traffic,
                 "subscriptions": subscriptions,
+                "scheduler": scheduler,
+                "egress": egress_details,
             },
             ok=not warnings,
             warnings=warnings,
@@ -1062,40 +1167,64 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
                 f"订阅 {label}: upload={usage.upload} download={usage.download}"
                 f" total={usage.total} expire={usage.expire} updated_at={usage.updated_at}"
             )
+        if scheduler.get("configured"):
+            print(
+                f"调度: mode={scheduler.get('scheduler_mode')} ok={scheduler.get('daemon_ok')}"
+                f" heartbeat_age={scheduler.get('heartbeat_age_sec')}"
+            )
         return 0
 
-    title = "◆ cproxy" if _icons_enabled() else "cproxy"
+    title = f"◆ cproxy v{__version__}" if _icons_enabled() else f"cproxy v{__version__}"
     print(_style(title, ANSI_BOLD, ANSI_BLUE))
     print(_section_rule())
 
-    _print_section("摘要")
-    summary_rows = [
-        ("状态", _status_label(status_text)),
-        ("API", _status_label(api_text)),
-        ("运行配置", _status_label(config_state)),
-        ("AI 路由", ai_mode),
-        ("通用出口", _accent(ai_summary)),
-    ]
-    if gemini_summary != "-":
-        summary_rows.append(("Gemini", _accent(gemini_summary)))
-    _render_kv(summary_rows)
-
-    print()
-    _print_section("资源")
     metrics = collect_runtime_metrics(paths, snapshot.pid)
     # API 已知不可达时不再试一次——否则白白多等一个 api-timeout（默认 2s）
     connections = _connection_count(paths) if api_text == "可访问" else None
-    _render_kv(
-        [
-            ("代理端口", snapshot.port),
-            ("控制接口", snapshot.controller),
-            ("PID", str(snapshot.pid) if snapshot.pid else ""),
-            ("连接数", "" if connections is None else str(connections)),
-            ("运行时间", "" if metrics.uptime_seconds is None else _format_uptime(metrics.uptime_seconds)),
-            ("内存", "" if metrics.memory_bytes is None else format_bytes(metrics.memory_bytes)),
-            ("日志", "" if metrics.log_bytes is None else format_bytes(metrics.log_bytes)),
-        ]
-    )
+
+    proc_parts: list[str] = []
+    if snapshot.pid:
+        proc_parts.append(f"PID {snapshot.pid}")
+    if metrics.uptime_seconds is not None:
+        proc_parts.append(f"运行 {_format_uptime(metrics.uptime_seconds)}")
+    if metrics.memory_bytes is not None:
+        proc_parts.append(f"内存 {format_bytes(metrics.memory_bytes)}")
+    if metrics.log_bytes is not None:
+        proc_parts.append(f"日志 {format_bytes(metrics.log_bytes)}")
+    proc_suffix = f"  {_style('(' + ' · '.join(proc_parts) + ')', ANSI_DIM)}" if proc_parts else ""
+
+    api_parts = [f"控制器 {snapshot.controller}", f"端口 {snapshot.port}"]
+    if connections is not None:
+        api_parts.append(f"连接 {connections}")
+    api_suffix = f"  {_style('(' + ' · '.join(api_parts) + ')', ANSI_DIM)}"
+
+    src_short = _shorten_path(snapshot.source_config, _STATUS_PATH_WIDTH)
+    rt_short = _shorten_path(snapshot.runtime_config, _STATUS_PATH_WIDTH)
+    cfg_suffix = f"  {_style(f'({src_short} → {rt_short})', ANSI_DIM)}"
+
+    _print_section("摘要 · 核心运行 (资源与路径)")
+    core_rows = [
+        ("状态", _status_label(status_text) + proc_suffix),
+        ("API", _status_label(api_text) + api_suffix),
+        ("运行配置", _status_label(config_state) + cfg_suffix),
+    ]
+    if snapshot.runtime_stale:
+        core_rows.append(("配置时效", _status_label("待刷新") + "  运行实例未跟随最近一次 render"))
+    _render_kv(core_rows)
+
+    print()
+    _print_section("AI 出口与看护")
+    ai_rows: list[tuple[str, str]] = [
+        ("AI 路由", ai_mode),
+        ("通用出口", _accent(ai_summary)),
+    ]
+    ai_rows.extend(_format_egress_watch_rows(egress_details.get("AI-MANUAL")))
+    if gemini_summary != "-":
+        ai_rows.append(("Gemini", _accent(gemini_summary)))
+        ai_rows.extend(_format_egress_watch_rows(egress_details.get("AI-GEMINI")))
+    _render_kv(ai_rows)
+
+    _render_scheduler_section(scheduler)
 
     traffic = _today_traffic_summary(paths)
     if traffic is not None:
@@ -1105,18 +1234,6 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
         _render_process_traffic(_today_process_traffic(paths, process_top))
 
     _render_subscription_info(display_entries(paths))
-
-    print()
-    _print_section("路径")
-    path_rows = [
-        ("原始配置", _shorten_path(snapshot.source_config, _STATUS_PATH_WIDTH)),
-        ("运行配置", _shorten_path(snapshot.runtime_config, _STATUS_PATH_WIDTH)),
-    ]
-    # 仅当运行实例加载的 runtime 内容已落后于磁盘当前版本时才展示：
-    # runtime 路径恒定，所以信号是**内容时效**而非路径差异
-    if snapshot.runtime_stale:
-        path_rows.append(("配置时效", _status_label("待刷新") + "  运行实例未跟随最近一次 render"))
-    _render_kv(path_rows)
 
     if not snapshot.running and api_text == "可访问":
         print()

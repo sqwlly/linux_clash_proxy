@@ -221,6 +221,18 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
 
     if not service_lines:
         service_lines.append("无 mihomo 进程")
+    try:
+        from .verge import collect_scheduler_telemetry
+
+        sched = collect_scheduler_telemetry(paths)
+        if sched.get("configured"):
+            service_lines.append(
+                f"SchedulerMode={sched.get('scheduler_mode')} "
+                f"SchedulerOK={sched.get('daemon_ok')} "
+                f"HeartbeatAgeSec={sched.get('heartbeat_age_sec')}"
+            )
+    except Exception:
+        pass
     sections.append(IncidentSection("service", service_lines))
 
     ai_lines: list[str] = []

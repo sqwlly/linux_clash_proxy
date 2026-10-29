@@ -611,3 +611,53 @@ def test_windows_reused_http2_thinking_with_response_id_and_pythonw_null_stderr(
     assert match_region("🇬🇧 英国 London 01") == "GB"
 
 
+def test_scheduler_telemetry_perceives_ai_watch_and_systemd_timers(tmp_path, monkeypatch):
+    """验证 Linux systemd timer 直接运行 cproxy ai-watch（未跑 verge daemon）时，
+    check_verge_effectiveness / collect_scheduler_telemetry / doctor 仍能感知调度看护存活。"""
+    from cproxy.config import ai_manual_order_file, ai_watch_state_file
+    from cproxy.doctor import _scheduler_doctor_check
+    from cproxy.services.verge import collect_scheduler_telemetry
+
+    paths = _paths(tmp_path)
+    ai_manual_order_file(paths).parent.mkdir(parents=True, exist_ok=True)
+    ai_manual_order_file(paths).write_text(json.dumps(["🇹🇼台湾 01 | 1X"]), encoding="utf-8")
+
+    groups = {
+        "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇹🇼台湾 01 | 1X", ["🇹🇼台湾 01 | 1X", "AI-AUTO"]),
+        "AI-GEMINI": ProxyGroup("AI-GEMINI", "fallback", "🇬🇧英国 01 | 1X", ["🇬🇧英国 01 | 1X", "AI-AUTO"]),
+        "AI-AUTO": ProxyGroup("AI-AUTO", "url-test", "🇹🇼台湾 01 | 1X", ["🇹🇼台湾 01 | 1X"]),
+        "🇹🇼台湾 01 | 1X": ProxyGroup("🇹🇼台湾 01 | 1X", "ss", None, [], delay=180, alive=True),
+        "🇬🇧英国 01 | 1X": ProxyGroup("🇬🇧英国 01 | 1X", "ss", None, [], delay=210, alive=True),
+    }
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: "ok")
+    monkeypatch.setattr(ai_watch_mod, "reap_idle_gemini_connections", lambda *a, **kw: ["c-99"])
+    monkeypatch.setattr(ai_watch_mod, "reap_stale_agy_processes", lambda *a, **kw: [])
+
+    svc = ai_watch_mod.AIWatchService(paths)
+    svc.query = type("_Q", (), {"api": type("_A", (), {"get_groups": lambda _s: groups})()})()
+    svc.watch()
+
+    assert ai_watch_state_file(paths).exists()
+    monkeypatch.setattr(
+        "cproxy.services.verge._probe_user_systemd_timers",
+        lambda _p: (
+            ["cproxy-ai-watch.timer", "cproxy-ai-rebalance.timer"],
+            ["cproxy-ai-watch.timer", "cproxy-ai-rebalance.timer"],
+        ),
+    )
+
+    telemetry = collect_scheduler_telemetry(paths)
+    assert telemetry["configured"] is True
+    assert telemetry["scheduler_mode"] == "systemd-timer"
+    assert telemetry["daemon_ok"] is True
+    assert telemetry["watch_runs"] == 1
+    assert telemetry["total_reaped_connections"] == 1
+    assert telemetry["last_verdicts"] == {"AI-MANUAL": "ok", "AI-GEMINI": "ok"}
+
+    doc_check = _scheduler_doctor_check(paths)
+    assert doc_check is not None
+    assert doc_check.name == "调度看护"
+    assert doc_check.status == "正常"
+    assert "systemd 定时器 2/2 活跃" in doc_check.detail
+
+

@@ -46,6 +46,38 @@ def _subscription_doctor_check(paths: AppPaths, source_data: dict | None) -> Doc
     return None
 
 
+def _scheduler_doctor_check(paths: AppPaths) -> DoctorCheck | None:
+    try:
+        from .services.verge import collect_scheduler_telemetry
+
+        telemetry = collect_scheduler_telemetry(paths)
+    except Exception:
+        return None
+    if not telemetry.get("configured"):
+        return None
+    mode = telemetry.get("scheduler_mode")
+    installed = telemetry.get("installed_timers") or []
+    active = telemetry.get("active_timers") or []
+    age = telemetry.get("heartbeat_age_sec")
+    age_text = f"最近看护 {age}s 前" if age is not None else "尚无看护记录"
+    if telemetry.get("daemon_ok"):
+        if mode == "systemd-timer" and installed:
+            detail = f"systemd 定时器 {len(active)}/{len(installed)} 活跃 · {age_text}"
+        elif telemetry.get("daemon_pid"):
+            detail = f"守护进程 PID {telemetry['daemon_pid']} · {age_text}"
+        else:
+            detail = age_text
+        return DoctorCheck("调度看护", "正常", detail)
+    if installed:
+        return DoctorCheck(
+            "调度看护",
+            "失败",
+            f"systemd 定时器 {len(active)}/{len(installed)} 活跃 · {age_text}",
+            "systemctl --user enable --now cproxy-ai-watch.timer cproxy-ai-rebalance.timer",
+        )
+    return DoctorCheck("调度看护", "失败", f"看护守护未运行或心跳超时 ({age_text})", "cproxy verge daemon")
+
+
 def run_doctor(paths: AppPaths) -> dict:
     checks: list[DoctorCheck] = []
     source = config_file(paths)
@@ -104,6 +136,10 @@ def run_doctor(paths: AppPaths) -> dict:
     sub_check = _subscription_doctor_check(paths, source_data)
     if sub_check is not None:
         checks.append(sub_check)
+
+    sched_check = _scheduler_doctor_check(paths)
+    if sched_check is not None:
+        checks.append(sched_check)
 
     failed = [item for item in checks if item.status == "失败"]
     actions = list(dict.fromkeys(item.action for item in failed if item.action))
