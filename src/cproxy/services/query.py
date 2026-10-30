@@ -268,6 +268,8 @@ class QueryService:
     def _connection_follows_ai_switch(item: dict[str, Any], group_name: str) -> bool:
         chains = item.get("chains") or []
         chain_names = {str(part) for part in chains} if isinstance(chains, list) else set()
+        if "H2-KEEPALIVE" in chain_names:
+            return False
         if group_name == AI_GEMINI_GROUP:
             return AI_GEMINI_GROUP in chain_names
         if AI_GEMINI_GROUP in chain_names:

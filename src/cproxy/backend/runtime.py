@@ -1465,6 +1465,26 @@ class RuntimeBackend:
         else:
             filtered_groups = filtered_groups[: insert_after + 1] + ai_groups + filtered_groups[insert_after + 1 :]
 
+        from ..services.h2_keepalive import DEFAULT_KEEPALIVE_PORT, is_h2_keepalive_running
+
+        h2_keepalive_active = is_h2_keepalive_running(self.paths.state_dir)
+        raw_proxies = data.get("proxies")
+        if isinstance(raw_proxies, list):
+            raw_proxies = [
+                p for p in raw_proxies if not (isinstance(p, dict) and p.get("name") == "H2-KEEPALIVE")
+            ]
+            if h2_keepalive_active:
+                raw_proxies.append(
+                    {
+                        "name": "H2-KEEPALIVE",
+                        "type": "http",
+                        "server": "127.0.0.1",
+                        "port": DEFAULT_KEEPALIVE_PORT,
+                    }
+                )
+            data["proxies"] = raw_proxies
+
+        h2_keepalive_rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE"
         ai_rules = [
             # Google / Gemini / Antigravity —— 必须排在 PROCESS-NAME,agy 之前，
             # 否则 agy 全部出站被 AI-MANUAL（美日新）吃掉，Gemini 仍 400。
@@ -1475,6 +1495,7 @@ class RuntimeBackend:
             # 数十 MB 缓冲日志，会彻底吃满阿里云 ECS 1Mbps 出站公网带宽，导致 daily-cloudcode-pa.googleapis.com
             # 的 1.3MB 上下文 POST 请求因上行饥饿超过 60s 被服务端 EOF 掐断；本地 REJECT 零公网带宽消耗）。
             "DOMAIN,play.googleapis.com,REJECT",
+            *([h2_keepalive_rule] if h2_keepalive_active else []),
             f"DOMAIN-SUFFIX,googleapis.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,googleusercontent.com,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,gstatic.com,{AI_GEMINI_GROUP}",
@@ -1544,6 +1565,7 @@ class RuntimeBackend:
             # 裸 GEOIP 位于注入规则之前会强制域名真实解析（首连延迟 + DNS 泄漏），
             # 末尾 no-resolve 版本已兜底
             "GEOIP,CN,DIRECT",
+            h2_keepalive_rule,
         }
 
         clean_rules = [

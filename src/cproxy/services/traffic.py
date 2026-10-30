@@ -65,7 +65,11 @@ def _conn_process(conn: dict[str, Any]) -> str:
     process = str(metadata.get("processPath") or "").strip()
     if not process:
         process = str(metadata.get("process") or "").strip()
-    return _normalize_process_label(process)
+    label = _normalize_process_label(process)
+    host = str(metadata.get("host") or "").strip().lower()
+    if host == "daily-cloudcode-pa.googleapis.com" and any(k in label.lower() for k in ("cproxy", "python")):
+        return "agy"
+    return label
 
 
 @dataclass(frozen=True)
@@ -228,6 +232,8 @@ class TrafficService:
                     continue
                 active_ids.add(conn_id)
                 chain, rule, host = _conn_label(conn)
+                if chain == "H2-KEEPALIVE":
+                    continue
                 download = int(conn.get("download") or 0)
                 upload = int(conn.get("upload") or 0)
                 previous = seen.get(conn_id)

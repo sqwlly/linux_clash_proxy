@@ -9,6 +9,7 @@ USER_CONFIG_DIR="${HOME}/.config/cproxy"
 mkdir -p "${USER_SYSTEMD_DIR}" "${USER_CONFIG_DIR}"
 
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy.service" "${HOME}/.config/systemd/user/cproxy.service"
+install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-h2-keepalive.service" "${HOME}/.config/systemd/user/cproxy-h2-keepalive.service"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-refresh.service" "${HOME}/.config/systemd/user/cproxy-refresh.service"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-refresh.timer" "${HOME}/.config/systemd/user/cproxy-refresh.timer"
 install -m 644 "${PROJECT_DIR}/systemd-user/cproxy-subscription.service" "${HOME}/.config/systemd/user/cproxy-subscription.service"
@@ -24,7 +25,7 @@ if [ ! -f "${HOME}/.config/cproxy/cproxy-command.env" ]; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now cproxy.service
+systemctl --user enable --now cproxy.service cproxy-h2-keepalive.service
 systemctl --user enable --now cproxy-refresh.timer cproxy-subscription.timer cproxy-ai-rebalance.timer cproxy-ai-watch.timer
 
 cat <<EOF

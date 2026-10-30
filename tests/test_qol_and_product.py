@@ -1732,16 +1732,101 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     )
     assert giant_failed is False
 
+    prefix_prev_fail = time.strftime("%m%d %H:%M:%S", time.localtime(now_epoch - 88))
+    (agy_giant_tool_dir / "cli-20261030_131645.log").write_text(
+        f'I{prefix_prev_fail}.100000 1 run.go:301] Run: attempt 3 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), retrying in 11s\n'
+        f'I{prefix_new}.200000 1 run.go:301] Run: attempt 4 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), retrying in 22s\n',
+        encoding="utf-8",
+    )
+    giant_post_eof_failed, _, _ = detect_recent_agy_retry_failure(
+        agy_giant_tool_dir, now=float(now_epoch + 1), since_ts=float(now_epoch - 30)
+    )
+    assert giant_post_eof_failed is False
 
 
+def test_h2_keepalive_ping_injection_and_end_stream(tmp_path: Path):
+    import asyncio
+    from cproxy.services.h2_keepalive import H2_PREFACE, _forward_h2_frames_with_ping
+
+    async def _run():
+        pings_received: list[bytes] = []
+
+        async def handle_upstream(up_r: asyncio.StreamReader, up_w: asyncio.StreamWriter):
+            assert await up_r.readexactly(len(H2_PREFACE)) == H2_PREFACE
+            fhdr = await up_r.readexactly(9)
+            flen = int.from_bytes(fhdr[:3], "big")
+            await up_r.readexactly(flen)
+
+            for _ in range(2):
+                phdr = await up_r.readexactly(9)
+                plen = int.from_bytes(phdr[:3], "big")
+                ppayload = await up_r.readexactly(plen)
+                assert phdr[3] == 0x06 and phdr[4] == 0x00
+                pings_received.append(ppayload)
+                up_w.write(b"\x00\x00\x08\x06\x01\x00\x00\x00\x00" + ppayload)
+                await up_w.drain()
+
+            body = b"done"
+            up_w.write(len(body).to_bytes(3, "big") + b"\x00\x01" + (1).to_bytes(4, "big") + body)
+            await up_w.drain()
+            await asyncio.sleep(0.25)
+            up_w.close()
+
+        up_srv = await asyncio.start_server(handle_upstream, "127.0.0.1", 0)
+        up_port = up_srv.sockets[0].getsockname()[1]
+
+        async def handle_client(c_r: asyncio.StreamReader, c_w: asyncio.StreamWriter):
+            u_r, u_w = await asyncio.open_connection("127.0.0.1", up_port)
+            try:
+                await _forward_h2_frames_with_ping(c_r, c_w, u_r, u_w, ping_interval=0.08)
+            finally:
+                u_w.close()
+                c_w.close()
+
+        c_srv = await asyncio.start_server(handle_client, "127.0.0.1", 0)
+        c_port = c_srv.sockets[0].getsockname()[1]
+
+        cr, cw = await asyncio.open_connection("127.0.0.1", c_port)
+        cw.write(H2_PREFACE + b"\x00\x00\x03\x01\x04\x00\x00\x00\x01abc")
+        await cw.drain()
+        dhdr = await cr.readexactly(9)
+        dbody = await cr.readexactly(int.from_bytes(dhdr[:3], "big"))
+        assert pings_received == [b"cproxy01", b"cproxy02"]
+        assert dhdr[3] == 0x00 and dhdr[4] == 0x01 and dbody == b"done"
+        cw.close()
+        c_srv.close()
+        up_srv.close()
+
+    asyncio.run(_run())
 
 
+def test_runtime_render_injects_h2_keepalive_rule_when_running(tmp_path: Path, monkeypatch):
+    import yaml
+    from cproxy.backend.runtime import RuntimeBackend
+    from cproxy.config import config_file
+    from cproxy.services import h2_keepalive
 
-
-
-
-
-
-
+    paths = _make_paths(tmp_path / "rt-keepalive")
+    config_file(paths).write_text(
+        "mixed-port: 7890\n"
+        "external-controller: 127.0.0.1:9090\n"
+        "proxies:\n"
+        "  - {name: '🇺🇸美国 01 | 1X', type: vless, server: 1.1.1.1, port: 443}\n"
+        "  - {name: '🇸🇬新加坡 01 | 1X', type: vless, server: 1.1.1.2, port: 443}\n"
+        "  - {name: '🇬🇧英国 01 | 1X', type: vless, server: 1.1.1.3, port: 443}\n"
+        "proxy-groups:\n"
+        "  - {name: Auto, type: fallback, proxies: ['🇺🇸美国 01 | 1X']}\n"
+        "rules:\n"
+        "  - MATCH,Auto\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(h2_keepalive, "is_h2_keepalive_running", lambda _state_dir: True)
+    rt_path = RuntimeBackend(paths).render_runtime()
+    rendered = yaml.safe_load(rt_path.read_text(encoding="utf-8"))
+    proxy_names = [p["name"] for p in rendered["proxies"]]
+    assert "H2-KEEPALIVE" in proxy_names
+    rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE"
+    assert rule in rendered["rules"]
+    assert rendered["rules"].index(rule) < rendered["rules"].index("DOMAIN-SUFFIX,googleapis.com,AI-GEMINI")
 
 

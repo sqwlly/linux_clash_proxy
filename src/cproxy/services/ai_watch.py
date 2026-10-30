@@ -494,6 +494,8 @@ def reap_idle_gemini_connections(
             continue
         chains = item.get("chains") or []
         chain_set = {str(part) for part in chains} if isinstance(chains, list) else set()
+        if "H2-KEEPALIVE" in chain_set:
+            continue
         leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
         active_leaf = manual_leaf if AI_MANUAL_GROUP in chain_set and manual_leaf else current_leaf
         on_stale_leaf = bool(active_leaf and leaf and leaf != active_leaf)
@@ -962,19 +964,24 @@ def detect_recent_agy_retry_failure(
                 event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
             except ValueError:
                 continue
-            if "stream reading error" in reason_lower:
+            is_post_eof = "streamgeneratecontent" in reason_lower and reason_lower.endswith(": eof")
+            if "stream reading error" in reason_lower or is_post_eof:
                 prev_ok_ts: float | None = None
+                prev_fail_ts: float | None = None
                 for prev_idx in range(idx - 1, max(-1, idx - 80), -1):
                     prev_stripped = lines[prev_idx].strip()
                     if _AGY_RETRY_FAIL_RE.match(prev_stripped):
+                        prev_fail_ts = _parse_glog_timestamp(prev_stripped, local_now)
                         break
                     if "streamGenerateContent" in prev_stripped and "ResponseID:" in prev_stripped:
                         prev_ok_ts = _parse_glog_timestamp(prev_stripped, local_now)
                         break
-                # 若本轮重试在收到 HTTP 200 ResponseID 后已持续流式等待 >= 55s（总轮次耗时 70~110s+），
+                # 若本轮重试在收到 HTTP 200 ResponseID 后已持续流式等待 >= 55s（或 Post EOF 距上一轮失败重试已持续 >= 65s），
                 # 说明出口节点链路完全正常且已越过 50s IEPL 闲置阈值，系模型单次生成超大 write_file/edit_file
-                # 工具调用参数触发上游 ~75-100s 源站静默读上限；切节点无法突破该上限且会误伤并发会话与污染 1X 节点池。
-                if prev_ok_ts is not None and 55.0 <= (event_ts - prev_ok_ts) <= 180.0:
+                # 工具调用参数触发上游 ~80s VLESS connIdle 静默读上限；切节点无法突破该上限且会误伤并发会话与污染 1X 节点池。
+                if (prev_ok_ts is not None and 55.0 <= (event_ts - prev_ok_ts) <= 180.0) or (
+                    is_post_eof and prev_fail_ts is not None and 65.0 <= (event_ts - prev_fail_ts) <= 180.0
+                ):
                     break
             if event_ts <= since_ts:
                 break

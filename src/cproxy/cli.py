@@ -674,6 +674,33 @@ def run(argv: list[str] | None = None) -> int:
                 action_label = "发现可清理残留 agy 进程" if args.dry_run else "已清理残留 agy 进程"
                 print(f"{action_label}: {pids_str}")
             return 0
+        if args.command == "h2-keepalive":
+            import asyncio
+            from .services.h2_keepalive import (
+                ensure_h2_keepalive_daemon,
+                h2_keepalive_pid_file,
+                run_h2_keepalive_server,
+            )
+
+            paths = default_paths()
+            if getattr(args, "daemon", False):
+                ok = ensure_h2_keepalive_daemon(
+                    paths.data_dir,
+                    paths.state_dir,
+                    listen_port=args.port,
+                    upstream_port=args.upstream_port,
+                )
+                print(f"H2 保活网关: {'已就绪' if ok else '启动失败'} (127.0.0.1:{args.port})")
+                return 0 if ok else 1
+            asyncio.run(
+                run_h2_keepalive_server(
+                    paths.data_dir / "tls",
+                    listen_port=args.port,
+                    upstream_port=args.upstream_port,
+                    pid_path=h2_keepalive_pid_file(paths.state_dir),
+                )
+            )
+            return 0
         if args.command == "guard":
             command = args.command_args
             if command and command[0] == "--":

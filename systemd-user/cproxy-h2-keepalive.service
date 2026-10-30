@@ -1,0 +1,15 @@
+[Unit]
+Description=cproxy HTTP/2 PING keepalive proxy for Cloud Code
+After=network-online.target cproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cproxy h2-keepalive
+Restart=always
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

@@ -154,6 +154,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("shadow-history", "查看最近稳定探测历史"),
             ("ai-rebalance", "按实测稳定度重排 AI-MANUAL 出口并热重载"),
             ("ai-watch", "看护 AI 出口：语义探测失败即自动切换"),
+            ("h2-keepalive", "启动本地 Cloud Code HTTP/2 PING 保活网关"),
             ("guard", "先选稳定 AI 出口，再按需注入代理执行命令"),
             ("ai-connections", "查看 AI/GitHub 相关活动连接"),
             ("incident", "输出 AI 出口故障排查报告"),
@@ -462,6 +463,11 @@ def build_root_parser() -> ArgumentParser:
 
     watch_parser = _add_command(subparsers, "ai-watch", raw=True)
     watch_parser.add_argument("--dry-run", action="store_true", help="只探测判定，不切换、不写状态")
+
+    keepalive_parser = _add_command(subparsers, "h2-keepalive", raw=True)
+    keepalive_parser.add_argument("--port", type=int, default=7895, help="监听端口（默认 7895）")
+    keepalive_parser.add_argument("--upstream-port", type=int, default=7890, help="上游 mihomo 端口（默认 7890）")
+    keepalive_parser.add_argument("--daemon", action="store_true", help="以后台守护进程方式启动")
 
     guard_parser = _add_command(subparsers, "guard")
     guard_parser.add_argument(
