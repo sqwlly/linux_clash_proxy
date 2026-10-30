@@ -1675,12 +1675,64 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     assert classify_ai_connection_lifecycle(830_000, 52_000, 55_353, 55_350, recv_q=0, send_q=0) == "thinking"
     assert classify_ai_connection_lifecycle(1_330_000, 12_400, 65_000, 92_000, recv_q=0, send_q=0) == "streaming"
     assert classify_ai_connection_lifecycle(417_187, 54_334, 35_813, 36_400, recv_q=0, send_q=0) == "streaming"
+    assert (
+        classify_ai_connection_lifecycle(
+            794_752, 8_547, 17_000, 33_000, on_stale_leaf=True, recv_q=0, send_q=0
+        )
+        == "streaming"
+    )
+    assert (
+        classify_ai_connection_lifecycle(
+            750_000, 75_000, 52_000, 60_000, on_stale_leaf=False, recv_q=0, send_q=0
+        )
+        == "streaming"
+    )
+    assert (
+        classify_ai_connection_lifecycle(
+            750_000, 75_000, 122_000, 130_000, on_stale_leaf=False, recv_q=0, send_q=0
+        )
+        == "idle_completed"
+    )
 
     # aicode.googleapis.com 与 antigravity-unleash.goog 纳入 AI_STREAM_HOSTS，闲置短连接自动回收
-    from cproxy.services.ai_watch import AI_STREAM_HOSTS
+    from cproxy.services.ai_watch import AI_STREAM_HOSTS, detect_recent_agy_retry_failure
 
     assert "aicode.googleapis.com" in AI_STREAM_HOSTS
     assert "antigravity-unleash.goog" in AI_STREAM_HOSTS
+
+    # 当 attempt 4 已被切流静默窗跳过但后续 attempt 6 仍持续 stream reading error: unexpected EOF 时，仍可触发自愈
+    agy_high_dir = tmp_path / "agy-high-attempt"
+    agy_high_dir.mkdir()
+    lt = time.localtime(now_epoch)
+    prefix_old = time.strftime("%m%d %H:%M:%S", time.localtime(now_epoch - 90))
+    prefix_new = time.strftime("%m%d %H:%M:%S", lt)
+    (agy_high_dir / "cli-20261029_170000.log").write_text(
+        f"I{prefix_old}.100000 1 run.go:301] Run: attempt 4 failed (stream reading error: unexpected EOF), retrying in 14s\n"
+        f"I{prefix_new}.200000 1 run.go:301] Run: attempt 6 failed (stream reading error: unexpected EOF), retrying in 25s\n",
+        encoding="utf-8",
+    )
+    hi_failed, _hi_ts, hi_reason = detect_recent_agy_retry_failure(
+        agy_high_dir, now=float(now_epoch + 1), since_ts=float(now_epoch - 30)
+    )
+    assert hi_failed is True
+    assert "attempt 6" in hi_reason
+
+    # 若本轮重试在收到 ResponseID 后已持续流式等待 >= 55s（如 72s 超大 write_file/edit_file 生成撞上源站静默上限），
+    # 不得误判为代理节点故障或污染 1X 节点池
+    agy_giant_tool_dir = tmp_path / "agy-giant-tool"
+    agy_giant_tool_dir.mkdir()
+    prefix_resp = time.strftime("%m%d %H:%M:%S", time.localtime(now_epoch - 72))
+    (agy_giant_tool_dir / "cli-20261030_131645.log").write_text(
+        f"I{prefix_resp}.100000 1 http_helpers.go:359] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1 ResponseID: abc\n"
+        f"I{prefix_new}.200000 1 run.go:301] Run: attempt 6 failed (stream reading error: unexpected EOF), retrying in 25s\n",
+        encoding="utf-8",
+    )
+    giant_failed, _, _ = detect_recent_agy_retry_failure(
+        agy_giant_tool_dir, now=float(now_epoch + 1), since_ts=float(now_epoch - 30)
+    )
+    assert giant_failed is False
+
+
 
 
 

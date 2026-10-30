@@ -367,12 +367,13 @@ def classify_ai_connection_lifecycle(
             return "idle_completed"
         return "idle_other"
     if upload >= 18_000:
-        if on_stale_leaf:
+        if download < 30_000:
+            threshold_ms = 120_000
+        elif on_stale_leaf:
             threshold_ms = 10_000
         elif (
-            download < 30_000
-            or (lastrcv_ms - lastsnd_ms) >= 15_000
-            or (upload >= 350_000 and download < 60_000)
+            (lastrcv_ms - lastsnd_ms) >= 15_000
+            or (upload >= 350_000 and (download < 60_000 or (lastrcv_ms - lastsnd_ms) >= 4_000))
         ):
             threshold_ms = 120_000
         else:
@@ -384,13 +385,16 @@ def classify_ai_connection_lifecycle(
         ):
             if min(lastsnd_ms, lastrcv_ms) <= 5_000 and download < 6_000:
                 return "uploading"
+            if download >= 6_000 and idle_ms > 120_000:
+                return "idle_completed"
             if idle_ms <= 300_000:
                 return "thinking"
             return "stalled_thinking"
         if (
             abs(lastsnd_ms - lastrcv_ms) < 50
             and idle_ms >= 10_000
-            and (on_stale_leaf or (download >= 30_000 and upload < 500_000))
+            and download >= 30_000
+            and (on_stale_leaf or upload < 500_000)
         ):
             return "idle_completed"
         if idle_ms < threshold_ms:
@@ -919,8 +923,11 @@ def detect_recent_agy_retry_failure(
             continue
 
         seen_fail_in_file = False
-        for line in reversed(tail.splitlines()):
-            stripped = line.strip()
+        file_candidate: tuple[float, int, str] | None = None
+        fallback_candidate: tuple[float, int, str] | None = None
+        lines = tail.splitlines()
+        for idx in range(len(lines) - 1, -1, -1):
+            stripped = lines[idx].strip()
             if "streamGenerateContent" in stripped and "ResponseID:" in stripped:
                 if not seen_fail_in_file:
                     ok_ts = _parse_glog_timestamp(stripped, local_now)
@@ -941,12 +948,8 @@ def detect_recent_agy_retry_failure(
             # 仅单次长流中途断流，不切走以免打断其它活跃会话；但若连续达到 attempt >= 4 仍反复中途断流，必须自愈切流。
             if "stream reading error" in reason_lower and attempt_num < 4:
                 break
-            # agy 自身对偶发单次 EOF 具备 4s/6s 静默指数退避自愈能力（attempt 1/2 不会向用户报错）。
-            # 单次请求的重试链（attempt 1..10）跨越约 7 分钟：
-            # - attempt == 3 时对易断流节点立即自愈；
-            # - attempt >= 4 时说明即便在常规/1X 节点上也已连续多次建连/发包失败，无论节点名称是否含 IEPL 均触发自愈，
-            #   且不被其它并发会话的小包监控请求（sir_flash_lite ResponseID）掩盖。
-            if attempt_num not in (3, 4) and "bad record mac" not in reason_lower:
+            is_high_stream_eof = attempt_num == 6 and "stream reading error" in reason_lower
+            if attempt_num not in (3, 4) and "bad record mac" not in reason_lower and not is_high_stream_eof:
                 continue
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
@@ -959,12 +962,34 @@ def detect_recent_agy_retry_failure(
                 event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
             except ValueError:
                 continue
+            if "stream reading error" in reason_lower:
+                prev_ok_ts: float | None = None
+                for prev_idx in range(idx - 1, max(-1, idx - 80), -1):
+                    prev_stripped = lines[prev_idx].strip()
+                    if _AGY_RETRY_FAIL_RE.match(prev_stripped):
+                        break
+                    if "streamGenerateContent" in prev_stripped and "ResponseID:" in prev_stripped:
+                        prev_ok_ts = _parse_glog_timestamp(prev_stripped, local_now)
+                        break
+                # 若本轮重试在收到 HTTP 200 ResponseID 后已持续流式等待 >= 55s（总轮次耗时 70~110s+），
+                # 说明出口节点链路完全正常且已越过 50s IEPL 闲置阈值，系模型单次生成超大 write_file/edit_file
+                # 工具调用参数触发上游 ~75-100s 源站静默读上限；切节点无法突破该上限且会误伤并发会话与污染 1X 节点池。
+                if prev_ok_ts is not None and 55.0 <= (event_ts - prev_ok_ts) <= 180.0:
+                    break
             if event_ts <= since_ts:
                 break
             age = ts_now - event_ts
             if -5.0 <= age <= window_seconds:
-                candidates.append((event_ts, attempt_num, f"attempt {attempt_num}: {reason}"))
+                if is_high_stream_eof and "bad record mac" not in reason_lower:
+                    if fallback_candidate is None:
+                        fallback_candidate = (event_ts, attempt_num, f"attempt {attempt_num}: {reason}")
+                    continue
+                file_candidate = (event_ts, attempt_num, f"attempt {attempt_num}: {reason}")
             break
+        if file_candidate is not None:
+            candidates.append(file_candidate)
+        elif fallback_candidate is not None:
+            candidates.append(fallback_candidate)
 
     max_seen_ts = max([since_ts] + [c[0] for c in candidates])
     triggered = [
@@ -1331,7 +1356,7 @@ class AIWatchService:
                     attempt_prefix.startswith("attempt ")
                     and attempt_prefix[8:].isdigit()
                     and int(attempt_prefix[8:]) >= 4
-                    and not has_inflight_now
+                    and (not has_inflight_now or "stream reading error" not in log_reason.lower())
                 )
                 is_severe_retry = "bad record mac" in log_reason.lower() or severe_attempt
                 if not on_healthy_safe_leaf or is_severe_retry:
