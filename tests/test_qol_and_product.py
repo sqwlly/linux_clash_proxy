@@ -1825,7 +1825,7 @@ def test_runtime_render_injects_h2_keepalive_rule_when_running(tmp_path: Path, m
     rendered = yaml.safe_load(rt_path.read_text(encoding="utf-8"))
     proxy_names = [p["name"] for p in rendered["proxies"]]
     assert "H2-KEEPALIVE" in proxy_names
-    rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE"
+    rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE"
     assert rule in rendered["rules"]
     assert rendered["rules"].index(rule) < rendered["rules"].index("DOMAIN-SUFFIX,googleapis.com,AI-GEMINI")
 

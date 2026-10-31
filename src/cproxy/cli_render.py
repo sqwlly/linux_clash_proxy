@@ -905,7 +905,10 @@ def _format_subscription_usage(usage: SubscriptionUsage) -> str:
     if usage.total:
         remaining = usage.remaining or 0
         pct_used = min(100.0, usage.used / usage.total * 100)
-        text = f"剩余 {format_bytes(remaining)} / {format_bytes(usage.total)}（已用 {pct_used:.1f}%）"
+        bar_w = 16
+        rem_cells = max(0, min(bar_w, round((remaining / usage.total) * bar_w)))
+        quota_bar = "█" * rem_cells + "░" * (bar_w - rem_cells)
+        text = f"[{quota_bar}]  剩余 {format_bytes(remaining)} / {format_bytes(usage.total)}（已用 {pct_used:.1f}%）"
         if remaining <= 0:
             color = ANSI_RED
         elif remaining < usage.total * _SUBSCRIPTION_LOW_RATIO:
@@ -978,33 +981,154 @@ def _format_sched_duration(seconds: object, *, suffix: str) -> str:
     return f"{h}h {m:02d}m {suffix}" if m else f"{h}h {suffix}"
 
 
-def _format_egress_watch_rows(egress_info: dict | None) -> list[tuple[str, str]]:
-    if not egress_info:
-        return []
-    verdict = str(egress_info.get("verdict") or "-")
-    if verdict == "ok":
-        v_badge = _style("● ok", ANSI_GREEN)
-    elif verdict in ("dead", "geo_blocked"):
-        v_badge = _style(f"○ {verdict}", ANSI_RED)
-    else:
-        v_badge = _style(f"? {verdict}", ANSI_DIM)
+def _render_rounded_table(
+    headers: list[str],
+    rows: list[list[TableCell]],
+    *,
+    aligns: list[str] | None = None,
+    indent: str = "  ",
+) -> None:
+    if not rows:
+        return
+    aligns = aligns or ["l"] * len(headers)
+    widths = _table_widths(headers, rows)
+    b = lambda s: _style(s, ANSI_DIM)
 
-    is_iepl = bool(egress_info.get("is_iepl"))
-    line_label = str(egress_info.get("line_label") or ("专线/IEPL [风险]" if is_iepl else "1X 独立 IP [安全]"))
-    line_badge = _style(line_label, ANSI_YELLOW if is_iepl else ANSI_GREEN)
-    conns = int(egress_info.get("active_connections") or 0)
-    watch_line = f"{v_badge}  ·  {line_badge}  ·  活跃连接 {conns}"
+    def fmt_row(row: list[TableCell]) -> str:
+        cells = []
+        for (text, codes), w, align in zip(row, widths, aligns):
+            padded = _pad_left(text, w) if align == "r" else _pad_right(text, w)
+            cells.append(_style(padded, *codes))
+        return f"{indent}{b('│ ')}" + b(" │ ").join(cells) + b(" │")
 
-    next_cands = [normalize_name(str(c)) for c in (egress_info.get("next_candidates") or []) if c]
-    standby_text = " → ".join(next_cands) if next_cands else "无可用备选"
-    pool_size = int(egress_info.get("pool_size") or 0)
-    cooled = int(egress_info.get("cooldown_count") or 0)
-    cooled_str = _style(f"冷却 {cooled}", ANSI_YELLOW) if cooled > 0 else f"冷却 {cooled}"
-    standby_line = f"{standby_text}  {_style(f'(候选池 {pool_size} · {cooled_str})', ANSI_DIM)}"
-    return [
-        ("├─ 看护", watch_line),
-        ("└─ 备选", standby_line),
-    ]
+    def border(left: str, mid: str, right: str) -> str:
+        return f"{indent}" + b(left + mid.join("─" * (w + 2) for w in widths) + right)
+
+    print(border("╭", "┬", "╮"))
+    print(fmt_row([(h, (ANSI_BOLD,)) for h in headers]))
+    print(border("├", "┼", "┤"))
+    for row in rows:
+        print(fmt_row(row))
+    print(border("╰", "┴", "╯"))
+
+
+def _sched_phase_bar(task: dict, width: int = 8) -> TableCell:
+    if not task.get("active"):
+        return ("○" + "─" * (width - 1), (ANSI_DIM,))
+    if task.get("name") == "h2-keepalive":
+        return ("━◆━━◆━━▸", (ANSI_CYAN,))
+    ago = task.get("last_ago_sec")
+    nxt = task.get("next_in_sec")
+    if isinstance(ago, (int, float)) and isinstance(nxt, (int, float)) and (ago + nxt) > 0:
+        ratio = max(0.0, min(1.0, float(ago) / float(ago + nxt)))
+        pos = min(width - 1, max(0, int(round(ratio * (width - 1)))))
+        track = "━" * pos + "●" + "─" * (width - 1 - pos)
+        return (track, (ANSI_GREEN,))
+    return ("━━━●────", (ANSI_GREEN,))
+
+
+def _strip_flag_chars(text: str) -> str:
+    return "".join(ch for ch in text if not (0x1F1E6 <= ord(ch) <= 0x1F1FF)).strip()
+
+
+def _box_cell(text: str, inner_width: int, *codes: str) -> str:
+    trimmed = text
+    while _display_width(trimmed) > inner_width and trimmed:
+        trimmed = trimmed[:-1]
+    padded = _pad_right(trimmed, inner_width)
+    return _style(padded, *codes) if codes else padded
+
+
+def _render_ai_egress_topology(egress_details: dict, gemini_summary: str) -> None:
+    if not egress_details:
+        return
+    print()
+    headers = ["通道", "看护", "线路品质", "活跃连接", "候选池健康度", "顺位备选"]
+    rows: list[list[TableCell]] = []
+    for label, group_key in (("通用出口", "AI-MANUAL"), ("Gemini", "AI-GEMINI")):
+        info = egress_details.get(group_key)
+        if not isinstance(info, dict):
+            continue
+        verdict = str(info.get("verdict") or "-")
+        if verdict == "ok":
+            v_cell: TableCell = ("● 正常", (ANSI_GREEN,))
+        elif verdict in ("dead", "geo_blocked"):
+            v_cell = (f"○ {verdict}", (ANSI_RED,))
+        else:
+            v_cell = (f"? {verdict}", (ANSI_DIM,))
+
+        is_iepl = bool(info.get("is_iepl"))
+        line_text = "专线/IEPL (风险)" if is_iepl else "1X 独立 IP (安全)"
+        line_cell: TableCell = (line_text, (ANSI_YELLOW,) if is_iepl else (ANSI_GREEN,))
+
+        conns = int(info.get("active_connections") or 0)
+        dots = "●" * min(conns, 4) + ("+" if conns > 4 else "") if conns > 0 else "○"
+        conn_cell: TableCell = (f"{conns} {dots}", (ANSI_GREEN,) if conns > 0 else (ANSI_DIM,))
+
+        pool_size = int(info.get("pool_size") or 0)
+        cooled = int(info.get("cooldown_count") or 0)
+        healthy = max(0, pool_size - cooled)
+        bar_w = 8
+        filled = max(0, min(bar_w, round((healthy / pool_size) * bar_w))) if pool_size > 0 else 0
+        bar_str = "█" * filled + "░" * (bar_w - filled)
+        cool_suffix = f" (冷却 {cooled})" if cooled > 0 else ""
+        pool_cell: TableCell = (
+            f"{bar_str} {healthy}/{pool_size}{cool_suffix}",
+            (ANSI_YELLOW,) if cooled > 0 else (ANSI_GREEN,),
+        )
+
+        next_cands = [_strip_flag_chars(normalize_name(str(c))) for c in (info.get("next_candidates") or []) if c]
+        standby_str = " → ".join(next_cands) if next_cands else "无可用备选"
+        rows.append([(label, (ANSI_BOLD,)), v_cell, line_cell, conn_cell, pool_cell, (standby_str, ())])
+
+    if rows:
+        _render_rounded_table(headers, rows, aligns=["l", "l", "l", "l", "l", "l"])
+
+    g_info = egress_details.get("AI-GEMINI")
+    h2_info = g_info.get("h2_keepalive") if isinstance(g_info, dict) else None
+    if not isinstance(h2_info, dict) or not h2_info.get("active"):
+        return
+
+    h2_port = int(h2_info.get("port") or 7895)
+    h2_pings = int(h2_info.get("pings_sent") or 0)
+    h2_sess = int(h2_info.get("h2_sessions") or 0)
+    leaf_raw = gemini_summary.split("->", 1)[-1].strip() if "->" in gemini_summary else gemini_summary
+    leaf_clean = _strip_flag_chars(leaf_raw) or "AI-GEMINI 节点"
+
+    w1, w2, w3, w4 = 14, 20, 22, 14
+    b = lambda s: _style(s, ANSI_DIM)
+    arr_top = f"   {_style('HTTP', ANSI_DIM)}    "
+    arr_mid = _style(" ────────▸ ", ANSI_GREEN)
+    arr_bot_1 = f"   {_style(':7890', ANSI_DIM)}   "
+    arr_top_2 = f"  {_style('SOCKS5', ANSI_DIM)}   "
+    arr_bot_2 = f"  {_style('1X 专线', ANSI_DIM)}  "
+    arr_top_3 = f"  {_style('TLS/H2', ANSI_DIM)}   "
+    arr_bot_3 = f"  {_style('防断流', ANSI_DIM)}   "
+
+    print()
+    print(
+        f"  {b('╭' + '─' * w1 + '╮')}{arr_top}{b('╭' + '─' * w2 + '╮')}"
+        f"{arr_top_2}{b('╭' + '─' * w3 + '╮')}{arr_top_3}{b('╭' + '─' * w4 + '╮')}"
+    )
+    print(
+        f"  {b('│')}{_box_cell('  agy 客户端', w1, ANSI_BOLD)}{b('│')}{arr_mid}"
+        f"{b('│')}{_box_cell(f'  H2 保活网关 :{h2_port}', w2, ANSI_BOLD, ANSI_CYAN)}{b('│')}{arr_mid}"
+        f"{b('│')}{_box_cell('  ' + leaf_clean, w3, ANSI_BOLD, ANSI_GREEN)}{b('│')}{arr_mid}"
+        f"{b('│')}{_box_cell('  Cloud Code', w4, ANSI_BOLD)}{b('│')}"
+    )
+    print(
+        f"  {b('│')}{_box_cell('  长思考请求', w1, ANSI_DIM)}{b('│')}{arr_bot_1}"
+        f"{b('│')}{_box_cell('  4.5s 注入 PING 帧', w2, ANSI_GREEN)}{b('│')}{arr_bot_2}"
+        f"{b('│')}{_box_cell('  VLESS-WS 独立 IP', w3, ANSI_DIM)}{b('│')}{arr_bot_3}"
+        f"{b('│')}{_box_cell('  Gemini API', w4, ANSI_DIM)}{b('│')}"
+    )
+    print(
+        f"  {b('╰' + '─' * w1 + '╯')}           {b('╰' + '─' * 9 + '┬' + '─' * 10 + '╯')}"
+        f"           {b('╰' + '─' * w3 + '╯')}           {b('╰' + '─' * w4 + '╯')}"
+    )
+    gauge = _style("█" * 15, ANSI_GREEN) + _style("░", ANSI_DIM)
+    meta = _style(f"(4.5s 心跳 vs 80s 断流阈值 · 护航 {h2_sess} 会话 · 已发 PING ×{h2_pings})", ANSI_DIM)
+    print(f"{' ' * 39}{b('╰──▸')} 保活裕度  [{gauge}] 94%  {meta}")
 
 
 def _render_scheduler_section(scheduler: dict) -> None:
@@ -1025,11 +1149,11 @@ def _render_scheduler_section(scheduler: dict) -> None:
         total_n = len(tasks)
         print()
         _print_section(f"调度系统 ({active_n}/{total_n} 运行中 · {mode_tag})")
-        headers = ["任务", "状态", "周期", "上次运行", "下次触发", "最近结果"]
+        headers = ["任务", "状态", "周期", "上次运行", "周期相位", "下次触发", "最近结果"]
         rows: list[list[TableCell]] = []
         for task in tasks:
             is_act = bool(task.get("active"))
-            state_cell = _status_cell("运行中" if is_act else "未运行")
+            state_cell = ("● 运行中", (ANSI_GREEN,)) if is_act else ("○ 未运行", (ANSI_RED,))
             last_str = _format_sched_duration(task.get("last_ago_sec"), suffix="前")
             next_str = _format_sched_duration(task.get("next_in_sec"), suffix="后") if is_act else "-"
             rows.append(
@@ -1038,11 +1162,12 @@ def _render_scheduler_section(scheduler: dict) -> None:
                     state_cell,
                     (str(task.get("interval") or "-"), (ANSI_CYAN,)),
                     (last_str, ()),
+                    _sched_phase_bar(task),
                     (next_str, (ANSI_GREEN,) if is_act and next_str != "-" else (ANSI_DIM,)),
                     (str(task.get("summary") or "-"), ()),
                 ]
             )
-        _render_table(headers, rows, aligns=["l", "l", "l", "r", "r", "l"])
+        _render_rounded_table(headers, rows, aligns=["l", "l", "l", "r", "l", "r", "l"])
         return
 
     daemon_ok = bool(scheduler.get("daemon_ok"))
@@ -1218,11 +1343,10 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
         ("AI 路由", ai_mode),
         ("通用出口", _accent(ai_summary)),
     ]
-    ai_rows.extend(_format_egress_watch_rows(egress_details.get("AI-MANUAL")))
     if gemini_summary != "-":
         ai_rows.append(("Gemini", _accent(gemini_summary)))
-        ai_rows.extend(_format_egress_watch_rows(egress_details.get("AI-GEMINI")))
     _render_kv(ai_rows)
+    _render_ai_egress_topology(egress_details, gemini_summary)
 
     _render_scheduler_section(scheduler)
 

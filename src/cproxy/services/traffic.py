@@ -60,7 +60,24 @@ def _normalize_process_label(raw: str) -> str:
     return cleaned or "-"
 
 
-def _conn_process(conn: dict[str, Any]) -> str:
+def _resolve_agy_process_label(connections: list[dict[str, Any]] | None = None) -> str:
+    for conn in connections or []:
+        chains = [str(x) for x in (conn.get("chains") or [])]
+        if "H2-KEEPALIVE" in chains:
+            meta = conn.get("metadata") or {}
+            raw = str(meta.get("processPath") or meta.get("process") or "").strip()
+            norm = _normalize_process_label(raw)
+            if norm and norm != "-" and not any(k in norm.lower() for k in ("cproxy", "python")):
+                return norm
+    from pathlib import Path
+
+    cand = Path.home() / ".local" / "bin" / "agy"
+    if cand.exists():
+        return str(cand)
+    return "agy"
+
+
+def _conn_process(conn: dict[str, Any], agy_label: str | None = None) -> str:
     metadata = conn.get("metadata") or {}
     process = str(metadata.get("processPath") or "").strip()
     if not process:
@@ -69,7 +86,7 @@ def _conn_process(conn: dict[str, Any]) -> str:
     host = str(metadata.get("host") or "").strip().lower()
     if any(k in label.lower() for k in ("cproxy", "python")):
         if host in ("daily-cloudcode-pa.googleapis.com", "aicode.googleapis.com"):
-            return "agy"
+            return agy_label or _resolve_agy_process_label()
         if host in ("chatgpt.com", "ws.chatgpt.com", "api.openai.com"):
             return "codex"
     return label
@@ -210,11 +227,31 @@ class TrafficService:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(connections_seen)")}
         if "process" not in columns:
             conn.execute("ALTER TABLE connections_seen ADD COLUMN process TEXT NOT NULL DEFAULT ''")
+        canonical_agy = _resolve_agy_process_label()
+        if canonical_agy != "agy":
+            rows_to_merge = conn.execute(
+                "SELECT day, hour, chain, download, upload FROM traffic_process_samples WHERE process = 'agy'"
+            ).fetchall()
+            if rows_to_merge:
+                with conn:
+                    for r in rows_to_merge:
+                        conn.execute(
+                            """
+                            INSERT INTO traffic_process_samples (day, hour, process, chain, download, upload)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT (day, hour, process, chain) DO UPDATE SET
+                                download = download + excluded.download,
+                                upload = upload + excluded.upload
+                            """,
+                            (r["day"], r["hour"], canonical_agy, r["chain"], r["download"], r["upload"]),
+                        )
+                    conn.execute("DELETE FROM traffic_process_samples WHERE process = 'agy'")
         return conn
 
     def collect(self) -> CollectResult:
         payload = self.api.get_connections()
         connections = payload.get("connections") or []
+        agy_label = _resolve_agy_process_label(connections)
         now = datetime.now().astimezone()
         day = now.strftime("%Y-%m-%d")
         hour = now.strftime("%H")
@@ -259,7 +296,7 @@ class TrafficService:
                     """,
                     (day, hour, chain, rule, host, delta_download, delta_upload),
                 )
-                process = _conn_process(conn)
+                process = _conn_process(conn, agy_label=agy_label)
                 db.execute(
                     """
                     INSERT INTO traffic_process_samples (day, hour, process, chain, download, upload)

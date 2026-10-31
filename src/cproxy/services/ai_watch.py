@@ -1314,6 +1314,18 @@ class AIWatchService:
                     verdicts[r.group] = r.verdict
                 state["last_verdicts"] = verdicts
                 _save_state(self.paths, state)
+                try:
+                    from ..backend.process import ProcessBackend
+                    from ..config import runtime_file
+
+                    proc = ProcessBackend(self.paths)
+                    rt = runtime_file(self.paths)
+                    if proc.is_runtime_stale(rt) and not has_any_inflight_ai_connection(
+                        self.paths, getattr(self.query, "api", None)
+                    ):
+                        proc.reload_if_running(rt)
+                except Exception:
+                    pass
             return report
 
     def _probe_group_verdict(self, group: str) -> tuple[str, str]:

@@ -52,6 +52,8 @@ _WS_TERMINAL_EVENT_MARKERS = (
 
 _SS_AGY_RE = re.compile(r'users:\(\("agy[^"]*",pid=(\d+),')
 _SS_LASTSND_RE = re.compile(r"\blastsnd:(\d+)\b")
+_SS_BYTES_RCV_RE = re.compile(r"\bbytes_received:(\d+)\b")
+_SS_BYTES_SENT_RE = re.compile(r"\bbytes_sent:(\d+)\b")
 
 
 def is_windows_admin() -> bool:
@@ -298,10 +300,6 @@ def _generate_certs_with_openssl(
                 "3650",
                 "-subj",
                 f"/CN={CA_COMMON_NAME}",
-                "-addext",
-                "basicConstraints=critical,CA:TRUE,pathlen:0",
-                "-addext",
-                "keyUsage=critical,digitalSignature,keyCertSign,cRLSign",
             ],
             check=True,
             stdout=subprocess.DEVNULL,
@@ -477,7 +475,17 @@ def ensure_local_ca_and_leaf_cert(
     if install_system_trust:
         _install_system_ca_trust(ca_crt, trust_marker, allow_user_prompt=allow_user_prompt)
 
-    trust_mtime = trust_marker.stat().st_mtime if trust_marker.exists() else ca_crt.stat().st_mtime
+    anchor_file = Path("/etc/pki/ca-trust/source/anchors/cproxy-h2-ca.crt")
+
+    if anchor_file.exists():
+        trust_mtime = anchor_file.stat().st_mtime
+    elif trust_marker.exists():
+        try:
+            trust_mtime = float(trust_marker.read_text(encoding="utf-8").strip())
+        except ValueError:
+            trust_mtime = trust_marker.stat().st_mtime
+    else:
+        trust_mtime = ca_crt.stat().st_mtime
     return ca_crt, leaf_crt, leaf_key, trust_mtime
 
 
@@ -518,7 +526,7 @@ def client_prefers_passthrough(
         return False
 
     best_pid: int | None = None
-    best_lastsnd = 300
+    best_key: tuple[int, int, int] = (1 << 60, 1 << 60, 1 << 60)
     lines = proc.stdout.splitlines()
     for idx, line in enumerate(lines):
         m_pid = _SS_AGY_RE.search(line)
@@ -526,10 +534,16 @@ def client_prefers_passthrough(
             continue
         pid = int(m_pid.group(1))
         detail = lines[idx + 1] if idx + 1 < len(lines) else ""
+        m_rcv = _SS_BYTES_RCV_RE.search(detail)
+        m_snt = _SS_BYTES_SENT_RE.search(detail)
         m_snd = _SS_LASTSND_RE.search(detail)
+        bytes_rcv = int(m_rcv.group(1)) if m_rcv else 0
+        bytes_snt = int(m_snt.group(1)) if m_snt else 0
         lastsnd = int(m_snd.group(1)) if m_snd else 0
-        if lastsnd <= best_lastsnd:
-            best_lastsnd = lastsnd
+        # 刚发送 CONNECT 尚未收到 200 响应的新建连接 bytes_received == 0 且 bytes_sent 极小
+        cand_key = (bytes_rcv, lastsnd, bytes_snt)
+        if cand_key < best_key and lastsnd <= 1000:
+            best_key = cand_key
             best_pid = pid
 
     if best_pid is None:
@@ -560,6 +574,47 @@ async def _pipe_raw(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) 
             pass
 
 
+def h2_keepalive_stats_file(state_dir: Path) -> Path:
+    return state_dir / "h2-keepalive-stats.json"
+
+
+def load_h2_keepalive_stats(state_dir: Path) -> dict[str, int | float]:
+    import json
+
+    path = h2_keepalive_stats_file(state_dir)
+    if not path.exists():
+        return {"h2_sessions": 0, "pings_sent": 0, "passthrough_sessions": 0, "updated_at": 0.0}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {
+                "h2_sessions": int(data.get("h2_sessions") or 0),
+                "pings_sent": int(data.get("pings_sent") or 0),
+                "passthrough_sessions": int(data.get("passthrough_sessions") or 0),
+                "updated_at": float(data.get("updated_at") or 0.0),
+            }
+    except Exception:
+        pass
+    return {"h2_sessions": 0, "pings_sent": 0, "passthrough_sessions": 0, "updated_at": 0.0}
+
+
+def _record_h2_keepalive_stat(stats_path: Path | None, field: str, delta: int = 1) -> None:
+    if stats_path is None:
+        return
+    try:
+        import json
+
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        cur = load_h2_keepalive_stats(stats_path.parent)
+        cur[field] = int(cur.get(field) or 0) + delta
+        cur["updated_at"] = time.time()
+        tmp = stats_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, stats_path)
+    except Exception:
+        pass
+
+
 async def _forward_h2_frames_with_ping(
     client_r: asyncio.StreamReader,
     client_w: asyncio.StreamWriter,
@@ -567,6 +622,7 @@ async def _forward_h2_frames_with_ping(
     upstream_w: asyncio.StreamWriter,
     *,
     ping_interval: float = PING_INTERVAL_SEC,
+    stats_path: Path | None = None,
 ) -> None:
     """在 HTTP/2 帧边界上透明转发双向流量，并在存在未完结流 (active_streams > 0) 且静默达到阈值时
     自动向远端发送 17 字节 HTTP/2 PING 帧，彻底阻断上游 VLESS/anytls 80s connIdle 断流。
@@ -576,6 +632,7 @@ async def _forward_h2_frames_with_ping(
         raise ValueError("Invalid HTTP/2 client preface")
     upstream_w.write(preface)
     await upstream_w.drain()
+    _record_h2_keepalive_stat(stats_path, "h2_sessions", 1)
 
     upstream_lock = asyncio.Lock()
     client_lock = asyncio.Lock()
@@ -641,6 +698,7 @@ async def _forward_h2_frames_with_ping(
                         upstream_w.write(ping_frame)
                         await upstream_w.drain()
                     state["last_io"] = time.monotonic()
+                    _record_h2_keepalive_stat(stats_path, "pings_sent", 1)
         except Exception:
             pass
 
@@ -962,6 +1020,7 @@ class H2KeepaliveProxy:
         install_system_trust: bool = True,
         allow_user_prompt: bool = False,
         require_system_trust: bool = False,
+        stats_path: Path | None = None,
     ) -> None:
         self.tls_dir = tls_dir
         self.listen_host = listen_host
@@ -972,6 +1031,7 @@ class H2KeepaliveProxy:
         self.ping_interval = ping_interval
         self.idle_ping_interval = idle_ping_interval
         self.require_system_trust = require_system_trust
+        self.stats_path = stats_path
         ca_crt, leaf_crt, leaf_key, trust_mtime = ensure_local_ca_and_leaf_cert(
             tls_dir,
             install_system_trust=install_system_trust,
@@ -1062,6 +1122,8 @@ class H2KeepaliveProxy:
             await client_w.drain()
 
             if passthrough:
+                if target_host == CLOUDCODE_HOST:
+                    _record_h2_keepalive_stat(self.stats_path, "passthrough_sessions", 1)
                 await asyncio.gather(
                     _pipe_raw(client_r, upstream_w),
                     _pipe_raw(upstream_r, client_w),
@@ -1077,8 +1139,6 @@ class H2KeepaliveProxy:
                     server_side=True,
                 )
             except ssl.SSLError:
-                self.trust_installed_mtime = time.time() + 1.0
-                self._passthrough_until[target_host] = time.monotonic() + 30.0
                 return
             client_w._transport = client_tls_t
             client_r._transport = client_tls_t
@@ -1108,6 +1168,7 @@ class H2KeepaliveProxy:
                     upstream_r,
                     upstream_w,
                     ping_interval=self.ping_interval,
+                    stats_path=self.stats_path,
                 )
             else:
                 await _forward_http1_or_ws_with_ping(
@@ -1143,6 +1204,7 @@ async def run_h2_keepalive_server(
     allow_user_prompt: bool = False,
     require_system_trust: bool = True,
 ) -> None:
+    stats_path = h2_keepalive_stats_file(pid_path.parent) if pid_path is not None else None
     proxy = H2KeepaliveProxy(
         tls_dir,
         listen_host=listen_host,
@@ -1154,12 +1216,14 @@ async def run_h2_keepalive_server(
         install_system_trust=install_system_trust,
         allow_user_prompt=allow_user_prompt,
         require_system_trust=require_system_trust,
+        stats_path=stats_path,
     )
     server = await asyncio.start_server(proxy.handle_client, listen_host, listen_port)
     if pid_path is not None:
         try:
             pid_path.parent.mkdir(parents=True, exist_ok=True)
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            _record_h2_keepalive_stat(stats_path, "pings_sent", 0)
         except OSError:
             pass
     async with server:

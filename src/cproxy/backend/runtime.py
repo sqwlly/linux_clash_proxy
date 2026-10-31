@@ -1485,7 +1485,7 @@ class RuntimeBackend:
                 )
             data["proxies"] = raw_proxies
 
-        h2_keepalive_rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE"
+        h2_keepalive_rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE"
         codex_keepalive_rule = (
             "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),"
             "(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE"
@@ -1574,6 +1574,7 @@ class RuntimeBackend:
             # 裸 GEOIP 位于注入规则之前会强制域名真实解析（首连延迟 + DNS 泄漏），
             # 末尾 no-resolve 版本已兜底
             "GEOIP,CN,DIRECT",
+            "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE",
             h2_keepalive_rule,
             codex_keepalive_rule,
         }

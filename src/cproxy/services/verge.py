@@ -1248,6 +1248,29 @@ def collect_scheduler_telemetry(
         except Exception:
             pass
 
+    from .h2_keepalive import DEFAULT_KEEPALIVE_PORT, is_h2_keepalive_running, load_h2_keepalive_stats
+
+    h2_alive = is_h2_keepalive_running(paths.state_dir)
+    if h2_alive:
+        h2_stats = load_h2_keepalive_stats(paths.state_dir)
+        h2_updated = float(h2_stats.get("updated_at") or 0.0)
+        h2_age = max(0.0, ts - h2_updated) if h2_updated > 0 else None
+        h2_only = int(h2_stats.get("h2_sessions") or 0)
+        h2_pass = int(h2_stats.get("passthrough_sessions") or 0)
+        h2_pings = int(h2_stats.get("pings_sent") or 0)
+        pass_tag = f" (旧会话直通 {h2_pass})" if h2_pass > 0 else ""
+        tasks.append(
+            {
+                "name": "h2-keepalive",
+                "unit": "cproxy-h2-keepalive.service",
+                "interval": "4.5s",
+                "active": True,
+                "last_ago_sec": round(h2_age, 1) if h2_age is not None else None,
+                "next_in_sec": 4.5,
+                "summary": f"127.0.0.1:{DEFAULT_KEEPALIVE_PORT} · H2保活 {h2_only} / 已发 PING {h2_pings}{pass_tag}",
+            }
+        )
+
     return {
         "configured": configured,
         "scheduler_mode": scheduler_mode,
@@ -1276,6 +1299,7 @@ def collect_ai_egress_deep_status(
 ) -> dict[str, dict[str, Any]]:
     """收集 AI-MANUAL 与 AI-GEMINI 的深度状态：看护判定、线路安全性、活跃连接数、顺位备选与冷却数。"""
     from .ai_watch import COOLDOWN_SECONDS
+    from .h2_keepalive import DEFAULT_KEEPALIVE_PORT, is_h2_keepalive_running, load_h2_keepalive_stats
 
     ts = time.time() if now is None else now
     sched = scheduler if scheduler is not None else collect_scheduler_telemetry(paths, now=ts)
@@ -1335,7 +1359,7 @@ def collect_ai_egress_deep_status(
                 if len(next_standby) >= 2:
                     break
 
-        details[gname] = {
+        entry: dict[str, Any] = {
             "group": gname,
             "leaf": leaf,
             "verdict": str(last_verdicts.get(gname) or "ok" if sched.get("configured") else "-"),
@@ -1346,6 +1370,16 @@ def collect_ai_egress_deep_status(
             "pool_size": len(leaf_cands),
             "cooldown_count": active_cooldowns,
         }
+        if gname == "AI-GEMINI" and is_h2_keepalive_running(paths.state_dir):
+            h2_stats = load_h2_keepalive_stats(paths.state_dir)
+            entry["h2_keepalive"] = {
+                "active": True,
+                "port": DEFAULT_KEEPALIVE_PORT,
+                "pings_sent": int(h2_stats.get("pings_sent") or 0),
+                "h2_sessions": int(h2_stats.get("h2_sessions") or 0),
+                "passthrough_sessions": int(h2_stats.get("passthrough_sessions") or 0),
+            }
+        details[gname] = entry
     return details
 
 
