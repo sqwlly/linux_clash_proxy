@@ -1128,5 +1128,119 @@ def test_codex_80s_silent_ws_10054_exemption_and_verge_keepalive_topology(tmp_pa
     assert '"PROCESS-NAME,ChatGPT.exe,AI-MANUAL"' in js
 
 
+def test_try_hot_reload_verge_runtime_compiles_scripts_and_preserves_egress(tmp_path, monkeypatch):
+    """验证 try_hot_reload_verge_runtime 能用 node 串联执行全局 Script.js 与订阅局部脚本、
+    保持当前 AI-MANUAL/AI-GEMINI 出口首位不变并通过 PUT /configs?force=true 热挂载。
+    """
+    import shutil
+
+    import yaml
+
+    from cproxy.backend.api import APIBackend, ProxyGroup
+    from cproxy.services.verge import inject_verge_global_script, try_hot_reload_verge_runtime
+
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+
+    paths = _paths(tmp_path)
+    verge_dir = tmp_path / "verge"
+    (verge_dir / "profiles").mkdir(parents=True)
+    inject_verge_global_script(verge_dir)
+
+    # 模拟一个订阅局部脚本（注入局部规则与本地回环代理）
+    (verge_dir / "profiles" / "local_sub.js").write_text(
+        "function main(cfg) {\n"
+        "  cfg.proxies = cfg.proxies || [];\n"
+        "  cfg.proxies.push({name: 'MITM-LOCAL', type: 'socks5', server: '127.0.0.1', port: 7893});\n"
+        "  cfg.rules = ['PROCESS-NAME,steam.exe,DIRECT', ...(cfg.rules || [])];\n"
+        "  return cfg;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (verge_dir / "profiles.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "current": "Sub1",
+                "items": [
+                    {"uid": "Script", "type": "script", "file": "Script.js"},
+                    {"uid": "sLocal", "type": "script", "file": "local_sub.js"},
+                    {"uid": "Sub1", "type": "remote", "name": "TestSub", "option": {"script": "sLocal"}},
+                ],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    (verge_dir / "clash-verge.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mixed-port": 7897,
+                "proxies": [
+                    {"name": "🇺🇸 US 01", "type": "ss", "server": "1.1.1.1", "port": 443},
+                    {"name": "🇺🇸 US 02", "type": "ss", "server": "1.1.1.2", "port": 443},
+                    {"name": "🇨🇳 TW 01", "type": "ss", "server": "2.2.2.1", "port": 443},
+                ],
+                "proxy-groups": [
+                    {"name": "Proxy", "type": "select", "proxies": ["🇺🇸 US 01", "🇺🇸 US 02"]},
+                ],
+                "rule-providers": {
+                    "Apple": {"type": "http", "path": "./ruleset/Apple.yaml"},
+                },
+                "rules": ["MATCH,Proxy"],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        APIBackend,
+        "get_groups",
+        lambda self: {
+            "AI-MANUAL": ProxyGroup(
+                name="AI-MANUAL", type="Fallback", current="🇺🇸 US 02", candidates=["🇺🇸 US 01", "🇺🇸 US 02"]
+            ),
+            "AI-GEMINI": ProxyGroup(
+                name="AI-GEMINI", type="Fallback", current="🇨🇳 TW 01", candidates=["🇨🇳 TW 01"]
+            ),
+            "Proxy": ProxyGroup(
+                name="Proxy", type="Selector", current="🇺🇸 US 02", candidates=["🇺🇸 US 01", "🇺🇸 US 02"]
+            ),
+        },
+    )
+    monkeypatch.setattr(APIBackend, "selector_now", lambda self: {"Proxy": "🇺🇸 US 02"})
+
+    def _fake_request(self, method, path, payload=None, **kwargs):
+        if method == "PUT" and path == "/configs?force=true":
+            captured["payload"] = payload
+        return {}
+
+    def _fake_restore(self, snapshot):
+        captured["restored"] = snapshot
+
+    monkeypatch.setattr(APIBackend, "request", _fake_request)
+    monkeypatch.setattr(APIBackend, "restore_selectors", _fake_restore)
+    monkeypatch.setattr(APIBackend, "delay_test", lambda self, *a, **kw: {"delay": 1})
+
+    ok = try_hot_reload_verge_runtime(paths, verge_dir)
+    assert ok is True
+    assert captured.get("restored") == {"Proxy": "🇺🇸 US 02"}
+
+    raw_payload = captured["payload"]
+    assert isinstance(raw_payload, dict)
+    loaded = yaml.safe_load(raw_payload["payload"])
+    groups = {g["name"]: g for g in loaded["proxy-groups"]}
+    assert "AI-MANUAL-KEEPALIVE" in groups
+    assert "AI-GEMINI-KEEPALIVE" in groups
+    # 当前正在使用的 🇺🇸 US 02 必须保持在 AI-MANUAL 首位，且本地回环代理 MITM-LOCAL 不混入 AI 候选池
+    assert groups["AI-MANUAL"]["proxies"][0] == "🇺🇸 US 02"
+    assert "MITM-LOCAL" not in groups["AI-MANUAL"]["proxies"]
+    assert loaded["rule-providers"]["Apple"]["path"] == "ruleset/Apple.yaml"
+    assert loaded["rules"][0] == "PROCESS-NAME,steam.exe,DIRECT"
+
+
+
 
 

@@ -345,6 +345,147 @@ def inject_verge_global_script(verge_dir: Path) -> tuple[Path, bool]:
     return target_js, chain_enabled
 
 
+def try_hot_reload_verge_runtime(
+    paths: AppPaths,
+    verge_dir: Path | None = None,
+    *,
+    force: bool = False,
+) -> bool:
+    """将 Clash Verge 当前生效配置重新应用 `Script.js`（及订阅局部 `option.script`）并通过
+    `PUT /configs?force=true` 内存热加载到运行中的 `verge-mihomo`，无需等待用户手工点「订阅 -> 刷新」。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    node_bin = shutil.which("node")
+    if not node_bin:
+        return False
+
+    target_dir = verge_dir
+    if target_dir is None:
+        target_dir = discover_clash_verge_config().source_dir
+    if target_dir is None or not target_dir.is_dir():
+        return False
+
+    verge_runtime_yaml = target_dir / "clash-verge.yaml"
+    global_script_js = target_dir / "profiles" / "Script.js"
+    if not verge_runtime_yaml.is_file() or not global_script_js.is_file():
+        return False
+
+    api = APIBackend(paths)
+    try:
+        groups_map = api.get_groups()
+    except Exception:
+        return False
+
+    if (
+        not force
+        and "AI-MANUAL-KEEPALIVE" in groups_map
+        and "AI-GEMINI-KEEPALIVE" in groups_map
+    ):
+        return True
+
+    raw_base = load_yaml_file(verge_runtime_yaml)
+    if not isinstance(raw_base, dict) or not raw_base.get("proxies"):
+        return False
+
+    script_paths: list[Path] = [global_script_js.resolve()]
+    profile_name = "VergeProfile"
+    profiles_yaml = target_dir / "profiles.yaml"
+    if profiles_yaml.is_file():
+        raw_profiles = load_yaml_file(profiles_yaml)
+        if isinstance(raw_profiles, dict):
+            current_uid = str(raw_profiles.get("current") or "")
+            items = [it for it in (raw_profiles.get("items") or []) if isinstance(it, dict)]
+            uid_map = {str(it.get("uid") or ""): it for it in items if it.get("uid")}
+            cur_item = uid_map.get(current_uid)
+            if isinstance(cur_item, dict):
+                profile_name = str(cur_item.get("name") or cur_item.get("file") or profile_name)
+                opt = cur_item.get("option")
+                prof_script_uid = str(opt.get("script") or "") if isinstance(opt, dict) else ""
+                prof_script_item = uid_map.get(prof_script_uid)
+                if isinstance(prof_script_item, dict) and prof_script_item.get("file"):
+                    cand_js = (target_dir / "profiles" / str(prof_script_item["file"])).resolve()
+                    if cand_js.is_file() and cand_js not in script_paths:
+                        script_paths.append(cand_js)
+
+    try:
+        selectors = api.selector_now()
+    except Exception:
+        selectors = {}
+    cur_manual = groups_map["AI-MANUAL"].current if "AI-MANUAL" in groups_map else None
+    cur_gemini = groups_map["AI-GEMINI"].current if "AI-GEMINI" in groups_map else None
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            in_json = td_path / "in.json"
+            out_json = td_path / "out.json"
+            runner_js = td_path / "run.js"
+            in_json.write_text(json.dumps(raw_base, ensure_ascii=False), encoding="utf-8")
+            js_list_literal = json.dumps([str(p) for p in script_paths])
+            runner_js.write_text(
+                "const fs = require('fs');\n"
+                "const vm = require('vm');\n"
+                f"let cfg = JSON.parse(fs.readFileSync({json.dumps(str(in_json))}, 'utf8'));\n"
+                f"for (const p of {js_list_literal}) {{\n"
+                "  const code = fs.readFileSync(p, 'utf8') + '\\n;globalThis.__main = main;';\n"
+                "  const ctx = { console, globalThis: {} };\n"
+                "  ctx.globalThis = ctx;\n"
+                "  vm.createContext(ctx);\n"
+                "  vm.runInContext(code, ctx);\n"
+                f"  cfg = ctx.__main(cfg, {json.dumps(profile_name)});\n"
+                "}\n"
+                f"fs.writeFileSync({json.dumps(str(out_json))}, JSON.stringify(cfg));\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [node_bin, str(runner_js)],
+                check=True,
+                capture_output=True,
+                timeout=15.0,
+            )
+            new_cfg = json.loads(out_json.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    if not isinstance(new_cfg, dict):
+        return False
+
+    rp_map = new_cfg.get("rule-providers")
+    if isinstance(rp_map, dict):
+        for rp in rp_map.values():
+            if isinstance(rp, dict) and isinstance(rp.get("path"), str):
+                if rp["path"].startswith("./"):
+                    rp["path"] = rp["path"][2:]
+
+    for grp in new_cfg.get("proxy-groups") or []:
+        if not isinstance(grp, dict) or not isinstance(grp.get("proxies"), list):
+            continue
+        if grp.get("name") == "AI-MANUAL" and cur_manual and cur_manual in grp["proxies"]:
+            grp["proxies"] = [cur_manual] + [x for x in grp["proxies"] if x != cur_manual]
+        elif grp.get("name") == "AI-GEMINI" and cur_gemini and cur_gemini in grp["proxies"]:
+            grp["proxies"] = [cur_gemini] + [x for x in grp["proxies"] if x != cur_gemini]
+
+    try:
+        payload_yaml = yaml.safe_dump(new_cfg, allow_unicode=True, sort_keys=False)
+        api.request("PUT", "/configs?force=true", {"path": "", "payload": payload_yaml})
+    except Exception:
+        return False
+
+    if selectors:
+        try:
+            api.restore_selectors(selectors)
+        except Exception:
+            pass
+    try:
+        api.delay_test("H2-KEEPALIVE", "http://cp.cloudflare.com/generate_204", 2000)
+    except Exception:
+        pass
+    return True
+
+
 def install_verge_oneclick(
     paths: AppPaths,
     *,
@@ -387,6 +528,15 @@ def install_verge_oneclick(
         injected_js, chain_enabled = inject_verge_global_script(target_dir)
     except OSError as exc:
         raise RuntimeError(f"无法注入 Clash Verge 全局扩展脚本: {target_dir}: {exc}") from exc
+
+    if verge_dir is None:
+        try:
+            from .ai_watch import has_any_inflight_ai_connection
+
+            if not has_any_inflight_ai_connection(paths, APIBackend(paths)):
+                try_hot_reload_verge_runtime(paths, target_dir)
+        except Exception:
+            pass
 
     return VergeInstallReport(
         config_path=cfg_path,
@@ -608,6 +758,7 @@ class VergeDaemonService:
 
         last_watch_ts = 0.0
         last_rebalance_ts = 0.0
+        last_keepalive_mount_check_ts = 0.0
         ticks = 0
         api = APIBackend(self.paths)
 
@@ -617,6 +768,20 @@ class VergeDaemonService:
                 if eff_keepalive and (keepalive_thread is None or not keepalive_thread.is_alive()):
                     keepalive_thread = self._start_embedded_keepalive_thread()
                 idle_map = sample_connections_activity(self.paths, api, now=now)
+                if eff_keepalive and (now - last_keepalive_mount_check_ts) >= 60.0:
+                    last_keepalive_mount_check_ts = now
+                    try:
+                        from .ai_watch import has_any_inflight_ai_connection
+
+                        gmap = api.get_groups()
+                        if (
+                            "AI-MANUAL" in gmap
+                            and "AI-MANUAL-KEEPALIVE" not in gmap
+                            and not has_any_inflight_ai_connection(self.paths, api)
+                        ):
+                            try_hot_reload_verge_runtime(self.paths)
+                    except Exception:
+                        pass
 
                 due_watch = (now - last_watch_ts) >= watch_sec
                 due_rebalance = (now - last_rebalance_ts) >= rebalance_sec
