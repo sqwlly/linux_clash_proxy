@@ -1015,7 +1015,7 @@ def _render_rounded_table(
 def _sched_phase_bar(task: dict, width: int = 8) -> TableCell:
     if not task.get("active"):
         return ("○" + "─" * (width - 1), (ANSI_DIM,))
-    if task.get("name") == "h2-keepalive":
+    if task.get("name") in ("h2-keepalive", "keepalive-gw"):
         return ("━◆━━◆━━▸", (ANSI_CYAN,))
     ago = task.get("last_ago_sec")
     nxt = task.get("next_in_sec")
@@ -1091,7 +1091,16 @@ def _render_ai_egress_topology(egress_details: dict, gemini_summary: str) -> Non
 
     h2_port = int(h2_info.get("port") or 7895)
     h2_pings = int(h2_info.get("pings_sent") or 0)
-    h2_sess = int(h2_info.get("h2_sessions") or 0)
+    tls_sess = int(
+        h2_info.get("tls_sessions")
+        or (
+            int(h2_info.get("h2_sessions") or 0)
+            + int(h2_info.get("ws_sessions") or 0)
+            + int(h2_info.get("http1_sessions") or 0)
+        )
+    )
+    act_sess = int(h2_info.get("active_sessions") or 0)
+    act_pass = int(h2_info.get("active_passthrough") or 0)
     leaf_raw = gemini_summary.split("->", 1)[-1].strip() if "->" in gemini_summary else gemini_summary
     leaf_clean = _strip_flag_chars(leaf_raw) or "AI-GEMINI 节点"
 
@@ -1112,7 +1121,7 @@ def _render_ai_egress_topology(egress_details: dict, gemini_summary: str) -> Non
     )
     print(
         f"  {b('│')}{_box_cell('  agy 客户端', w1, ANSI_BOLD)}{b('│')}{arr_mid}"
-        f"{b('│')}{_box_cell(f'  H2 保活网关 :{h2_port}', w2, ANSI_BOLD, ANSI_CYAN)}{b('│')}{arr_mid}"
+        f"{b('│')}{_box_cell(f'  H2/WS 保活 :{h2_port}', w2, ANSI_BOLD, ANSI_CYAN)}{b('│')}{arr_mid}"
         f"{b('│')}{_box_cell('  ' + leaf_clean, w3, ANSI_BOLD, ANSI_GREEN)}{b('│')}{arr_mid}"
         f"{b('│')}{_box_cell('  Cloud Code', w4, ANSI_BOLD)}{b('│')}"
     )
@@ -1127,7 +1136,9 @@ def _render_ai_egress_topology(egress_details: dict, gemini_summary: str) -> Non
         f"           {b('╰' + '─' * w3 + '╯')}           {b('╰' + '─' * w4 + '╯')}"
     )
     gauge = _style("█" * 15, ANSI_GREEN) + _style("░", ANSI_DIM)
-    meta = _style(f"(4.5s 心跳 vs 80s 断流阈值 · 护航 {h2_sess} 会话 · 已发 PING ×{h2_pings})", ANSI_DIM)
+    sess_meta = f"TLS接管 {act_sess}活跃/累计{tls_sess} 会话" if act_sess > 0 else f"TLS接管 {tls_sess} 会话"
+    pass_meta = f" · 旧进程直通 {act_pass}活跃" if act_pass > 0 else ""
+    meta = _style(f"(4.5s 心跳 vs 80s 断流阈值 · {sess_meta} · 已发 PING ×{h2_pings}{pass_meta})", ANSI_DIM)
     print(f"{' ' * 39}{b('╰──▸')} 保活裕度  [{gauge}] 94%  {meta}")
 
 

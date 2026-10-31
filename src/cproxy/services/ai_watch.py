@@ -485,6 +485,9 @@ def reap_idle_gemini_connections(
     if not isinstance(connections, list) or not connections:
         return []
 
+    from .h2_keepalive import is_h2_keepalive_running
+
+    keepalive_active = is_h2_keepalive_running(paths.state_dir)
     candidates: list[tuple[str, int, int, str, bool]] = []
     for item in connections:
         if not isinstance(item, dict):
@@ -512,6 +515,10 @@ def reap_idle_gemini_connections(
         leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
         active_leaf = manual_leaf if AI_MANUAL_GROUP in chain_set and manual_leaf else current_leaf
         on_stale_leaf = bool(active_leaf and leaf and leaf != active_leaf)
+        # 当本地 :7895 保活网关在线时，其出站腿以 SOCKS5 协议接入 mihomo（chains 不含 H2-KEEPALIVE），
+        # 由网关自身通过 4.5s/35s H2·WS PING 维护连接池健康；严禁在当前活跃叶子上误杀其底层 Socks5 长连接。
+        if keepalive_active and not on_stale_leaf and str(meta.get("type") or "").lower().startswith("socks5"):
+            continue
         # 在当前活跃叶子上，仅主动回收 Gemini HTTP/2 连接池与轻量化轮询（upload < 18KB），
         # 绝不主动强杀活跃叶子上 codex / claude 的大包长连接（防止多步推理/工具调用间隙断流）
         if not on_stale_leaf and host not in GEMINI_STREAM_HOSTS and upload >= 18_000:

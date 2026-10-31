@@ -42,7 +42,7 @@ install_with_pip() {
 }
 
 install_runtime_dependencies() {
-    local specs=("PyYAML>=6" "requests>=2" "tqdm>=4" "urllib3>=2.7.0" "idna>=3.15")
+    local specs=("PyYAML>=6" "requests>=2" "tqdm>=4" "urllib3>=2.7.0" "idna>=3.15" "h2>=4")
     if [ "${CPROXY_INSTALL_TUI:-1}" != "0" ]; then
         specs+=("textual>=5.0")
     fi

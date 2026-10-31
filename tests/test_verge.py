@@ -918,6 +918,8 @@ def test_h2_keepalive_proxy_e2e_tls_chatgpt_ws_and_generate204(tmp_path):
         ping_interval=0.06,
         idle_ping_interval=10.0,
     )
+    proxy.client_ssl = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+    proxy.client_ssl.set_alpn_protocols(["h2", "http/1.1"])
     proxy.client_ssl_h1 = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
     proxy.client_ssl_h1.set_alpn_protocols(["http/1.1"])
 
@@ -1239,6 +1241,505 @@ def test_try_hot_reload_verge_runtime_compiles_scripts_and_preserves_egress(tmp_
     assert "MITM-LOCAL" not in groups["AI-MANUAL"]["proxies"]
     assert loaded["rule-providers"]["Apple"]["path"] == "ruleset/Apple.yaml"
     assert loaded["rules"][0] == "PROCESS-NAME,steam.exe,DIRECT"
+
+
+def test_keepalive_multi_protocol_telemetry_and_summary(tmp_path, monkeypatch):
+    """验证保活网关对 WS / HTTP1.1 / 旧进程直通的多维活跃与累计统计及摘要展示。"""
+    import asyncio
+    import ssl
+
+    from cproxy.services import h2_keepalive as h2_mod
+    from cproxy.services.h2_keepalive import (
+        H2KeepaliveProxy,
+        h2_keepalive_stats_file,
+        load_h2_keepalive_stats,
+    )
+    from cproxy.services.verge import format_h2_keepalive_summary
+
+    stats_path = h2_keepalive_stats_file(tmp_path)
+    proxy = H2KeepaliveProxy(
+        tmp_path / "tls",
+        install_system_trust=False,
+        require_system_trust=False,
+        ping_interval=0.05,
+        idle_ping_interval=10.0,
+        stats_path=stats_path,
+    )
+    proxy.client_ssl = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+    proxy.client_ssl.set_alpn_protocols(["h2", "http/1.1"])
+    proxy.client_ssl_h1 = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+    proxy.client_ssl_h1.set_alpn_protocols(["http/1.1"])
+
+    upstream_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    upstream_tls.load_cert_chain(
+        certfile=str(tmp_path / "tls" / "cloudcode.crt"),
+        keyfile=str(tmp_path / "tls" / "cloudcode.key"),
+    )
+    upstream_tls.set_alpn_protocols(["http/1.1"])
+
+    prefer_passthrough = {"val": False}
+    monkeypatch.setattr(h2_mod, "client_prefers_passthrough", lambda *_a, **_kw: prefer_passthrough["val"])
+
+    async def _run():
+        hold_pass = asyncio.Event()
+        pass_entered = asyncio.Event()
+
+        async def mock_socks5_upstream(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+            assert await r.readexactly(3) == b"\x05\x01\x00"
+            w.write(b"\x05\x00")
+            await w.drain()
+            await r.readexactly(4)
+            dlen = (await r.readexactly(1))[0]
+            host = (await r.readexactly(dlen)).decode("ascii")
+            await r.readexactly(2)
+            w.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x01\xbb")
+            await w.drain()
+
+            if prefer_passthrough["val"]:
+                data = await r.readexactly(5)
+                assert data == b"hello"
+                pass_entered.set()
+                await hold_pass.wait()
+                w.close()
+                return
+
+            loop = asyncio.get_running_loop()
+            tls_t = await loop.start_tls(w.transport, w._protocol, upstream_tls, server_side=True)
+            w._transport = tls_t
+            r._transport = tls_t
+            w._protocol._over_ssl = True
+
+            req = await r.readuntil(b"\r\n\r\n")
+            if host == "chatgpt.com" and b"Upgrade: websocket" in req:
+                w.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                await w.drain()
+                # Read client frame & wait for injected WS Ping
+                ch2 = await r.readexactly(2)
+                clen = ch2[1] & 0x7F
+                await r.readexactly(4 + clen)
+                ph2 = await r.readexactly(2)
+                assert ph2[0] == 0x89
+                plen = ph2[1] & 0x7F
+                pmask = await r.readexactly(4)
+                pdata = bytes(b ^ pmask[i & 3] for i, b in enumerate(await r.readexactly(plen)))
+                w.write(bytes([0x8A, len(pdata)]) + pdata)
+                reply = b'{"type":"response.completed"}'
+                w.write(bytes([0x81, len(reply)]) + reply)
+                await w.drain()
+                await asyncio.sleep(0.03)
+                w.close()
+            else:
+                w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await w.drain()
+                await asyncio.sleep(0.02)
+                w.close()
+
+        socks_srv = await asyncio.start_server(mock_socks5_upstream, "127.0.0.1", 0)
+        proxy.upstream_port = socks_srv.sockets[0].getsockname()[1]
+        px_srv = await asyncio.start_server(proxy.handle_client, "127.0.0.1", 0)
+        px_port = px_srv.sockets[0].getsockname()[1]
+
+        cctx = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+        cctx.set_alpn_protocols(["http/1.1"])
+        loop = asyncio.get_running_loop()
+
+        # 1) HTTP/1.1 TLS 终结会话 (例如新 agy 会话)
+        cr, cw = await asyncio.open_connection("127.0.0.1", px_port)
+        cw.write(b"CONNECT daily-cloudcode-pa.googleapis.com:443 HTTP/1.1\r\nHost: daily-cloudcode-pa.googleapis.com:443\r\n\r\n")
+        await cw.drain()
+        await cr.readuntil(b"\r\n\r\n")
+        ct = await loop.start_tls(
+            cw.transport, cw._protocol, cctx, server_side=False, server_hostname="daily-cloudcode-pa.googleapis.com"
+        )
+        cw._transport = ct
+        cr._transport = ct
+        cw._protocol._over_ssl = True
+        cw.write(b"GET /v1/ping HTTP/1.1\r\nHost: daily-cloudcode-pa.googleapis.com\r\n\r\n")
+        await cw.drain()
+        await cr.readuntil(b"\r\n\r\n")
+        assert await cr.readexactly(2) == b"ok"
+        cw.close()
+        await asyncio.sleep(0.05)
+
+        # 2) WebSocket 101 保活会话 + Ping 计数 (例如 Codex)
+        wr, ww = await asyncio.open_connection("127.0.0.1", px_port)
+        ww.write(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+        await ww.drain()
+        await wr.readuntil(b"\r\n\r\n")
+        wt = await loop.start_tls(ww.transport, ww._protocol, cctx, server_side=False, server_hostname="chatgpt.com")
+        ww._transport = wt
+        wr._transport = wt
+        ww._protocol._over_ssl = True
+        ww.write(
+            b"GET /backend-api/codex/responses HTTP/1.1\r\n"
+            b"Host: chatgpt.com\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n"
+        )
+        await ww.drain()
+        await wr.readuntil(b"\r\n\r\n")
+        msg = b'{"type":"response.create"}'
+        mkey = b"\x01\x02\x03\x04"
+        masked = bytes(b ^ mkey[i & 3] for i, b in enumerate(msg))
+        ww.write(bytes([0x81, 0x80 | len(msg)]) + mkey + masked)
+        await ww.drain()
+        rh = await wr.readexactly(2)
+        await wr.readexactly(rh[1] & 0x7F)
+        ww.close()
+        await asyncio.sleep(0.05)
+
+        # 3) 旧进程直通：连接存续期间 active_passthrough == 1，断开后归零但保留历史累计
+        prefer_passthrough["val"] = True
+        pr, pw = await asyncio.open_connection("127.0.0.1", px_port)
+        pw.write(b"CONNECT daily-cloudcode-pa.googleapis.com:443 HTTP/1.1\r\nHost: daily-cloudcode-pa.googleapis.com:443\r\n\r\n")
+        await pw.drain()
+        await pr.readuntil(b"\r\n\r\n")
+        pw.write(b"hello")
+        await pw.drain()
+        await asyncio.wait_for(pass_entered.wait(), timeout=2.0)
+
+        live_stats = load_h2_keepalive_stats(tmp_path)
+        assert live_stats["http1_sessions"] == 1
+        assert live_stats["ws_sessions"] == 1
+        assert live_stats["ws_pings_sent"] >= 1
+        assert live_stats["pings_sent"] >= 1
+        assert live_stats["active_passthrough"] == 1
+        assert live_stats["passthrough_sessions"] == 1
+        live_summary = format_h2_keepalive_summary(7895, live_stats)
+        assert "TLS接管 累计2 (WS:1/H1:1)" in live_summary
+        assert "旧进程直通 当前1/累计1" in live_summary
+
+        hold_pass.set()
+        pw.close()
+        await asyncio.sleep(0.05)
+
+        after_stats = load_h2_keepalive_stats(tmp_path)
+        assert after_stats["active_sessions"] == 0
+        assert after_stats["active_passthrough"] == 0
+        assert after_stats["passthrough_sessions"] == 1
+        after_summary = format_h2_keepalive_summary(7895, after_stats)
+        assert "旧进程历史直通 1" in after_summary
+
+        px_srv.close()
+        socks_srv.close()
+
+    asyncio.run(_run())
+
+
+def test_h1_to_h2_upstream_bridge_sse_ping_flow_control_and_socks5_reap_guard(tmp_path, monkeypatch):
+    """验证 agy (HTTP/1.1 over CONNECT) -> 保活网关 (:7895) -> 上游 Google HTTP/2 自动升级桥接与防误杀：
+    1. 客户端仅协商 ALPN http/1.1 时，网关自动对 daily-cloudcode-pa.googleapis.com 发起上游 h2 握手；
+    2. >64KB (120KB) 大包请求体受 H2 流控窗口约束分片上传，收到 WINDOW_UPDATE 后完整送达；
+    3. 收到 HTTP 200 ResponseID 头后的模型长思考静默期内，网关持续发送 HTTP/2 PING 帧 (cproxy01/02...)；
+    4. 上游 H2 SSE 分片零缓冲转为 HTTP/1.1 chunked 回传，且同一客户端连接可继续复用发送第 2 个 chunked 请求；
+    5. ai_watch.reap_idle_gemini_connections 在保活网关在线时绝不误杀当前活跃叶子上的 Socks5 出站长连接，但仍清理旧叶子残留。
+    """
+    import asyncio
+    import ssl
+
+    from h2.config import H2Configuration
+    from h2.connection import H2Connection
+    from h2.events import DataReceived, PingReceived, RequestReceived, StreamEnded
+
+    from cproxy.services import h2_keepalive as h2_mod
+    from cproxy.services.h2_keepalive import (
+        H2KeepaliveProxy,
+        h2_keepalive_stats_file,
+        load_h2_keepalive_stats,
+    )
+
+    stats_path = h2_keepalive_stats_file(tmp_path)
+    proxy = H2KeepaliveProxy(
+        tmp_path / "tls",
+        install_system_trust=False,
+        require_system_trust=False,
+        ping_interval=0.045,
+        idle_ping_interval=10.0,
+        stats_path=stats_path,
+    )
+    proxy.client_ssl = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+    proxy.client_ssl.set_alpn_protocols(["h2", "http/1.1"])
+    proxy.client_ssl_h1 = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+    proxy.client_ssl_h1.set_alpn_protocols(["http/1.1"])
+
+    upstream_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    upstream_tls.load_cert_chain(
+        certfile=str(tmp_path / "tls" / "cloudcode.crt"),
+        keyfile=str(tmp_path / "tls" / "cloudcode.key"),
+    )
+    upstream_tls.set_alpn_protocols(["h2", "http/1.1"])
+    monkeypatch.setattr(h2_mod, "client_prefers_passthrough", lambda *_a, **_kw: False)
+
+    pings_received: list[bytes] = []
+    streams_seen: dict[int, dict[str, object]] = {}
+    large_body = b'{"contents":[{"text":"' + (b"X" * 120_000) + b'"}]}'
+
+    async def _run():
+        async def mock_socks5_h2_upstream(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+            assert await r.readexactly(3) == b"\x05\x01\x00"
+            w.write(b"\x05\x00")
+            await w.drain()
+            await r.readexactly(4)
+            dlen = (await r.readexactly(1))[0]
+            host = (await r.readexactly(dlen)).decode("ascii")
+            assert host == "daily-cloudcode-pa.googleapis.com"
+            await r.readexactly(2)
+            w.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x01\xbb")
+            await w.drain()
+
+            loop = asyncio.get_running_loop()
+            tls_t = await loop.start_tls(w.transport, w._protocol, upstream_tls, server_side=True)
+            w._transport = tls_t
+            r._transport = tls_t
+            w._protocol._over_ssl = True
+            ssl_obj = tls_t.get_extra_info("ssl_object")
+            assert ssl_obj.selected_alpn_protocol() == "h2"
+
+            srv_h2 = H2Connection(config=H2Configuration(client_side=False, header_encoding=None))
+            srv_h2.initiate_connection()
+            w.write(srv_h2.data_to_send())
+            await w.drain()
+            srv_lock = asyncio.Lock()
+
+            async def _respond_sse_stream_1(sid: int):
+                # 先返回 HTTP 200 头与 ResponseID，然后进入长思考静默期，等待网关注入 >= 2 个 H2 PING
+                async with srv_lock:
+                    srv_h2.send_headers(
+                        sid,
+                        [
+                            (b":status", b"200"),
+                            (b"content-type", b"text/event-stream"),
+                            (b"x-goog-ext-response-id", b"resp_h2_ok"),
+                        ],
+                        end_stream=False,
+                    )
+                    w.write(srv_h2.data_to_send())
+                    await w.drain()
+
+                for _ in range(40):
+                    if len(pings_received) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                for chunk in (b'data: {"delta":"hello "}\n\n', b'data: {"delta":"world"}\n\n'):
+                    async with srv_lock:
+                        srv_h2.send_data(sid, chunk, end_stream=False)
+                        w.write(srv_h2.data_to_send())
+                        await w.drain()
+                    await asyncio.sleep(0.01)
+
+                async with srv_lock:
+                    srv_h2.end_stream(sid)
+                    w.write(srv_h2.data_to_send())
+                    await w.drain()
+
+            bg_tasks: list[asyncio.Task[None]] = []
+            try:
+                while True:
+                    raw = await r.read(65536)
+                    if not raw:
+                        break
+                    async with srv_lock:
+                        evs = srv_h2.receive_data(raw)
+                        for ev in evs:
+                            if isinstance(ev, RequestReceived):
+                                streams_seen[ev.stream_id] = {
+                                    "headers": dict(ev.headers),
+                                    "body": bytearray(),
+                                }
+                            elif isinstance(ev, DataReceived):
+                                buf = streams_seen[ev.stream_id]["body"]
+                                assert isinstance(buf, bytearray)
+                                buf.extend(ev.data)
+                                if ev.flow_controlled_length > 0:
+                                    srv_h2.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                            elif isinstance(ev, PingReceived):
+                                pings_received.append(ev.ping_data)
+                            elif isinstance(ev, StreamEnded):
+                                if ev.stream_id == 1:
+                                    bg_tasks.append(asyncio.create_task(_respond_sse_stream_1(1)))
+                                else:
+                                    body_json = b'{"totalTokens":42}'
+                                    srv_h2.send_headers(
+                                        ev.stream_id,
+                                        [
+                                            (b":status", b"200"),
+                                            (b"content-type", b"application/json"),
+                                            (b"content-length", str(len(body_json)).encode("ascii")),
+                                        ],
+                                        end_stream=False,
+                                    )
+                                    srv_h2.send_data(ev.stream_id, body_json, end_stream=True)
+                        out = srv_h2.data_to_send()
+                        if out:
+                            w.write(out)
+                            await w.drain()
+            finally:
+                for bt in bg_tasks:
+                    await asyncio.gather(bt, return_exceptions=True)
+                w.close()
+
+        socks_srv = await asyncio.start_server(mock_socks5_h2_upstream, "127.0.0.1", 0)
+        proxy.upstream_port = socks_srv.sockets[0].getsockname()[1]
+        px_srv = await asyncio.start_server(proxy.handle_client, "127.0.0.1", 0, limit=262144)
+        px_port = px_srv.sockets[0].getsockname()[1]
+
+        # 客户端模拟 Go net/http over HTTPS_PROXY CONNECT：仅协商 http/1.1
+        cctx = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+        cctx.set_alpn_protocols(["http/1.1"])
+        loop = asyncio.get_running_loop()
+
+        cr, cw = await asyncio.open_connection("127.0.0.1", px_port)
+        cw.write(
+            b"CONNECT daily-cloudcode-pa.googleapis.com:443 HTTP/1.1\r\n"
+            b"Host: daily-cloudcode-pa.googleapis.com:443\r\n\r\n"
+        )
+        await cw.drain()
+        connect_resp = await cr.readuntil(b"\r\n\r\n")
+        assert b"200 Connection Established" in connect_resp
+
+        ct = await loop.start_tls(
+            cw.transport,
+            cw._protocol,
+            cctx,
+            server_side=False,
+            server_hostname="daily-cloudcode-pa.googleapis.com",
+        )
+        cw._transport = ct
+        cr._transport = ct
+        cw._protocol._over_ssl = True
+        assert ct.get_extra_info("ssl_object").selected_alpn_protocol() == "http/1.1"
+
+        # 请求 1: 120KB POST + SSE 流式响应 (触发 H2 WINDOW_UPDATE 流控 + 思考期 H2 PING)
+        req1 = (
+            b"POST /v1internal:streamGenerateContent?alt=sse HTTP/1.1\r\n"
+            b"Host: daily-cloudcode-pa.googleapis.com\r\n"
+            b"Connection: keep-alive\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(large_body)}\r\n\r\n".encode("ascii")
+            + large_body
+        )
+        cw.write(req1)
+        await cw.drain()
+
+        resp1_hdr = await cr.readuntil(b"\r\n\r\n")
+        assert resp1_hdr.startswith(b"HTTP/1.1 200 OK\r\n")
+        assert b"transfer-encoding: chunked\r\n" in resp1_hdr.lower()
+        assert b"x-goog-ext-response-id: resp_h2_ok\r\n" in resp1_hdr.lower()
+        assert b"connection: keep-alive\r\n" in resp1_hdr.lower()
+
+        sse_acc = bytearray()
+        while True:
+            sz_line = await cr.readline()
+            sz = int(sz_line.strip(), 16)
+            if sz == 0:
+                assert await cr.readexactly(2) == b"\r\n"
+                break
+            sse_acc.extend(await cr.readexactly(sz))
+            assert await cr.readexactly(2) == b"\r\n"
+        assert bytes(sse_acc) == b'data: {"delta":"hello "}\n\ndata: {"delta":"world"}\n\n'
+
+        # 请求 2: 在同一条 HTTP/1.1 TLS 连接上顺序复用，发送 chunked 请求体并读取定长响应
+        chunk_part = b'{"prompt":"hi"}'
+        req2 = (
+            b"POST /v1internal:countTokens HTTP/1.1\r\n"
+            b"Host: daily-cloudcode-pa.googleapis.com\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+            + f"{len(chunk_part):x}\r\n".encode("ascii")
+            + chunk_part
+            + b"\r\n0\r\n\r\n"
+        )
+        cw.write(req2)
+        await cw.drain()
+
+        resp2_hdr = await cr.readuntil(b"\r\n\r\n")
+        assert resp2_hdr.startswith(b"HTTP/1.1 200 OK\r\n")
+        assert b"content-length: 18\r\n" in resp2_hdr.lower()
+        assert b"connection: close\r\n" in resp2_hdr.lower()
+        resp2_body = await cr.readexactly(18)
+        assert resp2_body == b'{"totalTokens":42}'
+
+        cw.close()
+        await asyncio.sleep(0.05)
+        px_srv.close()
+        socks_srv.close()
+
+    asyncio.run(_run())
+
+    assert bytes(streams_seen[1]["body"]) == large_body  # type: ignore[arg-type]
+    assert streams_seen[1]["headers"][b":path"] == b"/v1internal:streamGenerateContent?alt=sse"  # type: ignore[index]
+    assert bytes(streams_seen[3]["body"]) == b'{"prompt":"hi"}'  # type: ignore[arg-type]
+    assert len(pings_received) >= 2
+    assert pings_received[0] == b"cproxy01"
+    assert pings_received[1] == b"cproxy02"
+
+    final_stats = load_h2_keepalive_stats(tmp_path)
+    assert final_stats["h2_sessions"] == 1
+    assert final_stats["http1_sessions"] == 0
+    assert final_stats["pings_sent"] >= 2
+    assert final_stats["active_sessions"] == 0
+
+    # 验证 ai_watch 在保活网关在线时保护活跃叶子上的 Socks5 出站长连接，同时正常回收旧叶子 Socks5 与直连闲置连接
+    paths = _paths(tmp_path)
+    monkeypatch.setattr("cproxy.services.h2_keepalive.is_h2_keepalive_running", lambda _sd, **_kw: True)
+    monkeypatch.setattr(
+        ai_watch_mod,
+        "get_local_proxy_socket_idle_ms",
+        lambda _port=7890: {
+            "61001": (45_000, 45_000),
+            "61002": (45_000, 45_000),
+            "61003": (45_000, 45_000),
+        },
+    )
+    mock_conns = [
+        {
+            "id": "socks5-active-leaf",
+            "chains": ["🇬🇧英国 01 | 1X", "AI-GEMINI"],
+            "upload": 220_000,
+            "download": 95_000,
+            "metadata": {
+                "type": "Socks5",
+                "host": "daily-cloudcode-pa.googleapis.com",
+                "sourcePort": "61001",
+            },
+        },
+        {
+            "id": "socks5-stale-leaf",
+            "chains": ["🇺🇸美国 02 | 1X", "AI-GEMINI"],
+            "upload": 220_000,
+            "download": 95_000,
+            "metadata": {
+                "type": "Socks5",
+                "host": "daily-cloudcode-pa.googleapis.com",
+                "sourcePort": "61002",
+            },
+        },
+        {
+            "id": "https-direct-idle",
+            "chains": ["🇬🇧英国 01 | 1X", "AI-GEMINI"],
+            "upload": 220_000,
+            "download": 95_000,
+            "metadata": {
+                "type": "HTTPS",
+                "host": "daily-cloudcode-pa.googleapis.com",
+                "sourcePort": "61003",
+            },
+        },
+    ]
+    closed_ids: list[str] = []
+
+    class _GuardAPI:
+        def get_connections(self):
+            return {"connections": mock_conns}
+
+        def close_connection(self, cid: str):
+            closed_ids.append(cid)
+
+    reaped = reap_idle_gemini_connections(paths, _GuardAPI(), current_leaf="🇬🇧英国 01 | 1X")
+    assert reaped == ["socks5-stale-leaf", "https-direct-idle"]
+    assert "socks5-active-leaf" not in closed_ids
+
 
 
 

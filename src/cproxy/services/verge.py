@@ -1230,10 +1230,17 @@ def collect_scheduler_telemetry(
                 DEFAULT_KEEPALIVE_PORT,
                 is_h2_keepalive_running,
                 is_local_ca_trusted,
+                load_h2_keepalive_stats,
             )
 
             if is_h2_keepalive_running(paths.state_dir, port=DEFAULT_KEEPALIVE_PORT):
                 ca_ok = is_local_ca_trusted(paths.data_dir / "tls" / "cproxy-h2-ca.crt")
+                gw_stats = load_h2_keepalive_stats(paths.state_dir)
+                gw_summary = (
+                    format_h2_keepalive_summary(DEFAULT_KEEPALIVE_PORT, gw_stats)
+                    if ca_ok
+                    else f"127.0.0.1:{DEFAULT_KEEPALIVE_PORT} · TCP 直通 (待信任 CA)"
+                )
                 tasks.append(
                     _task_entry(
                         "keepalive-gw",
@@ -1242,7 +1249,7 @@ def collect_scheduler_telemetry(
                         True,
                         heartbeat_age_sec,
                         4.5,
-                        f"127.0.0.1:{DEFAULT_KEEPALIVE_PORT} · {'H2+WS PING 激活' if ca_ok else 'TCP 直通 (待信任 CA)'}",
+                        gw_summary,
                     )
                 )
         except Exception:
@@ -1251,14 +1258,10 @@ def collect_scheduler_telemetry(
     from .h2_keepalive import DEFAULT_KEEPALIVE_PORT, is_h2_keepalive_running, load_h2_keepalive_stats
 
     h2_alive = is_h2_keepalive_running(paths.state_dir)
-    if h2_alive:
+    if h2_alive and not any(t.get("name") == "keepalive-gw" for t in tasks):
         h2_stats = load_h2_keepalive_stats(paths.state_dir)
         h2_updated = float(h2_stats.get("updated_at") or 0.0)
         h2_age = max(0.0, ts - h2_updated) if h2_updated > 0 else None
-        h2_only = int(h2_stats.get("h2_sessions") or 0)
-        h2_pass = int(h2_stats.get("passthrough_sessions") or 0)
-        h2_pings = int(h2_stats.get("pings_sent") or 0)
-        pass_tag = f" (旧会话直通 {h2_pass})" if h2_pass > 0 else ""
         tasks.append(
             {
                 "name": "h2-keepalive",
@@ -1267,7 +1270,7 @@ def collect_scheduler_telemetry(
                 "active": True,
                 "last_ago_sec": round(h2_age, 1) if h2_age is not None else None,
                 "next_in_sec": 4.5,
-                "summary": f"127.0.0.1:{DEFAULT_KEEPALIVE_PORT} · H2保活 {h2_only} / 已发 PING {h2_pings}{pass_tag}",
+                "summary": format_h2_keepalive_summary(DEFAULT_KEEPALIVE_PORT, h2_stats),
             }
         )
 
@@ -1289,6 +1292,40 @@ def collect_scheduler_telemetry(
         "last_verdicts": last_verdicts,
         "tasks": tasks,
     }
+
+
+def format_h2_keepalive_summary(port: int, stats: dict[str, int | float]) -> str:
+    """将保活网关多协议接管与旧进程直通统计格式化为清晰的活跃/累计摘要。"""
+    h2_s = int(stats.get("h2_sessions") or 0)
+    ws_s = int(stats.get("ws_sessions") or 0)
+    h1_s = int(stats.get("http1_sessions") or 0)
+    tls_total = h2_s + ws_s + h1_s
+    pings = int(stats.get("pings_sent") or 0)
+    act_s = int(stats.get("active_sessions") or 0)
+    act_p = int(stats.get("active_passthrough") or 0)
+    tot_p = int(stats.get("passthrough_sessions") or 0)
+
+    proto_parts = [
+        *([f"H2:{h2_s}"] if h2_s > 0 else []),
+        *([f"WS:{ws_s}"] if ws_s > 0 else []),
+        *([f"H1:{h1_s}"] if h1_s > 0 else []),
+    ]
+    if proto_parts:
+        act_prefix = f"{act_s}活跃/" if act_s > 0 else ""
+        tls_part = f"TLS接管 {act_prefix}累计{tls_total} ({'/'.join(proto_parts)})"
+    elif act_s > 0:
+        tls_part = f"TLS接管 {act_s}活跃"
+    else:
+        tls_part = "TLS接管 0"
+
+    if act_p > 0:
+        pass_tag = f" · 旧进程直通 当前{act_p}/累计{tot_p}"
+    elif tot_p > 0:
+        pass_tag = f" · 旧进程历史直通 {tot_p}"
+    else:
+        pass_tag = ""
+
+    return f"127.0.0.1:{port} · {tls_part} · 已发 PING {pings}{pass_tag}"
 
 
 def collect_ai_egress_deep_status(
@@ -1372,11 +1409,20 @@ def collect_ai_egress_deep_status(
         }
         if gname == "AI-GEMINI" and is_h2_keepalive_running(paths.state_dir):
             h2_stats = load_h2_keepalive_stats(paths.state_dir)
+            h2_s = int(h2_stats.get("h2_sessions") or 0)
+            ws_s = int(h2_stats.get("ws_sessions") or 0)
+            h1_s = int(h2_stats.get("http1_sessions") or 0)
             entry["h2_keepalive"] = {
                 "active": True,
                 "port": DEFAULT_KEEPALIVE_PORT,
                 "pings_sent": int(h2_stats.get("pings_sent") or 0),
-                "h2_sessions": int(h2_stats.get("h2_sessions") or 0),
+                "ws_pings_sent": int(h2_stats.get("ws_pings_sent") or 0),
+                "h2_sessions": h2_s,
+                "ws_sessions": ws_s,
+                "http1_sessions": h1_s,
+                "tls_sessions": h2_s + ws_s + h1_s,
+                "active_sessions": int(h2_stats.get("active_sessions") or 0),
+                "active_passthrough": int(h2_stats.get("active_passthrough") or 0),
                 "passthrough_sessions": int(h2_stats.get("passthrough_sessions") or 0),
             }
         details[gname] = entry
