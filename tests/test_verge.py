@@ -733,4 +733,400 @@ def test_windows_agy_exe_old_process_matching_and_python_direct_rule_warning(tmp
     assert any("python.exe,DIRECT" in item for item in rep.remedies)
 
 
+def test_ws_keepalive_ping_injection_pong_absorption_and_large_frame_streaming():
+    """验证 HTTP/1.1 Upgrade: websocket -> 101 Switching Protocols 的 RFC 6455 帧级 Ping 保活：
+    1. >64KB (70KB) 掩码大包客户端帧流式直传且绝不发生帧内插 Ping 破坏；
+    2. 思考静默期自动按 ping_interval 发送掩码 Ping (0x89, cproxy01/02) 并吸收对应 Pong (0x8A)；
+    3. 非 cproxy 前缀的业务 Pong 帧原样透传给客户端；
+    4. 收到 response.completed 终态帧后立即退出高频轮次保活；
+    5. 普通非 WebSocket HTTP/1.1 POST 请求保持零改动直通。
+    """
+    import asyncio
+    import os
+
+    from cproxy.services.h2_keepalive import _forward_http1_or_ws_with_ping
+
+    def _encode_client_ws_frame(opcode: int, payload: bytes) -> bytes:
+        mask = os.urandom(4)
+        plen = len(payload)
+        if plen < 126:
+            hdr = bytes([0x80 | opcode, 0x80 | plen])
+        elif plen < 65536:
+            hdr = bytes([0x80 | opcode, 0x80 | 126]) + plen.to_bytes(2, "big")
+        else:
+            hdr = bytes([0x80 | opcode, 0x80 | 127]) + plen.to_bytes(8, "big")
+        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        return hdr + mask + masked
+
+    def _encode_server_ws_frame(opcode: int, payload: bytes) -> bytes:
+        plen = len(payload)
+        if plen < 126:
+            hdr = bytes([0x80 | opcode, plen])
+        elif plen < 65536:
+            hdr = bytes([0x80 | opcode, 126]) + plen.to_bytes(2, "big")
+        else:
+            hdr = bytes([0x80 | opcode, 127]) + plen.to_bytes(8, "big")
+        return hdr + payload
+
+    async def _read_ws_frame(r: asyncio.StreamReader) -> tuple[int, bytes]:
+        h2 = await r.readexactly(2)
+        opcode = h2[0] & 0x0F
+        masked = bool(h2[1] & 0x80)
+        l7 = h2[1] & 0x7F
+        if l7 == 126:
+            plen = int.from_bytes(await r.readexactly(2), "big")
+        elif l7 == 127:
+            plen = int.from_bytes(await r.readexactly(8), "big")
+        else:
+            plen = l7
+        mkey = await r.readexactly(4) if masked else b""
+        data = await r.readexactly(plen) if plen else b""
+        if masked:
+            data = bytes(b ^ mkey[i & 3] for i, b in enumerate(data))
+        return opcode, data
+
+    async def _run():
+        pings_seen: list[bytes] = []
+        large_prompt = b'{"type":"response.create","input":"' + (b"A" * 70_000) + b'"}'
+
+        async def handle_upstream(up_r: asyncio.StreamReader, up_w: asyncio.StreamWriter):
+            req = await up_r.readuntil(b"\r\n\r\n")
+            assert b"Upgrade: websocket" in req
+            up_w.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n\r\n"
+            )
+            await up_w.drain()
+
+            op, body = await _read_ws_frame(up_r)
+            assert op == 0x01
+            assert body == large_prompt
+
+            # 静默思考期：接收 2 个由代理注入的掩码 Ping 并回复 Pong
+            for _ in range(2):
+                p_op, p_body = await _read_ws_frame(up_r)
+                assert p_op == 0x09
+                pings_seen.append(p_body)
+                up_w.write(_encode_server_ws_frame(0x0A, p_body))
+                await up_w.drain()
+
+            # 发送一个非 cproxy 的业务 Pong，随后发送 response.completed 终态帧
+            up_w.write(_encode_server_ws_frame(0x0A, b"userpong"))
+            completed_json = b'{"type":"response.completed","response":{"id":"resp_ok"}}'
+            up_w.write(_encode_server_ws_frame(0x01, completed_json))
+            await up_w.drain()
+
+            # 终态帧之后进入长空闲阈值 (idle_ping_interval=10s)，短时间内不应再收到高频 Ping
+            await asyncio.sleep(0.18)
+            assert len(pings_seen) == 2
+            up_w.close()
+
+        up_srv = await asyncio.start_server(handle_upstream, "127.0.0.1", 0)
+        up_port = up_srv.sockets[0].getsockname()[1]
+
+        async def handle_proxy_client(c_r: asyncio.StreamReader, c_w: asyncio.StreamWriter):
+            u_r, u_w = await asyncio.open_connection("127.0.0.1", up_port)
+            try:
+                await _forward_http1_or_ws_with_ping(
+                    c_r, c_w, u_r, u_w, ping_interval=0.06, idle_ping_interval=10.0
+                )
+            finally:
+                u_w.close()
+                c_w.close()
+
+        p_srv = await asyncio.start_server(handle_proxy_client, "127.0.0.1", 0)
+        p_port = p_srv.sockets[0].getsockname()[1]
+
+        cr, cw = await asyncio.open_connection("127.0.0.1", p_port)
+        cw.write(
+            b"GET /backend-api/codex/responses HTTP/1.1\r\n"
+            b"Host: chatgpt.com\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n"
+        )
+        await cw.drain()
+        resp = await cr.readuntil(b"\r\n\r\n")
+        assert b"101 Switching Protocols" in resp
+
+        cw.write(_encode_client_ws_frame(0x01, large_prompt))
+        await cw.drain()
+
+        # 客户端只应收到 userpong 与 response.completed，cproxy01/02 的 Pong 已被透明吸收
+        f1_op, f1_body = await _read_ws_frame(cr)
+        f2_op, f2_body = await _read_ws_frame(cr)
+        assert (f1_op, f1_body) == (0x0A, b"userpong")
+        assert f2_op == 0x01 and b'"response.completed"' in f2_body
+        assert pings_seen == [b"cproxy01", b"cproxy02"]
+
+        cw.close()
+        p_srv.close()
+        up_srv.close()
+
+        # 同时验证普通 HTTP/1.1 POST 直通不受影响
+        async def handle_http_upstream(up_r: asyncio.StreamReader, up_w: asyncio.StreamWriter):
+            hdr = await up_r.readuntil(b"\r\n\r\n")
+            assert b"POST /backend-api/codex/responses" in hdr
+            body = await up_r.readexactly(11)
+            assert body == b"hello-codex"
+            up_w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            await up_w.drain()
+            up_w.close()
+
+        h_up = await asyncio.start_server(handle_http_upstream, "127.0.0.1", 0)
+        h_up_port = h_up.sockets[0].getsockname()[1]
+
+        async def handle_http_proxy(c_r: asyncio.StreamReader, c_w: asyncio.StreamWriter):
+            u_r, u_w = await asyncio.open_connection("127.0.0.1", h_up_port)
+            try:
+                await _forward_http1_or_ws_with_ping(c_r, c_w, u_r, u_w, ping_interval=0.05)
+            finally:
+                u_w.close()
+                c_w.close()
+
+        h_px = await asyncio.start_server(handle_http_proxy, "127.0.0.1", 0)
+        h_px_port = h_px.sockets[0].getsockname()[1]
+        hr, hw = await asyncio.open_connection("127.0.0.1", h_px_port)
+        hw.write(b"POST /backend-api/codex/responses HTTP/1.1\r\nHost: chatgpt.com\r\nContent-Length: 11\r\n\r\nhello-codex")
+        await hw.drain()
+        h_resp = await hr.readuntil(b"\r\n\r\n")
+        h_body = await hr.readexactly(2)
+        assert b"200 OK" in h_resp and h_body == b"OK"
+        hw.close()
+        h_px.close()
+        h_up.close()
+
+    asyncio.run(_run())
+
+
+def test_h2_keepalive_proxy_e2e_tls_chatgpt_ws_and_generate204(tmp_path):
+    """端到端验证 H2KeepaliveProxy：
+    1. 多域名 SAN 证书覆盖 chatgpt.com / ws.chatgpt.com / daily-cloudcode-pa.googleapis.com；
+    2. HTTP generate_204 探针返回 204（供 Clash Verge AI-MANUAL-KEEPALIVE fallback 组毫秒级探活）；
+    3. CONNECT chatgpt.com:443 -> TLS 终结 -> SOCKS5 上游 -> TLS -> WebSocket 101 + Ping 保活全链路闭环。
+    """
+    import asyncio
+    import os
+    import ssl
+
+    from cproxy.services.h2_keepalive import H2KeepaliveProxy
+
+    proxy = H2KeepaliveProxy(
+        tmp_path / "tls",
+        install_system_trust=False,
+        require_system_trust=False,
+        ping_interval=0.06,
+        idle_ping_interval=10.0,
+    )
+    proxy.client_ssl_h1 = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+    proxy.client_ssl_h1.set_alpn_protocols(["http/1.1"])
+
+    upstream_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    upstream_tls.load_cert_chain(
+        certfile=str(tmp_path / "tls" / "cloudcode.crt"),
+        keyfile=str(tmp_path / "tls" / "cloudcode.key"),
+    )
+    upstream_tls.set_alpn_protocols(["http/1.1"])
+
+    async def _run():
+        ws_pings: list[bytes] = []
+
+        async def mock_socks5_upstream(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+            # SOCKS5 greeting & CONNECT chatgpt.com:443
+            assert await r.readexactly(3) == b"\x05\x01\x00"
+            w.write(b"\x05\x00")
+            await w.drain()
+            hdr = await r.readexactly(4)
+            assert hdr[:4] == b"\x05\x01\x00\x03"
+            dlen = (await r.readexactly(1))[0]
+            host_bytes = await r.readexactly(dlen)
+            port_bytes = await r.readexactly(2)
+            assert host_bytes == b"chatgpt.com" and int.from_bytes(port_bytes, "big") == 443
+            w.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x01\xbb")
+            await w.drain()
+
+            loop = asyncio.get_running_loop()
+            tls_t = await loop.start_tls(w.transport, w._protocol, upstream_tls, server_side=True)
+            w._transport = tls_t
+            r._transport = tls_t
+            w._protocol._over_ssl = True
+
+            req = await r.readuntil(b"\r\n\r\n")
+            assert b"Upgrade: websocket" in req
+            w.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            await w.drain()
+
+            # Read client text frame: {"type":"response.create"}
+            ch2 = await r.readexactly(2)
+            assert (ch2[0] & 0x0F) == 0x01 and (ch2[1] & 0x80)
+            clen = ch2[1] & 0x7F
+            cmask = await r.readexactly(4)
+            cdata = bytes(b ^ cmask[i & 3] for i, b in enumerate(await r.readexactly(clen)))
+            assert cdata == b'{"type":"response.create"}'
+
+            # Receive injected WebSocket Ping & reply Pong
+            ph2 = await r.readexactly(2)
+            assert ph2[0] == 0x89 and (ph2[1] & 0x80)
+            plen = ph2[1] & 0x7F
+            pmask = await r.readexactly(4)
+            pdata = bytes(b ^ pmask[i & 3] for i, b in enumerate(await r.readexactly(plen)))
+            ws_pings.append(pdata)
+            w.write(bytes([0x8A, len(pdata)]) + pdata)
+
+            reply = b'{"type":"response.completed"}'
+            w.write(bytes([0x81, len(reply)]) + reply)
+            await w.drain()
+            await asyncio.sleep(0.05)
+            w.close()
+
+        socks_srv = await asyncio.start_server(mock_socks5_upstream, "127.0.0.1", 0)
+        proxy.upstream_port = socks_srv.sockets[0].getsockname()[1]
+
+        px_srv = await asyncio.start_server(proxy.handle_client, "127.0.0.1", 0)
+        px_port = px_srv.sockets[0].getsockname()[1]
+
+        # 1. 验证 generate_204 本地毫秒探活
+        gr, gw = await asyncio.open_connection("127.0.0.1", px_port)
+        gw.write(b"GET http://cp.cloudflare.com/generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\n\r\n")
+        await gw.drain()
+        g_resp = await gr.readuntil(b"\r\n\r\n")
+        assert b"204 No Content" in g_resp
+        gw.close()
+
+        # 2. 验证 CONNECT chatgpt.com:443 + ws.chatgpt.com SAN 校验 + WebSocket Ping 保活
+        cli_ctx = ssl.create_default_context(cafile=str(proxy.ca_cert_path))
+        cli_ctx.set_alpn_protocols(["http/1.1"])
+
+        cr, cw = await asyncio.open_connection("127.0.0.1", px_port)
+        cw.write(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+        await cw.drain()
+        c_est = await cr.readuntil(b"\r\n\r\n")
+        assert b"200 Connection Established" in c_est
+
+        loop = asyncio.get_running_loop()
+        c_tls = await loop.start_tls(
+            cw.transport, cw._protocol, cli_ctx, server_side=False, server_hostname="chatgpt.com"
+        )
+        cw._transport = c_tls
+        cr._transport = c_tls
+        cw._protocol._over_ssl = True
+
+        cw.write(
+            b"GET /backend-api/codex/responses HTTP/1.1\r\n"
+            b"Host: chatgpt.com\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n"
+        )
+        await cw.drain()
+        assert b"101 Switching Protocols" in (await cr.readuntil(b"\r\n\r\n"))
+
+        msg = b'{"type":"response.create"}'
+        mkey = os.urandom(4)
+        cw.write(bytes([0x81, 0x80 | len(msg)]) + mkey + bytes(b ^ mkey[i & 3] for i, b in enumerate(msg)))
+        await cw.drain()
+
+        rh2 = await cr.readexactly(2)
+        rbody = await cr.readexactly(rh2[1] & 0x7F)
+        assert (rh2[0] & 0x0F) == 0x01 and rbody == b'{"type":"response.completed"}'
+        assert ws_pings == [b"cproxy01"]
+
+        cw.close()
+        px_srv.close()
+        socks_srv.close()
+
+    asyncio.run(_run())
+
+
+def test_codex_80s_silent_ws_10054_exemption_and_verge_keepalive_topology(tmp_path):
+    """回归保护：
+    1. Codex WebSocket 握手成功 (status=101) 后等待 72~81s 因超大上下文思考或 remote compaction v2
+       触发 os error 10054 / websocket closed by server 时，detect_recent_codex_retry_failure 豁免误切；
+    2. 真实死节点快速断连（如握手后 6s 断连）仍正常触发故障检测；
+    3. 35s 轮次间空闲保活微包 (<=128B) 不会误锁住 has_active_ai_transfer；
+    4. clash-verge-script.js 注入 H2-KEEPALIVE、AI-MANUAL-KEEPALIVE、codex.exe / ChatGPT.exe 规则。
+    """
+    import sqlite3
+    import time
+
+    from cproxy.services.ai_watch import detect_recent_codex_retry_failure
+
+    codex_dir = tmp_path / "codex-10054"
+    codex_dir.mkdir()
+    db_file = codex_dir / "logs_2.sqlite"
+    now_epoch = int(time.time())
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "CREATE TABLE logs ("
+        "id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, level TEXT, target TEXT, feedback_log_body TEXT)"
+    )
+    # 模拟真实的 81.005s 长上下文静默断连 (status=101 -> 81s -> os error 10054)
+    conn.execute(
+        "INSERT INTO logs VALUES (1, ?, 100000000, 'INFO', 'codex_api::endpoint::responses_websocket', "
+        "'successfully connected to Responses WebSocket status=101 Switching Protocols')",
+        (now_epoch - 83,),
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES (2, ?, 105000000, 'WARN', 'codex_core::responses_retry', "
+        "'stream disconnected - retrying sampling request (5/5 in 3.77s)... retries=5 max_retries=5 "
+        "sampling_error=stream disconnected before completion: IO error: 远程主机强迫关闭了一个现有的连接。 (os error 10054)')",
+        (now_epoch - 2,),
+    )
+    conn.commit()
+    conn.close()
+
+    failed_81s, _, _ = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
+    assert failed_81s is False
+
+    # 若仅过 6s 即断连（真实死节点/阻断），仍立即触发自愈切流
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "INSERT INTO logs VALUES (3, ?, 100000000, 'INFO', 'codex_api::endpoint::responses_websocket', "
+        "'successfully connected to Responses WebSocket status=101 Switching Protocols')",
+        (now_epoch - 7,),
+    )
+    conn.execute(
+        "INSERT INTO logs VALUES (4, ?, 200000000, 'WARN', 'codex_core::responses_retry', "
+        "'stream disconnected - retrying sampling request (3/5 in 1.2s)... retries=3 max_retries=5 "
+        "sampling_error=stream disconnected before completion: connection reset')",
+        (now_epoch - 1,),
+    )
+    conn.commit()
+    conn.close()
+
+    failed_fast, _, reason_fast = detect_recent_codex_retry_failure(codex_dir, now=float(now_epoch))
+    assert failed_fast is True
+    assert "connection reset" in reason_fast
+
+    # 验证 35s 轮次间 <=128B 空闲保活心跳不会刷新已闲置连接的活跃时间戳
+    paths = _paths(tmp_path)
+    conns = [
+        {
+            "id": "ws-idle-codex",
+            "chains": ["🇺🇸 United States 02", "AI-MANUAL"],
+            "upload": 150_000,
+            "download": 45_000,
+            "metadata": {"host": "chatgpt.com", "sourcePort": "54321"},
+        }
+    ]
+    t0 = 1_800_000_000.0
+    track_connections_idle_ms(paths, conns, now=t0)
+    # t0 + 40s：已完成轮次进入静默 (>= 35s)
+    idle_40 = track_connections_idle_ms(paths, conns, now=t0 + 40.0)
+    assert min(idle_40["54321"]) >= 39_000
+    # t0 + 43s：发生一次 36B Ping + 32B Pong 空闲保活心跳，连接仍应保持 >= 42s 闲置，不误判为活跃传输
+    conns[0]["upload"] += 36
+    conns[0]["download"] += 32
+    idle_43 = track_connections_idle_ms(paths, conns, now=t0 + 43.0)
+    assert min(idle_43["54321"]) >= 42_000
+
+    # 验证 clash-verge-script.js 注入保活策略组与 Codex 进程/域名规则
+    js = export_verge_script()
+    assert '"AI-MANUAL-KEEPALIVE"' in js
+    assert '"AI-GEMINI-KEEPALIVE"' in js
+    assert '"H2-KEEPALIVE"' in js
+    assert '"PROCESS-NAME,codex.exe,AI-MANUAL"' in js
+    assert '"PROCESS-NAME,ChatGPT.exe,AI-MANUAL"' in js
+
+
+
 

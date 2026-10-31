@@ -86,6 +86,7 @@ AI_STREAM_HOSTS = frozenset(
         "aicode.googleapis.com",
         "antigravity-unleash.goog",
         "chatgpt.com",
+        "ws.chatgpt.com",
         "api.openai.com",
         "api.anthropic.com",
         "claude.ai",
@@ -248,7 +249,19 @@ def track_connections_idle_ms(
                 and (ts_now - turn_ts) <= 180.0
                 and (turn_down < 16_000 or (ts_now - max(snd_ts, rcv_ts)) < 90.0)
             )
-            if delta_up > 0 and delta_down > 0:
+            # WebSocket 轮次间 35s 空闲 Ping/Pong 保活帧（单帧密文 ~32-40B）仅用于防止上游 80s connIdle 断连，
+            # 连接已静默 >= 20s 时不应将其误判为新一轮业务传输，以免永久锁住 has_active_ai_transfer。
+            is_idle_keepalive_heartbeat = (
+                not in_active_turn
+                and download >= 6_000
+                and 0 <= delta_up <= 128
+                and 0 <= delta_down <= 128
+                and (delta_up > 0 or delta_down > 0)
+                and (ts_now - max(snd_ts, rcv_ts)) >= 20.0
+            )
+            if is_idle_keepalive_heartbeat:
+                pass
+            elif delta_up > 0 and delta_down > 0:
                 if not in_active_turn and download >= 6_000 and delta_down >= 1_024:
                     snd_ts = ts_now
                     rcv_ts = ts_now - 0.6
@@ -1075,7 +1088,7 @@ def detect_recent_codex_retry_failure(
             continue
 
         ws_fail_events: list[tuple[float, str]] = []
-        for raw_ts, raw_nanos, target, body in rows:
+        for idx, (raw_ts, raw_nanos, target, body) in enumerate(rows):
             try:
                 event_ts = float(raw_ts) + float(raw_nanos or 0) / 1_000_000_000.0
             except (TypeError, ValueError):
@@ -1112,6 +1125,37 @@ def detect_recent_codex_retry_failure(
                 continue
             if target != "codex_core::responses_retry":
                 continue
+            text_lower = text.lower()
+            if (
+                "stream disconnected before completion" in text_lower
+                and "error sending request" not in text_lower
+                and "tls handshake" not in text_lower
+            ):
+                prev_ws_ok_ts: float | None = None
+                prev_retry_ts: float | None = None
+                for older_idx in range(idx + 1, min(len(rows), idx + 50)):
+                    o_ts, o_nanos, o_target, o_body = rows[older_idx]
+                    try:
+                        older_event_ts = float(o_ts) + float(o_nanos or 0) / 1_000_000_000.0
+                    except (TypeError, ValueError):
+                        continue
+                    o_text = str(o_body or "")
+                    if (
+                        o_target == "codex_api::endpoint::responses_websocket"
+                        and "successfully connected" in o_text
+                    ):
+                        prev_ws_ok_ts = older_event_ts
+                        break
+                    if o_target == "codex_core::responses_retry":
+                        prev_retry_ts = older_event_ts
+                        break
+                # 若 WebSocket 握手 (status=101) 成功后已持续等待 55~180s 才发生断流（如 360k+ 超大上下文非增量上传后
+                # 模型长思考 / remote compaction v2 触发上游 72~81s 静默读超时 / 10054），说明代理节点本身连通性完全正常；
+                # 盲目切流并 drop_connections 只会误杀所有并发会话与污染 1X 节点池。
+                if (prev_ws_ok_ts is not None and 55.0 <= (event_ts - prev_ws_ok_ts) <= 180.0) or (
+                    prev_retry_ts is not None and 65.0 <= (event_ts - prev_retry_ts) <= 180.0
+                ):
+                    break
             if event_ts <= since_ts:
                 break
             age = ts_now - event_ts
@@ -1140,7 +1184,7 @@ def detect_recent_codex_retry_failure(
             m_ret = _CODEX_RETRIES_RE.search(text)
             retries_num = int(m_ret.group(1)) if m_ret else 1
             if retries_num >= 2:
-                m_serr = _CODEX_SAMPLING_ERR_RE.search(text)
+                m_serr = _CODEX_SAMPLING_ERR_RE.search(text) or _CODEX_CONN_ERR_RE.search(text)
                 err_msg = m_serr.group(1).strip() if m_serr else "stream disconnected"
                 candidates.append((event_ts, retries_num, f"retries {retries_num}: {err_msg}"))
                 break

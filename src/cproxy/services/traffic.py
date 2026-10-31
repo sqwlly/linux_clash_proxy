@@ -67,8 +67,11 @@ def _conn_process(conn: dict[str, Any]) -> str:
         process = str(metadata.get("process") or "").strip()
     label = _normalize_process_label(process)
     host = str(metadata.get("host") or "").strip().lower()
-    if host == "daily-cloudcode-pa.googleapis.com" and any(k in label.lower() for k in ("cproxy", "python")):
-        return "agy"
+    if any(k in label.lower() for k in ("cproxy", "python")):
+        if host in ("daily-cloudcode-pa.googleapis.com", "aicode.googleapis.com"):
+            return "agy"
+        if host in ("chatgpt.com", "ws.chatgpt.com", "api.openai.com"):
+            return "codex"
     return label
 
 
@@ -232,7 +235,7 @@ class TrafficService:
                     continue
                 active_ids.add(conn_id)
                 chain, rule, host = _conn_label(conn)
-                if chain == "H2-KEEPALIVE":
+                if chain == "H2-KEEPALIVE" or "H2-KEEPALIVE" in (conn.get("chains") or []):
                     continue
                 download = int(conn.get("download") or 0)
                 upload = int(conn.get("upload") or 0)

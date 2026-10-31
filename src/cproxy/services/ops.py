@@ -22,7 +22,7 @@ AI_HOST_KEYWORDS = (
     "grok", "x.ai",
 )
 AI_KNOWN_PROCESSES = (
-    "agy", "claude", "codex", "gemini", "cursor", "aider", "opencode", "kimi",
+    "agy", "claude", "codex", "chatgpt", "gemini", "cursor", "aider", "opencode", "kimi",
 )
 
 

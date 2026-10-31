@@ -352,8 +352,9 @@ def install_verge_oneclick(
     secret: str | None = None,
     mixed_port: int | None = None,
     verge_dir: Path | None = None,
+    install_ca_trust: bool | None = None,
 ) -> VergeInstallReport:
-    """一键完成 Clash Verge 旁路配置初始化 + 全局扩展脚本自动注入。"""
+    """一键完成 Clash Verge 旁路配置初始化 + 全局扩展脚本自动注入 + 本地 H2/WS 保活证书初始化。"""
     detected = discover_clash_verge_config(verge_dir)
     target_dir = verge_dir or detected.source_dir
     if target_dir is None or not target_dir.is_dir():
@@ -368,6 +369,19 @@ def install_verge_oneclick(
     )
     fallback_js = paths.config_dir / "clash-verge-script.js"
     export_verge_script(fallback_js)
+
+    eff_ca_trust = (verge_dir is None) if install_ca_trust is None else bool(install_ca_trust)
+    if eff_ca_trust:
+        try:
+            from .h2_keepalive import ensure_local_ca_and_leaf_cert
+
+            ensure_local_ca_and_leaf_cert(
+                paths.data_dir / "tls",
+                install_system_trust=True,
+                allow_user_prompt=True,
+            )
+        except Exception:
+            pass
 
     try:
         injected_js, chain_enabled = inject_verge_global_script(target_dir)
@@ -529,6 +543,50 @@ class VergeDaemonService:
         )
         return report
 
+    def _start_embedded_keepalive_thread(self) -> Any:
+        import asyncio
+        import threading
+
+        from .h2_keepalive import (
+            DEFAULT_KEEPALIVE_PORT,
+            h2_keepalive_pid_file,
+            is_h2_keepalive_running,
+            is_windows_admin,
+            run_h2_keepalive_server,
+        )
+
+        if is_h2_keepalive_running(self.paths.state_dir, port=DEFAULT_KEEPALIVE_PORT):
+            return None
+
+        cfg = read_config(self.paths)
+        try:
+            mixed_port = int(cfg.get("mixed-port") or DEFAULT_VERGE_MIXED_PORT)
+        except (TypeError, ValueError):
+            mixed_port = DEFAULT_VERGE_MIXED_PORT
+
+        tls_dir = self.paths.data_dir / "tls"
+        pid_path = h2_keepalive_pid_file(self.paths.state_dir)
+
+        def _worker() -> None:
+            try:
+                asyncio.run(
+                    run_h2_keepalive_server(
+                        tls_dir,
+                        listen_port=DEFAULT_KEEPALIVE_PORT,
+                        upstream_port=mixed_port,
+                        pid_path=pid_path,
+                        install_system_trust=is_windows_admin(),
+                        allow_user_prompt=False,
+                        require_system_trust=True,
+                    )
+                )
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=_worker, name="cproxy-keepalive-gw", daemon=True)
+        thread.start()
+        return thread
+
     def run_daemon(
         self,
         *,
@@ -537,12 +595,16 @@ class VergeDaemonService:
         sample_interval: float = 3.0,
         dry_run: bool = False,
         max_ticks: int | None = None,
+        enable_keepalive: bool | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         on_tick: Callable[[VergeTickReport], None] | None = None,
     ) -> int:
         watch_sec = max(5.0, float(watch_interval))
         rebalance_sec = max(60.0, float(rebalance_interval))
         sample_sec = max(1.0, min(float(sample_interval), watch_sec))
+
+        eff_keepalive = (max_ticks is None and not dry_run) if enable_keepalive is None else bool(enable_keepalive)
+        keepalive_thread = self._start_embedded_keepalive_thread() if eff_keepalive else None
 
         last_watch_ts = 0.0
         last_rebalance_ts = 0.0
@@ -552,6 +614,8 @@ class VergeDaemonService:
         try:
             while max_ticks is None or ticks < max_ticks:
                 now = time.time()
+                if eff_keepalive and (keepalive_thread is None or not keepalive_thread.is_alive()):
+                    keepalive_thread = self._start_embedded_keepalive_thread()
                 idle_map = sample_connections_activity(self.paths, api, now=now)
 
                 due_watch = (now - last_watch_ts) >= watch_sec
@@ -996,6 +1060,28 @@ def collect_scheduler_telemetry(
                 f"跟踪活跃连接 {int(daemon_state.get('sampled_connections') or 0)} 条",
             )
         )
+        try:
+            from .h2_keepalive import (
+                DEFAULT_KEEPALIVE_PORT,
+                is_h2_keepalive_running,
+                is_local_ca_trusted,
+            )
+
+            if is_h2_keepalive_running(paths.state_dir, port=DEFAULT_KEEPALIVE_PORT):
+                ca_ok = is_local_ca_trusted(paths.data_dir / "tls" / "cproxy-h2-ca.crt")
+                tasks.append(
+                    _task_entry(
+                        "keepalive-gw",
+                        "verge-keepalive-gateway",
+                        "4.5s/35s",
+                        True,
+                        heartbeat_age_sec,
+                        4.5,
+                        f"127.0.0.1:{DEFAULT_KEEPALIVE_PORT} · {'H2+WS PING 激活' if ca_ok else 'TCP 直通 (待信任 CA)'}",
+                    )
+                )
+        except Exception:
+            pass
 
     return {
         "configured": configured,
@@ -1127,6 +1213,7 @@ def check_verge_effectiveness(
     groups_present: list[str] = []
     missing_groups: list[str] = list(REQUIRED_VERGE_GROUPS)
     topology_ok = False
+    keepalive_groups_mounted = False
     rules_ok = False
     python_direct_preempts_ai = False
     ai_manual_rules_count = 0
@@ -1146,6 +1233,9 @@ def check_verge_effectiveness(
             groups_present = [g for g in REQUIRED_VERGE_GROUPS if g in groups_map]
             missing_groups = [g for g in REQUIRED_VERGE_GROUPS if g not in groups_map]
             topology_ok = len(missing_groups) == 0
+            keepalive_groups_mounted = (
+                "AI-MANUAL-KEEPALIVE" in groups_map and "AI-GEMINI-KEEPALIVE" in groups_map
+            )
 
             # 统计当前活跃连接数
             conn_counts: dict[str, int] = {"AI-MANUAL": 0, "AI-GEMINI": 0}
@@ -1204,10 +1294,10 @@ def check_verge_effectiveness(
                 proxy_target = str(r.get("proxy") or "")
                 rtype = str(r.get("type") or "").lower().replace("-", "")
                 payload = str(r.get("payload") or "").strip().lower()
-                if proxy_target == "AI-MANUAL":
+                if proxy_target in ("AI-MANUAL", "AI-MANUAL-KEEPALIVE"):
                     ai_manual_rules_count += 1
                     seen_ai_rule = True
-                elif proxy_target == "AI-GEMINI":
+                elif proxy_target in ("AI-GEMINI", "AI-GEMINI-KEEPALIVE"):
                     ai_gemini_rules_count += 1
                     seen_ai_rule = True
                 elif (
@@ -1259,11 +1349,21 @@ def check_verge_effectiveness(
                 "内核内存中尚未挂载 AI-MANUAL / AI-GEMINI 策略组或分流规则："
                 "请在 Clash Verge 界面点击一次「订阅 (Profiles) -> 刷新」，或确认「脚本 (Script)」已启用。"
             )
-        elif python_direct_preempts_ai:
-            remedies.append(
-                "检测到订阅局部脚本在 AI 规则前注入了 `PROCESS-NAME,python.exe,DIRECT`："
-                "后台 `cproxy-daemon.exe` 不受影响，但终端直接执行 `cproxy verge once` / `ai-watch` 探测会被强制直连超时。"
+        else:
+            keepalive_gw_active = any(
+                isinstance(t, dict) and t.get("name") == "keepalive-gw"
+                for t in (telemetry.get("tasks") or [])
             )
+            if keepalive_gw_active and not keepalive_groups_mounted:
+                remedies.append(
+                    "本地 H2+WebSocket 保活网关 (127.0.0.1:7895) 已就绪，但内核尚未加载新版保活策略组 "
+                    "(AI-MANUAL-KEEPALIVE)：请在 Clash Verge 界面点击一次「订阅 -> 刷新」以激活防 10054 保活链路。"
+                )
+            if python_direct_preempts_ai:
+                remedies.append(
+                    "检测到订阅局部脚本在 AI 规则前注入了 `PROCESS-NAME,python.exe,DIRECT`："
+                    "后台 `cproxy-daemon.exe` 不受影响，但终端直接执行 `cproxy verge once` / `ai-watch` 探测会被强制直连超时。"
+                )
         for eg in egress_list:
             if eg.present and eg.is_iepl:
                 remedies.append(

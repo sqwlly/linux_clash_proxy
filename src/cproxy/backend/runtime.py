@@ -62,7 +62,7 @@ AI_CONFLICT_KEYWORDS = frozenset((
     "claude", "claudeusercontent", "gemini", "copilot", "grok",
     "google", "antigravity",
 ))
-AI_PROCESS_NAMES = frozenset(("agy", "agy.exe"))
+AI_PROCESS_NAMES = frozenset(("agy", "agy.exe", "codex", "codex.exe", "chatgpt.exe"))
 
 
 def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
@@ -87,7 +87,8 @@ def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
     else:
         return False
     # 末段为目标组（no-resolve 等修饰符位于中间）
-    allowed = AI_POLICY_GROUPS if ai_group in AI_POLICY_GROUPS else frozenset({ai_group})
+    keepalive_targets = frozenset({"H2-KEEPALIVE", "AI-MANUAL-KEEPALIVE", "AI-GEMINI-KEEPALIVE"})
+    allowed = (AI_POLICY_GROUPS | keepalive_targets) if ai_group in AI_POLICY_GROUPS else frozenset({ai_group})
     return hit and parts[-1] not in allowed
 
 EMOJI_REGION_GROUPS = frozenset({AI_REGION_JP, AI_REGION_US, AI_REGION_SG})
@@ -1485,6 +1486,10 @@ class RuntimeBackend:
             data["proxies"] = raw_proxies
 
         h2_keepalive_rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE"
+        codex_keepalive_rule = (
+            "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),"
+            "(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE"
+        )
         ai_rules = [
             # Google / Gemini / Antigravity —— 必须排在 PROCESS-NAME,agy 之前，
             # 否则 agy 全部出站被 AI-MANUAL（美日新）吃掉，Gemini 仍 400。
@@ -1504,12 +1509,16 @@ class RuntimeBackend:
             f"DOMAIN-KEYWORD,antigravity,{AI_GEMINI_GROUP}",
             f"DOMAIN-KEYWORD,gemini,{AI_GEMINI_GROUP}",
             f"DOMAIN-SUFFIX,goog,{AI_GEMINI_GROUP}",
-            # agy 非 Google 出站（github / playwright CDN 等）仍走通用 AI 出口；
+            *([codex_keepalive_rule] if h2_keepalive_active else []),
+            # agy / codex / ChatGPT 非专属域名出站仍走通用 AI 出口；
             # 热更新后旧会话的二进制名变成 agy.<timestamp>.old，用正则一并兜底
             f"PROCESS-NAME,agy,{AI_MANUAL_GROUP}",
             f"PROCESS-NAME,agy.exe,{AI_MANUAL_GROUP}",
             f"PROCESS-NAME-REGEX,^agy\\.[0-9]+\\.old,{AI_MANUAL_GROUP}",
             f"PROCESS-NAME-REGEX,^agy\\.exe\\.[0-9]+\\.old,{AI_MANUAL_GROUP}",
+            f"PROCESS-NAME,codex,{AI_MANUAL_GROUP}",
+            f"PROCESS-NAME,codex.exe,{AI_MANUAL_GROUP}",
+            f"PROCESS-NAME,ChatGPT.exe,{AI_MANUAL_GROUP}",
             # OpenAI
             f"DOMAIN-SUFFIX,openai.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,chatgpt.com,{AI_MANUAL_GROUP}",
@@ -1566,6 +1575,7 @@ class RuntimeBackend:
             # 末尾 no-resolve 版本已兜底
             "GEOIP,CN,DIRECT",
             h2_keepalive_rule,
+            codex_keepalive_rule,
         }
 
         clean_rules = [

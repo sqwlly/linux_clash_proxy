@@ -6,6 +6,8 @@
 // 4. 剔除订阅冲突 AI 规则，置顶注入 Google/Gemini/Cloud Code 与 OpenAI/Codex/Claude 分流规则
 
 const TEST_URL = "https://cp.cloudflare.com/generate_204";
+const KEEPALIVE_TEST_URL = "http://cp.cloudflare.com/generate_204";
+const DEFAULT_KEEPALIVE_PORT = 7895;
 const DEFAULT_MAX_AI_MULTIPLIER = 3.0;
 const STAGGERED_AUTO_INTERVALS = [317, 323, 331, 337, 347, 349, 353, 359];
 const AI_GEMINI_REGION_ORDER = ["KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU"];
@@ -47,6 +49,12 @@ const AI_CONFLICT_KEYWORDS = new Set([
 
 function isPanelInfoNode(name) {
   return !name || PANEL_INFO_RE.test(String(name));
+}
+
+function isLocalLoopbackProxy(proxy) {
+  if (!proxy || typeof proxy !== "object") return false;
+  const srv = String(proxy.server || "").trim().toLowerCase();
+  return srv === "127.0.0.1" || srv === "localhost" || srv === "::1";
 }
 
 function matchRegion(name) {
@@ -175,12 +183,12 @@ function isAiConflictRule(rule) {
   } else if (rtype === "DOMAIN-KEYWORD") {
     hit = AI_CONFLICT_KEYWORDS.has(domain);
   } else if (rtype === "PROCESS-NAME" || rtype === "PROCESS-NAME-REGEX") {
-    hit = domain === "agy" || domain === "agy.exe" || domain.startsWith("^agy");
+    hit = ["agy", "agy.exe", "codex", "codex.exe", "chatgpt.exe"].includes(domain) || domain.startsWith("^agy");
   } else {
     return false;
   }
   const target = parts[parts.length - 1];
-  return hit && !["AI-MANUAL", "AI-GEMINI", "AI-AUTO"].includes(target);
+  return hit && !["AI-MANUAL", "AI-GEMINI", "AI-AUTO", "AI-MANUAL-KEEPALIVE", "AI-GEMINI-KEEPALIVE", "H2-KEEPALIVE"].includes(target);
 }
 
 function normalizeIpCidrRule(rule) {
@@ -216,7 +224,10 @@ function main(config) {
   if (!config["keep-alive-interval"]) config["keep-alive-interval"] = 15;
 
   // 3. 按地区分桶并执行非 IEPL/非裸 Vision 优先排序
-  const proxies = Array.isArray(config.proxies) ? config.proxies : [];
+  const rawProxiesList = Array.isArray(config.proxies)
+    ? config.proxies.filter(p => !(p && typeof p === "object" && p.name === "H2-KEEPALIVE"))
+    : [];
+  const proxies = rawProxiesList;
   const proxyMap = new Map();
   for (const p of proxies) {
     if (p && p.name) proxyMap.set(String(p.name), p);
@@ -227,7 +238,7 @@ function main(config) {
     buckets.set(code, []);
   }
   for (const p of proxies) {
-    if (!p || !p.name) continue;
+    if (!p || !p.name || isLocalLoopbackProxy(p)) continue;
     const name = String(p.name);
     if (isPanelInfoNode(name)) continue;
     const code = matchRegion(name);
@@ -239,7 +250,10 @@ function main(config) {
   }
 
   const allValidNodes = preferNonIeplNodes(
-    proxies.map(p => p && String(p.name || "")).filter(n => n && !isPanelInfoNode(n)),
+    proxies
+      .filter(p => p && p.name && !isLocalLoopbackProxy(p))
+      .map(p => String(p.name))
+      .filter(n => n && !isPanelInfoNode(n)),
     proxyMap
   );
 
@@ -288,15 +302,49 @@ function main(config) {
   manualLeaves = deprioritizeHighMultiplier(preferNonIeplNodes(manualLeaves, proxyMap));
   const manualCandidates = [...manualLeaves, "AI-AUTO"];
 
+  config.proxies = [
+    ...rawProxiesList,
+    {
+      name: "H2-KEEPALIVE",
+      type: "http",
+      server: "127.0.0.1",
+      port: DEFAULT_KEEPALIVE_PORT,
+    },
+  ];
+
   const aiGroups = [
     { name: "AI-US", type: "fallback", proxies: usProxies, url: TEST_URL, interval: 283 },
     { name: "AI-SG", type: "fallback", proxies: sgProxies, url: TEST_URL, interval: 293 },
     { name: "AI-AUTO", type: "fallback", proxies: ["AI-US", "AI-SG"], url: TEST_URL, interval: 307 },
     { name: "AI-MANUAL", type: "fallback", proxies: manualCandidates, url: TEST_URL, interval: 300 },
     { name: "AI-GEMINI", type: "fallback", proxies: geminiProxies, url: TEST_URL, interval: 313 },
+    {
+      name: "AI-MANUAL-KEEPALIVE",
+      type: "fallback",
+      proxies: ["H2-KEEPALIVE", "AI-MANUAL"],
+      url: KEEPALIVE_TEST_URL,
+      interval: 15,
+      lazy: false,
+    },
+    {
+      name: "AI-GEMINI-KEEPALIVE",
+      type: "fallback",
+      proxies: ["H2-KEEPALIVE", "AI-GEMINI"],
+      url: KEEPALIVE_TEST_URL,
+      interval: 15,
+      lazy: false,
+    },
   ];
 
-  const managedNames = new Set(["AI-US", "AI-SG", "AI-AUTO", "AI-MANUAL", "AI-GEMINI"]);
+  const managedNames = new Set([
+    "AI-US",
+    "AI-SG",
+    "AI-AUTO",
+    "AI-MANUAL",
+    "AI-GEMINI",
+    "AI-MANUAL-KEEPALIVE",
+    "AI-GEMINI-KEEPALIVE",
+  ]);
   const rawGroups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
   const filteredGroups = rawGroups.filter(g => g && !managedNames.has(String(g.name || "")));
 
@@ -322,9 +370,15 @@ function main(config) {
   config["proxy-groups"] = [...aiGroups, ...filteredGroups];
 
   // 6. 置顶注入 AI 与大流量下载直连规则，剔除订阅冲突规则
+  const geminiKeepaliveRule =
+    "AND,((OR,((DOMAIN,daily-cloudcode-pa.googleapis.com),(DOMAIN,aicode.googleapis.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),AI-GEMINI-KEEPALIVE";
+  const codexKeepaliveRule =
+    "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN))),(NOT,((OR,((PROCESS-NAME,chrome.exe),(PROCESS-NAME,msedge.exe),(PROCESS-NAME,firefox.exe),(PROCESS-NAME,brave.exe)))))),AI-MANUAL-KEEPALIVE";
+
   const aiRules = [
     "DOMAIN-SUFFIX,google.com,AI-GEMINI",
     "DOMAIN,play.googleapis.com,REJECT",
+    geminiKeepaliveRule,
     "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI",
     "DOMAIN-SUFFIX,googleusercontent.com,AI-GEMINI",
     "DOMAIN-SUFFIX,gstatic.com,AI-GEMINI",
@@ -333,10 +387,14 @@ function main(config) {
     "DOMAIN-KEYWORD,antigravity,AI-GEMINI",
     "DOMAIN-KEYWORD,gemini,AI-GEMINI",
     "DOMAIN-SUFFIX,goog,AI-GEMINI",
+    codexKeepaliveRule,
     "PROCESS-NAME,agy,AI-MANUAL",
     "PROCESS-NAME,agy.exe,AI-MANUAL",
     "PROCESS-NAME-REGEX,^agy\\.[0-9]+\\.old,AI-MANUAL",
     "PROCESS-NAME-REGEX,^agy\\.exe\\.[0-9]+\\.old,AI-MANUAL",
+    "PROCESS-NAME,codex,AI-MANUAL",
+    "PROCESS-NAME,codex.exe,AI-MANUAL",
+    "PROCESS-NAME,ChatGPT.exe,AI-MANUAL",
     "DOMAIN-SUFFIX,openai.com,AI-MANUAL",
     "DOMAIN-SUFFIX,chatgpt.com,AI-MANUAL",
     "DOMAIN-SUFFIX,oaistatic.com,AI-MANUAL",
