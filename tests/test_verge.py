@@ -1741,6 +1741,333 @@ def test_h1_to_h2_upstream_bridge_sse_ping_flow_control_and_socks5_reap_guard(tm
     assert "socks5-active-leaf" not in closed_ids
 
 
+def test_h2_keepalive_default_intervals_strike_cap_and_sse_boundary_heartbeat(tmp_path):
+    """验证：
+    1. 生产默认参数将 WebSocket (4.5s) 与 HTTP/2 (25.0s) PING 周期解耦；
+    2. 面对 Google GFE 连续第 23 个无数据 PING 触发 `GOAWAY(ENHANCE_YOUR_CALM, too_many_pings)` 的硬限制，
+       网关严格在 `H2_MAX_PINGS_WITHOUT_DATA` (18) 封顶，收到 `DATA` 后自动清零预算继续保活；
+    3. `PingAckReceived` 驱动的下游 SSE 空事件心跳仅在完整事件边界 (`\\n\\n`) 注入，半行事件绝不插字节破坏帧语法。
+    """
+    import asyncio
+
+    from h2.config import H2Configuration
+    from h2.connection import H2Connection
+    from h2.errors import ErrorCodes
+    from h2.events import DataReceived, PingReceived, RequestReceived, StreamEnded
+
+    from cproxy.services.h2_keepalive import (
+        H2_MAX_PINGS_WITHOUT_DATA,
+        H2_PING_INTERVAL_SEC,
+        PING_INTERVAL_SEC,
+        SSE_DOWNSTREAM_KEEPALIVE_SEC,
+        H2KeepaliveProxy,
+        _bridge_http1_client_to_h2_upstream,
+    )
+
+    default_proxy = H2KeepaliveProxy(
+        tmp_path / "tls",
+        install_system_trust=False,
+        require_system_trust=False,
+    )
+    assert default_proxy.ping_interval == PING_INTERVAL_SEC == 4.5
+    assert default_proxy.h2_ping_interval == H2_PING_INTERVAL_SEC == 25.0
+    assert default_proxy.sse_keepalive_interval == SSE_DOWNSTREAM_KEEPALIVE_SEC == 45.0
+
+    pings_per_epoch: list[int] = [0]
+    too_many_pings_triggered = False
+
+    async def _run():
+        nonlocal too_many_pings_triggered
+
+        c2p_r, c2p_w = asyncio.StreamReader(), None
+        # 使用真实本地 loopback TCP 管道连接 client <-> bridge <-> mock GFE H2 server
+        bridge_tasks: list[asyncio.Task[None]] = []
+
+        async def mock_gfe_h2(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+            nonlocal too_many_pings_triggered
+            srv = H2Connection(config=H2Configuration(client_side=False, header_encoding=None))
+            srv.initiate_connection()
+            w.write(srv.data_to_send())
+            await w.drain()
+            srv_lock = asyncio.Lock()
+            pings_since_data = 0
+
+            async def _drive_sse(sid: int):
+                nonlocal pings_since_data
+                # 阶段 1: 发送 200 OK SSE 头（处于事件边界），静默超过 26 个 ping 周期
+                async with srv_lock:
+                    pings_since_data = 0
+                    srv.send_headers(
+                        sid,
+                        [(b":status", b"200"), (b"content-type", b"text/event-stream; charset=utf-8")],
+                        end_stream=False,
+                    )
+                    w.write(srv.data_to_send())
+                    await w.drain()
+
+                await asyncio.sleep(0.58)
+                epoch1_pings = pings_per_epoch[-1]
+                assert epoch1_pings == H2_MAX_PINGS_WITHOUT_DATA
+
+                # 阶段 2: 发送半行 SSE 数据（非 \n\n 边界），等待若干 ping 周期：
+                # 预算必须因 DATA 清零重计，但下游绝不能在半行中间注入 `\n\n` 心跳！
+                pings_per_epoch.append(0)
+                async with srv_lock:
+                    pings_since_data = 0
+                    srv.send_data(sid, b'data: {"part":', end_stream=False)
+                    w.write(srv.data_to_send())
+                    await w.drain()
+
+                await asyncio.sleep(0.14)
+
+                # 阶段 3: 补齐后半行并闭合流
+                async with srv_lock:
+                    pings_since_data = 0
+                    srv.send_data(sid, b"1}\n\n", end_stream=True)
+                    w.write(srv.data_to_send())
+                    await w.drain()
+
+            bg: list[asyncio.Task[None]] = []
+            try:
+                while True:
+                    raw = await r.read(65536)
+                    if not raw:
+                        break
+                    async with srv_lock:
+                        for ev in srv.receive_data(raw):
+                            if isinstance(ev, (RequestReceived, DataReceived)):
+                                pings_since_data = 0
+                            elif isinstance(ev, PingReceived):
+                                pings_since_data += 1
+                                pings_per_epoch[-1] += 1
+                                if pings_since_data >= 23:
+                                    too_many_pings_triggered = True
+                                    srv.close_connection(
+                                        error_code=ErrorCodes.ENHANCE_YOUR_CALM,
+                                        additional_data=b"too_many_pings",
+                                    )
+                            elif isinstance(ev, StreamEnded) and ev.stream_id == 1:
+                                bg.append(asyncio.create_task(_drive_sse(1)))
+                        out = srv.data_to_send()
+                        if out:
+                            w.write(out)
+                            await w.drain()
+                        if too_many_pings_triggered:
+                            break
+            finally:
+                for t in bg:
+                    await asyncio.gather(t, return_exceptions=True)
+                w.close()
+
+        gfe_srv = await asyncio.start_server(mock_gfe_h2, "127.0.0.1", 0)
+        gfe_port = gfe_srv.sockets[0].getsockname()[1]
+
+        async def bridge_handler(cr: asyncio.StreamReader, cw: asyncio.StreamWriter):
+            ur, uw = await asyncio.open_connection("127.0.0.1", gfe_port)
+            t = asyncio.current_task()
+            if t is not None:
+                bridge_tasks.append(t)
+            try:
+                await _bridge_http1_client_to_h2_upstream(
+                    cr,
+                    cw,
+                    ur,
+                    uw,
+                    target_host="daily-cloudcode-pa.googleapis.com",
+                    ping_interval=0.02,
+                    idle_ping_interval=10.0,
+                    sse_keepalive_interval=0.05,
+                )
+            finally:
+                cw.close()
+                uw.close()
+
+        br_srv = await asyncio.start_server(bridge_handler, "127.0.0.1", 0)
+        br_port = br_srv.sockets[0].getsockname()[1]
+
+        cr, cw = await asyncio.open_connection("127.0.0.1", br_port)
+        cw.write(
+            b"POST /v1internal:streamGenerateContent?alt=sse HTTP/1.1\r\n"
+            b"Host: daily-cloudcode-pa.googleapis.com\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: 2\r\n\r\n{}"
+        )
+        await cw.drain()
+
+        hdr = await cr.readuntil(b"\r\n\r\n")
+        assert hdr.startswith(b"HTTP/1.1 200 OK\r\n")
+
+        chunks: list[bytes] = []
+        while True:
+            sz_line = await cr.readline()
+            assert sz_line, "Expected clean chunked terminator 0\\r\\n\\r\\n, got unexpected EOF"
+            sz = int(sz_line.strip(), 16)
+            if sz == 0:
+                assert await cr.readexactly(2) == b"\r\n"
+                break
+            chunks.append(await cr.readexactly(sz))
+            assert await cr.readexactly(2) == b"\r\n"
+
+        cw.close()
+        br_srv.close()
+        gfe_srv.close()
+        if bridge_tasks:
+            await asyncio.gather(*bridge_tasks, return_exceptions=True)
+
+        assert not too_many_pings_triggered
+        # 阶段 1 封顶 18 次；阶段 2 收到 DATA 后重置计数并继续发送新 PING
+        assert pings_per_epoch[0] == H2_MAX_PINGS_WITHOUT_DATA
+        assert pings_per_epoch[1] >= 2
+        # 阶段 1 在事件边界至少注入过一次 `\n\n` 心跳；阶段 2 半行期间绝不插入 `\n\n` 打断 JSON 行
+        assert b"\n\n" in chunks
+        full_sse = b"".join(chunks)
+        assert b'data: {"part":1}\n\n' in full_sse
+        assert full_sse.strip(b"\n") == b'data: {"part":1}'
+
+    asyncio.run(_run())
+
+
+def test_h1_to_h2_graceful_goaway_drains_inflight_sse_without_eof():
+    """验证上游在流式响应中途发送优雅 `GOAWAY(NO_ERROR, last_stream_id=1)`（独立包及与 DATA+END_STREAM 粘包两种情形）时：
+    1. `pinger()` 立即停止发 PING 且不会取消正在收尾的 `u2c()`；
+    2. `_GracefulClientH2Connection` 不会因 `ConnectionState.CLOSED` 抛 `ProtocolError` 丢弃在途 `DATA`；
+    3. 下游客户端完整收到全部 SSE 事件与 `0\\r\\n\\r\\n`，零 `unexpected EOF`。
+    """
+    import asyncio
+
+    from h2.config import H2Configuration
+    from h2.connection import H2Connection
+    from h2.events import PingReceived, StreamEnded
+    from hyperframe.frame import DataFrame, GoAwayFrame
+
+    from cproxy.services.h2_keepalive import _bridge_http1_client_to_h2_upstream
+
+    async def _run_case(coalesced: bool) -> tuple[bytes, int]:
+        pings_after_goaway = 0
+        goaway_sent = False
+
+        async def mock_upstream(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+            nonlocal pings_after_goaway, goaway_sent
+            srv = H2Connection(config=H2Configuration(client_side=False, header_encoding=None))
+            srv.initiate_connection()
+            w.write(srv.data_to_send())
+            await w.drain()
+            srv_lock = asyncio.Lock()
+
+            async def _respond(sid: int):
+                nonlocal goaway_sent
+                async with srv_lock:
+                    srv.send_headers(
+                        sid,
+                        [(b":status", b"200"), (b"content-type", b"text/event-stream")],
+                        end_stream=False,
+                    )
+                    srv.send_data(sid, b"data: first\n\n", end_stream=False)
+                    w.write(srv.data_to_send())
+                    await w.drain()
+
+                gf = GoAwayFrame(0, last_stream_id=sid, error_code=0, additional_data=b"graceful_drain")
+                df = DataFrame(sid, data=b"data: second\n\n")
+                df.flags.add("END_STREAM")
+
+                if coalesced:
+                    await asyncio.sleep(0.02)
+                    async with srv_lock:
+                        goaway_sent = True
+                        w.write(gf.serialize() + df.serialize())
+                        await w.drain()
+                else:
+                    async with srv_lock:
+                        goaway_sent = True
+                        w.write(gf.serialize())
+                        await w.drain()
+                    # 等待超过 3 个 ping 周期，确认 pinger 在 GOAWAY 后不再发 PING 也不会杀死 u2c
+                    await asyncio.sleep(0.12)
+                    async with srv_lock:
+                        w.write(df.serialize())
+                        await w.drain()
+
+            bg: list[asyncio.Task[None]] = []
+            try:
+                while True:
+                    raw = await r.read(65536)
+                    if not raw:
+                        break
+                    async with srv_lock:
+                        for ev in srv.receive_data(raw):
+                            if isinstance(ev, PingReceived) and goaway_sent:
+                                pings_after_goaway += 1
+                            elif isinstance(ev, StreamEnded) and ev.stream_id == 1:
+                                bg.append(asyncio.create_task(_respond(1)))
+                        out = srv.data_to_send()
+                        if out:
+                            w.write(out)
+                            await w.drain()
+            finally:
+                for t in bg:
+                    await asyncio.gather(t, return_exceptions=True)
+                w.close()
+
+        up_srv = await asyncio.start_server(mock_upstream, "127.0.0.1", 0)
+        up_port = up_srv.sockets[0].getsockname()[1]
+
+        async def bridge_handler(cr: asyncio.StreamReader, cw: asyncio.StreamWriter):
+            ur, uw = await asyncio.open_connection("127.0.0.1", up_port)
+            try:
+                await _bridge_http1_client_to_h2_upstream(
+                    cr,
+                    cw,
+                    ur,
+                    uw,
+                    target_host="daily-cloudcode-pa.googleapis.com",
+                    ping_interval=0.025,
+                    idle_ping_interval=10.0,
+                    sse_keepalive_interval=10.0,
+                )
+            finally:
+                cw.close()
+                uw.close()
+
+        br_srv = await asyncio.start_server(bridge_handler, "127.0.0.1", 0)
+        br_port = br_srv.sockets[0].getsockname()[1]
+
+        cr, cw = await asyncio.open_connection("127.0.0.1", br_port)
+        cw.write(
+            b"POST /v1internal:streamGenerateContent?alt=sse HTTP/1.1\r\n"
+            b"Host: daily-cloudcode-pa.googleapis.com\r\n"
+            b"Connection: keep-alive\r\n"
+            b"Content-Length: 2\r\n\r\n{}"
+        )
+        await cw.drain()
+
+        hdr = await cr.readuntil(b"\r\n\r\n")
+        assert hdr.startswith(b"HTTP/1.1 200 OK\r\n")
+        acc = bytearray()
+        while True:
+            sz_line = await cr.readline()
+            assert sz_line, "Unexpected EOF before 0\\r\\n\\r\\n"
+            sz = int(sz_line.strip(), 16)
+            if sz == 0:
+                assert await cr.readexactly(2) == b"\r\n"
+                break
+            acc.extend(await cr.readexactly(sz))
+            assert await cr.readexactly(2) == b"\r\n"
+
+        cw.close()
+        br_srv.close()
+        up_srv.close()
+        return bytes(acc), pings_after_goaway
+
+    body_sep, pings_sep = asyncio.run(_run_case(coalesced=False))
+    assert body_sep == b"data: first\n\ndata: second\n\n"
+    assert pings_sep == 0
+
+    body_coal, pings_coal = asyncio.run(_run_case(coalesced=True))
+    assert body_coal == b"data: first\n\ndata: second\n\n"
+    assert pings_coal == 0
+
+
+
 
 
 

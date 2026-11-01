@@ -46,6 +46,10 @@ CA_COMMON_NAME = "cproxy Local H2 Keepalive CA"
 
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 PING_INTERVAL_SEC = 4.5
+H2_PING_INTERVAL_SEC = 25.0
+H2_MAX_PINGS_WITHOUT_DATA = 18
+H2_MAX_IDLE_PINGS = 4
+SSE_DOWNSTREAM_KEEPALIVE_SEC = 45.0
 WS_IDLE_PING_INTERVAL_SEC = 35.0
 WS_PRE_REPLY_TURN_TIMEOUT_SEC = 600.0
 WS_POST_REPLY_TURN_TIMEOUT_SEC = 180.0
@@ -665,11 +669,12 @@ async def _forward_h2_frames_with_ping(
     upstream_r: asyncio.StreamReader,
     upstream_w: asyncio.StreamWriter,
     *,
-    ping_interval: float = PING_INTERVAL_SEC,
+    ping_interval: float = H2_PING_INTERVAL_SEC,
     stats_path: Path | None = None,
 ) -> None:
     """在 HTTP/2 帧边界上透明转发双向流量，并在存在未完结流 (active_streams > 0) 且静默达到阈值时
-    自动向远端发送 17 字节 HTTP/2 PING 帧，彻底阻断上游 VLESS/anytls 80s connIdle 断流。
+    自动向远端发送 17 字节 HTTP/2 PING 帧（遵守单次无数据 PING 上限以避免触发 Google GFE `too_many_pings`），
+    彻底阻断上游 VLESS/anytls 80s connIdle 断流。
     """
     preface = await client_r.readexactly(len(H2_PREFACE))
     if preface != H2_PREFACE:
@@ -681,7 +686,12 @@ async def _forward_h2_frames_with_ping(
     upstream_lock = asyncio.Lock()
     client_lock = asyncio.Lock()
     active_streams: set[int] = set()
-    state = {"last_io": time.monotonic(), "closed": False}
+    state: dict[str, float | int | bool] = {
+        "last_io": time.monotonic(),
+        "closed": False,
+        "goaway": False,
+        "pings_without_data": 0,
+    }
 
     async def c2u() -> None:
         try:
@@ -692,10 +702,14 @@ async def _forward_h2_frames_with_ping(
                 stream_id = int.from_bytes(hdr[5:9], "big") & 0x7FFFFFFF
                 payload = await client_r.readexactly(length) if length else b""
                 if stream_id > 0:
+                    if ftype in (0x00, 0x01):  # DATA / HEADERS
+                        state["pings_without_data"] = 0
                     if ftype == 0x01:  # HEADERS
                         active_streams.add(stream_id)
                     elif ftype == 0x03:  # RST_STREAM
                         active_streams.discard(stream_id)
+                elif ftype == 0x07:  # GOAWAY
+                    state["goaway"] = True
                 async with upstream_lock:
                     upstream_w.write(hdr + payload)
                     await upstream_w.drain()
@@ -713,10 +727,14 @@ async def _forward_h2_frames_with_ping(
                 stream_id = int.from_bytes(hdr[5:9], "big") & 0x7FFFFFFF
                 payload = await upstream_r.readexactly(length) if length else b""
                 if stream_id > 0:
+                    if ftype in (0x00, 0x01):  # DATA / HEADERS
+                        state["pings_without_data"] = 0
                     if ftype in (0x00, 0x01) and (flags & 0x01):  # END_STREAM
                         active_streams.discard(stream_id)
                     elif ftype == 0x03:  # RST_STREAM
                         active_streams.discard(stream_id)
+                elif ftype == 0x07:  # GOAWAY
+                    state["goaway"] = True
                 elif ftype == 0x06 and (flags & 0x01) and payload.startswith(b"cproxy"):
                     state["last_io"] = time.monotonic()
                     continue
@@ -729,36 +747,53 @@ async def _forward_h2_frames_with_ping(
 
     async def pinger() -> None:
         seq = 0
-        tick = min(1.0, max(0.05, ping_interval / 4.0))
+        tick = min(1.0, max(0.02, ping_interval / 4.0))
         try:
-            while not state["closed"]:
+            while not state["closed"] and not state["goaway"]:
                 await asyncio.sleep(tick)
-                if state["closed"] or not active_streams:
+                if state["closed"] or state["goaway"] or not active_streams:
                     continue
-                if (time.monotonic() - state["last_io"]) >= ping_interval:
-                    seq = (seq + 1) % 100
-                    ping_frame = b"\x00\x00\x08\x06\x00\x00\x00\x00\x00" + f"cproxy{seq:02d}".encode()
+                if int(state["pings_without_data"]) >= H2_MAX_PINGS_WITHOUT_DATA:
+                    continue
+                if (time.monotonic() - float(state["last_io"])) >= ping_interval:
+                    sent_ping = False
                     async with upstream_lock:
-                        upstream_w.write(ping_frame)
-                        await upstream_w.drain()
-                    state["last_io"] = time.monotonic()
-                    _record_h2_keepalive_stat(stats_path, "pings_sent", 1)
+                        if (
+                            not state["closed"]
+                            and not state["goaway"]
+                            and active_streams
+                            and int(state["pings_without_data"]) < H2_MAX_PINGS_WITHOUT_DATA
+                            and (time.monotonic() - float(state["last_io"])) >= ping_interval
+                        ):
+                            seq = (seq + 1) % 100
+                            ping_frame = b"\x00\x00\x08\x06\x00\x00\x00\x00\x00" + f"cproxy{seq:02d}".encode()
+                            upstream_w.write(ping_frame)
+                            await upstream_w.drain()
+                            state["last_io"] = time.monotonic()
+                            state["pings_without_data"] = int(state["pings_without_data"]) + 1
+                            sent_ping = True
+                    if sent_ping:
+                        _record_h2_keepalive_stat(stats_path, "pings_sent", 1)
         except Exception:
             pass
 
-    tasks = [
+    io_tasks = [
         asyncio.create_task(c2u()),
         asyncio.create_task(u2c()),
-        asyncio.create_task(pinger()),
     ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for t in done:
-        if not t.cancelled():
-            t.exception()
-    for t in pending:
-        t.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    pinger_task = asyncio.create_task(pinger())
+    try:
+        done, pending = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            if not t.cancelled():
+                t.exception()
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        pinger_task.cancel()
+        await asyncio.gather(pinger_task, return_exceptions=True)
 
 
 def build_ws_masked_ping(payload: bytes, mask_key: bytes | None = None) -> bytes:
@@ -1106,9 +1141,12 @@ class _H1H2StreamContext:
     headers_sent: bool = False
     bodyless: bool = False
     use_chunked: bool = False
+    is_sse: bool = False
     chunk_terminated: bool = False
     expected_length: int | None = None
     bytes_sent: int = 0
+    tail_bytes: bytes = b""
+    last_client_io: float = 0.0
     trailers: list[tuple[bytes, bytes]] = field(default_factory=list)
 
 
@@ -1119,20 +1157,25 @@ async def _bridge_http1_client_to_h2_upstream(
     upstream_w: asyncio.StreamWriter,
     *,
     target_host: str,
-    ping_interval: float = PING_INTERVAL_SEC,
+    ping_interval: float = H2_PING_INTERVAL_SEC,
     idle_ping_interval: float = WS_IDLE_PING_INTERVAL_SEC,
+    sse_keepalive_interval: float = SSE_DOWNSTREAM_KEEPALIVE_SEC,
     stats_path: Path | None = None,
 ) -> None:
     """将本地客户端的 HTTP/1.1 (如 Go `net/http` over `HTTPS_PROXY` CONNECT) 自动升级桥接至上游 HTTP/2 连接，
     支持多 MB 请求体流控分片上传、SSE `text/event-stream` 零缓冲 chunked 回传、长连接顺序复用，
-    并在模型长思考静默期按 `ping_interval` (4.5s) / 轮次空闲期按 `idle_ping_interval` (35s) 注入 HTTP/2 PING 帧。
+    并在模型长思考静默期按 `ping_interval` (默认 25s，单次静默上限 18 次以规避 GFE `too_many_pings`) /
+    轮次空闲期按 `idle_ping_interval` (35s) 注入 HTTP/2 PING 帧，在收到 `PING ACK` 且 SSE 处于事件边界时
+    按 `sse_keepalive_interval` (45s) 向下游刷新空事件心跳以防超长思考客户端读超时。
     """
     from h2.config import H2Configuration
-    from h2.connection import H2Connection
+    from h2.connection import ConnectionState, H2Connection
+    from h2.errors import ErrorCodes
     from h2.events import (
         ConnectionTerminated,
         DataReceived,
         InformationalResponseReceived,
+        PingAckReceived,
         RemoteSettingsChanged,
         ResponseReceived,
         StreamEnded,
@@ -1142,8 +1185,22 @@ async def _bridge_http1_client_to_h2_upstream(
     )
     from h2.settings import SettingCodes
 
+    class _GracefulClientH2Connection(H2Connection):
+        def _receive_goaway_frame(self, frame):  # type: ignore[no-untyped-def]
+            has_inflight = int(frame.error_code) == 0 and any(
+                sid <= int(frame.last_stream_id) and not getattr(stream_obj, "closed", False)
+                for sid, stream_obj in self.streams.items()
+            )
+            if not has_inflight or self.state_machine.state == ConnectionState.CLOSED:
+                return super()._receive_goaway_frame(frame)
+            ev = ConnectionTerminated()
+            ev.error_code = ErrorCodes.NO_ERROR
+            ev.last_stream_id = frame.last_stream_id
+            ev.additional_data = frame.additional_data or None
+            return [], [ev]
+
     loop = asyncio.get_running_loop()
-    conn = H2Connection(
+    conn = _GracefulClientH2Connection(
         config=H2Configuration(
             client_side=True,
             header_encoding=None,
@@ -1164,10 +1221,11 @@ async def _bridge_http1_client_to_h2_upstream(
     flow_event = asyncio.Event()
     flow_event.set()
     active_streams: dict[int, _H1H2StreamContext] = {}
-    state: dict[str, float | bool] = {
+    state: dict[str, float | int | bool] = {
         "last_io": time.monotonic(),
         "closed": False,
         "goaway": False,
+        "pings_without_data": 0,
     }
 
     async def _send_h2_body_chunk(st: _H1H2StreamContext, buf: bytes, *, end_stream: bool) -> None:
@@ -1193,6 +1251,7 @@ async def _bridge_http1_client_to_h2_upstream(
                         upstream_w.write(out)
                         await upstream_w.drain()
                     state["last_io"] = time.monotonic()
+                    state["pings_without_data"] = 0
                     sent_now = True
                 else:
                     flow_event.clear()
@@ -1208,6 +1267,7 @@ async def _bridge_http1_client_to_h2_upstream(
                         upstream_w.write(out)
                         await upstream_w.drain()
                     state["last_io"] = time.monotonic()
+                    state["pings_without_data"] = 0
 
     async def c2u() -> None:
         try:
@@ -1315,6 +1375,7 @@ async def _bridge_http1_client_to_h2_upstream(
                         upstream_w.write(out)
                         await upstream_w.drain()
                     state["last_io"] = time.monotonic()
+                    state["pings_without_data"] = 0
 
                 if req_chunked:
                     while True:
@@ -1344,6 +1405,7 @@ async def _bridge_http1_client_to_h2_upstream(
                                             upstream_w.write(out)
                                             await upstream_w.drain()
                                         state["last_io"] = time.monotonic()
+                                        state["pings_without_data"] = 0
                             else:
                                 await _send_h2_body_chunk(st, b"", end_stream=True)
                             break
@@ -1383,6 +1445,16 @@ async def _bridge_http1_client_to_h2_upstream(
                 async with h2_lock:
                     events = conn.receive_data(raw)
                     for ev in events:
+                        if isinstance(
+                            ev,
+                            (
+                                InformationalResponseReceived,
+                                ResponseReceived,
+                                DataReceived,
+                                TrailersReceived,
+                            ),
+                        ):
+                            state["pings_without_data"] = 0
                         if isinstance(ev, DataReceived) and ev.flow_controlled_length > 0:
                             conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
                         elif isinstance(ev, (WindowUpdated, RemoteSettingsChanged)):
@@ -1406,7 +1478,7 @@ async def _bridge_http1_client_to_h2_upstream(
                         for hk, hv in ev.headers:
                             if hk == b":status":
                                 status_b = hv
-                            elif not hk.startswith(b":") and hk not in _H1_HOP_BY_HOP_HEADERS:
+                            elif not hk.startswith(b":") and hk.lower() not in _H1_HOP_BY_HOP_HEADERS:
                                 info_hdrs.append(hk + b": " + hv)
                         phrase = _http_status_phrase(status_b)
                         block = b"HTTP/1.1 " + status_b + b" " + phrase + b"\r\n"
@@ -1416,7 +1488,9 @@ async def _bridge_http1_client_to_h2_upstream(
                         async with client_lock:
                             client_w.write(block)
                             await client_w.drain()
-                        state["last_io"] = time.monotonic()
+                        now_io = time.monotonic()
+                        st.last_client_io = now_io
+                        state["last_io"] = now_io
 
                     elif isinstance(ev, ResponseReceived):
                         st = active_streams.get(ev.stream_id)
@@ -1425,13 +1499,17 @@ async def _bridge_http1_client_to_h2_upstream(
                         status_b = b"200"
                         resp_hdrs: list[bytes] = []
                         cl_val: int | None = None
+                        is_event_stream = False
                         for hk, hv in ev.headers:
+                            hk_lc = hk.lower()
                             if hk == b":status":
                                 status_b = hv
-                            elif hk.startswith(b":") or hk in _H1_HOP_BY_HOP_HEADERS:
+                            elif hk.startswith(b":") or hk_lc in _H1_HOP_BY_HOP_HEADERS:
                                 continue
                             else:
-                                if hk == b"content-length" and cl_val is None:
+                                if hk_lc == b"content-type" and b"text/event-stream" in hv.lower():
+                                    is_event_stream = True
+                                if hk_lc == b"content-length" and cl_val is None:
                                     try:
                                         cl_val = max(0, int(hv.strip()))
                                     except ValueError:
@@ -1443,7 +1521,7 @@ async def _bridge_http1_client_to_h2_upstream(
                         except ValueError:
                             status_int = 200
                         st.bodyless = status_int in (204, 304) or st.method == b"HEAD"
-                        if not st.req_body_complete and status_int >= 400:
+                        if (not st.req_body_complete and status_int >= 400) or bool(state["goaway"]):
                             st.client_close = True
                         if st.bodyless:
                             st.use_chunked = False
@@ -1456,6 +1534,7 @@ async def _bridge_http1_client_to_h2_upstream(
                             st.expected_length = None
                             resp_hdrs.append(b"Transfer-Encoding: chunked")
 
+                        st.is_sse = status_int == 200 and is_event_stream and st.use_chunked
                         resp_hdrs.append(b"Connection: close" if st.client_close else b"Connection: keep-alive")
                         phrase = _http_status_phrase(status_b)
                         block = (
@@ -1471,13 +1550,16 @@ async def _bridge_http1_client_to_h2_upstream(
                         async with client_lock:
                             client_w.write(block)
                             await client_w.drain()
-                        state["last_io"] = time.monotonic()
+                        now_io = time.monotonic()
+                        st.last_client_io = now_io
+                        state["last_io"] = now_io
 
                     elif isinstance(ev, DataReceived):
                         st = active_streams.get(ev.stream_id)
                         if st is None or not ev.data or st.bodyless:
                             continue
                         st.bytes_sent += len(ev.data)
+                        st.tail_bytes = (st.tail_bytes + ev.data)[-4:]
                         if st.use_chunked:
                             payload = f"{len(ev.data):x}\r\n".encode("ascii") + ev.data + b"\r\n"
                         else:
@@ -1485,14 +1567,36 @@ async def _bridge_http1_client_to_h2_upstream(
                         async with client_lock:
                             client_w.write(payload)
                             await client_w.drain()
-                        state["last_io"] = time.monotonic()
+                        now_io = time.monotonic()
+                        st.last_client_io = now_io
+                        state["last_io"] = now_io
 
                     elif isinstance(ev, TrailersReceived):
                         st = active_streams.get(ev.stream_id)
                         if st is not None:
                             for hk, hv in ev.headers:
-                                if not hk.startswith(b":") and hk not in _H1_HOP_BY_HOP_HEADERS:
+                                if not hk.startswith(b":") and hk.lower() not in _H1_HOP_BY_HOP_HEADERS:
                                     st.trailers.append((hk, hv))
+
+                    elif isinstance(ev, PingAckReceived):
+                        if sse_keepalive_interval > 0 and ev.ping_data.startswith(b"cproxy"):
+                            now_ack = time.monotonic()
+                            for st in list(active_streams.values()):
+                                if (
+                                    st.headers_sent
+                                    and st.is_sse
+                                    and st.use_chunked
+                                    and not st.bodyless
+                                    and not st.chunk_terminated
+                                    and (st.bytes_sent == 0 or st.tail_bytes.endswith((b"\n\n", b"\r\n\r\n")))
+                                    and (now_ack - st.last_client_io) >= sse_keepalive_interval
+                                ):
+                                    async with client_lock:
+                                        if not st.chunk_terminated and not state["closed"]:
+                                            client_w.write(b"2\r\n\n\n\r\n")
+                                            await client_w.drain()
+                                            st.tail_bytes = (st.tail_bytes + b"\n\n")[-4:]
+                                            st.last_client_io = time.monotonic()
 
                     elif isinstance(ev, StreamEnded):
                         st = active_streams.pop(ev.stream_id, None)
@@ -1517,10 +1621,15 @@ async def _bridge_http1_client_to_h2_upstream(
                             async with client_lock:
                                 client_w.write(end_chunk)
                                 await client_w.drain()
-                        state["last_io"] = time.monotonic()
+                        now_io = time.monotonic()
+                        st.last_client_io = now_io
+                        state["last_io"] = now_io
                         flow_event.set()
                         if not st.done_fut.done():
                             st.done_fut.set_result(True)
+                        if state["goaway"] and not active_streams:
+                            state["closed"] = True
+                            return
 
                     elif isinstance(ev, StreamReset):
                         st = active_streams.pop(ev.stream_id, None)
@@ -1533,6 +1642,13 @@ async def _bridge_http1_client_to_h2_upstream(
                     elif isinstance(ev, ConnectionTerminated):
                         state["goaway"] = True
                         flow_event.set()
+                        if int(ev.error_code) != 0:
+                            for sid in list(active_streams):
+                                rst_st = active_streams.pop(sid, None)
+                                if rst_st is not None and not rst_st.done_fut.done():
+                                    rst_st.done_fut.set_result(False)
+                            state["closed"] = True
+                            return
                         rejected = [
                             sid for sid in list(active_streams) if sid > int(ev.last_stream_id)
                         ]
@@ -1556,11 +1672,11 @@ async def _bridge_http1_client_to_h2_upstream(
         seq = 0
         eff_idle = idle_ping_interval if idle_ping_interval > 0 else ping_interval
         min_iv = min(ping_interval, eff_idle) if eff_idle > 0 else ping_interval
-        tick = min(1.0, max(0.05, min_iv / 4.0))
+        tick = min(1.0, max(0.02, min_iv / 4.0))
         try:
-            while not state["closed"]:
+            while not state["closed"] and not state["goaway"]:
                 await asyncio.sleep(tick)
-                if state["closed"]:
+                if state["closed"] or state["goaway"]:
                     break
                 if active_streams and (
                     client_r.at_eof()
@@ -1576,12 +1692,19 @@ async def _bridge_http1_client_to_h2_upstream(
                 threshold = ping_interval if active_streams else eff_idle
                 if threshold <= 0:
                     continue
+                max_strikes = H2_MAX_PINGS_WITHOUT_DATA if active_streams else H2_MAX_IDLE_PINGS
+                if int(state["pings_without_data"]) >= max_strikes:
+                    continue
                 if (time.monotonic() - float(state["last_io"])) >= threshold:
                     sent_ping = False
                     async with h2_lock:
-                        if state["closed"]:
+                        if state["closed"] or state["goaway"]:
                             break
-                        if (time.monotonic() - float(state["last_io"])) >= threshold:
+                        max_strikes = H2_MAX_PINGS_WITHOUT_DATA if active_streams else H2_MAX_IDLE_PINGS
+                        if (
+                            int(state["pings_without_data"]) < max_strikes
+                            and (time.monotonic() - float(state["last_io"])) >= threshold
+                        ):
                             seq = (seq + 1) % 100
                             conn.ping(f"cproxy{seq:02d}".encode("ascii"))
                             out = conn.data_to_send()
@@ -1589,25 +1712,30 @@ async def _bridge_http1_client_to_h2_upstream(
                                 upstream_w.write(out)
                                 await upstream_w.drain()
                             state["last_io"] = time.monotonic()
+                            state["pings_without_data"] = int(state["pings_without_data"]) + 1
                             sent_ping = True
                     if sent_ping:
                         _record_h2_keepalive_stat(stats_path, "pings_sent", 1)
         except Exception:
             pass
 
-    tasks = [
+    io_tasks = [
         asyncio.create_task(c2u()),
         asyncio.create_task(u2c()),
-        asyncio.create_task(pinger()),
     ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for t in done:
-        if not t.cancelled():
-            t.exception()
-    for t in pending:
-        t.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    pinger_task = asyncio.create_task(pinger())
+    try:
+        done, pending = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            if not t.cancelled():
+                t.exception()
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        pinger_task.cancel()
+        await asyncio.gather(pinger_task, return_exceptions=True)
 
 
 async def _connect_upstream_socks5(
@@ -1652,8 +1780,10 @@ class H2KeepaliveProxy:
         upstream_host: str = DEFAULT_UPSTREAM_PROXY_HOST,
         upstream_port: int = DEFAULT_UPSTREAM_PROXY_PORT,
         upstream_protocol: str = "socks5",
-        ping_interval: float = PING_INTERVAL_SEC,
+        ping_interval: float | None = None,
+        h2_ping_interval: float | None = None,
         idle_ping_interval: float = WS_IDLE_PING_INTERVAL_SEC,
+        sse_keepalive_interval: float = SSE_DOWNSTREAM_KEEPALIVE_SEC,
         install_system_trust: bool = True,
         allow_user_prompt: bool = False,
         require_system_trust: bool = False,
@@ -1665,8 +1795,14 @@ class H2KeepaliveProxy:
         self.upstream_host = upstream_host
         self.upstream_port = upstream_port
         self.upstream_protocol = upstream_protocol
-        self.ping_interval = ping_interval
+        self.ping_interval = PING_INTERVAL_SEC if ping_interval is None else ping_interval
+        self.h2_ping_interval = (
+            h2_ping_interval
+            if h2_ping_interval is not None
+            else (H2_PING_INTERVAL_SEC if ping_interval is None else ping_interval)
+        )
         self.idle_ping_interval = idle_ping_interval
+        self.sse_keepalive_interval = sse_keepalive_interval
         self.require_system_trust = require_system_trust
         self.stats_path = stats_path
         ca_crt, leaf_crt, leaf_key, trust_mtime = ensure_local_ca_and_leaf_cert(
@@ -1818,7 +1954,7 @@ class H2KeepaliveProxy:
                     client_w,
                     upstream_r,
                     upstream_w,
-                    ping_interval=self.ping_interval,
+                    ping_interval=self.h2_ping_interval,
                     stats_path=self.stats_path,
                 )
             elif cli_alpn != "h2" and alpn == "h2" and target_host in H1_TO_H2_HOSTS:
@@ -1828,8 +1964,9 @@ class H2KeepaliveProxy:
                     upstream_r,
                     upstream_w,
                     target_host=target_host,
-                    ping_interval=self.ping_interval,
+                    ping_interval=self.h2_ping_interval,
                     idle_ping_interval=self.idle_ping_interval,
+                    sse_keepalive_interval=self.sse_keepalive_interval,
                     stats_path=self.stats_path,
                 )
             else:
@@ -1866,8 +2003,10 @@ async def run_h2_keepalive_server(
     listen_port: int = DEFAULT_KEEPALIVE_PORT,
     upstream_host: str = DEFAULT_UPSTREAM_PROXY_HOST,
     upstream_port: int = DEFAULT_UPSTREAM_PROXY_PORT,
-    ping_interval: float = PING_INTERVAL_SEC,
+    ping_interval: float | None = None,
+    h2_ping_interval: float | None = None,
     idle_ping_interval: float = WS_IDLE_PING_INTERVAL_SEC,
+    sse_keepalive_interval: float = SSE_DOWNSTREAM_KEEPALIVE_SEC,
     pid_path: Path | None = None,
     install_system_trust: bool = True,
     allow_user_prompt: bool = False,
@@ -1881,7 +2020,9 @@ async def run_h2_keepalive_server(
         upstream_host=upstream_host,
         upstream_port=upstream_port,
         ping_interval=ping_interval,
+        h2_ping_interval=h2_ping_interval,
         idle_ping_interval=idle_ping_interval,
+        sse_keepalive_interval=sse_keepalive_interval,
         install_system_trust=install_system_trust,
         allow_user_prompt=allow_user_prompt,
         require_system_trust=require_system_trust,
