@@ -661,3 +661,114 @@ def test_verify_gemini_stream_hold_demotes_failing_node_and_switches(tmp_path, m
     assert json.loads(order_path.read_text(encoding="utf-8")) == ["NODE-GOOD", "NODE-BAD"]
 
 
+def test_rebalance_sinks_gemini_geo_blocked_nodes_and_renders_tail(tmp_path):
+    """验证被标记为 `gemini_geo_blocked` 的送中低延迟 1X 节点：
+    1. 在 `_smooth_rank_key(..., penalize_gemini_geo_blocked=True)` 下跌入 Tier 5 队尾（排在干净 1X 与干净 IEPL 之后）；
+    2. 在 `RuntimeBackend.render_runtime()` 生成 `AI-GEMINI` 时同样被沉底到末尾。
+    """
+    from cproxy.services.probe import probe_paths_context, record_gemini_geo_blocked_node
+    from cproxy.services.rebalance import _smooth_rank_key
+
+    config = """\
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: US-01
+  - name: SG-01
+  - name: 🇹🇼台湾 01 | 1X
+  - name: 🇩🇪德国 01 | 1X
+  - name: 🇬🇧英国 01 | IEPL 0.8X | CM
+proxy-groups:
+  - name: Auto
+    type: fallback
+    proxies: [US-01, SG-01, 🇹🇼台湾 01 | 1X, 🇩🇪德国 01 | 1X, 🇬🇧英国 01 | IEPL 0.8X | CM]
+rules:
+  - MATCH,Auto
+"""
+    paths = default_paths(tmp_path)
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "config.yaml").write_text(config, encoding="utf-8")
+    record_gemini_geo_blocked_node(paths, "🇹🇼台湾 01 | 1X")
+
+    summaries = [
+        _summary("🇹🇼台湾 01 | 1X", (48, 50, 49, 51, 50)),
+        _summary("🇩🇪德国 01 | 1X", (165, 168, 162, 170, 166)),
+        _summary("🇬🇧英国 01 | IEPL 0.8X | CM", (155, 158, 156, 160, 157)),
+    ]
+    with probe_paths_context(paths):
+        ranked = [
+            s.name
+            for s in sorted(
+                summaries,
+                key=lambda s: _smooth_rank_key(s, prefer_non_iepl=True, penalize_gemini_geo_blocked=True),
+            )
+        ]
+    assert ranked == ["🇩🇪德国 01 | 1X", "🇬🇧英国 01 | IEPL 0.8X | CM", "🇹🇼台湾 01 | 1X"]
+
+    RuntimeBackend(paths).render_runtime()
+    rendered = yaml.safe_load((paths.data_dir / "runtime.yaml").read_text(encoding="utf-8"))
+    gemini_group = next(g for g in rendered["proxy-groups"] if g["name"] == "AI-GEMINI")
+    assert gemini_group["proxies"][-1] == "🇹🇼台湾 01 | 1X"
+    assert gemini_group["proxies"][0] == "🇩🇪德国 01 | 1X"
+
+
+def test_verify_gemini_geo_eligibility_demotes_cn_polluted_head_and_switches(tmp_path, monkeypatch):
+    """验证 rebalance 落地后的 Google GWS 验毒：
+    若榜首低延迟节点命中 `.google.com.hk` 地区门禁（PROBE_GEO_BLOCKED），自动写入 12h 隔离池、
+    将其沉底到 `ai-gemini-order.json` 队尾，并强切（force_drop=True）到下一干净节点。
+    """
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.diagnostics import PROBE_GEO_BLOCKED, PROBE_OK
+    from cproxy.services.probe import is_gemini_geo_blocked
+
+    paths = _paths(tmp_path)
+    order_path = ai_gemini_order_file(paths)
+    switched: list[tuple[str, str, bool, bool]] = []
+    state = {"current": "🇹🇼台湾 01 | 1X"}
+
+    class _FakeAPI:
+        def __init__(self, *_a):
+            pass
+
+        def get_groups(self):
+            return {
+                "AI-GEMINI": ProxyGroup(
+                    name="AI-GEMINI",
+                    type="fallback",
+                    current=state["current"],
+                    candidates=["🇹🇼台湾 01 | 1X", "🇩🇪德国 01 | 1X"],
+                )
+            }
+
+        def reload_config(self, _path: str):
+            pass
+
+    class _FakeQuery:
+        def __init__(self, _p):
+            self.api = _FakeAPI()
+
+        def switch_group(self, group: str, target: str, *, drop_connections: bool = True, force_drop: bool = False):
+            switched.append((group, target, drop_connections, force_drop))
+            state["current"] = target
+
+    verdicts = iter([PROBE_GEO_BLOCKED, PROBE_OK])
+    monkeypatch.setattr(rebalance_mod, "ai_target_verdict", lambda *_a, **_kw: next(verdicts))
+    monkeypatch.setattr(rebalance_mod, "QueryService", _FakeQuery)
+    monkeypatch.setattr(rebalance_mod, "APIBackend", _FakeAPI)
+    monkeypatch.setattr(rebalance_mod, "ProcessBackend", lambda _p: _FakeProcess(False))
+    monkeypatch.setattr(rebalance_mod, "RuntimeBackend", lambda _p: _FakeBackend())
+
+    ordered, new_switch = RebalanceService(paths)._verify_gemini_geo_eligibility(
+        ["🇹🇼台湾 01 | 1X", "🇩🇪德国 01 | 1X"],
+        order_path,
+        switched_to=None,
+    )
+    assert ordered == ["🇩🇪德国 01 | 1X", "🇹🇼台湾 01 | 1X"]
+    assert new_switch == "🇩🇪德国 01 | 1X"
+    assert switched == [("AI-GEMINI", "🇩🇪德国 01 | 1X", True, True)]
+    assert is_gemini_geo_blocked("🇹🇼台湾 01 | 1X", paths) is True
+    assert json.loads(order_path.read_text(encoding="utf-8")) == ["🇩🇪德国 01 | 1X", "🇹🇼台湾 01 | 1X"]
+
+
+

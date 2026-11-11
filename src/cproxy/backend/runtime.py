@@ -1390,6 +1390,17 @@ class RuntimeBackend:
         ) + _deprioritize_high_multiplier(
             [n for n in extra_gemini_nodes if n not in gemini_leaves], max_mult=max_ai_mult
         )
+        from ..services.probe import is_gemini_geo_blocked
+
+        prefer_set = {str(p) for p in gemini_prefer if p}
+        non_geo_blocked_gemini = [
+            n for n in gemini_proxies if n in prefer_set or not is_gemini_geo_blocked(n, self.paths)
+        ]
+        geo_blocked_gemini = [
+            n for n in gemini_proxies if n not in prefer_set and is_gemini_geo_blocked(n, self.paths)
+        ]
+        if non_geo_blocked_gemini and geo_blocked_gemini:
+            gemini_proxies = non_geo_blocked_gemini + geo_blocked_gemini
 
         groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}

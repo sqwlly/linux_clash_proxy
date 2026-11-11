@@ -25,18 +25,29 @@ from ..config import (
     conn_activity_state_file,
     read_config,
 )
-from .diagnostics import DEFAULT_AI_PROBE_TARGETS, PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
-
-_DEFAULT_AI_TARGET_VERDICT = ai_target_verdict
+from .diagnostics import (
+    DEFAULT_AI_PROBE_TARGETS,
+    DEFAULT_GOOGLE_GEO_URL,
+    PROBE_DEAD,
+    PROBE_GEO_BLOCKED,
+    PROBE_OK,
+    ai_target_verdict,
+)
 from .probe import (
+    GEMINI_GEO_BLOCKED_TTL_SECONDS,
     STREAM_FRAGILE_TTL_SECONDS,
-    is_dynamic_stream_fragile,
+    clear_gemini_geo_blocked_node,
+    invalidate_probe_state_cache,
+    is_gemini_geo_blocked,
     is_iepl_node,
     is_static_iepl_node,
     probe_paths_context,
+    record_gemini_geo_blocked_node,
     resolve_current_leaf,
 )
 from .query import QueryService
+
+_DEFAULT_AI_TARGET_VERDICT = ai_target_verdict
 
 CONSECUTIVE_FAILURE_THRESHOLD = 2
 COOLDOWN_SECONDS = 10 * 60
@@ -784,18 +795,24 @@ DEFAULT_CLOUDCODE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
 
 def _watch_urls(paths: AppPaths, group: str) -> tuple[str, ...]:
-    """AI-MANUAL 测 ChatGPT Web + OpenAI API，AI-GEMINI 测 Gemini API + Cloud Code。
+    """AI-MANUAL 测 ChatGPT Web + OpenAI API，AI-GEMINI 测 Gemini API + Cloud Code + Google Geo。
 
-    双端点看护：
-    - AI-GEMINI 同时覆盖 Gemini API（识别地区门禁）与 agy 实际连接的
-      `daily-cloudcode-pa.googleapis.com`（识别 Cloud Code 链路断流）；
+    多端点看护：
+    - AI-GEMINI 同时覆盖 Gemini API、agy 实际连接的 `daily-cloudcode-pa.googleapis.com`
+      （识别 Cloud Code 链路断流），以及 `www.google.com/?hl=en`（无鉴权识别 Google GWS
+      将出口 IP 判为 CN“送中”或 HK 下发 `.google.com.hk` Cookie 的隐性地区门禁）；
     - AI-MANUAL 同时覆盖 `chatgpt.com` 与 `api.openai.com/v1/models`。
     """
     config = read_config(paths)
     if group == AI_GEMINI_GROUP:
         primary = str(config.get("ai-gemini-api-url") or DEFAULT_AI_PROBE_TARGETS[2][1])
         secondary = str(config.get("ai-cloudcode-url") or DEFAULT_CLOUDCODE_URL)
-        return (primary, secondary) if primary != secondary else (primary,)
+        geo_url = str(config.get("ai-google-geo-url") or DEFAULT_GOOGLE_GEO_URL)
+        urls: list[str] = []
+        for candidate in (primary, secondary, geo_url):
+            if candidate and candidate not in urls:
+                urls.append(candidate)
+        return tuple(urls)
     primary = str(config.get("ai-chatgpt-url") or DEFAULT_AI_PROBE_TARGETS[0][1])
     secondary = str(config.get("ai-openai-api-url") or DEFAULT_AI_PROBE_TARGETS[1][1])
     return (primary, secondary) if primary != secondary else (primary,)
@@ -819,6 +836,7 @@ def _save_state(paths: AppPaths, state: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
+    invalidate_probe_state_cache()
 
 
 def _group_state(state: dict, group: str) -> dict:
@@ -832,11 +850,28 @@ def _group_state(state: dict, group: str) -> dict:
     return item
 
 
-_AGY_GLOG_PREFIX = r"^(?:(?:ERROR|WARNING):\s+logging\s+before\s+google\.Init:\s+)?[IWE](\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+"
+_AGY_GLOG_PREFIX = (
+    r"^(?:(?:ERROR|WARNING):\s+logging\s+before\s+google\.Init:\s+)?[IWE](\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+"
+)
+_AGY_WARN_ERR_PREFIX = (
+    r"^(?:(?:ERROR|WARNING):\s+logging\s+before\s+google\.Init:\s+)?[WE](\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+"
+)
 _AGY_RETRY_FAIL_RE = re.compile(
     _AGY_GLOG_PREFIX
     + r"\d+\s+run\.go:\d+\]\s+Run:\s+attempt\s+(\d+)\s+failed\s+\((.+?)\),\s+retrying\s+in\b"
 )
+# 仅匹配 [WE] 级别且来自 RPC/执行器源码（errorreport.go / code_assist_client.go / run.go）的真实地区报错，
+# 严格排除 I 级别及 input_loop.go（避免用户在对话框粘贴报错文本被误判为真实门禁触发）。
+_AGY_GEO_BLOCK_RE = re.compile(
+    _AGY_WARN_ERR_PREFIX
+    + r"\d+\s+(errorreport|code_assist_client|run)\.go:\d+\]\s+(.*(?:"
+    + r"User location is not supported for the API use"
+    + r"|LOCATION_NOT_ELIGIBLE"
+    + r"|Your location is not eligible for this service"
+    + r").*)$",
+    re.IGNORECASE,
+)
+_AGY_DETECTED_LOC_RE = re.compile(r"\bdetected_location:([A-Z]{2,3})\b")
 AGY_LOG_WINDOW_SECONDS = 180.0
 
 
@@ -1033,6 +1068,96 @@ def detect_recent_agy_retry_failure(
     return False, max_seen_ts, ""
 
 
+def detect_recent_agy_geo_block(
+    log_dir: Path | None,
+    *,
+    now: float | None = None,
+    window_seconds: float = AGY_LOG_WINDOW_SECONDS,
+    since_ts: float = 0.0,
+) -> tuple[bool, float, str]:
+    """扫描近期活跃的 agy `cli-*.log` 与 IDE `language_server*.log` 尾部，检测 Google 地区限制报错。
+
+    覆盖两类真实触发源（严格限定 `[WE]` 级别与 `errorreport.go` / `code_assist_client.go` / `run.go`，
+    绝不匹配 `I` 级别或 `input_loop.go` 用户输入文本）：
+    1. 用户请求报错：`FAILED_PRECONDITION (code 400): User location is not supported for the API use.`
+    2. 后台每 ~60s 静默轮询：`AICode FetchConfig failed ... LOCATION_NOT_ELIGIBLE ... detected_location:CN`
+       （即便用户尚未发消息，也能在 1 分钟内捕获“送中”出口并提前切走）。
+    若任一会话在报错时间点之后已成功收到 `streamGenerateContent` 的 `ResponseID`，说明出口已恢复，不重复切流。
+    """
+    ts_now = time.time() if now is None else now
+    logs = _discover_agy_log_files(log_dir)
+    if not logs:
+        return False, since_ts, ""
+
+    local_now = time.localtime(ts_now)
+    newest_success_ts = 0.0
+    candidates: list[tuple[float, str]] = []
+
+    for log_path in reversed(logs[-10:]):
+        try:
+            with log_path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 262144), os.SEEK_SET)
+                tail = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+
+        seen_geo_in_file = False
+        lines = tail.splitlines()
+        for idx in range(len(lines) - 1, -1, -1):
+            stripped = lines[idx].strip()
+            if "streamGenerateContent" in stripped and "ResponseID:" in stripped:
+                ok_ts = _parse_glog_timestamp(stripped, local_now)
+                if ok_ts is not None and ok_ts > newest_success_ts:
+                    newest_success_ts = ok_ts
+                if not seen_geo_in_file:
+                    break
+                continue
+            m = _AGY_GEO_BLOCK_RE.match(stripped)
+            if not m:
+                continue
+            seen_geo_in_file = True
+            month, day, hour, minute, sec, usec, _src_file, msg = m.groups()
+            year = local_now.tm_year
+            if int(month) == 12 and local_now.tm_mon == 1:
+                year -= 1
+            try:
+                struct_t = time.strptime(
+                    f"{year:04d}-{int(month):02d}-{int(day):02d} {int(hour):02d}:{int(minute):02d}:{int(sec):02d}",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
+            except ValueError:
+                continue
+            if event_ts <= since_ts:
+                break
+            age = ts_now - event_ts
+            if -5.0 <= age <= window_seconds:
+                loc_m = _AGY_DETECTED_LOC_RE.search(msg)
+                if "location_not_eligible" in msg.lower():
+                    reason = (
+                        f"LOCATION_NOT_ELIGIBLE (detected_location={loc_m.group(1)})"
+                        if loc_m
+                        else "LOCATION_NOT_ELIGIBLE"
+                    )
+                else:
+                    reason = (
+                        f"400 User location is not supported (detected_location={loc_m.group(1)})"
+                        if loc_m
+                        else "400 User location is not supported"
+                    )
+                candidates.append((event_ts, reason))
+            break
+
+    max_seen_ts = max([since_ts] + [c[0] for c in candidates])
+    triggered = [c for c in candidates if c[0] > newest_success_ts]
+    if triggered:
+        best = max(triggered, key=lambda c: c[0])
+        return True, best[0], best[1]
+    return False, max_seen_ts, ""
+
+
 _CODEX_RETRIES_RE = re.compile(r"\bretries=(\d+)\b")
 _CODEX_SAMPLING_ERR_RE = re.compile(r"\bsampling_error=(.+)$")
 _CODEX_CONN_ERR_RE = re.compile(r"\berror=(.+?)(?:\s+retry_delay=|$)")
@@ -1216,10 +1341,11 @@ def _promote_gemini_order_head(
     group: str = AI_GEMINI_GROUP,
     *,
     demote: str | None = None,
+    sink_tail: bool = False,
 ) -> None:
     """将刚切中的 AI 健康目标节点同步提升到对应 order.json 首位，
     防止 15 分钟周期的 `cproxy render --apply` 把 fallback 组重新刷回刚故障的旧节点；
-    若提供 `demote`（刚故障/超时的旧节点），将其降级到非静态 IEPL 分区末尾，防止 mihomo fallback 立即回退到故障节点。"""
+    若提供 `demote`（刚故障/超时的旧节点），将其降级到非静态 IEPL 分区末尾（`sink_tail=True` 时沉底至整个列表末尾）。"""
     if not target or is_static_iepl_node(target, paths):
         return
     order_path = ai_gemini_order_file(paths) if group == AI_GEMINI_GROUP else ai_manual_order_file(paths)
@@ -1230,12 +1356,22 @@ def _promote_gemini_order_head(
         if not isinstance(data, list) or not data:
             return
         rest = [str(item) for item in data if item and str(item) != target]
-        demote_node = str(demote) if (demote and str(demote) != target and not is_static_iepl_node(str(demote), paths)) else None
-        non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != demote_node]
-        if demote_node and demote_node in rest:
-            non_static.append(demote_node)
-        static_tail = [x for x in rest if is_static_iepl_node(x, paths)]
-        updated = [target] + non_static + static_tail
+        if sink_tail and demote and str(demote) != target:
+            sink_node = str(demote)
+            non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != sink_node]
+            static_tail = [x for x in rest if is_static_iepl_node(x, paths) and x != sink_node]
+            updated = [target] + non_static + static_tail + ([sink_node] if sink_node in rest else [])
+        else:
+            demote_node = (
+                str(demote)
+                if (demote and str(demote) != target and not is_static_iepl_node(str(demote), paths))
+                else None
+            )
+            non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != demote_node]
+            if demote_node and demote_node in rest:
+                non_static.append(demote_node)
+            static_tail = [x for x in rest if is_static_iepl_node(x, paths)]
+            updated = [target] + non_static + static_tail
         if updated == data:
             return
         order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
@@ -1248,7 +1384,8 @@ def _is_stream_safe_gemini_leaf(paths: AppPaths, node_name: str | None) -> bool:
 
     兼容不同机场命名（包括完全无 IEPL 节点、或全部为普通命名的机场）：
     1. 若名称含 `IEPL` / `IPLC` / `内网专线`、或协议为裸 TCP `xtls-rprx-vision`，直接判为非安全；
-    2. 查阅本地 `config.yaml` 的 `proxies` 协议字典：若能查到该节点且 `not is_stream_fragile_proxy(proxy_dict, node_name)`，视为安全节点；
+    2. 查阅本地 `config.yaml` 的 `proxies` 协议字典：若能查到该节点且
+       `not is_stream_fragile_proxy(proxy_dict, node_name)`，视为安全节点；
     3. 若名称显式含 `1X`，判为安全。
     """
     if not node_name or is_static_iepl_node(node_name, paths):
@@ -1370,8 +1507,13 @@ class AIWatchService:
         group_busy = has_active_ai_transfer(
             self.paths, getattr(self.query, "api", None), group, current
         )
+        must_probe_now = not group_busy and (
+            bool(previous_active and current and previous_active != current)
+            or int(gs.get("fail_count") or 0) > 0
+        )
         pre_busy = group_busy or (
-            ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+            not must_probe_now
+            and ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
             and has_any_inflight_ai_connection(self.paths, getattr(self.query, "api", None))
         )
         active_busy = False
@@ -1407,35 +1549,50 @@ class AIWatchService:
 
         log_triggered = False
         if group == AI_GEMINI_GROUP:
-            # 若节点已由外部切换或自动优选变更，设 30s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
             if previous_active and current and previous_active != current:
-                gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 30.0)
-            since_ts = float(gs.get("last_log_fail_ts") or 0.0)
-            log_failed, log_ts, log_reason = detect_recent_agy_retry_failure(
-                self.agy_log_dir, now=now, since_ts=since_ts
+                gs["last_geo_fail_ts"] = max(float(gs.get("last_geo_fail_ts") or 0.0), now + 3.0)
+            geo_since_ts = float(gs.get("last_geo_fail_ts") or 0.0)
+            geo_failed, geo_ts, geo_reason = detect_recent_agy_geo_block(
+                self.agy_log_dir, now=now, since_ts=geo_since_ts
             )
-            if log_failed:
-                safe_leaf = _is_stream_safe_gemini_leaf(self.paths, current)
-                on_healthy_safe_leaf = verdict == PROBE_OK and safe_leaf
-                has_inflight_now = group_busy or (
-                    safe_leaf
-                    and has_active_ai_transfer(self.paths, getattr(self.query, "api", None), group, current)
+            if geo_failed:
+                # 地区门禁（400 User location not supported / LOCATION_NOT_ELIGIBLE）与节点是否 1X 无关，
+                # 一旦捕获必须无视 safe_leaf / active_busy 立即触发强切与连接池冲洗。
+                gs["last_geo_fail_ts"] = geo_ts
+                verdict = PROBE_GEO_BLOCKED
+                detail = f"agy_log_geo_block ({geo_reason})"
+                log_triggered = True
+                active_busy = False
+            else:
+                # 若节点已由外部切换或自动优选变更，设 30s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
+                if previous_active and current and previous_active != current:
+                    gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 30.0)
+                since_ts = float(gs.get("last_log_fail_ts") or 0.0)
+                log_failed, log_ts, log_reason = detect_recent_agy_retry_failure(
+                    self.agy_log_dir, now=now, since_ts=since_ts
                 )
-                attempt_prefix = log_reason.split(":", 1)[0].strip()
-                severe_attempt = (
-                    attempt_prefix.startswith("attempt ")
-                    and attempt_prefix[8:].isdigit()
-                    and int(attempt_prefix[8:]) >= 4
-                    and (not has_inflight_now or "stream reading error" not in log_reason.lower())
-                )
-                is_severe_retry = "bad record mac" in log_reason.lower() or severe_attempt
-                if not on_healthy_safe_leaf or is_severe_retry:
-                    gs["last_log_fail_ts"] = log_ts
-                    verdict = PROBE_DEAD
-                    detail = f"agy_log_retry ({log_reason})"
-                    log_triggered = True
-                else:
-                    gs["last_log_fail_ts"] = max(since_ts, log_ts)
+                if log_failed:
+                    safe_leaf = _is_stream_safe_gemini_leaf(self.paths, current)
+                    on_healthy_safe_leaf = verdict == PROBE_OK and safe_leaf
+                    has_inflight_now = group_busy or (
+                        safe_leaf
+                        and has_active_ai_transfer(self.paths, getattr(self.query, "api", None), group, current)
+                    )
+                    attempt_prefix = log_reason.split(":", 1)[0].strip()
+                    severe_attempt = (
+                        attempt_prefix.startswith("attempt ")
+                        and attempt_prefix[8:].isdigit()
+                        and int(attempt_prefix[8:]) >= 4
+                        and (not has_inflight_now or "stream reading error" not in log_reason.lower())
+                    )
+                    is_severe_retry = "bad record mac" in log_reason.lower() or severe_attempt
+                    if not on_healthy_safe_leaf or is_severe_retry:
+                        gs["last_log_fail_ts"] = log_ts
+                        verdict = PROBE_DEAD
+                        detail = f"agy_log_retry ({log_reason})"
+                        log_triggered = True
+                    else:
+                        gs["last_log_fail_ts"] = max(since_ts, log_ts)
         elif group == AI_MANUAL_GROUP:
             if previous_active and current and previous_active != current:
                 gs["last_log_fail_ts"] = max(float(gs.get("last_log_fail_ts") or 0.0), now + 75.0)
@@ -1510,6 +1667,18 @@ class AIWatchService:
             return result
 
         if verdict == PROBE_OK:
+            if (
+                not dry_run
+                and not active_busy
+                and group == AI_GEMINI_GROUP
+                and current
+                and ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+            ):
+                gb_map = state.get("gemini_geo_blocked")
+                if isinstance(gb_map, dict) and current in gb_map:
+                    gb_map.pop(current, None)
+                    state["gemini_geo_blocked"] = gb_map
+                clear_gemini_geo_blocked_node(self.paths, current)
             cooldown_map = gs.get("cooldown", {})
             other_group_name = (
                 AI_GEMINI_GROUP
@@ -1577,6 +1746,10 @@ class AIWatchService:
                             if c
                             and c != current
                             and not is_static_iepl_node(str(c), self.paths)
+                            and not (
+                                group == AI_GEMINI_GROUP
+                                and is_gemini_geo_blocked(str(c), self.paths, now=now)
+                            )
                             and not (groups.get(c) is not None and groups[c].candidates)
                             and not (active_bans and is_node_banned(str(c), active_bans))
                         ]
@@ -1670,11 +1843,20 @@ class AIWatchService:
                     or log_triggered
                     or is_static_iepl_node(current, self.paths)
                 )
+                force_drop = verdict == PROBE_GEO_BLOCKED
                 try:
                     try:
-                        self.query.switch_group(group, target, drop_connections=should_drop)
+                        if force_drop:
+                            self.query.switch_group(
+                                group, target, drop_connections=should_drop, force_drop=True
+                            )
+                        else:
+                            self.query.switch_group(group, target, drop_connections=should_drop)
                     except TypeError:
-                        self.query.switch_group(group, target)
+                        try:
+                            self.query.switch_group(group, target, drop_connections=should_drop)
+                        except TypeError:
+                            self.query.switch_group(group, target)
                 except Exception:
                     # 切换失败（目标在 fallback 中 alive=False 或 API 抖动）：将目标记入冷却期避免下轮死循环重试同一节点
                     gs.setdefault("cooldown", {})[target] = now
@@ -1686,9 +1868,24 @@ class AIWatchService:
                     else (AI_MANUAL_GROUP if group == AI_GEMINI_GROUP else "")
                 )
                 other_leaf = resolve_current_leaf(groups, other_grp) if other_grp and other_grp in groups else None
+                is_geo_blocked_switch = verdict == PROBE_GEO_BLOCKED and group == AI_GEMINI_GROUP
                 if current:
                     cooldown[current] = now
-                    if log_triggered and (current != other_leaf or ai_target_verdict is not _DEFAULT_AI_TARGET_VERDICT):
+                    if is_geo_blocked_switch:
+                        gb = state.get("gemini_geo_blocked")
+                        if not isinstance(gb, dict):
+                            gb = {}
+                        gb = {
+                            str(k): float(v)
+                            for k, v in gb.items()
+                            if k
+                            and isinstance(v, (int, float))
+                            and (now - float(v)) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+                        }
+                        gb[current] = now
+                        state["gemini_geo_blocked"] = gb
+                        record_gemini_geo_blocked_node(self.paths, current, now=now)
+                    elif log_triggered and (current != other_leaf or ai_target_verdict is not _DEFAULT_AI_TARGET_VERDICT):
                         sf = state.get("stream_fragile")
                         if not isinstance(sf, dict):
                             sf = {}
@@ -1707,12 +1904,28 @@ class AIWatchService:
                         now + silence_sec,
                         time.time() + silence_sec,
                     )
+                    if is_geo_blocked_switch:
+                        gs["last_geo_fail_ts"] = max(
+                            float(gs.get("last_geo_fail_ts") or 0.0),
+                            now + 15.0,
+                            time.time() + 15.0,
+                        )
                     _promote_gemini_order_head(
                         self.paths,
                         target,
                         group=group,
-                        demote=current if current != other_leaf else None,
+                        demote=current if (is_geo_blocked_switch or current != other_leaf) else None,
+                        sink_tail=is_geo_blocked_switch,
                     )
+                    if is_geo_blocked_switch:
+                        try:
+                            from ..backend.runtime import RuntimeBackend
+                            from ..config import config_file
+
+                            if config_file(self.paths).exists():
+                                RuntimeBackend(self.paths).render_runtime()
+                        except Exception:
+                            pass
                 gs["fail_node"] = None
                 gs["fail_count"] = 0
                 gs["busy_defer_count"] = 0
@@ -1789,6 +2002,10 @@ class AIWatchService:
             dynamic_non_static_iepl.sort(key=lambda c: _cand_sort_key(str(c)))
             static_iepl = [c for c in candidates if c and is_static_iepl_node(str(c), self.paths)]
             candidates = clean_non_iepl + dynamic_non_static_iepl + static_iepl
+        if group_name == AI_GEMINI_GROUP:
+            non_geo = [c for c in candidates if c and not is_gemini_geo_blocked(str(c), self.paths, now=now)]
+            geo_tail = [c for c in candidates if c and is_gemini_geo_blocked(str(c), self.paths, now=now)]
+            candidates = non_geo + geo_tail
         for idx, cand in enumerate(candidates):
             if not cand or cand == current:
                 continue
@@ -1798,17 +2015,27 @@ class AIWatchService:
             if entry is not None and entry.candidates:
                 continue
             is_dead = entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout")
+            is_geo_quarantined = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(
+                str(cand), self.paths, now=now
+            )
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
-                if is_managed_ai and not is_static_iepl_node(str(cand), self.paths) and not is_dead:
+                if (
+                    is_managed_ai
+                    and not is_static_iepl_node(str(cand), self.paths)
+                    and not is_geo_quarantined
+                    and not is_dead
+                ):
                     dyn_tier = 0 if not is_iepl_node(str(cand), self.paths) else 1
                     cooled_healthy_non_iepl.append((dyn_tier, float(ts), idx, str(cand)))
                 continue
             if is_dead:
-                if fallback_leaf is None:
+                if fallback_leaf is None and not is_geo_quarantined:
                     fallback_leaf = str(cand)
                 continue
-            if is_managed_ai and is_static_iepl_node(str(cand), self.paths) and cooled_healthy_non_iepl:
+            if (
+                (is_managed_ai and is_static_iepl_node(str(cand), self.paths)) or is_geo_quarantined
+            ) and cooled_healthy_non_iepl:
                 cooled_healthy_non_iepl.sort()
                 return cooled_healthy_non_iepl[0][3]
             return str(cand)

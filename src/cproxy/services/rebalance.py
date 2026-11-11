@@ -23,16 +23,20 @@ from ..backend.runtime import (
     _load_ai_manual_order,
 )
 from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, read_config, runtime_file
+from .diagnostics import DEFAULT_GOOGLE_GEO_URL, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
 from .nodelist import match_region
 from .probe import (
     GEMINI_FAST_REGIONS,
     ProbeService,
     ProbeSummary,
+    clear_gemini_geo_blocked_node,
     clear_stream_fragile_node,
+    is_gemini_geo_blocked,
     is_healthy_non_iepl_summary,
     is_iepl_node,
     is_static_iepl_node,
     probe_paths_context,
+    record_gemini_geo_blocked_node,
     record_stream_fragile_node,
 )
 from .query import QueryService
@@ -51,7 +55,12 @@ CHRONIC_PENALTY_SWITCH_THRESHOLD_MS = 80
 REBALANCE_TOP_K = 5
 
 
-def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
+def _smooth_rank_key(
+    summary: ProbeSummary,
+    *,
+    prefer_non_iepl: bool = False,
+    penalize_gemini_geo_blocked: bool = False,
+):
     """`rank_key` 基础上加重历史惩罚权重。
 
     rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
@@ -62,12 +71,24 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
     - Tier 2: 曾有动态重试记录但本身非静态 IEPL/裸 vision 的存活节点（防止 1X 节点偶发重试后跌到 50s 必断的 IEPL 之后）
     - Tier 3: 静态 IEPL / 裸 vision 健康节点
     - Tier 4: 其余劣化/超时节点
+    - Tier 5: 近期被 Google/Gemini 判定为地区受限（送中 CN / HK）的隔离节点
     """
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     weighted = penalty * HISTORY_PENALTY_WEIGHT
     max_w = max_plus_p - penalty + weighted
     avg_w = avg_plus_p - penalty + weighted
+    geo_quarantined = penalize_gemini_geo_blocked and is_gemini_geo_blocked(summary.name)
     if not prefer_non_iepl:
+        if penalize_gemini_geo_blocked:
+            return (
+                1 if geo_quarantined else 0,
+                neg_success,
+                failures,
+                max_w,
+                avg_w,
+                penalty,
+                name,
+            )
         return (
             neg_success,
             failures,
@@ -76,9 +97,10 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
             penalty,
             name,
         )
-    healthy_non_iepl = is_healthy_non_iepl_summary(summary)
+    healthy_non_iepl = not geo_quarantined and is_healthy_non_iepl_summary(summary)
     alive_non_iepl = (
-        not is_iepl_node(summary.name)
+        not geo_quarantined
+        and not is_iepl_node(summary.name)
         and summary.success_count > 0
         and summary.success_count >= failures
         and penalty < 200
@@ -86,14 +108,22 @@ def _smooth_rank_key(summary: ProbeSummary, *, prefer_non_iepl: bool = False):
         and summary.avg_delay <= 1350
     )
     dynamic_non_static_iepl = (
-        not is_static_iepl_node(summary.name)
+        not geo_quarantined
+        and not is_static_iepl_node(summary.name)
         and summary.success_count > 0
         and (summary.success_count >= failures or summary.success_count >= 2)
         and summary.avg_delay is not None
         and summary.avg_delay <= 1500
     )
-    is_healthy = summary.success_count > 0 and failures == 0 and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
-    if healthy_non_iepl:
+    is_healthy = (
+        not geo_quarantined
+        and summary.success_count > 0
+        and failures == 0
+        and penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS
+    )
+    if geo_quarantined:
+        tier = 5
+    elif healthy_non_iepl:
         tier = 0
     elif alive_non_iepl:
         tier = 1
@@ -221,7 +251,11 @@ class RebalanceService:
                 summary.name
                 for summary in sorted(
                     gemini_report.summaries,
-                    key=lambda s: _smooth_rank_key(s, prefer_non_iepl=True),
+                    key=lambda s: _smooth_rank_key(
+                        s,
+                        prefer_non_iepl=True,
+                        penalize_gemini_geo_blocked=True,
+                    ),
                 )
             ]
             gemini_ordered = _deprioritize_high_multiplier(
@@ -285,6 +319,7 @@ class RebalanceService:
             )
             cur_gemini_usable = bool(
                 cur_gemini_verdict is not None
+                and not is_gemini_geo_blocked(cur_gemini, self.paths)
                 and (
                     getattr(cur_gemini_verdict, "stable", False)
                     or cur_gemini_summary is None
@@ -400,6 +435,16 @@ class RebalanceService:
                     gemini_order_path,
                     gemini_switched_to,
                 )
+            if (
+                not is_external
+                and type(probe_service) is ProbeService
+                and not os.environ.get("PYTEST_CURRENT_TEST")
+            ):
+                effective_gemini_order, gemini_switched_to = self._verify_gemini_geo_eligibility(
+                    list(effective_gemini_order),
+                    gemini_order_path,
+                    gemini_switched_to,
+                )
 
         try:
             import time as _time
@@ -489,6 +534,101 @@ class RebalanceService:
                 pass
         return ordered, switched_to
 
+    def _verify_gemini_geo_eligibility(
+        self,
+        ordered: list[str],
+        order_path,
+        switched_to: str | None,
+        max_attempts: int = 4,
+    ) -> tuple[list[str], str | None]:
+        """对 AI-GEMINI 当前生效节点做一次 Google GWS 地区门禁实测验毒（Geo Probe）。
+
+        通用 `generate_204` 测速无法识别“送中（CN）”或香港门禁出口；此处在重排落地后
+        经本地代理请求 `ai-google-geo-url`（默认 `https://www.google.com/?hl=en`），
+        若命中 `.google.com.hk` Cookie 或地区限制，立即写入 12h 隔离池、沉底并切至下一干净候选。
+        """
+        cfg = read_config(self.paths)
+        geo_url = str((cfg.get("ai-google-geo-url") if isinstance(cfg, dict) else None) or DEFAULT_GOOGLE_GEO_URL)
+        try:
+            query = QueryService(self.paths)
+            group_obj = query.api.get_groups().get(AI_GEMINI_GROUP)
+            if group_obj is None:
+                return ordered, switched_to
+            from .probe import resolve_current_leaf
+
+            active_node = (
+                switched_to
+                or resolve_current_leaf(query.api.get_groups(), AI_GEMINI_GROUP)
+                or str(group_obj.current or "")
+                or (ordered[0] if ordered else "")
+            )
+        except Exception:
+            return ordered, switched_to
+
+        tried: set[str] = set()
+        demoted = False
+        for _ in range(max(1, max_attempts)):
+            if not active_node or active_node in tried:
+                break
+            tried.add(active_node)
+            try:
+                verdict = ai_target_verdict(self.paths, geo_url, timeout=4, retries=1)
+            except Exception:
+                break
+            if verdict == PROBE_OK:
+                clear_gemini_geo_blocked_node(self.paths, active_node)
+                break
+            if verdict != PROBE_GEO_BLOCKED:
+                break
+            record_gemini_geo_blocked_node(self.paths, active_node)
+            if active_node in ordered:
+                ordered.remove(active_node)
+                ordered.append(active_node)
+                demoted = True
+            next_candidate = next(
+                (c for c in ordered if c not in tried and not is_gemini_geo_blocked(c, self.paths)),
+                None,
+            )
+            if not next_candidate:
+                break
+            try:
+                try:
+                    query.switch_group(
+                        AI_GEMINI_GROUP,
+                        next_candidate,
+                        drop_connections=True,
+                        force_drop=True,
+                    )
+                except TypeError:
+                    try:
+                        query.switch_group(AI_GEMINI_GROUP, next_candidate, drop_connections=True)
+                    except TypeError:
+                        query.switch_group(AI_GEMINI_GROUP, next_candidate)
+                switched_to = next_candidate
+                active_node = next_candidate
+            except Exception:
+                break
+
+        if demoted:
+            try:
+                order_path.parent.mkdir(parents=True, exist_ok=True)
+                order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+                rt_path = RuntimeBackend(self.paths).render_runtime()
+                from .ai_watch import has_any_inflight_ai_connection
+
+                api_inst = APIBackend(self.paths)
+                proc_inst = ProcessBackend(self.paths)
+                if proc_inst.is_running() and not has_any_inflight_ai_connection(self.paths, api_inst):
+                    try:
+                        api_inst.reload_config(str(rt_path))
+                        if hasattr(proc_inst, "mark_runtime_applied"):
+                            proc_inst.mark_runtime_applied(rt_path)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return ordered, switched_to
+
     @staticmethod
     def _should_switch_current(
         report,
@@ -505,6 +645,13 @@ class RebalanceService:
         summaries = getattr(report, "summaries", ()) or ()
         best_summary = next((s for s in summaries if getattr(s, "name", None) == best_candidate), None)
         cur_summary = next((s for s in summaries if getattr(s, "name", None) == current_node), None)
+        if (
+            group_name == AI_GEMINI_GROUP
+            and is_gemini_geo_blocked(current_node)
+            and not is_gemini_geo_blocked(best_candidate)
+            and (best_summary is None or getattr(best_summary, "success_count", 0) > 0)
+        ):
+            return True
         cur_is_failing = cur_summary is not None and getattr(cur_summary, "success_count", 0) <= getattr(
             cur_summary, "failures", 0
         )
@@ -577,17 +724,35 @@ class RebalanceService:
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
             current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
+            cur_geo_blocked = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(current_node, self.paths)
             from .ai_watch import has_active_ai_transfer
 
-            if not is_static_iepl_node(current_node, self.paths) and has_active_ai_transfer(
-                self.paths, getattr(query, "api", None), group_name, current_node
+            if (
+                not cur_geo_blocked
+                and not is_static_iepl_node(current_node, self.paths)
+                and has_active_ai_transfer(self.paths, getattr(query, "api", None), group_name, current_node)
             ):
                 return None
-            should_drop = group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) or is_static_iepl_node(current_node, self.paths)
+            should_drop = (
+                cur_geo_blocked
+                or group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+                or is_static_iepl_node(current_node, self.paths)
+            )
             try:
-                query.switch_group(group_name, best_candidate, drop_connections=should_drop)
+                if cur_geo_blocked:
+                    query.switch_group(
+                        group_name,
+                        best_candidate,
+                        drop_connections=should_drop,
+                        force_drop=True,
+                    )
+                else:
+                    query.switch_group(group_name, best_candidate, drop_connections=should_drop)
             except TypeError:
-                query.switch_group(group_name, best_candidate)
+                try:
+                    query.switch_group(group_name, best_candidate, drop_connections=should_drop)
+                except TypeError:
+                    query.switch_group(group_name, best_candidate)
             return best_candidate
         except Exception:
             return None

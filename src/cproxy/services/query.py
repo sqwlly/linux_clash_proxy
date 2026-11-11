@@ -107,7 +107,14 @@ class QueryService:
     def get_ai_status_groups(self) -> dict[str, ProxyGroup]:
         return self.load_context(require_api=True).groups
 
-    def switch_group(self, group_name: str, target_name: str, *, drop_connections: bool = True) -> ProxyGroup:
+    def switch_group(
+        self,
+        group_name: str,
+        target_name: str,
+        *,
+        drop_connections: bool = True,
+        force_drop: bool = False,
+    ) -> ProxyGroup:
         groups = self.api.get_groups()
         self.groups_snapshot = groups
         group = groups.get(group_name)
@@ -154,7 +161,11 @@ class QueryService:
             self.groups_snapshot = updated_groups
             updated = updated_groups[group_name]
             keep = target_name if target_name != AI_AUTO_GROUP else None
-            dropped = self._drop_stale_ai_connections(group_name, keep_leaf=keep) if drop_connections else 0
+            dropped = (
+                self._drop_stale_ai_connections(group_name, keep_leaf=keep, force=force_drop)
+                if drop_connections
+                else 0
+            )
         except Exception as exc:
             write_audit_event(
                 self.paths,
@@ -183,15 +194,22 @@ class QueryService:
         assert group is not None
         return group
 
-    def _drop_stale_ai_connections(self, group_name: str, *, keep_leaf: str | None = None) -> int:
+    def _drop_stale_ai_connections(
+        self,
+        group_name: str,
+        *,
+        keep_leaf: str | None = None,
+        force: bool = False,
+    ) -> int:
         """切换 AI 出口后立刻掐掉旧 TCP，避免同一会话混用新旧出口 IP。
 
         Google Cloud Code / Gemini 会按请求 IP 做地区校验；mihomo 换组不会
         自动拆掉已建立的长连接，必须显式关闭。若指定 `keep_leaf`（被动 fallback
         巡检场景），则保留已落在新叶子（`chains[0] == keep_leaf`）上的新连接，
         只掐掉滞留在旧叶子上的陈旧连接。
-        对于 `AI-GEMINI` 与 `AI-MANUAL`，若旧叶子为非静态 IEPL 的安全节点（如 1X WebSocket），
-        仅关闭闲置连接与后台轮询，绝不强杀正在上传大包上下文、等待模型思考或正在流式接收响应的活跃长连接。
+        对于 `AI-GEMINI` 与 `AI-MANUAL`，若 `force=False` 且旧叶子为非静态 IEPL 的安全节点（如 1X WebSocket），
+        仅关闭闲置连接与后台轮询，绝不强杀正在上传大包上下文、等待模型思考或正在流式接收响应的活跃长连接；
+        当 `force=True`（如旧叶子触发地区门禁送中）时，强制关闭旧叶子上的全部长连接以重置 HTTP/2 连接池。
         """
         if group_name not in AI_SWITCH_DROP_GROUPS:
             return 0
@@ -211,7 +229,7 @@ class QueryService:
             leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
             if keep_leaf and leaf == keep_leaf:
                 continue
-            if group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and leaf:
+            if not force and group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and leaf:
                 upload = self._to_int(item.get("upload"))
                 download = self._to_int(item.get("download"))
                 raw_meta = item.get("metadata")

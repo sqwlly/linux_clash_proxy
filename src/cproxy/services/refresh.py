@@ -77,6 +77,8 @@ LOCAL_PREFERRED_KEYS = {
     "ai-chatgpt-url",
     "ai-openai-api-url",
     "ai-gemini-api-url",
+    "ai-cloudcode-url",
+    "ai-google-geo-url",
     "ai-probe-timeout",
     "ai-gemini-prefer",
     "ai-manual-prefer",

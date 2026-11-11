@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import time
+import zlib
 from collections.abc import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -37,6 +38,9 @@ DEFAULT_AI_PROBE_TARGETS = [
     ("OpenAI API", "https://api.openai.com/v1/models"),
     ("Gemini API", "https://generativelanguage.googleapis.com/v1beta/models"),
 ]
+# 无鉴权识别 Google 核心 GeoIP“送中 (CN)”与 HK 门禁的探测地址（命中 AI-GEMINI 的 google.com 规则）：
+# Google GWS 在将出口 IP 判为 CN（送中）或 HK 时，会在 GET 响应头下发 `domain=.google.com.hk` Cookie。
+DEFAULT_GOOGLE_GEO_URL = "https://www.google.com/?hl=en"
 # 探测预算分两档，因为两者的代价完全不对称：
 # - 面板（`ai-status` / TUI 的即时探测）只是给人看的快照，宁可快：最坏耗时从
 #   `8×(2+1)+退避 ≈ 26s` 降到 `3×(1+1)+退避 ≈ 6.2s`。实测健康目标约 0.75s，慢是
@@ -62,6 +66,25 @@ GEO_BLOCK_MARKERS = (
     "location not supported",
     "not supported for the api use",
     "available in your country",
+    "location_not_eligible",
+    "your location is not eligible",
+    "unsupported_country_code",
+    "region is not supported",
+)
+
+GOOGLE_GEO_BLOCKED_COOKIE_DOMAINS = (
+    "domain=.google.com.hk",
+    "domain=google.com.hk",
+    "domain=.google.cn",
+    "domain=google.cn",
+)
+
+GOOGLE_GEO_BLOCKED_URL_MARKERS = (
+    "available-regions",
+    "available_regions",
+    "available-locations",
+    "location-not-supported",
+    "unsupported-country",
 )
 
 _ERROR_BODY_MAX_BYTES = 4096
@@ -111,10 +134,26 @@ def _probe_failure_detail(exc: Exception) -> str:
     return "连接失败"
 
 
+def _safe_attr(obj: object, attr: str, default: object = None) -> object:
+    try:
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
+
+
 def _read_error_body(exc: HTTPError) -> str:
     """有界读取 HTTP 错误响应体；读取失败返回空串（宁可当作可达，也不误报 geo-block）。"""
     try:
-        return exc.read(_ERROR_BODY_MAX_BYTES).decode("utf-8", errors="replace").lower()
+        raw = exc.read(_ERROR_BODY_MAX_BYTES)
+        hdrs = _safe_attr(exc, "headers", None)
+        getter = _safe_attr(hdrs, "get", None)
+        enc = str(getter("Content-Encoding", "") if callable(getter) else "").lower()
+        if "gzip" in enc and raw:
+            try:
+                raw = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw)
+            except Exception:
+                pass
+        return raw.decode("utf-8", errors="replace").lower()
     except Exception:
         return ""
 
@@ -123,24 +162,76 @@ def _is_geo_blocked(body: str) -> bool:
     return any(marker in body for marker in GEO_BLOCK_MARKERS)
 
 
+def _headers_or_url_indicate_geo_blocked(headers: object, final_url: str = "") -> bool:
+    """检查响应最终 URL 或 GWS Set-Cookie 是否暴露 Google CN（送中）/ HK 地区限制。"""
+    url_lower = str(final_url or "").lower()
+    if url_lower and any(marker in url_lower for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
+        return True
+    if headers is None:
+        return False
+    cookies: list[str] = []
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        raw_list = get_all("Set-Cookie")
+        if raw_list:
+            cookies.extend(str(item) for item in raw_list if item)
+    else:
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            val = getter("Set-Cookie")
+            if val:
+                cookies.append(str(val))
+            loc = getter("Location")
+            if loc and any(marker in str(loc).lower() for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
+                return True
+    if hasattr(headers, "get"):
+        loc = headers.get("Location")  # type: ignore[union-attr]
+        if loc and any(marker in str(loc).lower() for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
+            return True
+    if cookies:
+        joined = " ; ".join(cookies).lower()
+        if any(dom in joined for dom in GOOGLE_GEO_BLOCKED_COOKIE_DOMAINS):
+            return True
+    return False
+
+
 def _probe_target(opener, url: str, timeout: int, retries: int) -> tuple[str, str]:
     """探测一个 AI 目标，返回 (判定, 详情)。判定 ∈ {ok, geo_blocked, dead}。
 
     4xx 不再一律算「可达」：读响应体识别 Gemini 的地区门禁（location not
-    supported）；其余 4xx（401 缺 key / 405 等）仍算可达。5xx/超时/连接失败算 dead。
+    supported）；2xx/3xx 同时检查 Google GWS 的 `.google.com.hk` 送中/香港 Cookie
+    与地区受限重定向 URL；其余 4xx（401 缺 key / 405 等）仍算可达。5xx/超时/连接失败算 dead。
 
     `retries` 与 `timeout` 由调用方按场景决定：面板用紧预算（快），看门狗用宽预算
     （避免把慢节点误判成坏节点）。最坏耗时 ≈ `timeout × (retries+1) + Σ退避`。
     """
     for attempt in range(retries + 1):
-        request = Request(url, headers={"User-Agent": f"cproxy/{__version__}"})
+        request = Request(
+            url,
+            headers={
+                "User-Agent": f"cproxy/{__version__}",
+                "Accept-Encoding": "gzip",
+            },
+        )
         try:
             with opener.open(request, timeout=timeout) as response:
-                status = getattr(response, "status", response.getcode())
+                status = _safe_attr(response, "status", response.getcode())
+                resp_headers = _safe_attr(response, "headers", None)
+                resp_url = str(_safe_attr(response, "url", "") or "")
+                if _headers_or_url_indicate_geo_blocked(resp_headers, resp_url):
+                    return PROBE_GEO_BLOCKED, "位置不支持（Google 判定 CN/HK 地区门禁）"
             return PROBE_OK, f"HTTP {status}" if status else "成功"
         except HTTPError as exc:
+            if 300 <= exc.code < 400:
+                if _headers_or_url_indicate_geo_blocked(
+                    _safe_attr(exc, "headers", None), str(_safe_attr(exc, "url", "") or "")
+                ):
+                    return PROBE_GEO_BLOCKED, "位置不支持（地区门禁重定向）"
+                return PROBE_OK, f"HTTP {exc.code}"
             if 400 <= exc.code < 500:
-                if _is_geo_blocked(_read_error_body(exc)):
+                if _headers_or_url_indicate_geo_blocked(_safe_attr(exc, "headers", None)) or _is_geo_blocked(
+                    _read_error_body(exc)
+                ):
                     return PROBE_GEO_BLOCKED, "位置不支持（地区门禁）"
                 return PROBE_OK, f"HTTP {exc.code}"
             if attempt == retries:

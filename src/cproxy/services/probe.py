@@ -3,6 +3,8 @@ from __future__ import annotations
 import socket
 import ssl
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import ceil
 
@@ -163,14 +165,19 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
         return current
 
 
-from contextlib import contextmanager
-from typing import Iterator
-
 _IEPL_KEYWORDS = ("IEPL", "IPLC", "内网专线")
 STREAM_FRAGILE_TTL_SECONDS = 1800.0
+GEMINI_GEO_BLOCKED_TTL_SECONDS = 12 * 3600.0
 _ACTIVE_PATHS: AppPaths | None = None
 _CONFIG_FRAGILE_CACHE: tuple[str, int, frozenset[str]] = ("", -1, frozenset())
-_DYNAMIC_FRAGILE_CACHE: tuple[str, int, dict[str, float]] = ("", -1, {})
+_DYNAMIC_FRAGILE_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
+_GEMINI_GEO_BLOCKED_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
+
+
+def invalidate_probe_state_cache() -> None:
+    global _DYNAMIC_FRAGILE_CACHE, _GEMINI_GEO_BLOCKED_CACHE
+    _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
+    _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
 
 
 @contextmanager
@@ -213,15 +220,20 @@ def _load_dynamic_fragile_map(paths: AppPaths) -> dict[str, float]:
     global _DYNAMIC_FRAGILE_CACHE
     try:
         import json
+
         from ..config import ai_watch_state_file
 
         state_path = ai_watch_state_file(paths)
         if not state_path.exists():
             return {}
-        mtime_ns = state_path.stat().st_mtime_ns
+        st = state_path.stat()
         key = str(state_path)
-        if _DYNAMIC_FRAGILE_CACHE[0] == key and _DYNAMIC_FRAGILE_CACHE[1] == mtime_ns:
-            return _DYNAMIC_FRAGILE_CACHE[2]
+        if (
+            _DYNAMIC_FRAGILE_CACHE[0] == key
+            and _DYNAMIC_FRAGILE_CACHE[1] == st.st_mtime_ns
+            and _DYNAMIC_FRAGILE_CACHE[2] == st.st_size
+        ):
+            return _DYNAMIC_FRAGILE_CACHE[3]
         data = json.loads(state_path.read_text(encoding="utf-8"))
         raw = data.get("stream_fragile") if isinstance(data, dict) else None
         parsed = (
@@ -229,7 +241,7 @@ def _load_dynamic_fragile_map(paths: AppPaths) -> dict[str, float]:
             if isinstance(raw, dict)
             else {}
         )
-        _DYNAMIC_FRAGILE_CACHE = (key, mtime_ns, parsed)
+        _DYNAMIC_FRAGILE_CACHE = (key, st.st_mtime_ns, st.st_size, parsed)
         return parsed
     except Exception:
         return {}
@@ -255,6 +267,7 @@ def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float 
         return
     try:
         import json
+
         from ..config import ai_watch_state_file
 
         state_path = ai_watch_state_file(paths)
@@ -281,7 +294,7 @@ def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float 
         tmp = state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(state_path)
-        _DYNAMIC_FRAGILE_CACHE = ("", -1, {})
+        _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
     except Exception:
         pass
 
@@ -292,6 +305,7 @@ def clear_stream_fragile_node(paths: AppPaths, name: str | None) -> None:
         return
     try:
         import json
+
         from ..config import ai_watch_state_file
 
         state_path = ai_watch_state_file(paths)
@@ -308,7 +322,120 @@ def clear_stream_fragile_node(paths: AppPaths, name: str | None) -> None:
         tmp = state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
         tmp.replace(state_path)
-        _DYNAMIC_FRAGILE_CACHE = ("", -1, {})
+        _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
+    except Exception:
+        pass
+
+
+def _load_gemini_geo_blocked_map(paths: AppPaths) -> dict[str, float]:
+    global _GEMINI_GEO_BLOCKED_CACHE
+    try:
+        import json
+
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        if not state_path.exists():
+            return {}
+        st = state_path.stat()
+        key = str(state_path)
+        if (
+            _GEMINI_GEO_BLOCKED_CACHE[0] == key
+            and _GEMINI_GEO_BLOCKED_CACHE[1] == st.st_mtime_ns
+            and _GEMINI_GEO_BLOCKED_CACHE[2] == st.st_size
+        ):
+            return _GEMINI_GEO_BLOCKED_CACHE[3]
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        raw = data.get("gemini_geo_blocked") if isinstance(data, dict) else None
+        parsed = (
+            {str(k): float(v) for k, v in raw.items() if k and isinstance(v, (int, float))}
+            if isinstance(raw, dict)
+            else {}
+        )
+        _GEMINI_GEO_BLOCKED_CACHE = (key, st.st_mtime_ns, st.st_size, parsed)
+        return parsed
+    except Exception:
+        return {}
+
+
+def is_gemini_geo_blocked(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
+    """判断节点是否近期被 Google/Gemini 判定为地区受限（CN 送中 / HK 等）。"""
+    if not name:
+        return False
+    eff_paths = paths or _ACTIVE_PATHS
+    if eff_paths is None:
+        return False
+    blocked_map = _load_gemini_geo_blocked_map(eff_paths)
+    ts = blocked_map.get(str(name))
+    if ts is None:
+        return False
+    ts_now = time.time() if now is None else now
+    return (ts_now - float(ts)) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+
+
+def record_gemini_geo_blocked_node(paths: AppPaths, name: str | None, *, now: float | None = None) -> None:
+    """持久化记录节点在 AI-GEMINI 上触发地区门禁（TTL 12 小时，防止 fallback / rebalance 反复切回送中节点）。"""
+    global _GEMINI_GEO_BLOCKED_CACHE
+    if not name:
+        return
+    try:
+        import json
+
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        data: dict = {}
+        if state_path.exists():
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+        ts_now = time.time() if now is None else now
+        gb = data.get("gemini_geo_blocked")
+        if not isinstance(gb, dict):
+            gb = {}
+        gb = {
+            str(k): float(v)
+            for k, v in gb.items()
+            if k and isinstance(v, (int, float)) and (ts_now - float(v)) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+        }
+        gb[str(name)] = ts_now
+        data["gemini_geo_blocked"] = gb
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(state_path)
+        _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
+    except Exception:
+        pass
+
+
+def clear_gemini_geo_blocked_node(paths: AppPaths, name: str | None) -> None:
+    global _GEMINI_GEO_BLOCKED_CACHE
+    if not name:
+        return
+    try:
+        import json
+
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        if not state_path.exists():
+            return
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return
+        gb = loaded.get("gemini_geo_blocked")
+        if not isinstance(gb, dict) or str(name) not in gb:
+            return
+        gb.pop(str(name), None)
+        loaded["gemini_geo_blocked"] = gb
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(state_path)
+        _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
     except Exception:
         pass
 
@@ -430,14 +557,18 @@ def is_healthy_non_iepl_summary(
 
 
 def probe_rank_key(
-    summary: ProbeSummary, *, prefer_non_iepl: bool = False
-) -> tuple[int, int, int, int, int, int, int, str]:
+    summary: ProbeSummary,
+    *,
+    prefer_non_iepl: bool = False,
+    penalize_gemini_geo_blocked: bool = False,
+) -> tuple[int, int, int, int, int, int, int, int, str]:
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
+    geo_tier = 1 if (penalize_gemini_geo_blocked and is_gemini_geo_blocked(summary.name)) else 0
     healthy_non_iepl = is_healthy_non_iepl_summary(summary)
     if prefer_non_iepl:
-        if healthy_non_iepl:
+        if healthy_non_iepl and not geo_tier:
             iepl_tier = 0
-        elif is_healthy_non_iepl_summary(summary, ignore_dynamic_fragile=True):
+        elif is_healthy_non_iepl_summary(summary, ignore_dynamic_fragile=True) and not geo_tier:
             iepl_tier = 1
         else:
             iepl_tier = 2
@@ -450,7 +581,7 @@ def probe_rank_key(
         region_tier = 0 if (reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None)) else 1
     else:
         region_tier = 0
-    return (neg_success, failures, iepl_tier, region_tier, max_plus_p, avg_plus_p, penalty, name)
+    return (geo_tier, neg_success, failures, iepl_tier, region_tier, max_plus_p, avg_plus_p, penalty, name)
 
 
 def active_candidates_after_round(
@@ -459,6 +590,7 @@ def active_candidates_after_round(
     history_penalties: dict[str, int] | None = None,
     *,
     prefer_non_iepl: bool = False,
+    penalize_gemini_geo_blocked: bool = False,
 ) -> set[str]:
     penalties = history_penalties or {}
     summaries = [
@@ -472,15 +604,30 @@ def active_candidates_after_round(
     ]
     keep = max(1, ceil(len(summaries) / 2))
     if prefer_non_iepl:
-        healthy_non_iepl_count = sum(1 for s in summaries if is_healthy_non_iepl_summary(s))
+        healthy_non_iepl_count = sum(
+            1
+            for s in summaries
+            if is_healthy_non_iepl_summary(s)
+            and not (penalize_gemini_geo_blocked and is_gemini_geo_blocked(s.name))
+        )
         keep = max(keep, healthy_non_iepl_count)
     active = {
-        s.name for s in sorted(summaries, key=lambda s: probe_rank_key(s, prefer_non_iepl=prefer_non_iepl))[:keep]
+        s.name
+        for s in sorted(
+            summaries,
+            key=lambda s: probe_rank_key(
+                s,
+                prefer_non_iepl=prefer_non_iepl,
+                penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
+            ),
+        )[:keep]
     }
     if prefer_non_iepl:
         for s in summaries:
-            if not is_static_iepl_node(s.name) and (
-                s.success_count > 0 or (s.failures <= 1 and s.history_penalty_ms < 200)
+            if (
+                not is_static_iepl_node(s.name)
+                and not (penalize_gemini_geo_blocked and is_gemini_geo_blocked(s.name))
+                and (s.success_count > 0 or (s.failures <= 1 and s.history_penalty_ms < 200))
             ):
                 active.add(s.name)
     if current and current in results:
@@ -529,11 +676,18 @@ def switch_skip_reason(
     strategy: ProbeStrategy,
     *,
     prefer_non_iepl: bool = False,
+    penalize_gemini_geo_blocked: bool = False,
 ) -> str:
     if best is None:
         return "没有可切换的成功节点"
     if current == best.name:
         return "当前已是推荐稳定节点"
+    if (
+        penalize_gemini_geo_blocked
+        and is_gemini_geo_blocked(current)
+        and not is_gemini_geo_blocked(best.name)
+    ):
+        return ""
     if prefer_non_iepl and is_iepl_node(current) and is_healthy_non_iepl_summary(best):
         return ""
     if not current_verdict.stable or current_summary is None:
@@ -556,15 +710,28 @@ def _preview_reason(
     strategy: ProbeStrategy,
     *,
     prefer_non_iepl: bool = False,
+    penalize_gemini_geo_blocked: bool = False,
 ) -> str:
     if not verdict.stable:
         if not current_verdict.stable:
             return switch_skip_reason(
-                best, current, current_verdict, current_summary, strategy, prefer_non_iepl=prefer_non_iepl
+                best,
+                current,
+                current_verdict,
+                current_summary,
+                strategy,
+                prefer_non_iepl=prefer_non_iepl,
+                penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
             )
         return verdict.reason
     return switch_skip_reason(
-        best, current, current_verdict, current_summary, strategy, prefer_non_iepl=prefer_non_iepl
+        best,
+        current,
+        current_verdict,
+        current_summary,
+        strategy,
+        prefer_non_iepl=prefer_non_iepl,
+        penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
     )
 
 
@@ -695,6 +862,7 @@ class ProbeService:
                     current,
                     penalties,
                     prefer_non_iepl=(group in ("AI-GEMINI", "AI-MANUAL") or profile in ("gemini", "codex")),
+                    penalize_gemini_geo_blocked=(group == "AI-GEMINI" or profile == "gemini"),
                 )
                 if show_progress:
                     progress.commit(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}")
@@ -703,6 +871,7 @@ class ProbeService:
             progress.commit("完成")
 
         prefer_non_iepl = group in ("AI-GEMINI", "AI-MANUAL") or profile in ("gemini", "codex")
+        penalize_gemini_geo = group == "AI-GEMINI" or profile == "gemini"
         summaries = tuple(
             ProbeSummary(
                 name=n,
@@ -713,12 +882,30 @@ class ProbeService:
             for n, d in results.items()
         )
         successful = [s for s in summaries if s.success_count > 0]
-        best = min(successful, key=lambda s: probe_rank_key(s, prefer_non_iepl=prefer_non_iepl)) if successful else None
+        best = (
+            min(
+                successful,
+                key=lambda s: probe_rank_key(
+                    s,
+                    prefer_non_iepl=prefer_non_iepl,
+                    penalize_gemini_geo_blocked=penalize_gemini_geo,
+                ),
+            )
+            if successful
+            else None
+        )
         verdict = stability_verdict(best, probe_rounds, strategy)
         current_summary = next((s for s in summaries if s.name == current), None)
         current_verdict = stability_verdict(current_summary, probe_rounds, strategy)
         preview = _preview_reason(
-            best, verdict, current, current_verdict, current_summary, strategy, prefer_non_iepl=prefer_non_iepl
+            best,
+            verdict,
+            current,
+            current_verdict,
+            current_summary,
+            strategy,
+            prefer_non_iepl=prefer_non_iepl,
+            penalize_gemini_geo_blocked=penalize_gemini_geo,
         )
 
         switched = False
