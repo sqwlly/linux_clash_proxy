@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -822,21 +823,26 @@ def _watch_url(paths: AppPaths, group: str) -> str:
     return _watch_urls(paths, group)[0]
 
 
+_WATCH_STATE_LOCK = threading.RLock()
+
+
 def _load_state(paths: AppPaths) -> dict:
-    try:
-        data = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    with _WATCH_STATE_LOCK:
+        try:
+            data = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
 
 def _save_state(paths: AppPaths, state: dict) -> None:
     path = ai_watch_state_file(paths)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-    invalidate_probe_state_cache()
+    with _WATCH_STATE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+        invalidate_probe_state_cache()
 
 
 def _group_state(state: dict, group: str) -> dict:
@@ -860,18 +866,38 @@ _AGY_RETRY_FAIL_RE = re.compile(
     _AGY_GLOG_PREFIX
     + r"\d+\s+run\.go:\d+\]\s+Run:\s+attempt\s+(\d+)\s+failed\s+\((.+?)\),\s+retrying\s+in\b"
 )
-# 仅匹配 [WE] 级别且来自 RPC/执行器源码（errorreport.go / code_assist_client.go / run.go）的真实地区报错，
+_AGY_EXEC_TRANSPORT_FAIL_RE = re.compile(
+    _AGY_WARN_ERR_PREFIX
+    + r"\d+\s+errorreport\.go:\d+\]\s+agent\s+executor\s+error:\s+(?:generating\s+and\s+executing:\s+)?"
+    + r'.*?(request\s+failed:\s+Post\s+"https://[^"]*googleapis\.com/[^"]*":\s+.+)$',
+    re.IGNORECASE,
+)
+_AGY_EXEC_TRANSPORT_MARKERS = (
+    "clientconn.close",
+    "unexpected eof",
+    ": eof",
+    "bad record mac",
+    "tls handshake",
+    "connection reset",
+    "forcibly closed",
+    "wsarecv",
+    "i/o timeout",
+    "io timeout",
+)
+# 仅匹配 [WE] 级别且来自 RPC/执行器/状态轮询源码（errorreport.go / code_assist_client.go / poll.go / run.go）的真实地区报错，
 # 严格排除 I 级别及 input_loop.go（避免用户在对话框粘贴报错文本被误判为真实门禁触发）。
 _AGY_GEO_BLOCK_RE = re.compile(
     _AGY_WARN_ERR_PREFIX
-    + r"\d+\s+(errorreport|code_assist_client|run)\.go:\d+\]\s+(.*(?:"
+    + r"\d+\s+(errorreport|code_assist_client|poll|run)\.go:\d+\]\s+(.*(?:"
     + r"User location is not supported for the API use"
     + r"|LOCATION_NOT_ELIGIBLE"
     + r"|Your location is not eligible for this service"
     + r").*)$",
     re.IGNORECASE,
 )
-_AGY_DETECTED_LOC_RE = re.compile(r"\bdetected_location:([A-Z]{2,3})\b")
+_AGY_DETECTED_LOC_RE = re.compile(
+    r"(?:\bdetected_location:([A-Z]{2,3})\b|\bDetected\s+location:\s*([A-Z]{2,3})\b)"
+)
 AGY_LOG_WINDOW_SECONDS = 180.0
 
 
@@ -979,7 +1005,10 @@ def detect_recent_agy_retry_failure(
         except OSError:
             continue
 
+        is_shared_ls_log = log_path.name.startswith("language_server")
         seen_fail_in_file = False
+        latest_ok_ts_in_file: float | None = None
+        stop_retry_scan = False
         file_candidate: tuple[float, int, str] | None = None
         fallback_candidate: tuple[float, int, str] | None = None
         lines = tail.splitlines()
@@ -988,10 +1017,54 @@ def detect_recent_agy_retry_failure(
             if "streamGenerateContent" in stripped and "ResponseID:" in stripped:
                 if not seen_fail_in_file:
                     ok_ts = _parse_glog_timestamp(stripped, local_now)
-                    if ok_ts is not None and ok_ts > newest_success_ts:
-                        newest_success_ts = ok_ts
-                    # 该会话在更晚时间点已成功收到 streamGenerateContent 响应头（正在流式输出或已完成），
-                    # 绝不能因更早前的 attempt 失败日志而切节点掐断当前正在进行的流
+                    if ok_ts is not None:
+                        if ok_ts > newest_success_ts:
+                            newest_success_ts = ok_ts
+                        if latest_ok_ts_in_file is None or ok_ts > latest_ok_ts_in_file:
+                            latest_ok_ts_in_file = ok_ts
+                    if not is_shared_ls_log:
+                        # 独立 cli-*.log 会话在更晚时间点已成功收到响应头，不因更早前的 attempt 失败切流
+                        break
+                    stop_retry_scan = True
+                continue
+            m_exec = _AGY_EXEC_TRANSPORT_FAIL_RE.match(stripped)
+            if m_exec:
+                month, day, hour, minute, sec, usec, exec_reason = m_exec.groups()
+                exec_lower = exec_reason.lower()
+                if "context canceled" not in exec_lower and any(
+                    mk in exec_lower for mk in _AGY_EXEC_TRANSPORT_MARKERS
+                ):
+                    seen_fail_in_file = True
+                    year = local_now.tm_year
+                    if int(month) == 12 and local_now.tm_mon == 1:
+                        year -= 1
+                    try:
+                        struct_t = time.strptime(
+                            f"{year:04d}-{int(month):02d}-{int(day):02d} {int(hour):02d}:{int(minute):02d}:{int(sec):02d}",
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
+                    except ValueError:
+                        continue
+                    if (
+                        stop_retry_scan
+                        and latest_ok_ts_in_file is not None
+                        and (latest_ok_ts_in_file - event_ts) >= 18.0
+                    ):
+                        break
+                    prev_ok_ts_exec: float | None = None
+                    for prev_idx in range(idx - 1, max(-1, idx - 80), -1):
+                        prev_stripped = lines[prev_idx].strip()
+                        if "streamGenerateContent" in prev_stripped and "ResponseID:" in prev_stripped:
+                            prev_ok_ts_exec = _parse_glog_timestamp(prev_stripped, local_now)
+                            break
+                    if prev_ok_ts_exec is not None and 55.0 <= (event_ts - prev_ok_ts_exec) <= 180.0:
+                        break
+                    if event_ts <= since_ts:
+                        break
+                    age = ts_now - event_ts
+                    if -5.0 <= age <= window_seconds:
+                        file_candidate = (event_ts, 4, f"attempt 4: {exec_reason}")
                     break
                 continue
             m = _AGY_RETRY_FAIL_RE.match(stripped)
@@ -1001,6 +1074,8 @@ def detect_recent_agy_retry_failure(
             month, day, hour, minute, sec, usec, attempt, reason = m.groups()
             reason_lower = reason.lower()
             attempt_num = int(attempt)
+            if stop_retry_scan and attempt_num < 4 and "bad record mac" not in reason_lower:
+                break
             # stream reading error: unexpected EOF 在低重试次数（attempt <= 3）说明节点已建连成功，
             # 仅单次长流中途断流，不切走以免打断其它活跃会话；但若连续达到 attempt >= 4 仍反复中途断流，必须自愈切流。
             if "stream reading error" in reason_lower and attempt_num < 4:
@@ -1019,6 +1094,12 @@ def detect_recent_agy_retry_failure(
                 event_ts = time.mktime(struct_t) + int(usec[:6].ljust(6, "0")) / 1_000_000.0
             except ValueError:
                 continue
+            if (
+                stop_retry_scan
+                and latest_ok_ts_in_file is not None
+                and (latest_ok_ts_in_file - event_ts) >= 18.0
+            ):
+                break
             is_post_eof = "streamgeneratecontent" in reason_lower and reason_lower.endswith(": eof")
             if "stream reading error" in reason_lower or is_post_eof:
                 prev_ok_ts: float | None = None
@@ -1091,7 +1172,7 @@ def detect_recent_agy_geo_block(
 
     local_now = time.localtime(ts_now)
     newest_success_ts = 0.0
-    candidates: list[tuple[float, str]] = []
+    candidates: list[tuple[float, str, bool]] = []
 
     for log_path in reversed(logs[-10:]):
         try:
@@ -1103,6 +1184,7 @@ def detect_recent_agy_geo_block(
         except OSError:
             continue
 
+        is_shared_ls_log = log_path.name.startswith("language_server")
         seen_geo_in_file = False
         lines = tail.splitlines()
         for idx in range(len(lines) - 1, -1, -1):
@@ -1111,14 +1193,14 @@ def detect_recent_agy_geo_block(
                 ok_ts = _parse_glog_timestamp(stripped, local_now)
                 if ok_ts is not None and ok_ts > newest_success_ts:
                     newest_success_ts = ok_ts
-                if not seen_geo_in_file:
+                if not is_shared_ls_log and not seen_geo_in_file:
                     break
                 continue
             m = _AGY_GEO_BLOCK_RE.match(stripped)
             if not m:
                 continue
             seen_geo_in_file = True
-            month, day, hour, minute, sec, usec, _src_file, msg = m.groups()
+            month, day, hour, minute, sec, usec, src_file, msg = m.groups()
             year = local_now.tm_year
             if int(month) == 12 and local_now.tm_mon == 1:
                 year -= 1
@@ -1135,23 +1217,30 @@ def detect_recent_agy_geo_block(
             age = ts_now - event_ts
             if -5.0 <= age <= window_seconds:
                 loc_m = _AGY_DETECTED_LOC_RE.search(msg)
-                if "location_not_eligible" in msg.lower():
+                loc_code = (loc_m.group(1) or loc_m.group(2)) if loc_m else None
+                msg_lc = msg.lower()
+                if "location_not_eligible" in msg_lc or "not eligible for this service" in msg_lc:
                     reason = (
-                        f"LOCATION_NOT_ELIGIBLE (detected_location={loc_m.group(1)})"
-                        if loc_m
+                        f"LOCATION_NOT_ELIGIBLE (detected_location={loc_code})"
+                        if loc_code
                         else "LOCATION_NOT_ELIGIBLE"
                     )
                 else:
                     reason = (
-                        f"400 User location is not supported (detected_location={loc_m.group(1)})"
-                        if loc_m
+                        f"400 User location is not supported (detected_location={loc_code})"
+                        if loc_code
                         else "400 User location is not supported"
                     )
-                candidates.append((event_ts, reason))
+                bypass_flash_lite_ok = is_shared_ls_log and src_file.lower() == "poll"
+                candidates.append((event_ts, reason, bypass_flash_lite_ok))
             break
 
     max_seen_ts = max([since_ts] + [c[0] for c in candidates])
-    triggered = [c for c in candidates if c[0] > newest_success_ts]
+    triggered = [
+        c
+        for c in candidates
+        if c[0] > newest_success_ts or (c[2] and (newest_success_ts - c[0]) < 30.0)
+    ]
     if triggered:
         best = max(triggered, key=lambda c: c[0])
         return True, best[0], best[1]
@@ -1352,6 +1441,8 @@ def _promote_gemini_order_head(
     if not order_path.exists():
         return
     try:
+        from .ban import filter_unbanned_nodes, load_active_bans
+
         data = json.loads(order_path.read_text(encoding="utf-8"))
         if not isinstance(data, list) or not data:
             return
@@ -1372,9 +1463,14 @@ def _promote_gemini_order_head(
                 non_static.append(demote_node)
             static_tail = [x for x in rest if is_static_iepl_node(x, paths)]
             updated = [target] + non_static + static_tail
+        active_bans = load_active_bans(paths)
+        if active_bans:
+            updated = filter_unbanned_nodes(updated, active_bans, keep_fallback=True)
         if updated == data:
             return
-        order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+        tmp_path = order_path.with_name(f"{order_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, order_path)
     except (OSError, ValueError):
         pass
 
@@ -1444,20 +1540,41 @@ class AIWatchService:
             )
             report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
             if not dry_run:
-                state["updated_at"] = now
-                state["last_watch_ts"] = now
-                state["watch_runs"] = int(state.get("watch_runs") or 0) + 1
-                state["total_switches"] = int(state.get("total_switches") or 0) + sum(
-                    1 for r in report.results if r.switched
-                )
-                state["total_reaped_connections"] = int(state.get("total_reaped_connections") or 0) + len(
-                    report.reaped_connections or []
-                )
-                verdicts = dict(state.get("last_verdicts") or {})
-                for r in report.results:
-                    verdicts[r.group] = r.verdict
-                state["last_verdicts"] = verdicts
-                _save_state(self.paths, state)
+                with _WATCH_STATE_LOCK:
+                    latest_disk = _load_state(self.paths)
+                    if "last_rebalance_ts" in latest_disk or "last_rebalance_ts" in state:
+                        state["last_rebalance_ts"] = max(
+                            float(state.get("last_rebalance_ts") or 0.0),
+                            float(latest_disk.get("last_rebalance_ts") or 0.0),
+                        )
+                    if "rebalance_runs" in latest_disk or "rebalance_runs" in state:
+                        state["rebalance_runs"] = max(
+                            int(state.get("rebalance_runs") or 0),
+                            int(latest_disk.get("rebalance_runs") or 0),
+                        )
+                    for map_key in ("stream_fragile", "gemini_geo_blocked", "gemini_geo_log_blocked"):
+                        disk_map = latest_disk.get(map_key)
+                        if isinstance(disk_map, dict):
+                            cur_map = dict(state.get(map_key) or {}) if isinstance(state.get(map_key), dict) else {}
+                            for k, v in disk_map.items():
+                                if isinstance(v, (int, float)) and float(v) >= now:
+                                    cur_map[str(k)] = max(float(cur_map.get(str(k)) or 0.0), float(v))
+                            if cur_map:
+                                state[map_key] = cur_map
+                    state["updated_at"] = now
+                    state["last_watch_ts"] = now
+                    state["watch_runs"] = int(state.get("watch_runs") or 0) + 1
+                    state["total_switches"] = int(state.get("total_switches") or 0) + sum(
+                        1 for r in report.results if r.switched
+                    )
+                    state["total_reaped_connections"] = int(state.get("total_reaped_connections") or 0) + len(
+                        report.reaped_connections or []
+                    )
+                    verdicts = dict(state.get("last_verdicts") or {})
+                    for r in report.results:
+                        verdicts[r.group] = r.verdict
+                    state["last_verdicts"] = verdicts
+                    _save_state(self.paths, state)
                 try:
                     from ..backend.process import ProcessBackend
                     from ..config import runtime_file
@@ -1548,6 +1665,7 @@ class AIWatchService:
                 gs["busy_defer_count"] = 0
 
         log_triggered = False
+        geo_log_triggered = False
         if group == AI_GEMINI_GROUP:
             if previous_active and current and previous_active != current:
                 gs["last_geo_fail_ts"] = max(float(gs.get("last_geo_fail_ts") or 0.0), now + 3.0)
@@ -1562,6 +1680,7 @@ class AIWatchService:
                 verdict = PROBE_GEO_BLOCKED
                 detail = f"agy_log_geo_block ({geo_reason})"
                 log_triggered = True
+                geo_log_triggered = True
                 active_busy = False
             else:
                 # 若节点已由外部切换或自动优选变更，设 30s 静默保护窗，旧节点上的滞后重试报错不归咎于新节点
@@ -1674,11 +1793,19 @@ class AIWatchService:
                 and current
                 and ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
             ):
-                gb_map = state.get("gemini_geo_blocked")
-                if isinstance(gb_map, dict) and current in gb_map:
-                    gb_map.pop(current, None)
-                    state["gemini_geo_blocked"] = gb_map
-                clear_gemini_geo_blocked_node(self.paths, current)
+                log_gb_map = state.get("gemini_geo_log_blocked")
+                has_log_geo_block = (
+                    isinstance(log_gb_map, dict)
+                    and current in log_gb_map
+                    and isinstance(log_gb_map.get(current), (int, float))
+                    and (now - float(log_gb_map[current])) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+                )
+                if not has_log_geo_block:
+                    gb_map = state.get("gemini_geo_blocked")
+                    if isinstance(gb_map, dict) and current in gb_map:
+                        gb_map.pop(current, None)
+                        state["gemini_geo_blocked"] = gb_map
+                    clear_gemini_geo_blocked_node(self.paths, current)
             cooldown_map = gs.get("cooldown", {})
             other_group_name = (
                 AI_GEMINI_GROUP
@@ -1690,8 +1817,11 @@ class AIWatchService:
                 if other_group_name and other_group_name in groups
                 else None
             )
+            from .ban import is_node_banned, load_active_bans
             from .nodelist import is_panel_info_node
 
+            active_bans_now = load_active_bans(self.paths, now=now)
+            on_banned = bool(current and active_bans_now and is_node_banned(current, active_bans_now))
             on_static_iepl = is_static_iepl_node(current, self.paths) or is_panel_info_node(str(current or ""))
             in_active_cooldown = (
                 isinstance(cooldown_map, dict)
@@ -1716,19 +1846,23 @@ class AIWatchService:
                 not dry_run
                 and group_obj is not None
                 and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
-                and (on_static_iepl or on_soft_unhealthy)
+                and (on_banned or on_static_iepl or on_soft_unhealthy)
             ):
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
                 cand_entry = groups.get(cand_1x) if cand_1x else None
                 cand_ready = (
                     cand_1x is not None
                     and not is_static_iepl_node(cand_1x, self.paths)
-                    and (on_static_iepl or (not is_iepl_node(cand_1x, self.paths) and cand_1x != other_active_leaf))
+                    and (
+                        on_static_iepl
+                        or on_banned
+                        or (not is_iepl_node(cand_1x, self.paths) and cand_1x != other_active_leaf)
+                    )
                     and cand_entry is not None
                     and cand_entry.alive is True
                     and delay_state(cand_entry.delay) != "timeout"
                 )
-                if not cand_ready and on_static_iepl:
+                if not cand_ready and (on_static_iepl or on_banned):
                     try:
                         from ..backend.runtime import TEST_URL, refresh_ws_cdn_ips_if_changed
 
@@ -1737,9 +1871,6 @@ class AIWatchService:
                         TEST_URL = "https://www.gstatic.com/generate_204"
                     delay_fn = getattr(getattr(self.query, "api", None), "delay_test", None)
                     if callable(delay_fn):
-                        from .ban import is_node_banned, load_active_bans
-
-                        active_bans = load_active_bans(self.paths, now=now)
                         non_iepl_cands = [
                             str(c)
                             for c in group_obj.candidates
@@ -1751,7 +1882,7 @@ class AIWatchService:
                                 and is_gemini_geo_blocked(str(c), self.paths, now=now)
                             )
                             and not (groups.get(c) is not None and groups[c].candidates)
-                            and not (active_bans and is_node_banned(str(c), active_bans))
+                            and not (active_bans_now and is_node_banned(str(c), active_bans_now))
                         ]
                         non_iepl_cands.sort(key=lambda c: (1 if c in cooldown_map else 0, float(cooldown_map.get(c, 0.0))))
                         for probe_cand in non_iepl_cands[:2]:
@@ -1767,7 +1898,9 @@ class AIWatchService:
                 if cand_ready and cand_1x is not None:
                     try:
                         try:
-                            self.query.switch_group(group, cand_1x, drop_connections=on_static_iepl)
+                            self.query.switch_group(
+                                group, cand_1x, drop_connections=(on_static_iepl or on_banned)
+                            )
                         except TypeError:
                             self.query.switch_group(group, cand_1x)
                         if isinstance(cooldown_map, dict):
@@ -1783,7 +1916,7 @@ class AIWatchService:
                         gs["last_active"] = cand_1x
                         result.switched = True
                         result.target = cand_1x
-                        result.detail = "migrated_off_iepl"
+                        result.detail = "migrated_off_banned" if on_banned else "migrated_off_iepl"
                         return result
                     except Exception:
                         pass
@@ -1884,6 +2017,19 @@ class AIWatchService:
                         }
                         gb[current] = now
                         state["gemini_geo_blocked"] = gb
+                        if geo_log_triggered:
+                            lgb = state.get("gemini_geo_log_blocked")
+                            if not isinstance(lgb, dict):
+                                lgb = {}
+                            lgb = {
+                                str(k): float(v)
+                                for k, v in lgb.items()
+                                if k
+                                and isinstance(v, (int, float))
+                                and (now - float(v)) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+                            }
+                            lgb[current] = now
+                            state["gemini_geo_log_blocked"] = lgb
                         record_gemini_geo_blocked_node(self.paths, current, now=now)
                     elif log_triggered and (current != other_leaf or ai_target_verdict is not _DEFAULT_AI_TARGET_VERDICT):
                         sf = state.get("stream_fragile")

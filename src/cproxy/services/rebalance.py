@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..backend.api import APIBackend
 from ..backend.process import ProcessBackend
@@ -27,6 +29,7 @@ from .diagnostics import DEFAULT_GOOGLE_GEO_URL, PROBE_GEO_BLOCKED, PROBE_OK, ai
 from .nodelist import match_region
 from .probe import (
     GEMINI_FAST_REGIONS,
+    GEMINI_GEO_BLOCKED_TTL_SECONDS,
     ProbeService,
     ProbeSummary,
     clear_gemini_geo_blocked_node,
@@ -38,8 +41,16 @@ from .probe import (
     probe_paths_context,
     record_gemini_geo_blocked_node,
     record_stream_fragile_node,
+    resolve_current_leaf,
 )
 from .query import QueryService
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 REBALANCE_PROFILE = "codex"
 REBALANCE_GEMINI_PROFILE = "gemini"
@@ -352,14 +363,22 @@ class RebalanceService:
                 gemini_order_path=str(gemini_order_path) if gemini_ordered else "",
             )
 
+        from .ban import filter_unbanned_nodes, load_active_bans
+
+        latest_bans = load_active_bans(self.paths)
         previous_order = _load_ai_manual_order(self.paths)
+        if latest_bans:
+            ordered = filter_unbanned_nodes(ordered, latest_bans, keep_fallback=True)
+            previous_order = filter_unbanned_nodes(previous_order, latest_bans, keep_fallback=True)
         order_updated = not _should_keep_previous_order(previous_order, ordered)
         effective_order = ordered if order_updated else previous_order
         if order_updated:
-            order_path.parent.mkdir(parents=True, exist_ok=True)
-            order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+            _atomic_write_json(order_path, ordered)
 
         gemini_previous_order = _load_ai_gemini_order(self.paths)
+        if latest_bans and gemini_ordered:
+            gemini_ordered = filter_unbanned_nodes(gemini_ordered, latest_bans, keep_fallback=True)
+            gemini_previous_order = filter_unbanned_nodes(gemini_previous_order, latest_bans, keep_fallback=True)
         gemini_baseline = (
             gemini_previous_order
             if gemini_previous_order or set(gemini_ordered) != set(previous_order)
@@ -370,8 +389,7 @@ class RebalanceService:
         )
         effective_gemini_order = gemini_ordered if gemini_order_updated else (gemini_previous_order or gemini_ordered)
         if gemini_order_updated:
-            gemini_order_path.parent.mkdir(parents=True, exist_ok=True)
-            gemini_order_path.write_text(json.dumps(gemini_ordered, ensure_ascii=False), encoding="utf-8")
+            _atomic_write_json(gemini_order_path, gemini_ordered)
 
         rerendered = False
         hot_reloaded = False
@@ -450,14 +468,16 @@ class RebalanceService:
             import time as _time
 
             from ..config import ai_watch_state_file
+            from .ai_watch import _WATCH_STATE_LOCK
             from .ai_watch import _load_state as _load_watch_state
             from .ai_watch import _save_state as _save_watch_state
 
-            if ai_watch_state_file(self.paths).exists():
-                w_state = _load_watch_state(self.paths)
-                w_state["last_rebalance_ts"] = _time.time()
-                w_state["rebalance_runs"] = int(w_state.get("rebalance_runs") or 0) + 1
-                _save_watch_state(self.paths, w_state)
+            with _WATCH_STATE_LOCK:
+                if ai_watch_state_file(self.paths).exists():
+                    w_state = _load_watch_state(self.paths)
+                    w_state["last_rebalance_ts"] = _time.time()
+                    w_state["rebalance_runs"] = int(w_state.get("rebalance_runs") or 0) + 1
+                    _save_watch_state(self.paths, w_state)
         except Exception:
             pass
 
@@ -528,8 +548,7 @@ class RebalanceService:
 
         if demoted:
             try:
-                order_path.parent.mkdir(parents=True, exist_ok=True)
-                order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+                _atomic_write_json(Path(order_path), ordered)
             except OSError:
                 pass
         return ordered, switched_to
@@ -576,7 +595,20 @@ class RebalanceService:
             except Exception:
                 break
             if verdict == PROBE_OK:
-                clear_gemini_geo_blocked_node(self.paths, active_node)
+                import time as _time
+
+                from .ai_watch import _load_state as _load_watch_state
+
+                w_state = _load_watch_state(self.paths)
+                log_gb_map = w_state.get("gemini_geo_log_blocked") if isinstance(w_state, dict) else None
+                has_log_geo_block = (
+                    isinstance(log_gb_map, dict)
+                    and active_node in log_gb_map
+                    and isinstance(log_gb_map.get(active_node), (int, float))
+                    and (_time.time() - float(log_gb_map[active_node])) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+                )
+                if not has_log_geo_block:
+                    clear_gemini_geo_blocked_node(self.paths, active_node)
                 break
             if verdict != PROBE_GEO_BLOCKED:
                 break
@@ -611,8 +643,7 @@ class RebalanceService:
 
         if demoted:
             try:
-                order_path.parent.mkdir(parents=True, exist_ok=True)
-                order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+                _atomic_write_json(Path(order_path), ordered)
                 rt_path = RuntimeBackend(self.paths).render_runtime()
                 from .ai_watch import has_any_inflight_ai_connection
 
@@ -717,24 +748,43 @@ class RebalanceService:
         if not self._should_switch_current(report, best_candidate, group_name):
             return None
         try:
+            from .ban import is_node_banned, load_active_bans
+
+            active_bans = load_active_bans(self.paths)
+            if active_bans and is_node_banned(best_candidate, active_bans):
+                return None
+            if group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(best_candidate, self.paths):
+                return None
+
             query = QueryService(self.paths)
-            group_obj = query.api.get_groups().get(group_name)
+            groups_map = query.api.get_groups()
+            group_obj = groups_map.get(group_name)
             if group_obj is None:
                 return None
             if group_name == AI_MANUAL_GROUP and group_obj.current == AI_AUTO_GROUP:
                 return None
-            current_node = getattr(report, "current", None) or getattr(group_obj, "current", None)
+            rep_current = getattr(report, "current", None)
+            live_current = resolve_current_leaf(groups_map, group_name) or getattr(group_obj, "current", None)
+            if rep_current and live_current and live_current != rep_current:
+                live_banned = bool(active_bans and is_node_banned(live_current, active_bans))
+                live_geo_blocked = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(live_current, self.paths)
+                if not live_banned and not live_geo_blocked and not is_static_iepl_node(live_current, self.paths):
+                    return None
+            current_node = live_current or rep_current
             cur_geo_blocked = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(current_node, self.paths)
+            cur_banned = bool(current_node and active_bans and is_node_banned(current_node, active_bans))
             from .ai_watch import has_active_ai_transfer
 
             if (
                 not cur_geo_blocked
+                and not cur_banned
                 and not is_static_iepl_node(current_node, self.paths)
                 and has_active_ai_transfer(self.paths, getattr(query, "api", None), group_name, current_node)
             ):
                 return None
             should_drop = (
                 cur_geo_blocked
+                or cur_banned
                 or group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
                 or is_static_iepl_node(current_node, self.paths)
             )

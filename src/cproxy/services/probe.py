@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from math import ceil
 
@@ -168,7 +171,8 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
 _IEPL_KEYWORDS = ("IEPL", "IPLC", "内网专线")
 STREAM_FRAGILE_TTL_SECONDS = 1800.0
 GEMINI_GEO_BLOCKED_TTL_SECONDS = 12 * 3600.0
-_ACTIVE_PATHS: AppPaths | None = None
+_ACTIVE_PATHS_VAR: ContextVar[AppPaths | None] = ContextVar("cproxy_probe_active_paths", default=None)
+_FRAGILE_STATE_LOCK = threading.RLock()
 _CONFIG_FRAGILE_CACHE: tuple[str, int, frozenset[str]] = ("", -1, frozenset())
 _DYNAMIC_FRAGILE_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
 _GEMINI_GEO_BLOCKED_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
@@ -182,13 +186,11 @@ def invalidate_probe_state_cache() -> None:
 
 @contextmanager
 def probe_paths_context(paths: AppPaths | None) -> Iterator[None]:
-    global _ACTIVE_PATHS
-    prev = _ACTIVE_PATHS
-    _ACTIVE_PATHS = paths
+    token = _ACTIVE_PATHS_VAR.set(paths)
     try:
         yield
     finally:
-        _ACTIVE_PATHS = prev
+        _ACTIVE_PATHS_VAR.reset(token)
 
 
 def _load_config_fragile_nodes(paths: AppPaths) -> frozenset[str]:
@@ -250,7 +252,7 @@ def _load_dynamic_fragile_map(paths: AppPaths) -> dict[str, float]:
 def is_dynamic_stream_fragile(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
     if not name:
         return False
-    eff_paths = paths or _ACTIVE_PATHS
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is None:
         return False
     fragile_map = _load_dynamic_fragile_map(eff_paths)
@@ -265,66 +267,68 @@ def record_stream_fragile_node(paths: AppPaths, name: str | None, *, now: float 
     global _DYNAMIC_FRAGILE_CACHE
     if not name:
         return
-    try:
-        import json
+    with _FRAGILE_STATE_LOCK:
+        try:
+            import json
 
-        from ..config import ai_watch_state_file
+            from ..config import ai_watch_state_file
 
-        state_path = ai_watch_state_file(paths)
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        data: dict = {}
-        if state_path.exists():
-            try:
-                loaded = json.loads(state_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-            except Exception:
-                data = {}
-        ts_now = time.time() if now is None else now
-        sf = data.get("stream_fragile")
-        if not isinstance(sf, dict):
-            sf = {}
-        sf = {
-            str(k): float(v)
-            for k, v in sf.items()
-            if k and isinstance(v, (int, float)) and (ts_now - float(v)) < STREAM_FRAGILE_TTL_SECONDS
-        }
-        sf[str(name)] = ts_now
-        data["stream_fragile"] = sf
-        tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(state_path)
-        _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
-    except Exception:
-        pass
+            state_path = ai_watch_state_file(paths)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            data: dict = {}
+            if state_path.exists():
+                try:
+                    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                except Exception:
+                    data = {}
+            ts_now = time.time() if now is None else now
+            sf = data.get("stream_fragile")
+            if not isinstance(sf, dict):
+                sf = {}
+            sf = {
+                str(k): float(v)
+                for k, v in sf.items()
+                if k and isinstance(v, (int, float)) and (ts_now - float(v)) < STREAM_FRAGILE_TTL_SECONDS
+            }
+            sf[str(name)] = ts_now
+            data["stream_fragile"] = sf
+            tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, state_path)
+            _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
+        except Exception:
+            pass
 
 
 def clear_stream_fragile_node(paths: AppPaths, name: str | None) -> None:
     global _DYNAMIC_FRAGILE_CACHE
     if not name:
         return
-    try:
-        import json
+    with _FRAGILE_STATE_LOCK:
+        try:
+            import json
 
-        from ..config import ai_watch_state_file
+            from ..config import ai_watch_state_file
 
-        state_path = ai_watch_state_file(paths)
-        if not state_path.exists():
-            return
-        loaded = json.loads(state_path.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            return
-        sf = loaded.get("stream_fragile")
-        if not isinstance(sf, dict) or str(name) not in sf:
-            return
-        sf.pop(str(name), None)
-        loaded["stream_fragile"] = sf
-        tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(state_path)
-        _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
-    except Exception:
-        pass
+            state_path = ai_watch_state_file(paths)
+            if not state_path.exists():
+                return
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                return
+            sf = loaded.get("stream_fragile")
+            if not isinstance(sf, dict) or str(name) not in sf:
+                return
+            sf.pop(str(name), None)
+            loaded["stream_fragile"] = sf
+            tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, state_path)
+            _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
+        except Exception:
+            pass
 
 
 def _load_gemini_geo_blocked_map(paths: AppPaths) -> dict[str, float]:
@@ -359,10 +363,10 @@ def _load_gemini_geo_blocked_map(paths: AppPaths) -> dict[str, float]:
 
 
 def is_gemini_geo_blocked(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
-    """判断节点是否近期被 Google/Gemini 判定为地区受限（CN 送中 / HK 等）。"""
+    """判断节点是否近期被 Google/Gemini 判定为地区受限（CN 送中 / HK / RU 等）。"""
     if not name:
         return False
-    eff_paths = paths or _ACTIVE_PATHS
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is None:
         return False
     blocked_map = _load_gemini_geo_blocked_map(eff_paths)
@@ -378,66 +382,68 @@ def record_gemini_geo_blocked_node(paths: AppPaths, name: str | None, *, now: fl
     global _GEMINI_GEO_BLOCKED_CACHE
     if not name:
         return
-    try:
-        import json
+    with _FRAGILE_STATE_LOCK:
+        try:
+            import json
 
-        from ..config import ai_watch_state_file
+            from ..config import ai_watch_state_file
 
-        state_path = ai_watch_state_file(paths)
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        data: dict = {}
-        if state_path.exists():
-            try:
-                loaded = json.loads(state_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-            except Exception:
-                data = {}
-        ts_now = time.time() if now is None else now
-        gb = data.get("gemini_geo_blocked")
-        if not isinstance(gb, dict):
-            gb = {}
-        gb = {
-            str(k): float(v)
-            for k, v in gb.items()
-            if k and isinstance(v, (int, float)) and (ts_now - float(v)) < GEMINI_GEO_BLOCKED_TTL_SECONDS
-        }
-        gb[str(name)] = ts_now
-        data["gemini_geo_blocked"] = gb
-        tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(state_path)
-        _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
-    except Exception:
-        pass
+            state_path = ai_watch_state_file(paths)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            data: dict = {}
+            if state_path.exists():
+                try:
+                    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                except Exception:
+                    data = {}
+            ts_now = time.time() if now is None else now
+            gb = data.get("gemini_geo_blocked")
+            if not isinstance(gb, dict):
+                gb = {}
+            gb = {
+                str(k): float(v)
+                for k, v in gb.items()
+                if k and isinstance(v, (int, float)) and (ts_now - float(v)) < GEMINI_GEO_BLOCKED_TTL_SECONDS
+            }
+            gb[str(name)] = ts_now
+            data["gemini_geo_blocked"] = gb
+            tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, state_path)
+            _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
+        except Exception:
+            pass
 
 
 def clear_gemini_geo_blocked_node(paths: AppPaths, name: str | None) -> None:
     global _GEMINI_GEO_BLOCKED_CACHE
     if not name:
         return
-    try:
-        import json
+    with _FRAGILE_STATE_LOCK:
+        try:
+            import json
 
-        from ..config import ai_watch_state_file
+            from ..config import ai_watch_state_file
 
-        state_path = ai_watch_state_file(paths)
-        if not state_path.exists():
-            return
-        loaded = json.loads(state_path.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            return
-        gb = loaded.get("gemini_geo_blocked")
-        if not isinstance(gb, dict) or str(name) not in gb:
-            return
-        gb.pop(str(name), None)
-        loaded["gemini_geo_blocked"] = gb
-        tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(state_path)
-        _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
-    except Exception:
-        pass
+            state_path = ai_watch_state_file(paths)
+            if not state_path.exists():
+                return
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                return
+            gb = loaded.get("gemini_geo_blocked")
+            if not isinstance(gb, dict) or str(name) not in gb:
+                return
+            gb.pop(str(name), None)
+            loaded["gemini_geo_blocked"] = gb
+            tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, state_path)
+            _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
+        except Exception:
+            pass
 
 
 def is_static_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
@@ -447,7 +453,7 @@ def is_static_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool
     upper = str(name).upper()
     if any(kw in upper for kw in _IEPL_KEYWORDS):
         return True
-    eff_paths = paths or _ACTIVE_PATHS
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is not None and str(name) in _load_config_fragile_nodes(eff_paths):
         return True
     return False
@@ -463,7 +469,7 @@ def is_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
         return False
     if is_static_iepl_node(name, paths):
         return True
-    eff_paths = paths or _ACTIVE_PATHS
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is not None and is_dynamic_stream_fragile(name, eff_paths):
         return True
     return False

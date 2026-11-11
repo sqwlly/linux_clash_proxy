@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ from ..config import (
     verge_daemon_state_file,
 )
 from .ai_watch import AIWatchService, WatchReport, sample_connections_activity
-from .probe import is_iepl_node, resolve_current_leaf
+from .probe import is_gemini_geo_blocked, is_iepl_node, resolve_current_leaf
 from .rebalance import RebalanceReport, RebalanceService
 
 DEFAULT_VERGE_CONTROLLER = "127.0.0.1:9097"
@@ -460,13 +461,57 @@ def try_hot_reload_verge_runtime(
                 if rp["path"].startswith("./"):
                     rp["path"] = rp["path"][2:]
 
+    from ..backend.runtime import _load_ai_gemini_order, _load_ai_manual_order
+    from .ban import filter_unbanned_nodes, is_node_banned, load_active_bans
+
+    active_bans = load_active_bans(paths)
+    manual_order = _load_ai_manual_order(paths)
+    gemini_order = _load_ai_gemini_order(paths)
+
+    def _apply_learned_order(leaves: list[str], order: list[str]) -> list[str]:
+        if not order or not leaves:
+            return list(leaves)
+        leaf_set = set(leaves)
+        front: list[str] = []
+        seen: set[str] = set()
+        for item in order:
+            if item in leaf_set and item not in seen:
+                seen.add(item)
+                front.append(item)
+        return front + [x for x in leaves if x not in seen]
+
     for grp in new_cfg.get("proxy-groups") or []:
         if not isinstance(grp, dict) or not isinstance(grp.get("proxies"), list):
             continue
-        if grp.get("name") == "AI-MANUAL" and cur_manual and cur_manual in grp["proxies"]:
-            grp["proxies"] = [cur_manual] + [x for x in grp["proxies"] if x != cur_manual]
-        elif grp.get("name") == "AI-GEMINI" and cur_gemini and cur_gemini in grp["proxies"]:
-            grp["proxies"] = [cur_gemini] + [x for x in grp["proxies"] if x != cur_gemini]
+        gname = str(grp.get("name") or "")
+        if gname in ("AI-US", "AI-SG") and active_bans:
+            grp["proxies"] = filter_unbanned_nodes([str(x) for x in grp["proxies"]], active_bans, keep_fallback=True)
+        elif gname == "AI-MANUAL":
+            raw_members = [str(x) for x in grp["proxies"]]
+            has_auto = "AI-AUTO" in raw_members
+            leaves = [x for x in raw_members if x != "AI-AUTO"]
+            if active_bans:
+                leaves = filter_unbanned_nodes(leaves, active_bans, keep_fallback=True)
+            leaves = _apply_learned_order(leaves, manual_order)
+            if cur_manual and cur_manual in leaves and not (active_bans and is_node_banned(cur_manual, active_bans)):
+                leaves = [cur_manual] + [x for x in leaves if x != cur_manual]
+            grp["proxies"] = leaves + (["AI-AUTO"] if has_auto else [])
+        elif gname == "AI-GEMINI":
+            leaves = [str(x) for x in grp["proxies"]]
+            if active_bans:
+                leaves = filter_unbanned_nodes(leaves, active_bans, keep_fallback=True)
+            leaves = _apply_learned_order(leaves, gemini_order)
+            clean_leaves = [x for x in leaves if not is_gemini_geo_blocked(x, paths)]
+            if clean_leaves and len(clean_leaves) < len(leaves):
+                leaves = clean_leaves + [x for x in leaves if is_gemini_geo_blocked(x, paths)]
+            if (
+                cur_gemini
+                and cur_gemini in leaves
+                and not (active_bans and is_node_banned(cur_gemini, active_bans))
+                and not is_gemini_geo_blocked(cur_gemini, paths)
+            ):
+                leaves = [cur_gemini] + [x for x in leaves if x != cur_gemini]
+            grp["proxies"] = leaves
 
     try:
         payload_yaml = yaml.safe_dump(new_cfg, allow_unicode=True, sort_keys=False)
@@ -475,8 +520,15 @@ def try_hot_reload_verge_runtime(
         return False
 
     if selectors:
+        selectors = {
+            g: t
+            for g, t in selectors.items()
+            if not (active_bans and g in ("AI-MANUAL", "AI-GEMINI") and is_node_banned(str(t), active_bans))
+            and not (g == "AI-GEMINI" and is_gemini_geo_blocked(str(t), paths))
+        }
         try:
-            api.restore_selectors(selectors)
+            if selectors:
+                api.restore_selectors(selectors)
         except Exception:
             pass
     try:
@@ -550,26 +602,31 @@ def install_verge_oneclick(
     )
 
 
+_DAEMON_STATE_LOCK = threading.RLock()
+
+
 def _load_daemon_state(paths: AppPaths) -> dict[str, Any]:
     path = verge_daemon_state_file(paths)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    with _DAEMON_STATE_LOCK:
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
 
 def _save_daemon_state(paths: AppPaths, state: dict[str, Any]) -> None:
     path = verge_daemon_state_file(paths)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    with _DAEMON_STATE_LOCK:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 def _is_pid_alive(pid: int | None) -> bool:
@@ -746,6 +803,7 @@ class VergeDaemonService:
         dry_run: bool = False,
         max_ticks: int | None = None,
         enable_keepalive: bool | None = None,
+        async_rebalance: bool | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         on_tick: Callable[[VergeTickReport], None] | None = None,
     ) -> int:
@@ -754,7 +812,13 @@ class VergeDaemonService:
         sample_sec = max(1.0, min(float(sample_interval), watch_sec))
 
         eff_keepalive = (max_ticks is None and not dry_run) if enable_keepalive is None else bool(enable_keepalive)
+        eff_async_rebalance = (max_ticks is None) if async_rebalance is None else bool(async_rebalance)
         keepalive_thread = self._start_embedded_keepalive_thread() if eff_keepalive else None
+
+        rebalance_thread: threading.Thread | None = None
+        rebalance_lock = threading.Lock()
+        pending_rebalance_result: list[tuple[RebalanceReport | None, str | None]] = []
+        last_synced_bans_sig: object = None
 
         last_watch_ts = 0.0
         last_rebalance_ts = 0.0
@@ -772,39 +836,104 @@ class VergeDaemonService:
                     last_keepalive_mount_check_ts = now
                     try:
                         from .ai_watch import has_any_inflight_ai_connection
+                        from .ban import is_node_banned, load_active_bans
 
                         gmap = api.get_groups()
-                        if (
-                            "AI-MANUAL" in gmap
-                            and "AI-MANUAL-KEEPALIVE" not in gmap
-                            and not has_any_inflight_ai_connection(self.paths, api)
+                        need_keepalive_mount = "AI-MANUAL" in gmap and "AI-MANUAL-KEEPALIVE" not in gmap
+                        active_bans = load_active_bans(self.paths, now=now)
+                        gem_obj = gmap.get("AI-GEMINI")
+                        gem_cands = [c for c in (gem_obj.candidates if gem_obj else []) if c and c != "AI-AUTO"]
+                        geo_blocked_cands = tuple(
+                            sorted(c for c in gem_cands if is_gemini_geo_blocked(c, self.paths, now=now))
+                        )
+                        bans_sig = (
+                            tuple((b.pattern, b.expires_at) for b in active_bans),
+                            geo_blocked_cands,
+                        )
+                        need_ban_evict = False
+                        if (active_bans or geo_blocked_cands) and bans_sig != last_synced_bans_sig:
+                            for gname in ("AI-MANUAL", "AI-GEMINI"):
+                                gobj = gmap.get(gname)
+                                cands = [c for c in (gobj.candidates if gobj else []) if c and c != "AI-AUTO"]
+                                if len(cands) > 1 and active_bans and any(
+                                    is_node_banned(c, active_bans) for c in cands
+                                ):
+                                    need_ban_evict = True
+                                    break
+                            if (
+                                not need_ban_evict
+                                and len(gem_cands) > len(geo_blocked_cands)
+                                and gem_cands
+                                and gem_cands[0] in geo_blocked_cands
+                            ):
+                                need_ban_evict = True
+                            if not need_ban_evict:
+                                last_synced_bans_sig = bans_sig
+                        if (need_keepalive_mount or need_ban_evict) and not has_any_inflight_ai_connection(
+                            self.paths, api
                         ):
-                            try_hot_reload_verge_runtime(self.paths)
+                            if try_hot_reload_verge_runtime(self.paths, force=need_ban_evict):
+                                last_synced_bans_sig = bans_sig
                     except Exception:
                         pass
 
+                finished_reb: tuple[RebalanceReport | None, str | None] | None = None
+                with rebalance_lock:
+                    if pending_rebalance_result:
+                        finished_reb = pending_rebalance_result.pop(0)
+
+                rebalance_running = rebalance_thread is not None and rebalance_thread.is_alive()
                 due_watch = (now - last_watch_ts) >= watch_sec
-                due_rebalance = (now - last_rebalance_ts) >= rebalance_sec
+                due_rebalance = (not rebalance_running) and ((now - last_rebalance_ts) >= rebalance_sec)
                 tick_report: VergeTickReport | None = None
-                if due_watch or due_rebalance:
+                if due_watch or due_rebalance or finished_reb is not None:
                     tick_report = VergeTickReport(timestamp=now, sampled_connections=len(idle_map))
+                    if finished_reb is not None:
+                        reb_rep, reb_err = finished_reb
+                        if reb_rep is not None:
+                            tick_report.rebalance_report = reb_rep
+                        if reb_err:
+                            tick_report.warnings.append(reb_err)
                     if due_watch:
                         tick_report.watch_report = AIWatchService(self.paths).watch(dry_run=dry_run)
                         last_watch_ts = time.time()
                     if due_rebalance:
-                        _record_daemon_heartbeat(
-                            self.paths,
-                            now=time.time(),
-                            sampled_connections=len(idle_map),
-                        )
-                        try:
-                            tick_report.rebalance_report = RebalanceService(self.paths).rebalance(
-                                dry_run=dry_run,
-                                external_only=True,
+                        if eff_async_rebalance:
+                            last_rebalance_ts = time.time()
+
+                            def _rebalance_worker() -> None:
+                                rep: RebalanceReport | None = None
+                                err: str | None = None
+                                try:
+                                    rep = RebalanceService(self.paths).rebalance(
+                                        dry_run=dry_run,
+                                        external_only=True,
+                                    )
+                                except Exception as exc:
+                                    err = str(exc)
+                                with rebalance_lock:
+                                    pending_rebalance_result.append((rep, err))
+
+                            rebalance_thread = threading.Thread(
+                                target=_rebalance_worker,
+                                name="cproxy-verge-rebalance",
+                                daemon=True,
                             )
-                        except Exception as exc:
-                            tick_report.warnings.append(str(exc))
-                        last_rebalance_ts = time.time()
+                            rebalance_thread.start()
+                        else:
+                            _record_daemon_heartbeat(
+                                self.paths,
+                                now=time.time(),
+                                sampled_connections=len(idle_map),
+                            )
+                            try:
+                                tick_report.rebalance_report = RebalanceService(self.paths).rebalance(
+                                    dry_run=dry_run,
+                                    external_only=True,
+                                )
+                            except Exception as exc:
+                                tick_report.warnings.append(str(exc))
+                            last_rebalance_ts = time.time()
                 _record_daemon_heartbeat(
                     self.paths,
                     now=time.time(),
@@ -1357,6 +1486,9 @@ def collect_ai_egress_deep_status(
     except Exception:
         pass
 
+    from .ban import is_node_banned, load_active_bans
+
+    active_bans = load_active_bans(paths, now=ts)
     details: dict[str, dict[str, Any]] = {}
     for gname in ("AI-MANUAL", "AI-GEMINI"):
         gobj = (groups_map or {}).get(gname)
@@ -1387,11 +1519,19 @@ def collect_ai_egress_deep_status(
         next_standby = [
             c
             for c in leaf_cands
-            if c != leaf and c not in cooled_set and not is_iepl_node(c, paths)
+            if c != leaf
+            and c not in cooled_set
+            and not is_iepl_node(c, paths)
+            and not (active_bans and is_node_banned(c, active_bans))
+            and not (gname == "AI-GEMINI" and is_gemini_geo_blocked(c, paths, now=ts))
         ]
         if len(next_standby) < 2:
             for c in leaf_cands:
-                if c != leaf and c not in next_standby:
+                if (
+                    c != leaf
+                    and c not in next_standby
+                    and not (active_bans and is_node_banned(c, active_bans))
+                ):
                     next_standby.append(c)
                 if len(next_standby) >= 2:
                     break

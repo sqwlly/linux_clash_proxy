@@ -1794,38 +1794,48 @@ def test_h2_keepalive_default_intervals_strike_cap_and_sse_boundary_heartbeat(tm
 
             async def _drive_sse(sid: int):
                 nonlocal pings_since_data
-                # 阶段 1: 发送 200 OK SSE 头（处于事件边界），静默超过 26 个 ping 周期
-                async with srv_lock:
-                    pings_since_data = 0
-                    srv.send_headers(
-                        sid,
-                        [(b":status", b"200"), (b"content-type", b"text/event-stream; charset=utf-8")],
-                        end_stream=False,
-                    )
-                    w.write(srv.data_to_send())
-                    await w.drain()
+                try:
+                    # 阶段 1: 发送 200 OK SSE 头（处于事件边界），等待达到封顶次数并确认持续静默不再多发（兼容 Windows 15.6ms 时钟粒度）
+                    async with srv_lock:
+                        pings_since_data = 0
+                        srv.send_headers(
+                            sid,
+                            [(b":status", b"200"), (b"content-type", b"text/event-stream; charset=utf-8")],
+                            end_stream=False,
+                        )
+                        w.write(srv.data_to_send())
+                        await w.drain()
 
-                await asyncio.sleep(0.58)
-                epoch1_pings = pings_per_epoch[-1]
-                assert epoch1_pings == H2_MAX_PINGS_WITHOUT_DATA
+                    deadline = asyncio.get_running_loop().time() + 2.0
+                    while pings_per_epoch[-1] < H2_MAX_PINGS_WITHOUT_DATA and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(0.02)
+                    # 再额外静默等待 6 个以上 ping 周期，确认封顶后绝不继续发送第 19 次 PING
+                    await asyncio.sleep(0.20)
+                    epoch1_pings = pings_per_epoch[-1]
+                    assert epoch1_pings == H2_MAX_PINGS_WITHOUT_DATA
 
-                # 阶段 2: 发送半行 SSE 数据（非 \n\n 边界），等待若干 ping 周期：
-                # 预算必须因 DATA 清零重计，但下游绝不能在半行中间注入 `\n\n` 心跳！
-                pings_per_epoch.append(0)
-                async with srv_lock:
-                    pings_since_data = 0
-                    srv.send_data(sid, b'data: {"part":', end_stream=False)
-                    w.write(srv.data_to_send())
-                    await w.drain()
+                    # 阶段 2: 发送半行 SSE 数据（非 \n\n 边界），等待若干 ping 周期：
+                    # 预算必须因 DATA 清零重计，但下游绝不能在半行中间注入 `\n\n` 心跳！
+                    pings_per_epoch.append(0)
+                    async with srv_lock:
+                        pings_since_data = 0
+                        srv.send_data(sid, b'data: {"part":', end_stream=False)
+                        w.write(srv.data_to_send())
+                        await w.drain()
 
-                await asyncio.sleep(0.14)
+                    deadline2 = asyncio.get_running_loop().time() + 1.5
+                    while pings_per_epoch[-1] < 2 and asyncio.get_running_loop().time() < deadline2:
+                        await asyncio.sleep(0.02)
 
-                # 阶段 3: 补齐后半行并闭合流
-                async with srv_lock:
-                    pings_since_data = 0
-                    srv.send_data(sid, b"1}\n\n", end_stream=True)
-                    w.write(srv.data_to_send())
-                    await w.drain()
+                    # 阶段 3: 补齐后半行并闭合流
+                    async with srv_lock:
+                        pings_since_data = 0
+                        srv.send_data(sid, b"1}\n\n", end_stream=True)
+                        w.write(srv.data_to_send())
+                        await w.drain()
+                except BaseException:
+                    w.close()
+                    raise
 
             bg: list[asyncio.Task[None]] = []
             try:
@@ -2020,7 +2030,7 @@ def test_h1_to_h2_graceful_goaway_drains_inflight_sse_without_eof():
                     ur,
                     uw,
                     target_host="daily-cloudcode-pa.googleapis.com",
-                    ping_interval=0.025,
+                    ping_interval=0.06 if coalesced else 0.025,
                     idle_ping_interval=10.0,
                     sse_keepalive_interval=10.0,
                 )
@@ -2067,8 +2077,354 @@ def test_h1_to_h2_graceful_goaway_drains_inflight_sse_without_eof():
     assert pings_coal == 0
 
 
+def test_agy_log_geo_block_and_transport_crash_auto_bans_and_switches(tmp_path, monkeypatch):
+    """回归保护（广播脏 IP / poll.go RU 地区封锁 / HTTP2 ClientConn.Close 根治）：
+    1. 即使未鉴权 HTTP 探测全部返回 ok（如 `🇬🇧 United Kingdom 03` 公网显示 GB，但 Google Cloud 鉴权表判定为 `RU`）
+       且末尾仍有部分非受限模型的 `ResponseID:`，`detect_recent_agy_geo_block` 仍能从 `poll.go` / `errorreport.go`
+       捕获 `Detected location: RU` / `User location is not supported`；
+    2. `AIWatchService.watch()` 首次命中地区封锁即立判 `geo_blocked`、立即强切冲洗连接池、写入 12h 隔离池
+       (`gemini_geo_blocked` + `gemini_geo_log_blocked`) 并在 `ai-gemini-order.json` 沉底；且后续未鉴权 `PROBE_OK`
+       绝不会误清由真实日志鉴权捕获的地区隔离；
+    3. `errorreport.go` 的 `http2: client connection force closed via ClientConn.Close` 被识别为底层断流触发切流，
+       而用户主动取消的 `context canceled` 绝不误触发。
+    """
+    import os
+    import time
+    from datetime import datetime
+
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.ai_watch import (
+        AIWatchService,
+        detect_recent_agy_geo_block,
+        detect_recent_agy_retry_failure,
+    )
+    from cproxy.services.probe import is_gemini_geo_blocked
+
+    paths = _paths(tmp_path)
+    ai_gemini_order_file(paths).parent.mkdir(parents=True, exist_ok=True)
+    ai_gemini_order_file(paths).write_text(
+        json.dumps(["🇬🇧 United Kingdom 03", "🇨🇳 Taiwan 01", "🇰🇷 South Korea 01"], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    log_dir = tmp_path / "antigravity-logs"
+    log_dir.mkdir(parents=True)
+    now_ts = time.time()
+    ts_poll = datetime.fromtimestamp(now_ts - 12).strftime("%m%d %H:%M:%S")
+    ts_ok = datetime.fromtimestamp(now_ts - 3).strftime("%m%d %H:%M:%S")
+
+    # 场景 1：poll.go 报 Detected location: RU，且随后还有一条 streamGenerateContent ResponseID
+    ls_log = log_dir / "language_server.log"
+    ls_log.write_text(
+        f"E{ts_poll}.120000 18944 poll.go:67] failed to fetch user status: "
+        "rpc error: code = PermissionDenied desc = PERMISSION_DENIED (code 403): "
+        "Your location is not eligible for this service at this time. Detected location: RU.\n"
+        f"I{ts_ok}.500000 18944 http_helpers.go:349] "
+        "URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse "
+        "Trace: 0x99 ResponseID: resp_flash_lite_ok\n",
+        encoding="utf-8",
+    )
+    os.utime(ls_log, (now_ts - 2, now_ts - 2))
+
+    hit_geo, _, reason_geo = detect_recent_agy_geo_block(log_dir, now=now_ts, window_seconds=60.0)
+    assert hit_geo is True
+    assert "RU" in reason_geo
+
+    # 场景 2：AIWatchService 即使主动探测全部返回 ok，仍凭借日志 geo_blocked 首轮切走并写入 12h 隔离 + 沉底
+    switched: list[tuple[str, str, bool, bool]] = []
+    groups = {
+        "AI-MANUAL": ProxyGroup("AI-MANUAL", "fallback", "🇺🇸 United States 01", ["🇺🇸 United States 01"]),
+        "AI-GEMINI": ProxyGroup(
+            "AI-GEMINI",
+            "fallback",
+            "🇬🇧 United Kingdom 03",
+            ["🇬🇧 United Kingdom 03", "🇨🇳 Taiwan 01", "🇰🇷 South Korea 01"],
+        ),
+        "🇺🇸 United States 01": ProxyGroup("🇺🇸 United States 01", "ss", None, [], delay=160, alive=True),
+        "🇬🇧 United Kingdom 03": ProxyGroup("🇬🇧 United Kingdom 03", "ss", None, [], delay=240, alive=True),
+        "🇨🇳 Taiwan 01": ProxyGroup("🇨🇳 Taiwan 01", "ss", None, [], delay=85, alive=True),
+        "🇰🇷 South Korea 01": ProxyGroup("🇰🇷 South Korea 01", "ss", None, [], delay=95, alive=True),
+    }
+
+    class _FakeQuery:
+        def __init__(self, _p):
+            self.api = SimpleNamespace(
+                get_groups=lambda: groups,
+                get_connections=lambda: {"connections": []},
+            )
+
+        def switch_group(
+            self,
+            grp: str,
+            target: str,
+            *,
+            drop_connections: bool = True,
+            force_drop: bool = False,
+        ):
+            switched.append((grp, target, drop_connections, force_drop))
+            groups[grp] = ProxyGroup(grp, "fallback", target, groups[grp].candidates)
+
+    monkeypatch.setattr(ai_watch_mod, "QueryService", _FakeQuery)
+    monkeypatch.setattr(ai_watch_mod, "_DEFAULT_AI_TARGET_VERDICT", lambda _p, _u: "ok")
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", ai_watch_mod._DEFAULT_AI_TARGET_VERDICT)
+    monkeypatch.setattr(ai_watch_mod, "reap_idle_gemini_connections", lambda *a, **kw: [])
+    monkeypatch.setattr(ai_watch_mod, "reap_stale_agy_processes", lambda *a, **kw: [])
+
+    watch_rep = AIWatchService(paths, agy_log_dir=log_dir).watch()
+    gem_res = next(r for r in watch_rep.results if r.group == "AI-GEMINI")
+    assert gem_res.verdict == "geo_blocked"
+    assert gem_res.switched is True
+    assert gem_res.target == "🇨🇳 Taiwan 01"
+    assert ("AI-GEMINI", "🇨🇳 Taiwan 01", True, True) in switched
+
+    assert is_gemini_geo_blocked("🇬🇧 United Kingdom 03", paths) is True
+    new_order = json.loads(ai_gemini_order_file(paths).read_text(encoding="utf-8"))
+    assert new_order[0] == "🇨🇳 Taiwan 01"
+    assert new_order[-1] == "🇬🇧 United Kingdom 03"
+
+    # 若外部手动切回该脏节点且未鉴权 HTTP 探测返回 ok，不得误清日志鉴权捕获的 12h 隔离态
+    groups["AI-GEMINI"] = ProxyGroup(
+        "AI-GEMINI",
+        "fallback",
+        "🇬🇧 United Kingdom 03",
+        ["🇬🇧 United Kingdom 03", "🇨🇳 Taiwan 01", "🇰🇷 South Korea 01"],
+    )
+    AIWatchService(paths, agy_log_dir=tmp_path / "empty-logs").watch()
+    assert is_gemini_geo_blocked("🇬🇧 United Kingdom 03", paths) is True
+
+    # 场景 3：errorreport.go 底层 HTTP/2 ClientConn.Close 断流识别 vs context canceled 豁免
+    ts_crash = datetime.fromtimestamp(now_ts - 5).strftime("%m%d %H:%M:%S")
+    ls_log.write_text(
+        f"E{ts_crash}.200000 18944 errorreport.go:273] agent executor error: "
+        'request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": '
+        "http2: client connection force closed via ClientConn.Close\n",
+        encoding="utf-8",
+    )
+    os.utime(ls_log, (now_ts - 1, now_ts - 1))
+    hit_h2, _, reason_h2 = detect_recent_agy_retry_failure(log_dir, now=now_ts, window_seconds=60.0)
+    assert hit_h2 is True
+    assert "attempt 4" in reason_h2
+
+    ls_log.write_text(
+        f"E{ts_crash}.300000 18944 errorreport.go:273] agent executor error: "
+        'request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": '
+        "context canceled\n",
+        encoding="utf-8",
+    )
+    os.utime(ls_log, (now_ts, now_ts))
+    hit_cancel, _, _ = detect_recent_agy_retry_failure(log_dir, now=now_ts, window_seconds=60.0)
+    assert hit_cancel is False
 
 
+def test_try_hot_reload_verge_runtime_strips_banned_nodes_and_applies_learned_order(tmp_path, monkeypatch):
+    """验证 Clash Verge 热重载与深度状态面板会剔除已封禁脏节点并应用已学习的优选顺序。"""
+    import shutil
 
+    from cproxy.backend.api import APIBackend
+    from cproxy.config import ai_gemini_order_file
+    from cproxy.services.ban import add_ban
+    from cproxy.services.verge import (
+        collect_ai_egress_deep_status,
+        inject_verge_global_script,
+        try_hot_reload_verge_runtime,
+    )
+
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+
+    paths = _paths(tmp_path)
+    add_ban(paths, "🇬🇧 United Kingdom 03", hours=24.0, reason="agy_geo_blocked_RU")
+    ai_gemini_order_file(paths).parent.mkdir(parents=True, exist_ok=True)
+    ai_gemini_order_file(paths).write_text(
+        json.dumps(["🇰🇷 South Korea 02", "🇨🇳 Taiwan 01"], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    verge_dir = tmp_path / "verge-ban"
+    (verge_dir / "profiles").mkdir(parents=True)
+    inject_verge_global_script(verge_dir)
+    (verge_dir / "clash-verge.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mixed-port": 7897,
+                "proxies": [
+                    {"name": "🇬🇧 United Kingdom 03", "type": "ss", "server": "3.3.3.3", "port": 443},
+                    {"name": "🇨🇳 Taiwan 01", "type": "ss", "server": "2.2.2.1", "port": 443},
+                    {"name": "🇰🇷 South Korea 02", "type": "ss", "server": "4.4.4.2", "port": 443},
+                ],
+                "proxy-groups": [
+                    {
+                        "name": "Proxy",
+                        "type": "select",
+                        "proxies": ["🇬🇧 United Kingdom 03", "🇨🇳 Taiwan 01", "🇰🇷 South Korea 02"],
+                    }
+                ],
+                "rules": ["MATCH,Proxy"],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+    gmap = {
+        "AI-MANUAL": ProxyGroup(
+            "AI-MANUAL",
+            "Fallback",
+            "🇬🇧 United Kingdom 03",
+            ["🇬🇧 United Kingdom 03", "🇨🇳 Taiwan 01", "🇰🇷 South Korea 02", "AI-AUTO"],
+        ),
+        "AI-GEMINI": ProxyGroup(
+            "AI-GEMINI",
+            "Fallback",
+            "🇬🇧 United Kingdom 03",
+            ["🇬🇧 United Kingdom 03", "🇨🇳 Taiwan 01", "🇰🇷 South Korea 02"],
+        ),
+    }
+    monkeypatch.setattr(APIBackend, "get_groups", lambda self: gmap)
+    monkeypatch.setattr(
+        APIBackend,
+        "selector_now",
+        lambda self: {"AI-GEMINI": "🇬🇧 United Kingdom 03", "Proxy": "🇨🇳 Taiwan 01"},
+    )
+    monkeypatch.setattr(
+        APIBackend,
+        "request",
+        lambda self, method, path, payload=None, **kw: captured.setdefault("payload", payload) or {},
+    )
+    monkeypatch.setattr(
+        APIBackend,
+        "restore_selectors",
+        lambda self, snap: captured.setdefault("restored", snap),
+    )
+    monkeypatch.setattr(APIBackend, "delay_test", lambda self, *a, **kw: {"delay": 1})
+
+    assert try_hot_reload_verge_runtime(paths, verge_dir, force=True) is True
+    loaded = yaml.safe_load(captured["payload"]["payload"])
+    groups = {g["name"]: g["proxies"] for g in loaded["proxy-groups"]}
+    assert "🇬🇧 United Kingdom 03" not in groups["AI-GEMINI"]
+    assert "🇬🇧 United Kingdom 03" not in groups["AI-MANUAL"]
+    assert groups["AI-GEMINI"][:2] == ["🇰🇷 South Korea 02", "🇨🇳 Taiwan 01"]
+    assert captured["restored"] == {"Proxy": "🇨🇳 Taiwan 01"}
+
+    deep = collect_ai_egress_deep_status(paths, groups_map=gmap)
+    assert "🇬🇧 United Kingdom 03" not in deep["AI-GEMINI"]["next_candidates"]
+
+
+def test_verge_daemon_async_rebalance_does_not_block_watch_heartbeats(tmp_path, monkeypatch):
+    """验证 Verge 守护进程异步执行耗时 rebalance 时，主循环连接采样与 ai-watch 看护零阻塞持续推进，
+    并在后台线程完成后正确回收 rebalance_runs 计数。
+    """
+    import threading
+    import time
+
+    paths = _paths(tmp_path)
+    init_verge_config(paths, controller="127.0.0.1:9097", secret="s", mixed_port=7897)
+
+    reb_started = threading.Event()
+    reb_release = threading.Event()
+    reb_finished = threading.Event()
+    watch_calls = 0
+
+    monkeypatch.setattr(
+        "cproxy.services.verge.sample_connections_activity",
+        lambda p, api, now=None: {},
+    )
+
+    def _fast_watch(self, dry_run=False):
+        nonlocal watch_calls
+        watch_calls += 1
+        return ai_watch_mod.WatchReport(
+            results=[ai_watch_mod.WatchGroupResult(group="AI-GEMINI", current="TW-01", verdict="ok")]
+        )
+
+    def _slow_rebalance(self, dry_run=False, external_only=True):
+        reb_started.set()
+        reb_release.wait(timeout=2.0)
+        rep = rebalance_mod.RebalanceReport(
+            ordered=("TW-01",),
+            order_path=str(ai_manual_order_file(paths)),
+            rerendered=False,
+            hot_reloaded=False,
+            switched_to=None,
+            reason="external-only",
+            gemini_ordered=("TW-01",),
+        )
+        reb_finished.set()
+        return rep
+
+    monkeypatch.setattr("cproxy.services.verge.AIWatchService.watch", _fast_watch)
+    monkeypatch.setattr("cproxy.services.verge.RebalanceService.rebalance", _slow_rebalance)
+
+    clock = [2000.0]
+
+    def _fake_time():
+        return clock[0]
+
+    def _fake_sleep(_sec: float):
+        if clock[0] == 2000.0:
+            assert reb_started.wait(timeout=1.0)
+        elif clock[0] == 2040.0:
+            reb_release.set()
+            assert reb_finished.wait(timeout=1.0)
+            time.sleep(0.03)
+        clock[0] += 20.0
+
+    monkeypatch.setattr("cproxy.services.verge.time.time", _fake_time)
+    svc = VergeDaemonService(paths)
+    svc.run_daemon(
+        watch_interval=20.0,
+        rebalance_interval=1800.0,
+        sample_interval=3.0,
+        max_ticks=4,
+        enable_keepalive=False,
+        async_rebalance=True,
+        sleep_fn=_fake_sleep,
+    )
+
+    # rebalance 卡住期间 watch 依然每 20s 照常跑满 4 轮，且 rebalance 解锁后计数被回收为 1
+    assert watch_calls == 4
+    daemon_state = json.loads((paths.state_dir / "verge-daemon.json").read_text(encoding="utf-8"))
+    assert daemon_state["watch_runs"] == 4
+    assert daemon_state["rebalance_runs"] == 1
+
+
+def test_probe_paths_context_is_thread_isolated(tmp_path):
+    """验证并发线程（后台 rebalance 与主线程 ai-watch）各自持有独立的 ContextVar AppPaths，互不篡改。"""
+    import threading
+
+    from cproxy.services.probe import (
+        is_dynamic_stream_fragile,
+        probe_paths_context,
+        record_stream_fragile_node,
+    )
+
+    paths_a = _paths(tmp_path / "a")
+    paths_b = _paths(tmp_path / "b")
+    record_stream_fragile_node(paths_a, "Node-Fragile-A")
+
+    barrier = threading.Barrier(2)
+    results: dict[str, bool] = {}
+
+    def _worker_a():
+        with probe_paths_context(paths_a):
+            barrier.wait(timeout=2.0)
+            barrier.wait(timeout=2.0)
+            results["a"] = is_dynamic_stream_fragile("Node-Fragile-A")
+
+    def _worker_b():
+        with probe_paths_context(paths_b):
+            barrier.wait(timeout=2.0)
+            results["b"] = is_dynamic_stream_fragile("Node-Fragile-A")
+            barrier.wait(timeout=2.0)
+
+    ta = threading.Thread(target=_worker_a)
+    tb = threading.Thread(target=_worker_b)
+    ta.start()
+    tb.start()
+    ta.join(timeout=3.0)
+    tb.join(timeout=3.0)
+
+    assert results == {"a": True, "b": False}
 
 
