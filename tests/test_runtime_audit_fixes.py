@@ -214,7 +214,7 @@ def test_render_runtime_injects_keepalive_fallback_groups_and_tcp_rules(tmp_path
         "(NETWORK,TCP),(NOT,((IN-TYPE,SOCKS5)))),AI-GEMINI-KEEPALIVE"
     )
     manual_ka = (
-        "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),"
+        "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com),(DOMAIN,api.openai.com))),(NETWORK,TCP),"
         "(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),AI-MANUAL-KEEPALIVE"
     )
     assert gemini_ka in rules

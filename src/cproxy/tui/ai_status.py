@@ -2,8 +2,8 @@
 
 仪表盘（`dash-ai-*`）与 AI 路由面板（`ai-route-*`）展示的是同一组数据，此前各自
 写了一套「取组 → 读 delay/alive → 拼标记」的逻辑，两处都**直接读组自身的 delay**，
-而 AI-MANUAL/AI-GEMINI 是 fixed fallback 组（mihomo 不做健康检查、`history` 恒空），
-于是延迟永远显示成 `─`、健康永远显示成 `?`。
+而 AI-MANUAL 是 fixed fallback 组（mihomo 不做健康检查、`history` 恒空），AI-GEMINI
+首次健康检查返回前也没有组延迟，直接读组会把延迟显示成 `─`、健康显示成 `?`。
 
 现在解析统一由 :func:`cproxy.backend.runtime.resolve_ai_route` 提供，这里只负责
 把结果拼成 Textual 标记串，色板与两个面板既有的配色保持一致。

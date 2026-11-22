@@ -34,8 +34,8 @@ class _TabbedApp(App):
 
 
 def test_dashboard_ai_cards_render_resolved_exit(ai_route_groups, tmp_path):
-    """仪表盘 AI 卡片此前只读组自身的 delay——fixed fallback 组恒空，于是永远显示 `─`
-    与 `?`；现在走统一的解析，延迟与健康都取自出口节点。"""
+    """AI-MANUAL 无健康检查、AI-GEMINI 首次检查前组 delay 为空时，
+    仪表盘走统一解析，从出口节点取得延迟与健康。"""
     paths = _isolated_paths(tmp_path)
 
     async def run_case():

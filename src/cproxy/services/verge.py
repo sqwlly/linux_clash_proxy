@@ -594,6 +594,10 @@ def try_hot_reload_verge_runtime(
     except Exception as exc:
         logger.warning("verge hot-reload PUT /configs failed: %s", exc)
         return False
+    try:
+        atomic_write_text(verge_runtime_yaml, payload_yaml, mode=0o600)
+    except OSError:
+        pass
 
     if selectors:
         selectors = {

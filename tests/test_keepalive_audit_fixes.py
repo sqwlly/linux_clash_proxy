@@ -175,7 +175,11 @@ def test_ai_watch_survives_system_exit_from_switch_group(
         def switch_group(self, group: str, target: str, **_kw):
             raise SystemExit(f"missing group {group}")
 
-    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda _p, _u: ai_watch_mod.PROBE_DEAD)
+    monkeypatch.setattr(
+        ai_watch_mod,
+        "ai_target_verdict",
+        lambda _p, u: ai_watch_mod.PROBE_OK if "google" in u else ai_watch_mod.PROBE_DEAD,
+    )
     svc = ai_watch_mod.AIWatchService(paths, agy_log_dir=tmp_path / "no-agy", codex_log_dir=tmp_path / "no-codex")
     svc.query = _SystemExitQuery()  # type: ignore[assignment]
 
@@ -944,7 +948,7 @@ def test_pick_next_non_iepl_subscription_sorts_and_recovers_alive_cooled(tmp_pat
     }
     # Without IEPL nodes, AI-MANUAL still avoids colliding with AI-GEMINI's active JP-01
     assert svc._pick_next(groups, groups["AI-MANUAL"], "US-01", {}, now) == "SG-01"
-    # When all candidates are cooled and confirmed alive=True, recovers oldest cooled node
+    # When all candidates are still in cooldown, holds current node (None) instead of flapping
     picked = svc._pick_next(
         groups,
         groups["AI-MANUAL"],
@@ -952,7 +956,7 @@ def test_pick_next_non_iepl_subscription_sorts_and_recovers_alive_cooled(tmp_pat
         {"JP-01": now - 300.0, "SG-01": now - 60.0},
         now,
     )
-    assert picked == "JP-01"
+    assert picked is None
 
 
 def test_on_soft_unhealthy_gated_by_group_busy(

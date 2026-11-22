@@ -230,7 +230,7 @@ def test_query_commands_use_api_output(tmp_path: Path):
         assert ai_status_raw.returncode == 0
         assert "AI-MANUAL: type=Selector now=AI-AUTO" in ai_status_raw.stdout
         assert "AI-GEMINI: type=Fallback now=🇰🇷 Korea丨01" in ai_status_raw.stdout
-        # delay 取出口节点的真实延迟：fixed fallback 组自身 history 为空，旧实现打成 None
+        # AI-MANUAL 无健康检查、AI-GEMINI 首次检查前均回退到出口节点延迟
         assert "delay=88" in ai_status_raw.stdout
         assert "AI-MODE: auto 池=AI-US" in ai_status_raw.stdout
         assert "AI-EXIT: node=🇺🇸 United States丨01 delay=95 alive=True" in ai_status_raw.stdout

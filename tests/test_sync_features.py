@@ -296,7 +296,7 @@ def test_render_ssrdog_rules_removed(tmp_path: Path):
     assert ssrdog == []
     manual_rules = [r for r in data["rules"] if "AI-MANUAL" in str(r)]
     gemini_rules = [r for r in data["rules"] if "AI-GEMINI" in str(r)]
-    assert len(manual_rules) == 24
+    assert len(manual_rules) == 38
     assert len(gemini_rules) == 9
     # Google / Gemini 规则前移到首条，且排在 PROCESS-NAME,agy 之前
     assert "AI-GEMINI" in str(data["rules"][0])
@@ -327,8 +327,8 @@ rules:
 """
     data = _render_config(tmp_path, config)
     gemini = _groups_by_name(data)["AI-GEMINI"]["proxies"]
-    assert gemini[0] == "🇰🇷 KR 01 | 1X"
-    assert "🇹🇼 TW 01 | 1X" in gemini
+    assert gemini[0] == "🇹🇼 TW 01 | 1X"
+    assert "🇰🇷 KR 01 | 1X" in gemini
     assert "🇭🇰 HK 01 | 1X" not in gemini
     assert "🇺🇸 US 01 | 1X" not in gemini
     assert "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI" in data["rules"]

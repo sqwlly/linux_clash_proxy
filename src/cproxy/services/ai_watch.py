@@ -2,7 +2,7 @@
 
 与 mihomo 的 fallback（测通用连通性 generate_204）互补：fallback 兜「节点彻底挂」，
 本看门狗兜「节点通但 AI 用不了」（Gemini 地区门禁等）。语义判定由
-`diagnostics.ai_target_verdict` 提供；连续失败阈值 + 冷却期抗抖，状态持久化到
+`diagnostics.ai_target_verdict` 提供；连续失败阈值 + 硬冷却/驻留/熔断抗抖，状态持久化到
 `ai-watch.json`（oneshot timer 跨轮恢复）。
 """
 from __future__ import annotations
@@ -55,6 +55,10 @@ _DEFAULT_AI_TARGET_VERDICT = ai_target_verdict
 
 CONSECUTIVE_FAILURE_THRESHOLD = 2
 COOLDOWN_SECONDS = 10 * 60
+MIN_SWITCH_DWELL_SECONDS = 3 * 60
+SWITCH_CIRCUIT_WINDOW_SECONDS = 10 * 60
+SWITCH_CIRCUIT_THRESHOLD = 3
+SWITCH_CIRCUIT_COOLDOWN_SECONDS = 10 * 60
 # agy 自更新会把旧二进制重命名为 `agy.<ns>.old`（或进一步 unlink 成 `(deleted)`）。
 # 闲置超过 30 分钟的 `.old` 进程仍会每 ~15s 轮询 daily-cloudcode-pa.googleapis.com，
 # 抢占同账号流式配额导致活跃会话报 "There was a network issue connecting to the server"。
@@ -901,9 +905,12 @@ def _save_state(
     *,
     cleared_geo_blocked: dict[str, float] | None = None,
     cleared_stream_fragile: dict[str, float] | None = None,
+    clear_shared_circuit: bool = False,
+    now: float | None = None,
 ) -> None:
     path = ai_watch_state_file(paths)
     lock_path = path.with_name(f"{path.name}.lock")
+    ts_now = time.time() if now is None else now
     with _WATCH_STATE_LOCK, _advisory_file_lock(lock_path):
         disk: dict[str, Any] = {}
         if path.exists():
@@ -924,13 +931,39 @@ def _save_state(
                 merged[k] = _merge_timestamp_map(disk.get(k), v, cleared_stream_fragile)
             elif k == "last_rebalance_ts":
                 merged[k] = max(float(disk.get(k) or 0.0), float(v or 0.0))
+            elif k == "shared_circuit_open_until":
+                merged[k] = max(float(disk.get(k) or 0.0), float(v or 0.0))
             elif k in ("rebalance_runs", "watch_runs", "total_switches", "total_reaped_connections"):
                 merged[k] = max(int(disk.get(k) or 0), int(v or 0))
             elif k == "last_verdicts" and isinstance(v, dict) and isinstance(disk.get(k), dict):
                 merged[k] = {**disk[k], **v}
+            elif k in (AI_MANUAL_GROUP, AI_GEMINI_GROUP) and isinstance(v, dict) and isinstance(disk.get(k), dict):
+                disk_gs = disk[k]
+                merged_gs = dict(v)
+                disk_switch = float(disk_gs.get("last_switch_ts") or 0.0)
+                cur_switch = float(merged_gs.get("last_switch_ts") or 0.0)
+                if disk_switch > cur_switch:
+                    merged_gs["last_switch_ts"] = disk_switch
+                    if disk_gs.get("last_active"):
+                        merged_gs["last_active"] = disk_gs["last_active"]
+                circuit_until = max(
+                    float(merged_gs.get("circuit_open_until") or 0.0),
+                    float(disk_gs.get("circuit_open_until") or 0.0),
+                )
+                if circuit_until > ts_now:
+                    merged_gs["circuit_open_until"] = circuit_until
+                else:
+                    merged_gs.pop("circuit_open_until", None)
+                history = set(_recent_switches(merged_gs, ts_now))
+                history.update(_recent_switches(disk_gs, ts_now))
+                if history or "switch_history" in merged_gs:
+                    merged_gs["switch_history"] = sorted(history)
+                merged[k] = merged_gs
             else:
                 merged[k] = v
 
+        if clear_shared_circuit and "shared_circuit_open_until" not in state:
+            merged.pop("shared_circuit_open_until", None)
         if cleared_geo_blocked and "gemini_geo_blocked" not in state and "gemini_geo_blocked" in disk:
             merged["gemini_geo_blocked"] = _merge_timestamp_map(disk.get("gemini_geo_blocked"), None, cleared_geo_blocked)
         if cleared_stream_fragile and "stream_fragile" not in state and "stream_fragile" in disk:
@@ -968,6 +1001,79 @@ def _group_state(state: dict, group: str) -> dict:
     item.setdefault("fail_count", 0)
     item.setdefault("cooldown", {})
     return item
+
+
+def _recent_switches(gs: dict, now: float) -> list[float]:
+    return [
+        float(ts)
+        for ts in gs.get("switch_history", [])
+        if isinstance(ts, (int, float)) and 0 <= now - float(ts) < SWITCH_CIRCUIT_WINDOW_SECONDS
+    ]
+
+
+def _record_group_switch(gs: dict, now: float) -> None:
+    history = _recent_switches(gs, now)
+    history.append(now)
+    gs["switch_history"] = history
+    gs["last_switch_ts"] = now
+    if len(history) >= SWITCH_CIRCUIT_THRESHOLD:
+        gs["circuit_open_until"] = now + SWITCH_CIRCUIT_COOLDOWN_SECONDS
+
+
+def _shared_failure_active(state: dict, now: float) -> bool:
+    if float(state.get("shared_circuit_open_until") or 0.0) > now:
+        return True
+    for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+        gs = state.get(group)
+        if not isinstance(gs, dict) or gs.get("last_verdict") != PROBE_DEAD or int(gs.get("fail_count") or 0) < 1:
+            return False
+    return True
+
+
+def _group_switch_block_reason(state: dict, group: str, now: float) -> str:
+    gs = state.get(group)
+    if not isinstance(gs, dict):
+        return ""
+    if float(gs.get("circuit_open_until") or 0.0) > now:
+        return "switch_circuit"
+    last_switch = float(gs.get("last_switch_ts") or 0.0)
+    if last_switch > 0 and now - last_switch < MIN_SWITCH_DWELL_SECONDS:
+        return "switch_dwell"
+    return ""
+
+
+def automatic_switch_block_reason(paths: AppPaths, group: str, *, now: float) -> str:
+    state = _load_state(paths)
+    if _shared_failure_active(state, now):
+        return "shared_failure_circuit"
+    return _group_switch_block_reason(state, group, now)
+
+
+def record_external_automatic_switch(
+    paths: AppPaths,
+    group: str,
+    target: str | None = None,
+    *,
+    now: float | None = None,
+) -> None:
+    ts_now = time.time() if now is None else now
+    path = ai_watch_state_file(paths)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with _WATCH_STATE_LOCK, _advisory_file_lock(lock_path):
+        state: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    state = loaded
+            except (OSError, ValueError):
+                state = {}
+        gs = _group_state(state, group)
+        _record_group_switch(gs, ts_now)
+        if target:
+            gs["last_active"] = target
+        _atomic_write_text(path, json.dumps(state, ensure_ascii=False), mode=0o600)
+        invalidate_probe_state_cache()
 
 
 _AGY_GLOG_PREFIX = (
@@ -1654,6 +1760,9 @@ class AIWatchService:
             state = _load_state(self.paths)
             now = time.time()
             cleared_geo_blocked: dict[str, float] = {}
+            shared_failure = _shared_failure_active(state, now)
+            if shared_failure:
+                state["shared_circuit_open_until"] = now + SWITCH_CIRCUIT_COOLDOWN_SECONDS
             for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
                 report.results.append(
                     self._watch_group(
@@ -1663,8 +1772,18 @@ class AIWatchService:
                         now,
                         dry_run,
                         cleared_geo_blocked=cleared_geo_blocked,
+                        allow_automatic_switch=not shared_failure,
                     )
                 )
+            watched_groups = {r.group for r in report.results}
+            clear_shared_circuit = False
+            if watched_groups == {AI_MANUAL_GROUP, AI_GEMINI_GROUP} and all(
+                r.verdict == PROBE_DEAD for r in report.results
+            ):
+                state["shared_circuit_open_until"] = now + SWITCH_CIRCUIT_COOLDOWN_SECONDS
+            else:
+                state.pop("shared_circuit_open_until", None)
+                clear_shared_circuit = True
             gemini_res = next((r for r in report.results if r.group == AI_GEMINI_GROUP), None)
             gemini_leaf = (gemini_res.target or gemini_res.current) if gemini_res else None
             manual_res = next((r for r in report.results if r.group == AI_MANUAL_GROUP), None)
@@ -1695,6 +1814,8 @@ class AIWatchService:
                     self.paths,
                     state,
                     cleared_geo_blocked=cleared_geo_blocked or None,
+                    clear_shared_circuit=clear_shared_circuit,
+                    now=now,
                 )
                 try:
                     from ..backend.process import ProcessBackend
@@ -1729,6 +1850,7 @@ class AIWatchService:
         dry_run: bool,
         *,
         cleared_geo_blocked: dict[str, float] | None = None,
+        allow_automatic_switch: bool = True,
     ) -> WatchGroupResult:
         group_obj = groups.get(group)
         if group_obj is None:
@@ -1741,9 +1863,15 @@ class AIWatchService:
         current = resolve_current_leaf(groups, group)
         gs = _group_state(state, group)
         _prune_cooldown(gs, now)
+        if float(gs.get("circuit_open_until") or 0.0) <= now:
+            gs.pop("circuit_open_until", None)
+            if gs.get("switch_history"):
+                gs["switch_history"] = _recent_switches(gs, now)
         previous_active = gs.get("last_active")
         if previous_active and current and previous_active != current:
             gs["busy_defer_count"] = 0
+            if not dry_run:
+                _record_group_switch(gs, now)
 
         group_busy = has_active_ai_transfer(
             self.paths, getattr(self.query, "api", None), group, current
@@ -1879,7 +2007,6 @@ class AIWatchService:
         # 若 mihomo fallback 被动切换了出口叶子，清理仍滞留在旧叶子上的陈旧长连接，
         # 避免同一会话混用新旧出口 IP；若旧叶子已被健康检查标死/超时，同步写入冷却期并把
         # fallback 的 `fixed` 指针更新到新叶子，防止旧叶子短暂回包后 mihomo 瞬间跳回造成乒乓抖动。
-        passive_dead_switch = False
         if current:
             if not dry_run and previous_active and previous_active != current:
                 prev_entry = groups.get(previous_active)
@@ -1888,7 +2015,6 @@ class AIWatchService:
                     and not prev_entry.candidates
                     and (prev_entry.alive is False or delay_state(prev_entry.delay) == "timeout")
                 ):
-                    passive_dead_switch = True
                     if not has_active_ai_transfer(
                         self.paths, getattr(self.query, "api", None), group, previous_active
                     ):
@@ -2023,6 +2149,12 @@ class AIWatchService:
                                     break
                             except Exception:
                                 continue
+                switch_block = "" if on_banned else _group_switch_block_reason(state, group, now)
+                if not allow_automatic_switch and not on_banned:
+                    switch_block = "shared_failure_circuit"
+                if cand_ready and switch_block:
+                    result.detail = switch_block
+                    cand_ready = False
                 if cand_ready and cand_1x is not None:
                     try:
                         try:
@@ -2042,6 +2174,7 @@ class AIWatchService:
                         gs["fail_node"] = None
                         gs["fail_count"] = 0
                         gs["last_active"] = cand_1x
+                        _record_group_switch(gs, now)
                         result.switched = True
                         result.target = cand_1x
                         result.detail = "migrated_off_banned" if on_banned else "migrated_off_iepl"
@@ -2049,7 +2182,8 @@ class AIWatchService:
                     except (Exception, SystemExit):
                         pass
             if (
-                passive_dead_switch
+                previous_active
+                and previous_active != current
                 and not dry_run
                 and group_obj is not None
                 and current in group_obj.candidates
@@ -2076,6 +2210,12 @@ class AIWatchService:
             gs["fail_count"] = 1
 
         if gs["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD and group_obj is not None and not dry_run:
+            switch_block = _group_switch_block_reason(state, group, now)
+            if not allow_automatic_switch:
+                switch_block = "shared_failure_circuit"
+            if verdict != PROBE_GEO_BLOCKED and switch_block:
+                result.detail = switch_block
+                return result
             cdn_reloaded = False
             try:
                 from ..backend.runtime import refresh_ws_cdn_ips_if_changed
@@ -2095,6 +2235,9 @@ class AIWatchService:
                 except Exception:
                     pass
             target = self._pick_next(groups, group_obj, current, gs.get("cooldown", {}), now)
+            if target is None:
+                result.detail = "no_healthy_candidate"
+                return result
             if target is not None:
                 # 仅在 AI-MANUAL、地区封锁、客户端真实重试报错或易断流节点切换时关闭旧连接；
                 # 当 AI-GEMINI 已在健康节点上被动切换时，不强杀活跃 TCP 连接，防止掐断并发 agy 会话的流式输出。
@@ -2204,6 +2347,7 @@ class AIWatchService:
                 gs["fail_count"] = 0
                 gs["busy_defer_count"] = 0
                 gs["last_active"] = target
+                _record_group_switch(gs, now)
                 result.switched = True
                 result.target = target
                 try:
@@ -2224,21 +2368,16 @@ class AIWatchService:
 
         mihomo `/proxies` 对每个叶子节点也返回一条 `candidates=[]` 的条目，因此必须用
         `bool(entry.candidates)` 判嵌套组（与 `resolve_ai_leaf` 一致），而不能用
-        `cand in groups`。同时优先挑选健康检查存活（非 `alive=False`/超时）的叶子，
-        仅当所有非冷却叶子都被标死时才回退到首个可用候选。
-        对于 `AI-GEMINI` 与 `AI-MANUAL`，按三层优先级挑选：
-        1. 零动态断流且非静态 IEPL 的干净节点（优先避开另一 AI 组的在用节点，并优先选择低延迟节点）；
-        2. 曾有动态断流记录但非静态 IEPL 的节点；
-        3. 若所有非静态 IEPL 存活叶子均在冷却期内，优先回收最早进入冷却的存活非静态 IEPL 叶子，
-           绝不轻易回退到 50 秒必断流的静态 IEPL/裸 vision 节点。
+        `cand in groups`。仅选择健康检查存活、未在冷却期且未被隔离的叶子；
+        没有合格候选时返回 None，让看门狗保持当前节点，而不是在故障节点间轮换。
+        对于 `AI-GEMINI` 与 `AI-MANUAL`，优先选择零动态断流且非静态 IEPL 的干净节点，
+        其次是曾有动态断流记录但非静态 IEPL 的节点；静态 IEPL/裸 vision 不作为自动切换目标。
         """
         from .ban import is_node_banned, load_active_bans
         from .nodelist import is_panel_info_node, match_region
         from .probe import GEMINI_FAST_REGIONS
 
         active_bans = load_active_bans(self.paths, now=now)
-        fallback_leaf: str | None = None
-        cooled_healthy_non_iepl: list[tuple[int, float, int, str]] = []
         candidates = [c for c in group.candidates if c and not is_panel_info_node(str(c))]
         group_name = getattr(group, "name", "")
         is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
@@ -2278,7 +2417,7 @@ class AIWatchService:
             non_geo = [c for c in candidates if c and not is_gemini_geo_blocked(str(c), self.paths, now=now)]
             geo_tail = [c for c in candidates if c and is_gemini_geo_blocked(str(c), self.paths, now=now)]
             candidates = non_geo + geo_tail
-        for idx, cand in enumerate(candidates):
+        for cand in candidates:
             if not cand or cand == current:
                 continue
             if active_bans and is_node_banned(str(cand), active_bans):
@@ -2286,40 +2425,14 @@ class AIWatchService:
             entry = groups.get(cand)
             if entry is not None and entry.candidates:
                 continue
-            is_dead = entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout")
-            is_geo_quarantined = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(
-                str(cand), self.paths, now=now
-            )
+            if is_managed_ai and is_static_iepl_node(str(cand), self.paths):
+                continue
+            if entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout"):
+                continue
+            if group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(str(cand), self.paths, now=now):
+                continue
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
-                if (
-                    is_managed_ai
-                    and entry is not None
-                    and entry.alive is True
-                    and not is_static_iepl_node(str(cand), self.paths)
-                    and not is_geo_quarantined
-                    and not is_dead
-                ):
-                    dyn_tier = 0 if not is_iepl_node(str(cand), self.paths) else 1
-                    cooled_healthy_non_iepl.append((dyn_tier, float(ts), idx, str(cand)))
                 continue
-            if is_dead:
-                if (
-                    fallback_leaf is None
-                    and not is_geo_quarantined
-                    and not (is_managed_ai and is_static_iepl_node(str(cand), self.paths))
-                ):
-                    fallback_leaf = str(cand)
-                continue
-            if (
-                (is_managed_ai and is_static_iepl_node(str(cand), self.paths)) or is_geo_quarantined
-            ) and cooled_healthy_non_iepl:
-                cooled_healthy_non_iepl.sort()
-                return cooled_healthy_non_iepl[0][3]
             return str(cand)
-        if fallback_leaf is not None:
-            return fallback_leaf
-        if cooled_healthy_non_iepl:
-            cooled_healthy_non_iepl.sort()
-            return cooled_healthy_non_iepl[0][3]
         return None

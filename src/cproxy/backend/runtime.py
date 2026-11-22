@@ -40,9 +40,10 @@ AI_REGION_JP = "🇯🇵 Japan"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
+GEMINI_TEST_URL = "https://www.gstatic.com/generate_204"
 KEEPALIVE_TEST_URL = "http://cp.cloudflare.com/generate_204"
-# 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported；韩/台/英低延迟区排欧陆/南美前）
-AI_GEMINI_REGION_ORDER = ("KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU")
+# 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported；台/韩/英低延迟区排欧陆/南美前）
+AI_GEMINI_REGION_ORDER = ("TW", "KR", "GB", "DE", "FR", "BR", "AE", "AU")
 AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_AUTO_GROUP})
 # AI 面板（`cproxy ai-status` / `cproxy incident`）要展示的组，及展示顺序。
 # 单一来源：此前 cli_render 与 services.ops 各硬编码了一份同样的 5 元组。
@@ -63,6 +64,14 @@ SECRET_PROVIDER_KEYS = {
 # AI 域名全集（后缀与精确），用于识别任意订阅商的 AI 冲突规则
 AI_DOMAINS = frozenset((
     "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "chatgpt.livekit.cloud", "host.livekit.cloud", "turn.livekit.cloud",
+    "openai-api.arkoselabs.com", "client-api.arkoselabs.com",
+    "featuregates.org", "api.statsig.com", "events.statsigapi.net",
+    "openaiapi-site.azureedge.net", "openaicom.imgix.net",
+    "openaicomproductionae4b.blob.core.windows.net",
+    "production-openaicom-storage.azureedge.net",
+    "openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net",
+    "chat.openai.com.cdn.cloudflare.net",
     "sora.com", "anthropic.com", "claude.ai", "claudeusercontent.com",
     "x.ai", "grok.com", "openai.azure.com", "githubcopilot.com",
     "meta.ai", "llama.com", "meta.com",
@@ -220,8 +229,8 @@ def ai_exit_metrics(groups: dict[str, ProxyGroup], name: str) -> tuple[str, int 
     """某组的出口三要素 `(node, delay, alive)`。
 
     `node` 沿 `now` 下钻到真实节点（兜底组与自动池都适用）。延迟/健康优先取该组自身的
-    history——AI-AUTO/AI-US/AI-SG 这类会被 mihomo 健康检查的组有值；AI-MANUAL/AI-GEMINI
-    是 fixed fallback，mihomo 不检查它们（`history` 恒空 ⇒ 组自身 delay 为 None），这时
+    history——AI-AUTO/AI-US/AI-SG/AI-GEMINI 这类会被 mihomo 健康检查的组有值；AI-MANUAL
+    是 fixed fallback，mihomo 不检查它（`history` 恒空 ⇒ 组自身 delay 为 None），这时
     回退到出口节点自身的 history，避免展示成空。
     """
     group = groups.get(name)
@@ -437,7 +446,7 @@ def _collect_gemini_nodes(
     extra_names: list[str],
     prefer: list | None = None,
 ) -> list[str]:
-    """收集 Gemini 专用出口：优先韩/台/欧/巴东等实测可用地区，1X/ws/grpc 排 IEPL/裸vision 前。
+    """收集 Gemini 专用出口：优先台/韩/欧/巴东等实测可用地区，1X/ws/grpc 排 IEPL/裸vision 前。
 
     prefer（config.yaml 的 ai-gemini-prefer）按给定顺序把已入选的节点提到最前，
     用于把实测更稳的节点钉成 fallback 默认出口；未入选（改名/不在优选地区）
@@ -1532,8 +1541,11 @@ class RuntimeBackend:
                 "name": AI_GEMINI_GROUP,
                 "type": "fallback",
                 "proxies": gemini_proxies,
-                "url": TEST_URL,
-                "interval": 313,
+                "url": GEMINI_TEST_URL,
+                "interval": 60,
+                "lazy": False,
+                "max-failed-times": 1,
+                "expected-status": 204,
             },
         ]
         if h2_keepalive_active:
@@ -1601,7 +1613,7 @@ class RuntimeBackend:
             f"(NETWORK,TCP),(NOT,((IN-TYPE,SOCKS5)))),{AI_GEMINI_KEEPALIVE_GROUP}"
         )
         codex_keepalive_rule = (
-            "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),"
+            "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com),(DOMAIN,api.openai.com))),(NETWORK,TCP),"
             f"(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),{AI_MANUAL_KEEPALIVE_GROUP}"
         )
         ai_rules = [
@@ -1638,6 +1650,20 @@ class RuntimeBackend:
             f"DOMAIN-SUFFIX,chatgpt.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,oaistatic.com,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,oaiusercontent.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,chatgpt.livekit.cloud,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,host.livekit.cloud,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,turn.livekit.cloud,{AI_MANUAL_GROUP}",
+            f"DOMAIN,openai-api.arkoselabs.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,client-api.arkoselabs.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,featuregates.org,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,api.statsig.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,events.statsigapi.net,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,openaiapi-site.azureedge.net,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,openaicom.imgix.net,{AI_MANUAL_GROUP}",
+            f"DOMAIN,openaicomproductionae4b.blob.core.windows.net,{AI_MANUAL_GROUP}",
+            f"DOMAIN,production-openaicom-storage.azureedge.net,{AI_MANUAL_GROUP}",
+            f"DOMAIN,openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net,{AI_MANUAL_GROUP}",
+            f"DOMAIN,chat.openai.com.cdn.cloudflare.net,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,sora.com,{AI_MANUAL_GROUP}",
             f"DOMAIN,cdn.auth0.com,{AI_MANUAL_GROUP}",
             # Anthropic

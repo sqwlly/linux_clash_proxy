@@ -662,8 +662,8 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
             if group is None:
                 print(f"{name}: 缺失")
                 continue
-            # delay 取**出口节点**的真实延迟：fixed fallback 组自身 history 恒空，
-            # 直接读组会打出 None（旧实现即如此）
+            # fixed fallback（如 AI-MANUAL）的组自身 history 恒空，需回退到出口节点；
+            # AI-GEMINI 等持续健康检查组优先使用组自身延迟。
             _node, exit_delay, _alive = _ai_exit(groups, name)
             print(
                 f"{name}: type={_group_value(group, 'type', '-')} now={_group_value(group, 'now', '-')} "

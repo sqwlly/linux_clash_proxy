@@ -145,35 +145,74 @@ def _resolve_ruleset_path(
     paths: AppPaths,
     provider_name: str,
     provider_cfg: dict[str, Any] | None = None,
+    *,
+    ruleset_base_dirs: tuple[Path, ...] = (),
 ) -> Path | None:
     """安全定位本地 ruleset 文件，严禁目录穿越或逃逸出 `ruleset/` 目录。"""
     name = str(provider_name or "").strip()
     if not name or "/" in name or "\\" in name or ".." in name or Path(name).name != name:
         return None
-    ruleset_dir = (paths.data_dir / "ruleset").resolve()
+    base_dirs: list[Path] = [paths.data_dir]
+    for base_dir in ruleset_base_dirs:
+        if base_dir not in base_dirs:
+            base_dirs.append(base_dir)
+    allowed_ruleset_dirs = [(base / "ruleset").resolve() for base in base_dirs]
     candidates: list[Path] = []
     if isinstance(provider_cfg, dict):
         raw_path = str(provider_cfg.get("path") or "").strip()
         if raw_path and "\\" not in raw_path:
             rel = Path(raw_path)
             if not rel.is_absolute():
-                candidates.append(paths.data_dir / rel)
-    candidates.extend(
-        [
-            paths.data_dir / "ruleset" / f"{name}.yaml",
-            paths.data_dir / "ruleset" / f"{name}.yml",
-        ]
-    )
+                for base in base_dirs:
+                    candidates.append(base / rel)
+    for base in base_dirs:
+        candidates.append(base / "ruleset" / f"{name}.yaml")
+        candidates.append(base / "ruleset" / f"{name}.yml")
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
         except OSError:
             continue
-        if not resolved.is_relative_to(ruleset_dir):
+        if not any(resolved.is_relative_to(allowed_dir) for allowed_dir in allowed_ruleset_dirs):
             continue
         if resolved.is_file():
             return resolved
     return None
+
+
+def _split_top_level(text: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for idx, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(text[start:idx].strip())
+            start = idx + 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _strip_condition_parens(condition: str) -> str:
+    value = condition.strip()
+    while value.startswith("(") and value.endswith(")"):
+        depth = 0
+        wraps_whole_value = True
+        for idx, char in enumerate(value):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and idx < len(value) - 1:
+                    wraps_whole_value = False
+                    break
+        if not wraps_whole_value:
+            break
+        value = value[1:-1].strip()
+    return value
 
 
 def _match_ruleset(
@@ -182,6 +221,7 @@ def _match_ruleset(
     host: str,
     ip_obj: Any,
     *,
+    ruleset_base_dirs: tuple[Path, ...] = (),
     rule_providers: dict[str, Any] | None = None,
 ) -> bool:
     """尝试在本地 ruleset 文件（支持 classical / domain / ipcidr）中匹配域名或 IP。"""
@@ -190,7 +230,12 @@ def _match_ruleset(
         if isinstance(rule_providers, dict) and isinstance(rule_providers.get(provider_name), dict)
         else None
     )
-    ruleset_path = _resolve_ruleset_path(paths, provider_name, provider_cfg)
+    ruleset_path = _resolve_ruleset_path(
+        paths,
+        provider_name,
+        provider_cfg,
+        ruleset_base_dirs=ruleset_base_dirs,
+    )
     if ruleset_path is None:
         return False
     try:
@@ -218,9 +263,88 @@ def _match_ruleset(
                 except ValueError:
                     continue
         else:
-            if _rule_matches_target(cleaned, host, ip_obj, process=None, paths=None):
+            if _rule_matches_target(
+                cleaned,
+                host,
+                ip_obj,
+                process=None,
+                paths=None,
+                ruleset_base_dirs=ruleset_base_dirs,
+                rule_providers=rule_providers,
+            ):
                 return True
     return False
+
+
+def _logical_condition_matches(
+    condition: str,
+    host: str,
+    ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address | None,
+    *,
+    process: str | None,
+    paths: AppPaths | None,
+    ruleset_base_dirs: tuple[Path, ...],
+    rule_providers: dict[str, Any] | None,
+) -> bool:
+    normalized = _strip_condition_parens(condition)
+    parts = _split_top_level(normalized)
+    if not parts:
+        return False
+    rtype = parts[0].upper()
+    nested = parts[1:]
+    if rtype in {"AND", "OR"} and len(nested) == 1:
+        expanded = _split_top_level(_strip_condition_parens(nested[0]))
+        if len(expanded) > 1 and expanded[0].upper() not in {"AND", "OR", "NOT"}:
+            nested = expanded
+    if rtype == "AND":
+        return bool(nested) and all(
+            _logical_condition_matches(
+                item,
+                host,
+                ip_obj,
+                process=process,
+                paths=paths,
+                ruleset_base_dirs=ruleset_base_dirs,
+                rule_providers=rule_providers,
+            )
+            for item in nested
+        )
+    if rtype == "OR":
+        return any(
+            _logical_condition_matches(
+                item,
+                host,
+                ip_obj,
+                process=process,
+                paths=paths,
+                ruleset_base_dirs=ruleset_base_dirs,
+                rule_providers=rule_providers,
+            )
+            for item in nested
+        )
+    if rtype == "NOT":
+        return len(nested) == 1 and not _logical_condition_matches(
+            nested[0],
+            host,
+            ip_obj,
+            process=process,
+            paths=paths,
+            ruleset_base_dirs=ruleset_base_dirs,
+            rule_providers=rule_providers,
+        )
+    if rtype == "NETWORK":
+        return len(parts) >= 2 and parts[1].upper() == "TCP"
+    if rtype == "IN-TYPE":
+        return len(parts) >= 2 and parts[1].upper() in {"HTTP", "TUN"}
+    return _rule_matches_target(
+        normalized,
+        host,
+        ip_obj,
+        process=process,
+        paths=paths,
+        ruleset_base_dirs=ruleset_base_dirs,
+        rule_providers=rule_providers,
+    )
 
 
 def _rule_matches_target(
@@ -230,14 +354,56 @@ def _rule_matches_target(
     *,
     process: str | None,
     paths: AppPaths | None,
+    ruleset_base_dirs: tuple[Path, ...] = (),
     rule_providers: dict[str, Any] | None = None,
 ) -> bool:
-    parts = [item.strip() for item in rule.split(",")]
+    parts = _split_top_level(rule)
     if not parts:
         return False
     rtype = parts[0].upper()
     if rtype == "MATCH":
         return True
+    if rtype in {"AND", "OR", "NOT"}:
+        conditions = parts[1:-1]
+        if rtype in {"AND", "OR"} and len(conditions) == 1:
+            expanded = _split_top_level(_strip_condition_parens(conditions[0]))
+            if len(expanded) > 1 and expanded[0].upper() not in {"AND", "OR", "NOT"}:
+                conditions = expanded
+        if rtype == "AND":
+            return bool(conditions) and all(
+                _logical_condition_matches(
+                    item,
+                    host,
+                    ip_obj,
+                    process=process,
+                    paths=paths,
+                    ruleset_base_dirs=ruleset_base_dirs,
+                    rule_providers=rule_providers,
+                )
+                for item in conditions
+            )
+        if rtype == "OR":
+            return any(
+                _logical_condition_matches(
+                    item,
+                    host,
+                    ip_obj,
+                    process=process,
+                    paths=paths,
+                    ruleset_base_dirs=ruleset_base_dirs,
+                    rule_providers=rule_providers,
+                )
+                for item in conditions
+            )
+        return len(conditions) == 1 and not _logical_condition_matches(
+            conditions[0],
+            host,
+            ip_obj,
+            process=process,
+            paths=paths,
+            ruleset_base_dirs=ruleset_base_dirs,
+            rule_providers=rule_providers,
+        )
     if len(parts) < 2:
         return False
     pattern = parts[1]
@@ -266,7 +432,14 @@ def _rule_matches_target(
         except re.error:
             return False
     if rtype == "RULE-SET" and paths is not None:
-        return _match_ruleset(paths, pattern, host, ip_obj, rule_providers=rule_providers)
+        return _match_ruleset(
+            paths,
+            pattern,
+            host,
+            ip_obj,
+            ruleset_base_dirs=ruleset_base_dirs,
+            rule_providers=rule_providers,
+        )
     if rtype == "GEOIP" and pattern.upper() == "CN":
         if host.endswith(".cn"):
             return True
@@ -274,12 +447,14 @@ def _rule_matches_target(
 
 
 def _rule_target_group(rule: str) -> str:
-    parts = [item.strip() for item in rule.split(",")]
+    parts = _split_top_level(rule)
     if not parts:
         return "DIRECT"
     rtype = parts[0].upper()
     if rtype == "MATCH":
         return parts[1] if len(parts) >= 2 and parts[1] else "DIRECT"
+    if rtype in {"AND", "OR", "NOT"}:
+        return parts[-1] if len(parts) >= 3 and parts[-1] else "DIRECT"
     if len(parts) >= 3 and parts[2]:
         return parts[2]
     return "DIRECT"
@@ -386,13 +561,29 @@ def explain_route(
 
     rfile = runtime_file(paths)
     cfile = config_file(paths)
+    source_file = rfile if rfile.exists() else cfile
     try:
-        data = load_yaml_file(rfile) if rfile.exists() else load_yaml_file(cfile)
+        sidecar_config = load_yaml_file(cfile)
+    except Exception:
+        sidecar_config = {}
+    if isinstance(sidecar_config, dict) and sidecar_config.get("verge-mode") is True:
+        try:
+            from .verge import discover_clash_verge_config
+
+            verge_dir = discover_clash_verge_config().source_dir
+            verge_runtime = verge_dir / "clash-verge.yaml" if verge_dir is not None else None
+            if verge_runtime is not None and verge_runtime.is_file():
+                source_file = verge_runtime
+        except Exception:
+            pass
+    try:
+        data = load_yaml_file(source_file)
     except Exception:
         data = {}
     if not isinstance(data, dict):
         data = {}
 
+    ruleset_base_dirs = [source_file.parent]
     raw_rules = data.get("rules")
     rules = [str(item) for item in raw_rules if isinstance(item, str)] if isinstance(raw_rules, list) else []
     raw_providers = data.get("rule-providers")
@@ -427,6 +618,7 @@ def explain_route(
             ip_obj,
             process=effective_process,
             paths=paths,
+            ruleset_base_dirs=tuple(ruleset_base_dirs),
             rule_providers=rule_providers,
         ):
             matched_rule = rule

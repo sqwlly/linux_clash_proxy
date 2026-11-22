@@ -234,8 +234,8 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
             if group is None:
                 ai_lines.append(f"{name}: 缺失")
                 continue
-            # 延迟取出口节点的真实值：fixed fallback 组（AI-MANUAL/AI-GEMINI）自身
-            # history 恒空，直接读 group.delay 会打成 None
+            # fixed fallback（AI-MANUAL）自身 history 恒空，需取出口节点的真实值；
+            # AI-GEMINI 等持续健康检查组优先使用组自身延迟。
             _node, delay, _alive = ai_exit_metrics(groups, name)
             ai_lines.append(
                 f"{name}: type={group.type} now={group.current} alive={group.alive} "

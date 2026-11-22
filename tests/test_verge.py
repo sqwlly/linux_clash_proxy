@@ -95,6 +95,70 @@ def test_discover_and_init_clash_verge_config(tmp_path):
     assert saved["mixed-port"] == 7897
 
 
+def test_why_uses_verge_runtime_logical_rules_and_provider_paths(tmp_path, monkeypatch):
+    from cproxy.services.why import explain_route
+
+    paths = _paths(tmp_path)
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    config_file(paths).write_text("verge-mode: true\n", encoding="utf-8")
+    paths.data_dir.mkdir(parents=True, exist_ok=True)
+    (paths.data_dir / "runtime.yaml").write_text("rules:\n  - MATCH,DIRECT\n", encoding="utf-8")
+
+    verge_dir = tmp_path / "verge"
+    (verge_dir / "ruleset").mkdir(parents=True)
+    keepalive_rule = (
+        "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com),(DOMAIN,api.openai.com))),(NETWORK,TCP),"
+        "(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN))),(NOT,((OR,((PROCESS-NAME,chrome.exe),"
+        "(PROCESS-NAME,msedge.exe),(PROCESS-NAME,firefox.exe),(PROCESS-NAME,brave.exe)))))),AI-MANUAL-KEEPALIVE"
+    )
+    (verge_dir / "clash-verge.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "rule-providers": {"OpenAI": {"path": "./ruleset/OpenAI_No_Resolve.yaml"}},
+                "rules": [
+                    keepalive_rule,
+                    "PROCESS-NAME,codex.exe,AI-MANUAL",
+                    "DOMAIN-SUFFIX,chatgpt.com,AI-MANUAL",
+                    "RULE-SET,OpenAI,OpenAI",
+                    "MATCH,Proxy",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (verge_dir / "ruleset" / "OpenAI_No_Resolve.yaml").write_text(
+        "payload:\n  - DOMAIN-SUFFIX,featuregates.org\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "cproxy.services.verge.discover_clash_verge_config",
+        lambda: SimpleNamespace(source_dir=verge_dir),
+    )
+    monkeypatch.setattr(
+        "cproxy.services.why.APIBackend.get_groups",
+        lambda self, **kw: {
+            "AI-MANUAL-KEEPALIVE": ProxyGroup(
+                "AI-MANUAL-KEEPALIVE", "Fallback", "H2-KEEPALIVE", ["H2-KEEPALIVE", "AI-MANUAL"]
+            ),
+            "H2-KEEPALIVE": ProxyGroup("H2-KEEPALIVE", "HTTP", "-", [], delay=10, alive=True),
+            "AI-MANUAL": ProxyGroup("AI-MANUAL", "Fallback", "US", ["US"]),
+            "US": ProxyGroup("US", "VLESS", "-", [], delay=100, alive=True),
+            "OpenAI": ProxyGroup("OpenAI", "Selector", "JP", ["JP"]),
+            "JP": ProxyGroup("JP", "VLESS", "-", [], delay=90, alive=True),
+        },
+    )
+    monkeypatch.setattr("cproxy.services.why.APIBackend.get_connections", lambda self: [])
+
+    codex = explain_route(paths, "chatgpt.com", process="codex.exe")
+    assert codex.matched_rule == keepalive_rule
+    assert codex.policy_group == "AI-MANUAL-KEEPALIVE"
+    assert explain_route(paths, "api.openai.com", process="codex.exe").policy_group == "AI-MANUAL-KEEPALIVE"
+    assert explain_route(paths, "chatgpt.com", process="chrome.exe").policy_group == "AI-MANUAL"
+
+    statsig = explain_route(paths, "featuregates.org")
+    assert statsig.matched_rule == "RULE-SET,OpenAI,OpenAI"
+    assert statsig.exit_node == "JP"
+
+
 def test_export_verge_preprocess_script_and_node_execution(tmp_path):
     out_file = tmp_path / "clash-verge-script.js"
     content = export_verge_script(out_file)
@@ -121,6 +185,7 @@ def test_export_verge_preprocess_script_and_node_execution(tmp_path):
             + "      'ws-opts': { headers: { Host: 'us1.sub.example.com' } } },\n"
             + "    { name: '🇰🇷韩国 01 | 1X', type: 'vless', network: 'ws' },\n"
             + "    { name: '🇰🇷韩国 01 | 1X', type: 'vless', network: 'ws' },\n"
+            + "    { name: '🇨🇳台湾 01 | 1X', type: 'vless', network: 'ws' },\n"
             + "    { name: '剩余流量: 99GB', type: 'ss' }\n"
             + "  ],\n"
             + "  'proxy-groups': [{ name: 'Proxy', type: 'select', proxies: ['🇺🇸美国 01 | 1X', '剩余流量: 99GB'] }],\n"
@@ -137,6 +202,13 @@ def test_export_verge_preprocess_script_and_node_execution(tmp_path):
         # 1X 非易断流节点必须排在 IEPL / 裸 vision 之前
         assert groups["AI-MANUAL"]["proxies"][0] == "🇺🇸美国 01 | 1X"
         assert groups["AI-MANUAL"]["proxies"][-1] == "AI-AUTO"
+        # 台湾节点默认优先，韩国作为后备；Google 健康检查持续执行并允许自动故障转移
+        assert groups["AI-GEMINI"]["proxies"][0] == "🇨🇳台湾 01 | 1X"
+        assert groups["AI-GEMINI"]["url"] == "https://www.gstatic.com/generate_204"
+        assert groups["AI-GEMINI"]["interval"] == 60
+        assert groups["AI-GEMINI"]["lazy"] is False
+        assert groups["AI-GEMINI"]["max-failed-times"] == 1
+        assert groups["AI-GEMINI"]["expected-status"] == 204
         # 重名节点已被自动消歧为 #2
         assert "🇰🇷韩国 01 | 1X #2" in groups["AI-GEMINI"]["proxies"]
         # 443 WS 节点的 server 已优选为独立子域 Host
@@ -146,6 +218,11 @@ def test_export_verge_preprocess_script_and_node_execution(tmp_path):
         assert "DOMAIN-SUFFIX,openai.com,Proxy" not in rendered["rules"]
         assert rendered["rules"][0] == "DOMAIN-SUFFIX,google.com,AI-GEMINI"
         assert "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve" in rendered["rules"]
+        assert "DOMAIN-SUFFIX,featuregates.org,AI-MANUAL" in rendered["rules"]
+        assert "DOMAIN-SUFFIX,chatgpt.livekit.cloud,AI-MANUAL" in rendered["rules"]
+        assert "DOMAIN,openai-api.arkoselabs.com,AI-MANUAL" in rendered["rules"]
+        codex_rule = next(rule for rule in rendered["rules"] if rule.startswith("AND,") and "chatgpt.com" in rule)
+        assert "DOMAIN,api.openai.com" in codex_rule
 
 
 def test_cross_platform_connection_activity_tracker_without_ss(tmp_path, monkeypatch):
@@ -1254,6 +1331,8 @@ def test_try_hot_reload_verge_runtime_compiles_scripts_and_preserves_egress(tmp_
     assert loaded["rule-providers"]["Apple"]["path"] == "ruleset/Apple.yaml"
     assert loaded["rules"][0] == "DOMAIN-SUFFIX,google.com,AI-GEMINI"
     assert "PROCESS-NAME,steam.exe,DIRECT" in loaded["rules"]
+    on_disk = yaml.safe_load((verge_dir / "clash-verge.yaml").read_text(encoding="utf-8"))
+    assert on_disk["rules"] == loaded["rules"]
 
 
 def test_keepalive_multi_protocol_telemetry_and_summary(tmp_path, monkeypatch):

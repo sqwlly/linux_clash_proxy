@@ -503,7 +503,7 @@ def test_detect_recent_agy_retry_failure_scans_all_concurrent_session_logs(tmp_p
     assert hit_stream_eof is False
 
 
-def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_fallback(tmp_path: Path) -> None:
+def test_gemini_active_candidates_retains_healthy_1x_and_keeps_stable_fallback(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
     from cproxy.backend.models import ProxyGroup
@@ -531,8 +531,7 @@ def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_f
         "🇧🇷巴西 01 | 1X",
     }.issubset(kept)
 
-    # 2. 当 AI-GEMINI 滞留在高延迟 🇫🇷法国 01 | 1X (780ms) 时，应自动迁回 🇰🇷韩国 01 | 1X (260ms)；
-    #    但若当前已在 🇬🇧英国 01 | 1X (350ms) 且与榜首差距 <180ms，保持 Sticky Active Head 不乱切。
+    # 2. 当前节点已经稳定时，即使其他优选地区节点延迟更低，也只调整备用顺序，不主动替换现役节点。
     fr_slow_report = SimpleNamespace(
         current="🇫🇷法国 01 | 1X",
         current_verdict=StabilityVerdict(True, "5/5 稳定"),
@@ -542,7 +541,7 @@ def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_f
             ProbeSummary("🇫🇷法国 01 | 1X", (760, 780, 790, 770, 800), 0),
         ],
     )
-    assert RebalanceService._should_switch_current(fr_slow_report, "🇰🇷韩国 01 | 1X", "AI-GEMINI") is True
+    assert RebalanceService._should_switch_current(fr_slow_report, "🇰🇷韩国 01 | 1X", "AI-GEMINI") is False
 
     gb_close_report = SimpleNamespace(
         current="🇬🇧英国 01 | 1X",
@@ -555,7 +554,7 @@ def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_f
     )
     assert RebalanceService._should_switch_current(gb_close_report, "🇰🇷韩国 01 | 1X", "AI-GEMINI") is False
 
-    # 3. _pick_next 在所有 1X 均处于冷却期时，优先回收最早冷却的存活 1X，绝不落入 50s 必断的 IEPL
+    # 3. 所有 1X 均处于冷却期时保持当前节点，既不提前回收，也不落入易断流的 IEPL
     paths = _make_paths(tmp_path)
     svc = AIWatchService(paths)
     now = 10_000.0
@@ -577,7 +576,7 @@ def test_gemini_active_candidates_retains_all_healthy_1x_and_migrates_off_slow_f
         {"🇰🇷韩国 01 | 1X": now - 120.0},
         now,
     )
-    assert picked == "🇰🇷韩国 01 | 1X"
+    assert picked is None
 
     # 4. _promote_gemini_order_head 绝不把 IEPL 节点提拔到 ai-gemini-order.json 首位
     order_path = ai_gemini_order_file(paths)
@@ -1885,5 +1884,58 @@ def test_runtime_render_injects_h2_keepalive_rule_when_running(tmp_path: Path, m
     )
     assert rule in rendered["rules"]
     assert rendered["rules"].index(rule) < rendered["rules"].index("DOMAIN-SUFFIX,googleapis.com,AI-GEMINI")
+    groups = {group["name"]: group for group in rendered["proxy-groups"]}
+    assert groups["AI-MANUAL-KEEPALIVE"]["proxies"] == ["H2-KEEPALIVE", "AI-MANUAL"]
+    codex_rule = next(rule for rule in rendered["rules"] if rule.startswith("AND,") and "chatgpt.com" in rule)
+    assert "DOMAIN,api.openai.com" in codex_rule
+    assert codex_rule.endswith(",AI-MANUAL-KEEPALIVE")
+    assert "DOMAIN-SUFFIX,featuregates.org,AI-MANUAL" in rendered["rules"]
+    assert "DOMAIN-SUFFIX,chatgpt.livekit.cloud,AI-MANUAL" in rendered["rules"]
+
+
+def test_upstream_client_context_prefers_chrome_fingerprint(monkeypatch):
+    from cproxy.services import h2_keepalive as mod
+
+    calls: dict[str, object] = {}
+
+    class _Ctx:
+        def set_fingerprint(self, name: str) -> None:
+            calls["fp"] = name
+
+        def set_alpn_protocols(self, alpn: list[str]) -> None:
+            calls["alpn"] = list(alpn)
+
+    class _Utls:
+        @staticmethod
+        def create_default_context() -> _Ctx:
+            calls["created"] = True
+            return _Ctx()
+
+    monkeypatch.setattr(mod, "_load_utls", lambda: _Utls)
+    ctx = mod._upstream_client_context(["h2", "http/1.1"])
+    assert isinstance(ctx, _Ctx)
+    assert calls["created"] is True
+    assert calls["fp"] == "chrome:stable"
+    assert calls["alpn"] == ["h2", "http/1.1"]
+
+
+def test_upstream_client_context_falls_back_without_utls(monkeypatch):
+    from cproxy.services import h2_keepalive as mod
+
+    class _StdCtx:
+        def __init__(self) -> None:
+            self.alpn: list[str] | None = None
+
+        def set_alpn_protocols(self, alpn: list[str]) -> None:
+            self.alpn = list(alpn)
+
+    def _missing():
+        raise ImportError("utls not installed")
+
+    monkeypatch.setattr(mod, "_load_utls", _missing)
+    monkeypatch.setattr(mod.ssl, "create_default_context", _StdCtx)
+    ctx = mod._upstream_client_context(["http/1.1"])
+    assert isinstance(ctx, _StdCtx)
+    assert ctx.alpn == ["http/1.1"]
 
 

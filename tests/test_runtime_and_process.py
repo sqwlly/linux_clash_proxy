@@ -875,6 +875,9 @@ rules:
     assert "DOMAIN-SUFFIX,meta.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,openai.azure.com,AI-MANUAL" in rules
     assert "DOMAIN,cdn.auth0.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,featuregates.org,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,chatgpt.livekit.cloud,AI-MANUAL" in rules
+    assert "DOMAIN,openai-api.arkoselabs.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,challenges.cloudflare.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,google.com,AI-GEMINI" in rules
     assert "DOMAIN-SUFFIX,googleapis.com,AI-GEMINI" in rules

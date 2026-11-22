@@ -6,11 +6,12 @@
 // 4. 剔除订阅冲突 AI 规则，置顶注入 Google/Gemini/Cloud Code 与 OpenAI/Codex/Claude 分流规则
 
 const TEST_URL = "https://cp.cloudflare.com/generate_204";
+const GEMINI_TEST_URL = "https://www.gstatic.com/generate_204";
 const KEEPALIVE_TEST_URL = "http://cp.cloudflare.com/generate_204";
 const DEFAULT_KEEPALIVE_PORT = 7895;
 const DEFAULT_MAX_AI_MULTIPLIER = 3.0;
 const STAGGERED_AUTO_INTERVALS = [317, 323, 331, 337, 347, 349, 353, 359];
-const AI_GEMINI_REGION_ORDER = ["KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU"];
+const AI_GEMINI_REGION_ORDER = ["TW", "KR", "GB", "DE", "FR", "BR", "AE", "AU"];
 const AI_MANUAL_REGION_ORDER = ["US", "JP", "SG", "KR", "GB", "TW", "FR", "DE"];
 
 const PANEL_INFO_RE = /剩余流量|套餐到期|距离下次重置|官网|群组|导航|下次重置|到期时间|流量重置|重置剩余|过期时间|有效期|Expire|Traffic|网址|公告|客服|频道|\b\d+(?:\.\d+)?\s*[KMGTPE]i?B\s*(?:[|/]|of)\s*\d+(?:\.\d+)?\s*[KMGTPE]i?B\b/i;
@@ -32,6 +33,14 @@ const REGION_PATTERNS = [
 
 const AI_DOMAINS = new Set([
   "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+  "chatgpt.livekit.cloud", "host.livekit.cloud", "turn.livekit.cloud",
+  "openai-api.arkoselabs.com", "client-api.arkoselabs.com",
+  "featuregates.org", "api.statsig.com", "events.statsigapi.net",
+  "openaiapi-site.azureedge.net", "openaicom.imgix.net",
+  "openaicomproductionae4b.blob.core.windows.net",
+  "production-openaicom-storage.azureedge.net",
+  "openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net",
+  "chat.openai.com.cdn.cloudflare.net",
   "sora.com", "anthropic.com", "claude.ai", "claudeusercontent.com",
   "x.ai", "grok.com", "openai.azure.com", "githubcopilot.com",
   "meta.ai", "llama.com", "meta.com",
@@ -216,12 +225,46 @@ function main(config) {
   dedupeProxyNames(config);
   optimizeWsCdnServers(config.proxies);
 
-  // 2. 清理易卡死 mihomo 的 geosite fallback-filter & 注入长连接保活设置
+  // 2. 清理易卡死 mihomo 的 geosite fallback-filter、补齐游戏/加速器 fake-ip-filter & 注入长连接保活设置
   if (config.dns && config.dns["fallback-filter"]) {
     delete config.dns["fallback-filter"].geosite;
   }
+  if (config.dns && typeof config.dns === "object") {
+    const extraFakeIpFilter = [
+      "+.leigod.com",
+      "+.leigodtech.com",
+      "+.nn.com",
+      "+.playbattlegrounds.com",
+      "+.playbattlegrounds.com.cn",
+      "+.krafton.com",
+      "+.krafton.io",
+      "+.pubg.com",
+      "+.battleye.com",
+      "+.eac-cdn.com",
+      "+.easyanticheat.net",
+      "+.steamserver.net",
+      "+.kookapp.cn",
+      "+.kaiheila.cn",
+      "stun.*.*",
+      "stun.*.*.*",
+    ];
+    const curFilter = Array.isArray(config.dns["fake-ip-filter"]) ? [...config.dns["fake-ip-filter"]] : [];
+    const filterSet = new Set(curFilter);
+    for (const item of extraFakeIpFilter) {
+      if (!filterSet.has(item)) {
+        curFilter.push(item);
+        filterSet.add(item);
+      }
+    }
+    config.dns["fake-ip-filter"] = curFilter;
+  }
   if (!(config.dns && config.dns.ipv6 === true)) {
     config.ipv6 = false;
+  }
+  if (config.tun && typeof config.tun === "object") {
+    if (!config.tun.stack || config.tun.stack === "gvisor") {
+      config.tun.stack = "system";
+    }
   }
   config["tcp-concurrent"] = false;
   config["unified-delay"] = true;
@@ -269,7 +312,7 @@ function main(config) {
     return config;
   }
 
-  // 4. 构建 AI-GEMINI 候选池（韩/台/英/德/法/巴/阿/澳 优先，缺失时回退日/美/新）
+  // 4. 构建 AI-GEMINI 候选池（台/韩/英/德/法/巴/阿/澳 优先，缺失时回退日/美/新）
   let geminiLeaves = [];
   for (const code of AI_GEMINI_REGION_ORDER) {
     for (const n of buckets.get(code) || []) {
@@ -329,7 +372,16 @@ function main(config) {
     { name: "AI-SG", type: "fallback", proxies: sgProxies, url: TEST_URL, interval: 293 },
     { name: "AI-AUTO", type: "fallback", proxies: ["AI-US", "AI-SG"], url: TEST_URL, interval: 307 },
     { name: "AI-MANUAL", type: "fallback", proxies: manualCandidates, url: TEST_URL, interval: 300 },
-    { name: "AI-GEMINI", type: "fallback", proxies: geminiProxies, url: TEST_URL, interval: 313 },
+    {
+      name: "AI-GEMINI",
+      type: "fallback",
+      proxies: geminiProxies,
+      url: GEMINI_TEST_URL,
+      interval: 60,
+      lazy: false,
+      "max-failed-times": 1,
+      "expected-status": 204,
+    },
     {
       name: "AI-MANUAL-KEEPALIVE",
       type: "fallback",
@@ -388,7 +440,7 @@ function main(config) {
   const geminiKeepaliveRule =
     "AND,((OR,((DOMAIN,daily-cloudcode-pa.googleapis.com),(DOMAIN,aicode.googleapis.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),AI-GEMINI-KEEPALIVE";
   const codexKeepaliveRule =
-    "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN))),(NOT,((OR,((PROCESS-NAME,chrome.exe),(PROCESS-NAME,msedge.exe),(PROCESS-NAME,firefox.exe),(PROCESS-NAME,brave.exe)))))),AI-MANUAL-KEEPALIVE";
+    "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com),(DOMAIN,api.openai.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN))),(NOT,((OR,((PROCESS-NAME,chrome.exe),(PROCESS-NAME,msedge.exe),(PROCESS-NAME,firefox.exe),(PROCESS-NAME,brave.exe)))))),AI-MANUAL-KEEPALIVE";
 
   const aiRules = [
     "DOMAIN-SUFFIX,google.com,AI-GEMINI",
@@ -414,6 +466,20 @@ function main(config) {
     "DOMAIN-SUFFIX,chatgpt.com,AI-MANUAL",
     "DOMAIN-SUFFIX,oaistatic.com,AI-MANUAL",
     "DOMAIN-SUFFIX,oaiusercontent.com,AI-MANUAL",
+    "DOMAIN-SUFFIX,chatgpt.livekit.cloud,AI-MANUAL",
+    "DOMAIN-SUFFIX,host.livekit.cloud,AI-MANUAL",
+    "DOMAIN-SUFFIX,turn.livekit.cloud,AI-MANUAL",
+    "DOMAIN,openai-api.arkoselabs.com,AI-MANUAL",
+    "DOMAIN-SUFFIX,client-api.arkoselabs.com,AI-MANUAL",
+    "DOMAIN-SUFFIX,featuregates.org,AI-MANUAL",
+    "DOMAIN-SUFFIX,api.statsig.com,AI-MANUAL",
+    "DOMAIN-SUFFIX,events.statsigapi.net,AI-MANUAL",
+    "DOMAIN-SUFFIX,openaiapi-site.azureedge.net,AI-MANUAL",
+    "DOMAIN-SUFFIX,openaicom.imgix.net,AI-MANUAL",
+    "DOMAIN,openaicomproductionae4b.blob.core.windows.net,AI-MANUAL",
+    "DOMAIN,production-openaicom-storage.azureedge.net,AI-MANUAL",
+    "DOMAIN,openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net,AI-MANUAL",
+    "DOMAIN,chat.openai.com.cdn.cloudflare.net,AI-MANUAL",
     "DOMAIN-SUFFIX,sora.com,AI-MANUAL",
     "DOMAIN,cdn.auth0.com,AI-MANUAL",
     "DOMAIN-SUFFIX,anthropic.com,AI-MANUAL",
@@ -427,6 +493,58 @@ function main(config) {
     "DOMAIN-SUFFIX,openai.azure.com,AI-MANUAL",
     "DOMAIN-SUFFIX,githubcopilot.com,AI-MANUAL",
     "DOMAIN-SUFFIX,challenges.cloudflare.com,AI-MANUAL",
+  ];
+
+  const gameDirectRules = [
+    // Steam 与语音/游戏辅助
+    "PROCESS-NAME,steam.exe,DIRECT",
+    "PROCESS-NAME,steamservice.exe,DIRECT",
+    "PROCESS-NAME,steamwebhelper.exe,DIRECT",
+    "PROCESS-NAME,kook.exe,DIRECT",
+    "PROCESS-NAME,GamePP.exe,DIRECT",
+    // 雷神加速器（Electron 壳 + 真核心隧道引擎 leishenSdk + 本地 SSL 反代）
+    "PROCESS-NAME,leigod.exe,DIRECT",
+    "PROCESS-NAME,leigod_launcher.exe,DIRECT",
+    "PROCESS-NAME,leishenSdk.exe,DIRECT",
+    "PROCESS-NAME,networktunnel_proxy.exe,DIRECT",
+    "PROCESS-NAME,xroute.exe,DIRECT",
+    "PROCESS-NAME,leigod_pubg_tool.exe,DIRECT",
+    "PROCESS-NAME,leigod-tool.exe,DIRECT",
+    // UU 加速器
+    "PROCESS-NAME,uu.exe,DIRECT",
+    "PROCESS-NAME,uu_ball.exe,DIRECT",
+    "PROCESS-NAME,uu_cloudsyn.exe,DIRECT",
+    "PROCESS-NAME,uu_launcher.exe,DIRECT",
+    // PUBG 绝地求生及反作弊（BattlEye / Zakynthos / 内置 CEF 大厅）
+    "PROCESS-NAME,TslGame.exe,DIRECT",
+    "PROCESS-NAME,TslGame_BE.exe,DIRECT",
+    "PROCESS-NAME,TslGame_ZK.exe,DIRECT",
+    "PROCESS-NAME,TslGame_UC.exe,DIRECT",
+    "PROCESS-NAME,ExecPubg.exe,DIRECT",
+    "PROCESS-NAME,BEService.exe,DIRECT",
+    "PROCESS-NAME,BEService_x64.exe,DIRECT",
+    "PROCESS-NAME,zksvc.exe,DIRECT",
+    "PROCESS-NAME,BroCrashReporter.exe,DIRECT",
+    "PROCESS-NAME-REGEX,^UnrealCEFSubProcess.*\\.exe$,DIRECT",
+    // 通用反作弊与常见联机游戏
+    "PROCESS-NAME,EasyAntiCheat.exe,DIRECT",
+    "PROCESS-NAME,EasyAntiCheat_EOS.exe,DIRECT",
+    "PROCESS-NAME,cs2.exe,DIRECT",
+    "PROCESS-NAME,dota2.exe,DIRECT",
+    "PROCESS-NAME,RustClient.exe,DIRECT",
+    "PROCESS-NAME,Rust.exe,DIRECT",
+    "PROCESS-NAME,RidersRepublic.exe,DIRECT",
+    "PROCESS-NAME,RidersRepublic_BE.exe,DIRECT",
+    "PROCESS-NAME,RDR2.exe,DIRECT",
+    "PROCESS-NAME,PlayRDR2.exe,DIRECT",
+    "PROCESS-NAME,AimLab_tb.exe,DIRECT",
+    "PROCESS-NAME,b1-Win64-Shipping.exe,DIRECT",
+    // 加速器与语音控制面域名直连
+    "DOMAIN-SUFFIX,kookapp.cn,DIRECT",
+    "DOMAIN-SUFFIX,kaiheila.cn,DIRECT",
+    "DOMAIN-SUFFIX,leigod.com,DIRECT",
+    "DOMAIN-SUFFIX,leigodtech.com,DIRECT",
+    "DOMAIN-SUFFIX,nn.com,DIRECT",
   ];
 
   const bulkDownloadDirect = [
@@ -458,12 +576,12 @@ function main(config) {
     return target === "H2-KEEPALIVE" || target === "AI-MANUAL-KEEPALIVE" || target === "AI-GEMINI-KEEPALIVE";
   };
 
-  const frontSet = new Set([...aiRules, ...bulkDownloadDirect]);
+  const frontSet = new Set([...aiRules, ...gameDirectRules, ...bulkDownloadDirect]);
   const rawRules = Array.isArray(config.rules) ? config.rules : [];
   const cleanRules = rawRules
     .map(normalizeIpCidrRule)
     .filter(r => !frontSet.has(r) && !staleRules.has(r) && !isLegacyKeepaliveRule(r) && !isAiConflictRule(r));
 
-  config.rules = [...aiRules, ...bulkDownloadDirect, ...cleanRules];
+  config.rules = [...aiRules, ...gameDirectRules, ...bulkDownloadDirect, ...cleanRules];
   return config;
 }

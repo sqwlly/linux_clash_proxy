@@ -274,6 +274,51 @@ def test_rebalance_marks_runtime_applied_and_switches_unstable_current(tmp_path,
     assert switched == [("AI-MANUAL", "stable")]
 
 
+def test_rebalance_respects_recent_watch_switch_dwell(tmp_path, monkeypatch):
+    import time
+
+    from cproxy.backend.models import ProxyGroup
+    from cproxy.config import ai_watch_state_file
+    from cproxy.services import ai_watch as ai_watch_mod
+    from cproxy.services.probe import StabilityVerdict
+
+    paths = _paths(tmp_path)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    ai_watch_state_file(paths).write_text(
+        json.dumps({"AI-MANUAL": {"last_switch_ts": time.time()}}),
+        encoding="utf-8",
+    )
+    report = SimpleNamespace(
+        current="slow",
+        current_verdict=StabilityVerdict(False, "失败 2 次"),
+        verdict=StabilityVerdict(True, "5/5 稳定"),
+        summaries=[_summary("slow", (500,), failures=2), _summary("stable", (100, 110))],
+    )
+    switched = []
+
+    class _FakeAPI:
+        def get_groups(self):
+            return {
+                "AI-MANUAL": ProxyGroup(
+                    name="AI-MANUAL", type="fallback", current="slow", candidates=["slow", "stable"]
+                )
+            }
+
+    class _FakeQuery:
+        def __init__(self, p):
+            self.api = _FakeAPI()
+
+        def switch_group(self, group, target, **kwargs):
+            switched.append((group, target))
+
+    monkeypatch.setattr(rebalance_mod, "QueryService", _FakeQuery)
+
+    reasons = [ai_watch_mod.automatic_switch_block_reason(paths, "AI-MANUAL", now=time.time()) for _ in range(2)]
+    assert reasons == ["switch_dwell", "switch_dwell"], reasons
+    assert RebalanceService(paths)._switch_if_current_unstable(report, "stable", "AI-MANUAL") is None
+    assert switched == []
+
+
 def test_rebalance_suppresses_tail_noise_when_top_k_unchanged(tmp_path, monkeypatch):
     """当候选集不变且前 REBALANCE_TOP_K(5) 名完全一致，仅第 6、7 名因单轮抖动互换时，
     不应重写 ai-manual-order.json，也不触发无意义的热重载。"""
@@ -370,6 +415,11 @@ rules:
         "🇬🇧英国 01 | IEPL 1.7X | CM",
         "🇰🇷韩国 01 | 1X",
     ]
+    assert gemini["url"] == "https://www.gstatic.com/generate_204"
+    assert gemini["interval"] == 60
+    assert gemini["lazy"] is False
+    assert gemini["max-failed-times"] == 1
+    assert gemini["expected-status"] == 204
 
 
 def test_rebalance_orders_and_switches_ai_gemini(tmp_path, monkeypatch):

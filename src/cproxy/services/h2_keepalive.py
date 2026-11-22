@@ -49,6 +49,9 @@ LEAF_CERT_SANS = (
 )
 LEAF_SAN_VERSION = "v2:googleapis+chatgpt+openai"
 CA_COMMON_NAME = "cproxy Local H2 Keepalive CA"
+# 上游 Cloudflare 按 TLS 指纹挑战。stdlib OpenSSL 会得到 Cf-Mitigated，
+# 同一出口上完整 Chrome 指纹可以到达源站（401，缺登录态）。
+_UPSTREAM_CHROME_FINGERPRINT = "chrome:stable"
 
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 H2_MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024
@@ -615,6 +618,35 @@ def _proc_start_time(pid: int) -> float:
     except Exception:
         pass
     return os.stat(f"/proc/{pid}").st_mtime
+
+
+def _load_utls():
+    import utls
+
+    return utls
+
+
+def _upstream_client_context(alpn: list[str]) -> ssl.SSLContext:
+    """建一条朝向源站的 TLS。
+
+    保活网关要插入 HTTP/2 PING，所以必须终结桌面端的 TLS。第二跳如果仍用
+    Python 自带的 OpenSSL，Cloudflare 会返回人机验证页，ChatGPT 的账号设置
+    请求因此失败。这里换成 Chrome 的 ClientHello；客户端自己的 HTTP/2 帧
+    仍原样转发，PING 注入逻辑不变。`utls` 缺失时退回 stdlib，行为与旧版相同。
+    """
+    ctx: Any
+    try:
+        utls_mod = _load_utls()
+    except ImportError:
+        ctx = ssl.create_default_context()
+    else:
+        try:
+            ctx = utls_mod.create_default_context()
+            ctx.set_fingerprint(_UPSTREAM_CHROME_FINGERPRINT)
+        except Exception:
+            ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(alpn)
+    return ctx
 
 
 def client_prefers_passthrough(
@@ -2173,10 +2205,8 @@ class H2KeepaliveProxy:
         self.server_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.server_ssl.load_cert_chain(certfile=str(leaf_crt), keyfile=str(leaf_key))
         self.server_ssl.set_alpn_protocols(["h2", "http/1.1"])
-        self.client_ssl = ssl.create_default_context()
-        self.client_ssl.set_alpn_protocols(["h2", "http/1.1"])
-        self.client_ssl_h1 = ssl.create_default_context()
-        self.client_ssl_h1.set_alpn_protocols(["http/1.1"])
+        self.client_ssl = _upstream_client_context(["h2", "http/1.1"])
+        self.client_ssl_h1 = _upstream_client_context(["http/1.1"])
 
     def is_ca_trusted(self) -> bool:
         if self._ca_trusted_cached:

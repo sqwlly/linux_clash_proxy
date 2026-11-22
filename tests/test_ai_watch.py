@@ -12,7 +12,7 @@ SRC_DIR = ROOT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from cproxy.backend.models import ProxyGroup
-from cproxy.config import AppPaths
+from cproxy.config import AppPaths, ai_watch_state_file
 from cproxy.services import ai_watch as ai_watch_mod
 from cproxy.services.ai_watch import AIWatchService
 from cproxy.services.diagnostics import PROBE_DEAD, PROBE_GEO_BLOCKED, PROBE_OK, _probe_target
@@ -151,7 +151,11 @@ def test_pick_next_skips_cooldown_and_nested_group(tmp_path):
 def test_state_persists_across_instances(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     groups = _groups()
-    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_DEAD)
+    monkeypatch.setattr(
+        ai_watch_mod,
+        "ai_target_verdict",
+        lambda p, url: PROBE_DEAD if "google" in url else PROBE_OK,
+    )
 
     svc1 = AIWatchService(paths)
     svc1.query = _FakeQuery(groups)
@@ -163,6 +167,76 @@ def test_state_persists_across_instances(tmp_path, monkeypatch):
     report = svc2.watch()  # 读到 fail_count=1 → 变 2 → 切换
     assert any(r.switched for r in report.results)
     assert fake_q2.switches
+
+
+def test_watch_shared_dead_failure_circuit_prevents_candidate_rotation(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    groups = _groups()
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_DEAD)
+    svc = AIWatchService(paths)
+    fake_q = _FakeQuery(groups)
+    svc.query = fake_q
+
+    svc.watch()
+    report = svc.watch()
+
+    assert fake_q.switches == []
+    assert all(r.detail == "shared_failure_circuit" for r in report.results)
+    state = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
+    assert state["shared_circuit_open_until"] > time.time()
+
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_OK)
+    svc.watch()
+    state = json.loads(ai_watch_state_file(paths).read_text(encoding="utf-8"))
+    assert "shared_circuit_open_until" not in state
+
+
+def test_watch_switch_dwell_blocks_quick_return_but_geo_block_can_escape(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    groups = _groups()
+    groups.pop("AI-MANUAL")
+    groups["AI-GEMINI"] = _group("AI-GEMINI", ["KR-01", "GB-01", "DE-01"], "KR-01")
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_DEAD)
+
+    class _SwitchingQuery(_FakeQuery):
+        def switch_group(self, group, target, **kwargs):
+            self.switches.append((group, target))
+            candidates = list(groups[group].candidates)
+            groups[group] = _group(group, candidates, target)
+
+    svc = AIWatchService(paths)
+    fake_q = _SwitchingQuery(groups)
+    svc.query = fake_q
+    svc.watch()
+    switched = svc.watch()
+    assert next(r for r in switched.results if r.group == "AI-GEMINI").target == "GB-01"
+
+    svc.watch()
+    deferred = svc.watch()
+    gemini = next(r for r in deferred.results if r.group == "AI-GEMINI")
+    assert gemini.switched is False
+    assert gemini.detail == "switch_dwell"
+    assert fake_q.switches == [("AI-GEMINI", "GB-01")]
+
+    monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda p, url: PROBE_GEO_BLOCKED)
+    escaped = svc.watch()
+    gemini = next(r for r in escaped.results if r.group == "AI-GEMINI")
+    assert gemini.switched is True
+    assert gemini.target == "DE-01"
+
+
+def test_switch_circuit_opens_after_three_switches_in_ten_minutes(tmp_path):
+    paths = _paths(tmp_path)
+    now = time.time()
+    state = {}
+    gs = ai_watch_mod._group_state(state, "AI-GEMINI")
+    for offset in range(3):
+        ai_watch_mod._record_group_switch(gs, now + offset)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    ai_watch_state_file(paths).write_text(json.dumps(state), encoding="utf-8")
+
+    assert ai_watch_mod.automatic_switch_block_reason(paths, "AI-GEMINI", now=now + 3) == "switch_circuit"
+    assert ai_watch_mod.automatic_switch_block_reason(paths, "AI-GEMINI", now=now + 603) == ""
 
 
 def test_watch_skips_auto_mode(tmp_path, monkeypatch):
@@ -232,8 +306,8 @@ def test_pick_next_with_leaf_entries_in_groups_and_health_preference(tmp_path):
     group = groups["AI-MANUAL"]
     # 跳过 DEAD-01（alive=False）与 TIMEOUT-01（delay=5000 超时），优先选健康叶子 JP-01
     assert svc._pick_next(groups, group, "US-01", {}, now) == "JP-01"
-    # 当唯一健康叶子 JP-01 也在冷却期时，回退到首个非冷却叶子 DEAD-01，而非彻底返回 None
-    assert svc._pick_next(groups, group, "US-01", {"JP-01": now}, now) == "DEAD-01"
+    # 当唯一健康叶子 JP-01 也在冷却期时，保持当前节点，不回退到已知死节点
+    assert svc._pick_next(groups, group, "US-01", {"JP-01": now}, now) is None
 
 
 def _make_fake_proc(

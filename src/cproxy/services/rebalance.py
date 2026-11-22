@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -528,6 +529,10 @@ class RebalanceService:
             next_candidate = next((c for c in ordered if c not in tried), None)
             if not next_candidate:
                 break
+            from .ai_watch import automatic_switch_block_reason, record_external_automatic_switch
+
+            if automatic_switch_block_reason(self.paths, AI_GEMINI_GROUP, now=time.time()):
+                break
             try:
                 should_drop = is_static_iepl_node(active_node, self.paths)
                 try:
@@ -536,6 +541,7 @@ class RebalanceService:
                     query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
+                record_external_automatic_switch(self.paths, AI_GEMINI_GROUP, next_candidate)
             except (Exception, SystemExit):
                 break
 
@@ -632,6 +638,9 @@ class RebalanceService:
                         query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
+                from .ai_watch import record_external_automatic_switch
+
+                record_external_automatic_switch(self.paths, AI_GEMINI_GROUP, next_candidate)
             except (Exception, SystemExit):
                 break
 
@@ -698,29 +707,12 @@ class RebalanceService:
             and not migrating_off_static_iepl_with_majority_1x
         ):
             return False
-        cur_region = match_region(str(current_node or ""))
         migrating_gemini_off_iepl = (
             is_managed_ai
             and (is_static_iepl_node(current_node) or cur_is_failing)
             and (is_healthy_non_iepl_summary(best_summary) or migrating_off_static_iepl_with_majority_1x)
         )
-        migrating_gemini_off_slow = (
-            is_managed_ai
-            and cur_summary is not None
-            and best_summary is not None
-            and is_healthy_non_iepl_summary(best_summary)
-            and (
-                not is_healthy_non_iepl_summary(cur_summary)
-                or (
-                    cur_region not in GEMINI_FAST_REGIONS
-                    and cur_region not in ("OTHER", None)
-                    and cur_summary.avg_delay is not None
-                    and best_summary.avg_delay is not None
-                    and cur_summary.avg_delay - best_summary.avg_delay >= 180
-                )
-            )
-        )
-        if current_verdict.stable and not migrating_gemini_off_iepl and not migrating_gemini_off_slow:
+        if current_verdict.stable and not migrating_gemini_off_iepl:
             cur_penalty = getattr(cur_summary, "history_penalty_ms", 0) if cur_summary else 0
             best_penalty = getattr(best_summary, "history_penalty_ms", 0) if best_summary else 0
             if cur_penalty < CHRONIC_PENALTY_SWITCH_THRESHOLD_MS or best_penalty * 2 > cur_penalty:
@@ -767,8 +759,12 @@ class RebalanceService:
             current_node = live_current or rep_current
             cur_geo_blocked = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(current_node, self.paths)
             cur_banned = bool(current_node and active_bans and is_node_banned(current_node, active_bans))
-            from .ai_watch import has_active_ai_transfer
+            from .ai_watch import automatic_switch_block_reason, has_active_ai_transfer
 
+            if not cur_geo_blocked and not cur_banned and automatic_switch_block_reason(
+                self.paths, group_name, now=time.time()
+            ):
+                return None
             if (
                 not cur_geo_blocked
                 and not cur_banned
@@ -797,6 +793,9 @@ class RebalanceService:
                     query.switch_group(group_name, best_candidate, drop_connections=should_drop)
                 except TypeError:
                     query.switch_group(group_name, best_candidate)
+            from .ai_watch import record_external_automatic_switch
+
+            record_external_automatic_switch(self.paths, group_name, best_candidate)
             return best_candidate
         except (Exception, SystemExit):
             return None

@@ -36,9 +36,9 @@ def _proxy_node(name, delay):
 def build_ai_route_groups() -> dict:
     """兜底模式（AI-MANUAL 钉住韩国**节点**）的 AI 出口现场。
 
-    AI-MANUAL/AI-GEMINI 是 fixed fallback，mihomo 不做健康检查、`history` 恒空，
-    所以它们自身 `delay=None`；真实延迟只能从出口节点条目上取——这正是解析层要处理的
-    不变式，CLI（`ai-status`/`status`）与 TUI（仪表盘/AI 路由面板）的测试共用这份现场。
+    AI-MANUAL 是 fixed fallback，mihomo 不做健康检查、`history` 恒空；AI-GEMINI
+    在这里模拟首次健康检查尚未返回。二者真实延迟都回退到出口节点条目——这正是解析层
+    要处理的情况，CLI（`ai-status`/`status`）与 TUI 的测试共用这份现场。
     """
     return {
         "AI-MANUAL": _proxy_group("AI-MANUAL", "Fallback", AI_KR_NODE, ["AI-AUTO", AI_KR_NODE, AI_US_NODE]),
