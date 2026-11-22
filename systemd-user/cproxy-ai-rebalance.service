@@ -6,3 +6,6 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/cproxy ai-rebalance
+TimeoutStartSec=300s
+NoNewPrivileges=yes
+PrivateTmp=yes

@@ -30,7 +30,8 @@ class RuntimeMetrics:
 
 def _clk_tck() -> int:
     try:
-        return int(os.sysconf("SC_CLK_TCK"))
+        value = int(os.sysconf("SC_CLK_TCK"))
+        return value if value > 0 else _DEFAULT_CLK_TCK
     except (ValueError, OSError, AttributeError):
         return _DEFAULT_CLK_TCK
 
@@ -48,14 +49,19 @@ def _read_uptime_seconds(pid: int) -> int | None:
 
     # comm 字段(第 2 个)可能含空格与括号,因此从最后一个 ')' 之后开始切分。
     # 切分后 fields[0] 是 state(第 3 字段),故 starttime(第 22 字段)位于 fields[19]。
-    _, _, tail = stat_text.rpartition(")")
+    _, sep, tail = stat_text.rpartition(")")
+    if not sep:
+        return None
     fields = tail.split()
     if len(fields) <= 19:
         return None
+    clk_tck = _clk_tck()
+    if clk_tck <= 0:
+        return None
     try:
-        start_seconds = int(fields[19]) / _clk_tck()
+        start_seconds = int(fields[19]) / clk_tck
         boot_uptime = float(uptime_text.split()[0])
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, ZeroDivisionError):
         return None
 
     elapsed = int(boot_uptime - start_seconds)

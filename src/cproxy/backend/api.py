@@ -7,6 +7,7 @@ from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import BaseHandler, HTTPSHandler, OpenerDirector, ProxyHandler, Request, build_opener
 
@@ -80,6 +81,54 @@ class APIUnavailableError(RuntimeError):
     pass
 
 
+class APIRequestError(APIUnavailableError):
+    """Controller 可达但返回了 HTTP 4xx/5xx 错误响应。"""
+
+    def __init__(self, message: str, *, status: int, body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+def normalize_controller_url(addr: str, default_scheme: str = "http") -> str:
+    """规范化 Mihomo external-controller 地址。
+
+    将 `:port`、`0.0.0.0:port`、`[::]:port`、`*:port` 映射为 `127.0.0.1:port`，
+    并剥离尾随 `/`，避免 Windows `WinError 10049` 或空主机 URL 失败。
+    """
+    raw = str(addr or "").strip().rstrip("/")
+    if not raw:
+        raw = "127.0.0.1:9090"
+    scheme = default_scheme
+    rest = raw
+    if rest.startswith(("http://", "https://")):
+        scheme, _, rest = rest.partition("://")
+        rest = rest.rstrip("/")
+    authority, _, path_part = rest.partition("/")
+    if authority.startswith(":"):
+        authority = f"127.0.0.1{authority}"
+    else:
+        host, sep, port_str = authority.rpartition(":")
+        if sep:
+            clean_host = host.strip().strip("[]")
+            if clean_host in ("", "0.0.0.0", "::", "*"):
+                authority = f"127.0.0.1:{port_str}"
+    base = f"{scheme}://{authority}"
+    if path_part:
+        return f"{base}/{path_part.rstrip('/')}"
+    return base
+
+
+def normalize_controller_endpoint(addr: str) -> str:
+    """规范化控制器地址并保留原始是否带 scheme 的形式，供配置文件写入与展示。"""
+    raw = str(addr or "").strip().rstrip("/")
+    if not raw:
+        return raw
+    if raw.startswith(("http://", "https://")):
+        return normalize_controller_url(raw)
+    return normalize_controller_url(raw, default_scheme="http").removeprefix("http://")
+
+
 def _restore_selector_targets(
     group_name: str,
     wanted: str,
@@ -119,7 +168,7 @@ class APIBackend:
 
     def __init__(self, paths: AppPaths):
         self.paths = paths
-        self._opener: OpenerDirector | None = None
+        self._openers: dict[tuple[str, str | None], OpenerDirector] = {}
 
     def controller_url(self) -> str:
         return self._controller_url_from_config(read_config(self.paths))
@@ -139,9 +188,7 @@ class APIBackend:
         return self._controller_url(str(addr), default_scheme="http")
 
     def _controller_url(self, addr: str, default_scheme: str) -> str:
-        if str(addr).startswith(("http://", "https://")):
-            return str(addr)
-        return f"{default_scheme}://{addr}"
+        return normalize_controller_url(str(addr), default_scheme=default_scheme)
 
     def api_secret(self) -> str:
         return self._secret_from_config(read_config(self.paths))
@@ -149,9 +196,20 @@ class APIBackend:
     def _secret_from_config(self, config: dict[str, Any]) -> str:
         credential_name = str(config.get("secret-systemd-credential", "") or "").strip()
         if credential_name:
+            if (
+                "/" in credential_name
+                or "\\" in credential_name
+                or ".." in credential_name
+                or credential_name in {".", ".."}
+            ):
+                raise APIUnavailableError("错误: secret-systemd-credential 包含非法路径字符")
             credentials_dir = os.environ.get("CREDENTIALS_DIRECTORY")
             if credentials_dir:
-                secret = self._read_secret_file(Path(credentials_dir) / credential_name)
+                cred_root = Path(credentials_dir).resolve()
+                cred_path = (cred_root / credential_name).resolve()
+                if not cred_path.is_relative_to(cred_root):
+                    raise APIUnavailableError("错误: secret-systemd-credential 超出 CREDENTIALS_DIRECTORY 目录")
+                secret = self._read_secret_file(cred_path)
                 if secret:
                     return secret
 
@@ -220,21 +278,47 @@ class APIBackend:
                 if not response_body.strip():
                     return {}
                 return json.loads(response_body)
+        except HTTPError as exc:
+            body_text = ""
+            try:
+                raw_err = exc.read()
+                if isinstance(raw_err, bytes):
+                    body_text = raw_err.decode("utf-8", errors="replace").strip()
+                elif isinstance(raw_err, str):
+                    body_text = raw_err.strip()
+            except Exception:
+                pass
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+            detail = f": {body_text}" if body_text else ""
+            raise APIRequestError(
+                f"错误: Mihomo API 请求失败 (HTTP {exc.code}){detail}",
+                status=int(exc.code),
+                body=body_text,
+            ) from exc
         except Exception as exc:
             raise APIUnavailableError("错误: Mihomo API 不可访问，请检查 external-controller、secret 或服务状态") from exc
 
     def _http_opener(self, url: str) -> OpenerDirector:
-        """同一进程内复用 opener，避免每发一个 DELETE 就新建 TCP。
+        """同一进程内按 (scheme, hostname) 复用 opener，避免每发一个 DELETE 就新建 TCP，
+        同时防止在 HTTP 与 loopback/remote HTTPS 控制器之间切换时复用错误的 SSLContext。
 
         Controller 流量不能再套一层正在管理的代理，所以固定 `ProxyHandler({})`。
         """
-        if self._opener is None:
+        parsed = urlparse(url)
+        key = (parsed.scheme, parsed.hostname)
+        opener = self._openers.get(key)
+        if opener is None:
             handlers: list[BaseHandler] = [ProxyHandler({})]
             context = self._tls_context(url)
             if context is not None:
                 handlers.append(HTTPSHandler(context=context))
-            self._opener = build_opener(*handlers)
-        return self._opener
+            opener = build_opener(*handlers)
+            self._openers[key] = opener
+        return opener
 
     def _tls_context(self, url: str) -> ssl.SSLContext | None:
         parsed = urlparse(url)

@@ -6,6 +6,7 @@ mihomo ``GET /connections`` 返回自进程启动以来的 ``downloadTotal`` / `
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -20,7 +21,8 @@ class TrafficRate:
 
 def format_rate(bps: float) -> str:
     """把字节/秒格式化为易读速率（B/KB/MB/GB per s，1024 进制）。"""
-    value = float(bps)
+    raw = float(bps)
+    value = 0.0 if (math.isnan(raw) or math.isinf(raw) or raw < 0) else raw
     for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
         if value < 1024 or unit == "GB/s":
             return f"{value:.1f} {unit}"
@@ -28,16 +30,29 @@ def format_rate(bps: float) -> str:
     return f"{value:.1f} GB/s"
 
 
+def _safe_counter(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def fetch_total_traffic(api: Any) -> tuple[int, int]:
     """读 mihomo /connections 的全局累计计数，返回 (上传字节, 下载字节)。"""
     data = api.get_connections()
-    upload = int(data.get("uploadTotal") or 0)
-    download = int(data.get("downloadTotal") or 0)
+    if not isinstance(data, dict):
+        return 0, 0
+    upload = _safe_counter(data.get("uploadTotal"))
+    download = _safe_counter(data.get("downloadTotal"))
     return upload, download
 
 
 def measure_once(api: Any, window: float = 1.0) -> TrafficRate | None:
     """采样两次（间隔 window 秒），返回瞬时速率；API 异常由调用方处理。"""
+    if window <= 0:
+        raise ValueError("错误: 采样窗口必须大于 0")
     meter = RateMeter()
     up, down = fetch_total_traffic(api)
     meter.sample(up, down)

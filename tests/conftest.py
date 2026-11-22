@@ -54,16 +54,29 @@ def build_ai_route_groups() -> dict:
 
 @pytest.fixture(autouse=True)
 def isolate_xdg_environment(monkeypatch, tmp_path):
-    for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
+    from cproxy import cli_render
+
+    home = tmp_path / "home"
+    for name in (
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CPROXY_CONFIG_DIR",
+        "CPROXY_DATA_DIR",
+        "CPROXY_STATE_DIR",
+    ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(home))
     if os.name == "nt":
-        monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     for name in ("NO_PROXY", "no_proxy"):
         monkeypatch.setenv(name, "127.0.0.1,localhost")
     monkeypatch.setenv("CPROXY_NO_SYSTEMD", "1")
+    cli_render._output_config.cache_clear()
+    yield
+    cli_render._output_config.cache_clear()
 
 
 @pytest.fixture

@@ -7,7 +7,11 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
-SERVICE_NAME="$1"
+SERVICE_NAME="${1%.service}"
+if [ -z "${SERVICE_NAME}" ]; then
+    echo "错误: 服务名不能为空" >&2
+    exit 1
+fi
 
 cat <<EOF
 为服务 ${SERVICE_NAME} 创建如下 drop-in:

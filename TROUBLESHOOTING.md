@@ -118,11 +118,13 @@ cproxy test-group "AI-AUTO"
    cproxy restart
    ```
 
-2. 你把 `AI-MANUAL` 手动切到了固定区域  
+2. 当前选中的 AI 出口节点已失效或受限
    处理：
 
    ```bash
-   cproxy switch "AI-MANUAL" "AI-AUTO"
+   cproxy ai-use codex     # 自动探测并切换最稳出口
+   # 或交互式手动挑选节点：
+   cproxy switch
    ```
 
 3. 美国和新加坡区域都不可用  
@@ -295,4 +297,4 @@ journalctl --user -u cproxy.service -n 100 --no-pager
 
 - `cproxy.service` 应为 `active`
 - `cproxy-refresh.timer` 应为 `active (waiting)`
-- 如果命令找不到，先确认 `~/.local/bin` 已在 PATH 中
+- 如果命令找不到，非 root 用户请确认 `~/.local/bin` 已在 PATH 中，root 系统级安装请确认 `/usr/local/bin/cproxy` 存在

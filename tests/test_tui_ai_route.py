@@ -18,6 +18,16 @@ class _AIRouteApp(App):
         yield AIRouteScreen(self.paths)
 
 
+def _isolated_paths(tmp_path) -> AppPaths:
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\nexternal-controller: 127.0.0.1:9\n",
+        encoding="utf-8",
+    )
+    return paths
+
+
 def _labels(screen: AIRouteScreen) -> dict[str, str]:
     return {
         key: str(screen.query_one(f"#ai-route-{key}", Label).render())
@@ -38,7 +48,7 @@ def test_tui_delay_text_uses_the_same_sentinel_semantics_as_cli():
 
 def test_ai_route_panel_renders_resolved_exit_for_pinned_node(ai_route_groups, tmp_path):
     """兜底模式钉住真实节点时，出口要显示该节点与**真实延迟**，而不是旧实现的空 `-`。"""
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _AIRouteApp(paths)
@@ -75,7 +85,7 @@ def test_ai_route_panel_renders_auto_chain(ai_route_groups, tmp_path):
         alive=True,
         delay=None,
     )
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _AIRouteApp(paths)
@@ -95,7 +105,7 @@ def test_ai_route_panel_renders_auto_chain(ai_route_groups, tmp_path):
 
 
 def test_ai_route_panel_shows_placeholder_when_groups_missing(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _AIRouteApp(paths)
@@ -125,7 +135,7 @@ def test_ai_route_probe_streams_results_per_target(monkeypatch, tmp_path):
             return AIProbeReport(results=[item1, item2])
 
     monkeypatch.setattr(ai_route_module, "DiagnosticsService", FakeDiagnostics)
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _AIRouteApp(paths)
@@ -171,7 +181,7 @@ def test_ai_route_probe_failure_recovers_state(monkeypatch, tmp_path):
             raise RuntimeError("proxy down")
 
     monkeypatch.setattr(ai_route_module, "DiagnosticsService", FakeDiagnostics)
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _AIRouteApp(paths)

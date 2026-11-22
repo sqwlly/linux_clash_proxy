@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import codecs
 import os
+import re
 import select
 import sys
 from collections.abc import Callable, Iterable, Sequence
@@ -82,7 +84,7 @@ def select_one(
         return _loop(
             choices, index,
             read_key=lambda: next(stream, None),
-            draw=lambda _f, _i, _q: None,
+            draw=lambda _f, _i, _q, _s: None,
             current=current,
             back_hint=back_hint,
         )
@@ -94,7 +96,7 @@ def select_one(
     saved = termios.tcgetattr(fd)
     drawn = 0
 
-    def draw(filtered: list[str], position: int, query: str) -> None:
+    def draw(filtered: list[str], position: int, query: str, searching: bool) -> None:
         nonlocal drawn
         drawn = _redraw(
             filtered, position, title, drawn,
@@ -103,6 +105,7 @@ def select_one(
             current=current,
             total=len(choices),
             query=query,
+            searching=searching,
             back_hint=back_hint,
         )
 
@@ -151,7 +154,7 @@ def _loop(
     index: int,
     *,
     read_key: Callable[[], str | None],
-    draw: Callable[[list[str], int, str], None],
+    draw: Callable[[list[str], int, str, bool], None],
     current: str | None = None,
     back_hint: bool = False,
 ) -> str | None:
@@ -163,7 +166,7 @@ def _loop(
     while True:
         if filtered:
             index = max(0, min(index, len(filtered) - 1))
-        draw(filtered, index, query if searching else "")
+        draw(filtered, index, query if searching else "", searching)
 
         try:
             key = read_key()
@@ -173,8 +176,8 @@ def _loop(
         if key is None:
             return None
 
-        if not filtered and key in _UP_KEYS | _DOWN_KEYS | _CONFIRM_KEYS:
-            # 空列表：移动/确认无意义，但搜索输入、退格、取消、返回仍要往下走
+        if not filtered and not searching and key in _UP_KEYS | _DOWN_KEYS | _CONFIRM_KEYS:
+            # 空列表且非搜索态：移动/确认无意义，但取消、返回仍要往下走
             continue
 
         # --- 搜索模式 ---
@@ -239,20 +242,116 @@ def _loop(
 
 
 def _terminal_read_key(fd: int) -> Callable[[], str | None]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending: list[str] = []
+
     def read() -> str | None:
-        data = os.read(fd, 1)
-        if not data:
-            return None  # EOF（如 Ctrl-D）
-        char = data.decode("utf-8", "replace")
-        if char != "\x1b":
-            return char
-        # 必须用带超时的 select：否则单按 Esc 会一直等后续字节而阻塞
-        ready, _, _ = select.select([fd], [], [], _ESCAPE_SEQUENCE_TIMEOUT)
-        if not ready:
-            return char
-        return char + os.read(fd, 2).decode("utf-8", "replace")
+        while True:
+            if pending:
+                char = pending.pop(0)
+            else:
+                data = os.read(fd, 1)
+                if not data:
+                    flushed = decoder.decode(b"", final=True)
+                    if not flushed:
+                        return None  # EOF（如 Ctrl-D）
+                    pending.extend(flushed[1:])
+                    char = flushed[0]
+                else:
+                    decoded = decoder.decode(data, final=False)
+                    if not decoded:
+                        continue
+                    pending.extend(decoded[1:])
+                    char = decoded[0]
+            if char != "\x1b":
+                return char
+            # 必须用带超时的 select：否则单按 Esc 会一直等后续字节而阻塞
+            ready, _, _ = select.select([fd], [], [], _ESCAPE_SEQUENCE_TIMEOUT)
+            if not ready:
+                return char
+            seq = bytearray(b"\x1b")
+            nxt = os.read(fd, 1)
+            if not nxt:
+                return char
+            seq.extend(nxt)
+            if nxt == b"[":
+                # CSI 序列：完整排干直至终结字节 0x40..0x7E（避免 Delete/PgUp 的 '~' 漏进搜索框）
+                for _ in range(16):
+                    ready_more, _, _ = select.select([fd], [], [], _ESCAPE_SEQUENCE_TIMEOUT)
+                    if not ready_more:
+                        break
+                    chunk = os.read(fd, 1)
+                    if not chunk:
+                        break
+                    seq.extend(chunk)
+                    if 0x40 <= chunk[0] <= 0x7E:
+                        break
+            elif nxt == b"O":
+                ready_more, _, _ = select.select([fd], [], [], _ESCAPE_SEQUENCE_TIMEOUT)
+                if ready_more:
+                    chunk = os.read(fd, 1)
+                    if chunk:
+                        seq.extend(chunk)
+            return seq.decode("utf-8", "replace")
 
     return read
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _terminal_columns() -> int:
+    try:
+        return max(20, os.get_terminal_size().columns)
+    except OSError:
+        return 80
+
+
+def _visible_text_width(text: str) -> int:
+    return _display_width(_ANSI_ESCAPE_RE.sub("", text))
+
+
+def _truncate_ansi_line(line: str, max_width: int) -> str:
+    """按显示宽度截断含 ANSI 转义的单行文本，避免超宽折行破坏 CUU 光标回退行数。"""
+    if max_width < 2 or _visible_text_width(line) <= max_width:
+        return line
+    out: list[str] = []
+    width = 0
+    budget = max_width - 1
+    saw_ansi = False
+    pos = 0
+    length = len(line)
+    while pos < length:
+        if line[pos] == "\x1b":
+            match = _ANSI_ESCAPE_RE.match(line, pos)
+            if match:
+                out.append(match.group(0))
+                saw_ansi = True
+                pos = match.end()
+                continue
+        ch = line[pos]
+        if (
+            0x1F1E6 <= ord(ch) <= 0x1F1FF
+            and pos + 1 < length
+            and 0x1F1E6 <= ord(line[pos + 1]) <= 0x1F1FF
+        ):
+            unit = line[pos : pos + 2]
+            pos += 2
+        else:
+            unit = ch
+            pos += 1
+        while pos < length and line[pos] != "\x1b" and _display_width(line[pos]) == 0:
+            unit += line[pos]
+            pos += 1
+        unit_w = _display_width(unit)
+        if width + unit_w > budget:
+            break
+        out.append(unit)
+        width += unit_w
+    out.append("…")
+    if saw_ansi:
+        out.append(_ANSI_RESET)
+    return "".join(out)
 
 
 def _window(count: int, index: int, limit: int = _MAX_VISIBLE) -> tuple[int, int]:
@@ -292,9 +391,11 @@ def _paint(lines: list[str], drawn: int) -> int:
 
     清屏与新内容放进同一次 write，减少「先空白再画出」的闪烁。
     """
+    max_cols = _terminal_columns() - 1
+    clamped = [_truncate_ansi_line(line, max_cols) for line in lines]
     prefix = f"\033[{drawn}A\r{_CLEAR_BELOW}" if drawn else ""
-    _write(prefix + "\n".join(lines) + "\n")
-    return len(lines)
+    _write(prefix + "\n".join(clamped) + "\n")
+    return len(clamped)
 
 
 def _redraw(
@@ -308,21 +409,23 @@ def _redraw(
     current: str | None = None,
     total: int | None = None,
     query: str = "",
+    searching: bool = False,
     back_hint: bool = False,
 ) -> int:
     """重绘列表，返回本次画出的行数（下次据此上移光标）。"""
+    in_search = searching or bool(query)
     if not choices:
         # 搜索无结果
         pos_label = f" [0/{total}]" if total else ""
         lines = [_section_heading(f"{title}{pos_label}")]
         lines.append(f"{_ANSI_DIM}  (无匹配项){_ANSI_RESET}")
-        if query:
+        if in_search:
             lines.append(f"  搜索: {query}▏")
-        lines.append(_footer_line(searching=bool(query), back_hint=back_hint))
+        lines.append(_footer_line(searching=in_search, back_hint=back_hint))
         return _paint(lines, drawn)
 
     display_total = total if total is not None else len(choices)
-    start, end = _window(len(choices), index, limit=_visible_capacity(extra=1 if query else 0))
+    start, end = _window(len(choices), index, limit=_visible_capacity(extra=1 if in_search else 0))
     visible = choices[start:end]
     notes = annotations or {}
     styles = annotation_styles or {}
@@ -387,11 +490,11 @@ def _redraw(
         lines.append(f"{_ANSI_DIM}  ▼ 还有 {remaining_below} 项{_ANSI_RESET}")
 
     # 搜索栏
-    if query:
+    if in_search:
         lines.append(f"  搜索: {query}▏")
 
     # 底部提示
-    lines.append(_footer_line(searching=bool(query), back_hint=back_hint))
+    lines.append(_footer_line(searching=in_search, back_hint=back_hint))
     return _paint(lines, drawn)
 
 

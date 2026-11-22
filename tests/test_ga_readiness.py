@@ -22,6 +22,7 @@ def test_security_report_passes_for_ga_controller_config(tmp_path):
     paths.config_dir.mkdir(parents=True)
     secret_path = paths.config_dir / "controller-secret"
     secret_path.write_text("controller-secret\n", encoding="utf-8")
+    secret_path.chmod(0o600)
     (paths.config_dir / "config.yaml").write_text(
         "external-controller: 127.0.0.1:9090\n"
         "external-controller-tls: 127.0.0.1:9443\n"

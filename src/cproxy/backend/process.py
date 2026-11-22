@@ -9,8 +9,18 @@ import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlparse
 
-from ..config import AppPaths, config_file, log_file, pid_file, process_meta_file, read_config, runtime_file
+from ..config import (
+    AppPaths,
+    atomic_write_text,
+    config_file,
+    log_file,
+    pid_file,
+    process_meta_file,
+    read_config,
+    runtime_file,
+)
 from .models import ProcessOwner, StatusSnapshot
 
 #: 生产代理的 systemd 单元名（用户级 `systemd-user/cproxy.service`），供端口冲突提示与
@@ -45,17 +55,30 @@ class ProcessBackend:
 
     def _acquire_lock(self) -> bool:
         lock = self._lock_path()
-        if lock.exists():
-            try:
-                age = time.time() - lock.stat().st_mtime
-            except OSError:
-                age = LOCK_STALE_SECONDS + 1
-            if age < LOCK_STALE_SECONDS:
-                return False
-            lock.unlink(missing_ok=True)
         lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.touch()
-        return True
+        for _ in range(2):
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                except OSError:
+                    continue
+                if age < LOCK_STALE_SECONDS:
+                    return False
+                try:
+                    lock.unlink(missing_ok=True)
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                return False
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            finally:
+                os.close(fd)
+            return True
+        return False
 
     def _release_lock(self) -> None:
         self._lock_path().unlink(missing_ok=True)
@@ -66,7 +89,7 @@ class ProcessBackend:
             return None
         try:
             return int(path.read_text(encoding="utf-8").strip())
-        except ValueError:
+        except (OSError, ValueError):
             return None
 
     def _is_pid_running(self, pid: int | None) -> bool:
@@ -84,17 +107,20 @@ class ProcessBackend:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
             return ProcessOwner(
                 pid=int(data["pid"]),
                 program=str(data["program"]),
                 runtime=str(data["runtime"]),
                 runtime_hash=str(data.get("runtime_hash") or ""),
             )
-        except (ValueError, KeyError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return None
 
     def _write_process_owner(self, owner: ProcessOwner) -> None:
-        process_meta_file(self.paths).write_text(
+        atomic_write_text(
+            process_meta_file(self.paths),
             json.dumps(
                 {
                     "pid": owner.pid,
@@ -105,7 +131,7 @@ class ProcessBackend:
                 ensure_ascii=True,
             )
             + "\n",
-            encoding="utf-8",
+            mode=0o600,
         )
 
     @staticmethod
@@ -185,7 +211,7 @@ class ProcessBackend:
 
         cmdline_path = Path(f"/proc/{pid}/cmdline")
         try:
-            cmdline = cmdline_path.read_text(encoding="utf-8").replace("\x00", " ")
+            cmdline = cmdline_path.read_text(encoding="utf-8", errors="replace").replace("\x00", " ")
         except OSError:
             return False
 
@@ -196,12 +222,6 @@ class ProcessBackend:
         running = self._is_owned_process(pid)
         if not running and pid_file(self.paths).exists() and not self._is_pid_running(pid):
             self._cleanup_process_state()
-        if running:
-            config = read_config(self.paths)
-            port_value = config.get("mixed-port", 7890)
-            address = self._parse_listen_address(port_value)
-            if address and not self._port_accepts_connection(address):
-                return False
         return running
 
     @staticmethod
@@ -214,11 +234,23 @@ class ProcessBackend:
             if not 0 < port < 65536:
                 return None
             return "127.0.0.1", port
+        if "://" in text:
+            parsed = urlparse(text)
+            try:
+                parsed_port = parsed.port
+            except ValueError:
+                return None
+            if parsed_port is None or not 0 < parsed_port < 65536:
+                return None
+            host = (parsed.hostname or "").strip("[]") or "127.0.0.1"
+            if host in ("0.0.0.0", "::", "*"):
+                host = "127.0.0.1"
+            return host, parsed_port
         host, sep, port_text = text.rpartition(":")
         if not sep:
             return None
         host = host.strip().strip("[]") or "127.0.0.1"
-        if host in ("0.0.0.0", "::"):
+        if host in ("0.0.0.0", "::", "*"):
             host = "127.0.0.1"
         try:
             port = int(port_text)
@@ -279,7 +311,7 @@ class ProcessBackend:
                     start_new_session=True,
                 )
 
-            pid_file(self.paths).write_text(f"{process.pid}\n", encoding="utf-8")
+            atomic_write_text(pid_file(self.paths), f"{process.pid}\n", mode=0o600)
             # 记下启动时加载的 runtime 内容指纹，供 status 判断运行实例是否已落后
             self._write_process_owner(
                 ProcessOwner(
@@ -307,13 +339,25 @@ class ProcessBackend:
             raise ProcessOwnershipError("错误: 当前 PID 文件指向的进程不属于 cproxy 管理的进程")
 
         assert pid is not None
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            self._cleanup_process_state()
+            return True
         for _ in range(20):
             if not self._is_pid_running(pid):
                 self._cleanup_process_state()
                 return True
             time.sleep(0.1)
-        os.kill(pid, signal.SIGKILL)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            self._cleanup_process_state()
+            return True
+        for _ in range(10):
+            if not self._is_pid_running(pid):
+                break
+            time.sleep(0.05)
         self._cleanup_process_state()
         return True
 

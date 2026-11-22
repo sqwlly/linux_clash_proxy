@@ -16,6 +16,7 @@ from ..backend.runtime import (
     AI_SG_GROUP,
     AI_US_GROUP,
     RuntimeBackend,
+    resolve_ai_leaf,
 )
 from ..config import AppPaths, load_yaml_file, runtime_file
 from ..names import match_candidates_fuzzy, normalize_name, resolve_candidate, resolve_group_alias
@@ -159,8 +160,18 @@ class QueryService:
             self.api.switch_group(group_name, target_name)
             updated_groups = self.api.get_groups()
             self.groups_snapshot = updated_groups
-            updated = updated_groups[group_name]
-            keep = target_name if target_name != AI_AUTO_GROUP else None
+            updated = updated_groups.get(group_name)
+            if updated is None:
+                updated = ProxyGroup(
+                    name=group_name,
+                    type=group.type,
+                    current=target_name,
+                    candidates=list(group.candidates),
+                    alive=group.alive,
+                    delay=group.delay,
+                    source=group.source,
+                )
+            keep = resolve_ai_leaf(updated_groups, target_name) if target_name != AI_AUTO_GROUP else None
             dropped = (
                 self._drop_stale_ai_connections(group_name, keep_leaf=keep, force=force_drop)
                 if drop_connections
@@ -185,12 +196,14 @@ class QueryService:
         return updated
 
     def switch_path(self, path: list[tuple[str, str]]) -> ProxyGroup:
-        """按序切换多级 selector 路径（内层组到外层组），返回最后一步更新后的组。"""
+        """按内层到外层顺序切换多级 selector 路径，并在最后一步统一清理旧连接。"""
         if not path:
             raise SystemExit("错误: 切换路径为空")
+        steps = list(reversed(path))
         group: ProxyGroup | None = None
-        for group_name, target_name in path:
-            group = self.switch_group(group_name, target_name)
+        for index, (group_name, target_name) in enumerate(steps):
+            is_last = index == len(steps) - 1
+            group = self.switch_group(group_name, target_name, drop_connections=is_last)
         assert group is not None
         return group
 
@@ -220,7 +233,7 @@ class QueryService:
         connections = payload.get("connections") if isinstance(payload, dict) else []
         if not isinstance(connections, list):
             return 0
-        socket_idle_map: dict[str, tuple[int, int]] | None = None
+        socket_idle_map: dict[str, tuple[int, ...]] | None = None
         dropped = 0
         for item in connections:
             if not isinstance(item, dict) or not self._connection_follows_ai_switch(item, group_name):
@@ -238,10 +251,9 @@ class QueryService:
                 src_port = str(meta.get("sourcePort") or "")
                 from .ai_watch import (
                     AI_STREAM_HOSTS,
+                    _resolve_socket_idle_map,
                     _unpack_socket_timings,
-                    get_local_proxy_socket_idle_ms,
                     is_inflight_ai_connection,
-                    track_connections_idle_ms,
                 )
                 from .probe import is_static_iepl_node
 
@@ -251,9 +263,19 @@ class QueryService:
                     and src_port.isdigit()
                 ):
                     if socket_idle_map is None:
-                        socket_idle_map = get_local_proxy_socket_idle_ms(self.runtime.mixed_port())
-                        if not socket_idle_map:
-                            socket_idle_map = track_connections_idle_ms(self.paths, connections)
+                        candidate_ports = {
+                            str(c.get("metadata", {}).get("sourcePort") or "")
+                            for c in connections
+                            if isinstance(c, dict)
+                            and isinstance(c.get("metadata"), dict)
+                            and str(c.get("metadata", {}).get("sourcePort") or "").isdigit()
+                        }
+                        socket_idle_map = _resolve_socket_idle_map(
+                            self.paths,
+                            connections,
+                            self.runtime.mixed_port(),
+                            candidate_ports,
+                        )
                     unpacked = _unpack_socket_timings(socket_idle_map.get(src_port), src_port)
                     if unpacked is not None:
                         if (
@@ -304,7 +326,7 @@ class QueryService:
 
     def list_connections(self) -> list[ConnectionEntry]:
         payload = self.api.get_connections()
-        connections = payload.get("connections", [])
+        connections = payload.get("connections", []) if isinstance(payload, dict) else []
         if not isinstance(connections, list):
             return []
         return [self._to_connection(item) for item in connections if isinstance(item, dict)]
@@ -333,7 +355,7 @@ class QueryService:
 
     def list_proxy_providers(self) -> list[ProviderEntry]:
         payload = self.api.get_proxy_providers()
-        providers = payload.get("providers", {})
+        providers = payload.get("providers", {}) if isinstance(payload, dict) else {}
         if not isinstance(providers, dict):
             return []
         entries = []

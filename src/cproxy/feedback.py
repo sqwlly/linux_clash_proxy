@@ -46,17 +46,42 @@ def _terminal_columns(stream: object) -> int:
         return 80
 
 
+def _is_regional_indicator(ch: str) -> bool:
+    return 0x1F1E6 <= ord(ch) <= 0x1F1FF
+
+
+def _iter_display_units(text: str) -> list[str]:
+    units: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if _is_regional_indicator(char) and index + 1 < length and _is_regional_indicator(text[index + 1]):
+            unit = text[index : index + 2]
+            index += 2
+        else:
+            unit = char
+            index += 1
+        while index < length and display_width(text[index]) == 0:
+            unit += text[index]
+            index += 1
+        units.append(unit)
+    return units
+
+
 def _truncate(text: str, max_width: int) -> str:
     if max_width < 1 or display_width(text) <= max_width:
         return text
+    if max_width == 1:
+        return "…"
     result: list[str] = []
     width = 0
-    for char in text:
-        char_width = 2 if display_width(char) == 2 else 1
-        if width + char_width > max_width - 1:
+    for unit in _iter_display_units(text):
+        unit_width = display_width(unit)
+        if width + unit_width > max_width - 1:
             break
-        result.append(char)
-        width += char_width
+        result.append(unit)
+        width += unit_width
     return "".join(result) + "…"
 
 

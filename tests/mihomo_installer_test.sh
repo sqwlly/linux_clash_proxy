@@ -142,4 +142,23 @@ if grep -Fq "clash-proxy" "$INSTALLER"; then
     fail "install-mihomo.sh 不应残留已退役的 clash-proxy 服务名"
 fi
 
+echo ">>> 场景 11: 目标目录不存在时应在下载前失败"
+MISSING_DIR="${TMP_ROOT}/does-not-exist"
+CURL_MARKER="${TMP_ROOT}/curl-called"
+cat > "${FAKE_BIN}/curl" <<EOF
+#!/bin/bash
+touch "${CURL_MARKER}"
+exit 0
+EOF
+chmod 0755 "${FAKE_BIN}/curl"
+if env \
+    PATH="${FAKE_BIN}:/usr/bin:/bin" \
+    BINDIR="$MISSING_DIR" \
+    MIHOMO_VERSION="$STUB_VERSION" \
+    MIHOMO_SHA256="$STUB_SHA256" \
+    bash "$INSTALLER" >/dev/null 2>&1; then
+    fail "目标目录不存在时应返回非 0"
+fi
+[ ! -e "$CURL_MARKER" ] || fail "目标目录不可写/不存在时不应先执行下载"
+
 echo "mihomo installer 测试通过"

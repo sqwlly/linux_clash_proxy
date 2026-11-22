@@ -19,7 +19,9 @@ from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
 
+from .backend.runtime import AI_GEMINI_GROUP, AI_MANUAL_GROUP
 from .config import AppPaths
+from .names import resolve_group_alias
 from .output import (
     _COMMAND_HELP,
     NOTIFY_ACTIONS,
@@ -48,7 +50,7 @@ _POSITIONAL_SOURCES: dict[str, tuple[str, ...]] = {
     "ban": ("nodes",),
     "unban": ("banned-patterns",),
     "rule": ("rule-actions",),
-    "flush": ("groups",),
+    "flush": ("flush-targets",),
     "guard": ("profiles",),
     "incident": ("profiles",),
     "ai-use": ("profiles",),
@@ -58,6 +60,7 @@ _POSITIONAL_SOURCES: dict[str, tuple[str, ...]] = {
     "snapshots": ("snapshots-actions",),
     "notify": ("notify-actions",),
     "verge": ("verge-actions",),
+    "completion": ("shells",),
 }
 
 # `--flag` 取值补什么
@@ -100,17 +103,21 @@ def _candidates(paths: AppPaths, words: list[str], point: int) -> list[str]:
 
     # 当前词是某个 flag 的取值
     if args and args[-1] in _FLAG_SOURCES:
-        return _matching(prefix, _values_for(paths, _FLAG_SOURCES[args[-1]], args[:-1]))
+        return _matching(prefix, _values_for(paths, _FLAG_SOURCES[args[-1]], command, args[:-1]))
+    # 属于其他带值 flag（未登记候选来源，如 --hours / --lines）时，不误补位置参数
+    if args and args[-1] in _command_value_options(command):
+        return []
 
+    positionals = _extract_positionals(command, args)
     sources = _POSITIONAL_SOURCES.get(command, ())
-    if len(args) < len(sources):
-        return _matching(prefix, _values_for(paths, sources[len(args)], args))
+    if len(positionals) < len(sources):
+        return _matching(prefix, _values_for(paths, sources[len(positionals)], command, args))
     return []
 
 
 @lru_cache(maxsize=1)
-def _options_index() -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
-    """(顶层选项, 命令 → 选项)，从 parser 现取，不另维护一份清单。
+def _options_index() -> tuple[tuple[str, ...], dict[str, tuple[str, ...]], dict[str, frozenset[str]]]:
+    """(顶层选项, 命令 → 选项, 命令 → 需要取值的选项集合)，从 parser 现取，不另维护一份清单。
 
     只收 `--xxx`：补出 `-h` 这类单字母选项只是噪音。
     """
@@ -120,18 +127,26 @@ def _options_index() -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
 
     root: tuple[str, ...] = ()
     commands: dict[str, tuple[str, ...]] = {}
+    value_options: dict[str, frozenset[str]] = {}
     for action in build_root_parser()._actions:
         if isinstance(action, _SubParsersAction):
             for name, sub in action.choices.items():
-                commands[str(name)] = tuple(
+                cmd = str(name)
+                commands[cmd] = tuple(
                     string
                     for sub_action in sub._actions
                     for string in sub_action.option_strings
                     if string.startswith("--")
                 )
+                value_options[cmd] = frozenset(
+                    string
+                    for sub_action in sub._actions
+                    if sub_action.option_strings and sub_action.nargs != 0
+                    for string in sub_action.option_strings
+                )
         else:
             root += tuple(string for string in action.option_strings if string.startswith("--"))
-    return root, commands
+    return root, commands, value_options
 
 
 def _root_options() -> tuple[str, ...]:
@@ -142,7 +157,32 @@ def _command_options(command: str) -> tuple[str, ...]:
     return _options_index()[1].get(command, ())
 
 
-def _values_for(paths: AppPaths, source: str, prior_args: list[str]) -> list[str]:
+def _command_value_options(command: str) -> frozenset[str]:
+    return _options_index()[2].get(command, frozenset())
+
+
+def _extract_positionals(command: str, args: list[str]) -> list[str]:
+    """剥离 `--flag` 及其消费的参数值，只保留真正的位置参数。"""
+    value_flags = _command_value_options(command)
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        word = args[index]
+        if word == "--":
+            positionals.extend(args[index + 1 :])
+            break
+        if word.startswith("-"):
+            if "=" not in word and word in value_flags:
+                index += 2
+            else:
+                index += 1
+            continue
+        positionals.append(word)
+        index += 1
+    return positionals
+
+
+def _values_for(paths: AppPaths, source: str, command: str, prior_args: list[str]) -> list[str]:
     if source == "profiles":
         return list(PROFILE_CHOICES)
     if source == "strategies":
@@ -167,16 +207,24 @@ def _values_for(paths: AppPaths, source: str, prior_args: list[str]) -> list[str
         return list(RULE_TYPE_CHOICES)
     if source == "verge-actions":
         return list(VERGE_ACTIONS)
+    if source == "shells":
+        return ["bash", "zsh"]
     if source == "banned-patterns":
         from .services.ban import load_active_bans
 
         return [item.pattern for item in load_active_bans(paths)]
     if source == "groups":
         return _group_names(paths)
+    if source == "flush-targets":
+        targets = ["all"]
+        for name in _group_names(paths):
+            if name not in targets:
+                targets.append(name)
+        return targets
     if source == "selector-groups":
         return _group_names(paths, selectable_only=True)
     if source == "nodes":
-        return _node_names(paths, _group_from(prior_args))
+        return _node_names(paths, _group_from(command, prior_args))
     return []
 
 
@@ -185,7 +233,12 @@ def _group_names(paths: AppPaths, *, selectable_only: bool = False) -> list[str]
     service = QueryService(paths)
     groups = service.list_groups(request_timeout=_API_TIMEOUT_SECONDS)
     if selectable_only:
-        groups = [group for group in groups if str(group.type).lower() in {"selector", "select"}]
+        groups = [
+            group
+            for group in groups
+            if str(group.type).lower() in {"selector", "select"}
+            or (str(group.type).lower() == "fallback" and group.name in {AI_MANUAL_GROUP, AI_GEMINI_GROUP})
+        ]
     names = [group.name for group in groups]
     try:
         from .config import read_config
@@ -205,12 +258,34 @@ def _group_names(paths: AppPaths, *, selectable_only: bool = False) -> list[str]
 
 
 def _node_names(paths: AppPaths, group_name: str | None) -> list[str]:
-    groups = QueryService(paths).list_groups(request_timeout=_API_TIMEOUT_SECONDS)
+    service = QueryService(paths)
+    groups = service.list_groups(request_timeout=_API_TIMEOUT_SECONDS)
     if group_name:
-        for group in groups:
-            if group.name == group_name:
-                return list(group.candidates)
-        return []
+        groups_by_name = {group.name: group for group in groups}
+        target = groups_by_name.get(group_name)
+        if target is None:
+            aliased = resolve_group_alias(group_name, groups_by_name.keys(), match_group=service.match_rule_group())
+            if aliased:
+                target = groups_by_name.get(aliased)
+        if target is None:
+            try:
+                from .config import read_config
+                from .services.switch_tree import build_switch_tree, extra_subscription_names, lookup_choice
+
+                tree = build_switch_tree(
+                    groups_by_name,
+                    match_group=service.match_rule_group(),
+                    extra_names=extra_subscription_names(read_config(paths)),
+                )
+                choice = lookup_choice(group_name, tree)
+                if choice is not None:
+                    if choice.key in groups_by_name:
+                        target = groups_by_name[choice.key]
+                    elif choice.group_name in groups_by_name:
+                        target = groups_by_name[choice.group_name]
+            except Exception:
+                pass
+        return list(target.candidates) if target is not None else []
     # 没有分组上下文时汇总全部候选（去重且保持稳定顺序）
     seen: dict[str, None] = {}
     for group in groups:
@@ -219,15 +294,15 @@ def _node_names(paths: AppPaths, group_name: str | None) -> list[str]:
     return list(seen)
 
 
-def _group_from(args: list[str]) -> str | None:
-    """从已输入的参数里推断分组名：`--group X` 优先，否则第一个非选项词。"""
+def _group_from(command: str, args: list[str]) -> str | None:
+    """从已输入的参数里推断分组名：`--group X` 优先，否则第一个位置参数（忽略其他 flag 值）。"""
     for index, word in enumerate(args):
         if word == "--group" and index + 1 < len(args):
             return args[index + 1]
-    for word in args:
-        if not word.startswith("-"):
-            return word
-    return None
+        if word.startswith("--group="):
+            return word.split("=", 1)[1]
+    positionals = _extract_positionals(command, args)
+    return positionals[0] if positionals else None
 
 
 def _matching(prefix: str, items: list[str]) -> list[str]:

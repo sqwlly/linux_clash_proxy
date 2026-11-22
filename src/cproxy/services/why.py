@@ -89,14 +89,17 @@ def extract_host(query: str) -> str:
     raw = str(query or "").strip()
     if not raw:
         raise ValueError("错误: 请提供要追查的域名、URL 或 IP")
-    if "://" in raw:
-        parsed = urlparse(raw)
-        host = parsed.hostname or ""
-    elif "/" in raw:
-        parsed = urlparse(f"https://{raw}")
-        host = parsed.hostname or ""
-    else:
-        host = _strip_port(raw)
+    try:
+        if "://" in raw:
+            parsed = urlparse(raw)
+            host = parsed.hostname or ""
+        elif any(ch in raw for ch in ("/", "?", "#", "@")):
+            parsed = urlparse(f"https://{raw}")
+            host = parsed.hostname or ""
+        else:
+            host = _strip_port(raw)
+    except ValueError as exc:
+        raise ValueError(f"错误: 无法从输入中解析主机名: {query}") from exc
     host = host.strip().strip("[]").lower().rstrip(".")
     if not host:
         raise ValueError(f"错误: 无法从输入中解析主机名: {query}")
@@ -110,13 +113,84 @@ def _parse_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None
         return None
 
 
-def _match_ruleset(paths: AppPaths, provider_name: str, host: str, ip_obj: Any) -> bool:
-    """尝试在本地 ruleset 文件（如 ChinaMax.yml）中匹配域名或 IP。"""
-    candidates = [
-        paths.data_dir / "ruleset" / f"{provider_name}.yaml",
-        paths.data_dir / "ruleset" / f"{provider_name}.yml",
-    ]
-    ruleset_path: Path | None = next((p for p in candidates if p.exists()), None)
+def _safe_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _match_domain_pattern(pattern: str, host: str) -> bool:
+    entry = pattern.strip().lower()
+    if not entry:
+        return False
+    if entry.startswith("+."):
+        suffix = entry[2:].lstrip(".")
+        return bool(suffix) and (host == suffix or host.endswith(f".{suffix}"))
+    if entry.startswith("*."):
+        suffix = entry[2:].lstrip(".")
+        if not suffix or not host.endswith(f".{suffix}"):
+            return False
+        prefix = host[: -(len(suffix) + 1)]
+        return bool(prefix) and "." not in prefix
+    if entry.startswith("."):
+        suffix = entry.lstrip(".")
+        return bool(suffix) and host.endswith(f".{suffix}")
+    return host == entry
+
+
+def _resolve_ruleset_path(
+    paths: AppPaths,
+    provider_name: str,
+    provider_cfg: dict[str, Any] | None = None,
+) -> Path | None:
+    """安全定位本地 ruleset 文件，严禁目录穿越或逃逸出 `ruleset/` 目录。"""
+    name = str(provider_name or "").strip()
+    if not name or "/" in name or "\\" in name or ".." in name or Path(name).name != name:
+        return None
+    ruleset_dir = (paths.data_dir / "ruleset").resolve()
+    candidates: list[Path] = []
+    if isinstance(provider_cfg, dict):
+        raw_path = str(provider_cfg.get("path") or "").strip()
+        if raw_path and "\\" not in raw_path:
+            rel = Path(raw_path)
+            if not rel.is_absolute():
+                candidates.append(paths.data_dir / rel)
+    candidates.extend(
+        [
+            paths.data_dir / "ruleset" / f"{name}.yaml",
+            paths.data_dir / "ruleset" / f"{name}.yml",
+        ]
+    )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(ruleset_dir):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _match_ruleset(
+    paths: AppPaths,
+    provider_name: str,
+    host: str,
+    ip_obj: Any,
+    *,
+    rule_providers: dict[str, Any] | None = None,
+) -> bool:
+    """尝试在本地 ruleset 文件（支持 classical / domain / ipcidr）中匹配域名或 IP。"""
+    provider_cfg = (
+        rule_providers.get(provider_name)
+        if isinstance(rule_providers, dict) and isinstance(rule_providers.get(provider_name), dict)
+        else None
+    )
+    ruleset_path = _resolve_ruleset_path(paths, provider_name, provider_cfg)
     if ruleset_path is None:
         return False
     try:
@@ -126,11 +200,26 @@ def _match_ruleset(paths: AppPaths, provider_name: str, host: str, ip_obj: Any) 
     payload = data.get("payload") if isinstance(data, dict) else None
     if not isinstance(payload, list):
         return False
+    behavior = str((provider_cfg or {}).get("behavior") or "classical").strip().lower()
     for entry in payload:
         if not isinstance(entry, str):
             continue
-        if _rule_matches_target(entry, host, ip_obj, process=None, paths=None):
-            return True
+        cleaned = entry.strip()
+        if not cleaned:
+            continue
+        if behavior == "domain":
+            if _match_domain_pattern(cleaned, host):
+                return True
+        elif behavior == "ipcidr":
+            if ip_obj is not None:
+                try:
+                    if ip_obj in ipaddress.ip_network(cleaned, strict=False):
+                        return True
+                except ValueError:
+                    continue
+        else:
+            if _rule_matches_target(cleaned, host, ip_obj, process=None, paths=None):
+                return True
     return False
 
 
@@ -141,6 +230,7 @@ def _rule_matches_target(
     *,
     process: str | None,
     paths: AppPaths | None,
+    rule_providers: dict[str, Any] | None = None,
 ) -> bool:
     parts = [item.strip() for item in rule.split(",")]
     if not parts:
@@ -167,18 +257,18 @@ def _rule_matches_target(
         except ValueError:
             return False
     if rtype == "PROCESS-NAME" and process:
-        proc_base = Path(process).name.lower()
-        return proc_base == pattern_lower
+        proc_base = _process_basename({"process": process}).lower()
+        return proc_base != "-" and proc_base == pattern_lower
     if rtype == "PROCESS-NAME-REGEX" and process:
-        proc_base = Path(process).name
+        proc_base = _process_basename({"process": process})
         try:
-            return bool(re.search(pattern, proc_base)) or bool(re.search(pattern, process))
+            return (proc_base != "-" and bool(re.search(pattern, proc_base))) or bool(re.search(pattern, process))
         except re.error:
             return False
     if rtype == "RULE-SET" and paths is not None:
-        return _match_ruleset(paths, pattern, host, ip_obj)
+        return _match_ruleset(paths, pattern, host, ip_obj, rule_providers=rule_providers)
     if rtype == "GEOIP" and pattern.upper() == "CN":
-        if host.endswith(".cn") or host.endswith(".com.cn"):
+        if host.endswith(".cn"):
             return True
     return False
 
@@ -189,12 +279,9 @@ def _rule_target_group(rule: str) -> str:
         return "DIRECT"
     rtype = parts[0].upper()
     if rtype == "MATCH":
-        return parts[1] if len(parts) >= 2 else "DIRECT"
-    if len(parts) >= 3:
-        # 末段可能带 no-resolve 等修饰符
-        if parts[-1].lower() in {"no-resolve", "src"} and len(parts) >= 4:
-            return parts[-2]
-        return parts[-1]
+        return parts[1] if len(parts) >= 2 and parts[1] else "DIRECT"
+    if len(parts) >= 3 and parts[2]:
+        return parts[2]
     return "DIRECT"
 
 
@@ -268,7 +355,10 @@ def _collect_active_host_connections(
         rule_payload = str(item.get("rulePayload") or "").strip()
         rule_desc = f"{rule_name},{rule_payload}" if rule_payload else (rule_name or "-")
 
-        raw_chains = [str(c) for c in (item.get("chains") or []) if c]
+        raw_chains_field = item.get("chains")
+        raw_chains = (
+            [str(c) for c in raw_chains_field if c] if isinstance(raw_chains_field, list) else []
+        )
         # mihomo chains 是倒序（[叶子节点, ..., 入口策略组]），翻转为正序展示
         chain = list(reversed(raw_chains))
         matched.append(
@@ -277,8 +367,8 @@ def _collect_active_host_connections(
                 destination=target_str,
                 rule=rule_desc,
                 chain=chain,
-                download=int(item.get("download") or 0),
-                upload=int(item.get("upload") or 0),
+                download=_safe_int(item.get("download")),
+                upload=_safe_int(item.get("upload")),
             )
         )
     return matched
@@ -296,11 +386,17 @@ def explain_route(
 
     rfile = runtime_file(paths)
     cfile = config_file(paths)
-    data = load_yaml_file(rfile) if rfile.exists() else load_yaml_file(cfile)
+    try:
+        data = load_yaml_file(rfile) if rfile.exists() else load_yaml_file(cfile)
+    except Exception:
+        data = {}
     if not isinstance(data, dict):
         data = {}
 
-    rules = [str(item) for item in (data.get("rules") or []) if isinstance(item, str)]
+    raw_rules = data.get("rules")
+    rules = [str(item) for item in raw_rules if isinstance(item, str)] if isinstance(raw_rules, list) else []
+    raw_providers = data.get("rule-providers")
+    rule_providers = raw_providers if isinstance(raw_providers, dict) else {}
     api = APIBackend(paths)
     source = "runtime"
     try:
@@ -325,7 +421,14 @@ def explain_route(
     policy_group = "DIRECT"
 
     for idx, rule in enumerate(rules, start=1):
-        if _rule_matches_target(rule, host, ip_obj, process=effective_process, paths=paths):
+        if _rule_matches_target(
+            rule,
+            host,
+            ip_obj,
+            process=effective_process,
+            paths=paths,
+            rule_providers=rule_providers,
+        ):
             matched_rule = rule
             rule_index = idx
             policy_group = _rule_target_group(rule)

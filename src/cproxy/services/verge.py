@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,12 +22,14 @@ from typing import Any
 
 import yaml
 
-from ..backend.api import APIBackend, APIUnavailableError
+from ..backend.api import APIBackend, APIUnavailableError, normalize_controller_endpoint
 from ..config import (
     AppPaths,
     ai_gemini_order_file,
     ai_manual_order_file,
     ai_watch_state_file,
+    atomic_write_bytes,
+    atomic_write_text,
     config_file,
     default_paths,
     load_yaml_file,
@@ -35,6 +39,8 @@ from ..config import (
 from .ai_watch import AIWatchService, WatchReport, sample_connections_activity
 from .probe import is_iepl_node, resolve_current_leaf
 from .rebalance import RebalanceReport, RebalanceService
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_VERGE_CONTROLLER = "127.0.0.1:9097"
 DEFAULT_VERGE_MIXED_PORT = 7897
@@ -156,6 +162,15 @@ def candidate_clash_verge_dirs(home: Path | None = None) -> list[Path]:
     return deduped
 
 
+def _safe_load_yaml_dict(path: Path) -> dict[str, Any]:
+    """容错读取 YAML 字典；遇到文件损坏、半写截断或非字典顶层时返回空字典。"""
+    try:
+        data = load_yaml_file(path)
+    except (yaml.YAMLError, UnicodeDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def discover_clash_verge_config(
     verge_dir: Path | None = None,
     *,
@@ -166,20 +181,17 @@ def discover_clash_verge_config(
     for d in dirs:
         if d is None or not d.is_dir():
             continue
-        runtime_cfg = load_yaml_file(d / "clash-verge.yaml") or load_yaml_file(d / "config.yaml") or {}
-        verge_cfg = load_yaml_file(d / "verge.yaml") or {}
-        if not isinstance(runtime_cfg, dict):
-            runtime_cfg = {}
-        if not isinstance(verge_cfg, dict):
-            verge_cfg = {}
+        runtime_cfg = _safe_load_yaml_dict(d / "clash-verge.yaml") or _safe_load_yaml_dict(d / "config.yaml")
+        verge_cfg = _safe_load_yaml_dict(d / "verge.yaml")
         if not runtime_cfg and not verge_cfg:
             continue
 
-        controller = str(
+        raw_controller = str(
             runtime_cfg.get("external-controller")
             or verge_cfg.get("clash_core_external_controller")
             or DEFAULT_VERGE_CONTROLLER
         ).strip()
+        controller = normalize_controller_endpoint(raw_controller) or DEFAULT_VERGE_CONTROLLER
         secret = str(
             runtime_cfg.get("secret")
             or verge_cfg.get("clash_core_secret")
@@ -220,7 +232,8 @@ def init_verge_config(
 ) -> tuple[Path, VergeDetectedConfig]:
     """初始化或更新供 Clash Verge 旁路模式使用的 `config.yaml`。"""
     detected = discover_clash_verge_config(verge_dir)
-    eff_controller = (controller or detected.controller or DEFAULT_VERGE_CONTROLLER).strip()
+    raw_controller = (controller or detected.controller or DEFAULT_VERGE_CONTROLLER).strip()
+    eff_controller = normalize_controller_endpoint(raw_controller) or DEFAULT_VERGE_CONTROLLER
     eff_secret = secret if secret is not None else detected.secret
     eff_port = int(mixed_port) if mixed_port is not None else detected.mixed_port
 
@@ -232,11 +245,8 @@ def init_verge_config(
     merged["secret"] = eff_secret
     merged["mixed-port"] = eff_port
 
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False, default_flow_style=False)
-    tmp_path = cfg_path.with_suffix(".tmp")
-    tmp_path.write_text(rendered, encoding="utf-8")
-    os.replace(tmp_path, cfg_path)
+    atomic_write_text(cfg_path, rendered, mode=0o600)
 
     final_detected = VergeDetectedConfig(
         controller=eff_controller,
@@ -278,8 +288,8 @@ def inject_verge_global_script(verge_dir: Path) -> tuple[Path, bool]:
     chain_enabled = False
 
     if profiles_yaml.exists():
-        raw_profiles = load_yaml_file(profiles_yaml)
-        if isinstance(raw_profiles, dict):
+        raw_profiles = _safe_load_yaml_dict(profiles_yaml)
+        if raw_profiles:
             profiles_data = dict(raw_profiles)
             items = profiles_data.get("items")
             items_list = list(items) if isinstance(items, list) else []
@@ -321,13 +331,11 @@ def inject_verge_global_script(verge_dir: Path) -> tuple[Path, bool]:
                 bak_yaml = profiles_yaml.with_suffix(".yaml.bak")
                 if not bak_yaml.exists():
                     try:
-                        bak_yaml.write_bytes(profiles_yaml.read_bytes())
+                        atomic_write_bytes(bak_yaml, profiles_yaml.read_bytes(), mode=0o600)
                     except OSError:
                         pass
                 rendered = yaml.safe_dump(profiles_data, allow_unicode=True, sort_keys=False, default_flow_style=False)
-                tmp_yaml = profiles_yaml.with_suffix(".yaml.tmp")
-                tmp_yaml.write_text(rendered, encoding="utf-8")
-                os.replace(tmp_yaml, profiles_yaml)
+                atomic_write_text(profiles_yaml, rendered, mode=0o600)
 
     profiles_dir = verge_dir / "profiles"
     profiles_dir.mkdir(parents=True, exist_ok=True)
@@ -338,11 +346,39 @@ def inject_verge_global_script(verge_dir: Path) -> tuple[Path, bool]:
             if old_js.strip() and old_js != content:
                 bak_js = target_js.with_suffix(".js.bak")
                 if not bak_js.exists():
-                    bak_js.write_text(old_js, encoding="utf-8")
+                    atomic_write_text(bak_js, old_js, mode=0o600)
         except OSError:
             pass
-    target_js.write_text(content, encoding="utf-8")
+    atomic_write_text(target_js, content, mode=0o600)
     return target_js, chain_enabled
+
+
+def _resolve_verge_global_script_filename(profiles_data: dict[str, Any], *, exclude_uid: str = "") -> str:
+    """从 profiles.yaml 中解析全局扩展脚本文件名（与 inject_verge_global_script 一致）。"""
+    items = [it for it in (profiles_data.get("items") or []) if isinstance(it, dict)]
+    uid_map = {str(it.get("uid") or ""): it for it in items if it.get("uid")}
+    chain = profiles_data.get("chain")
+    if isinstance(chain, list):
+        for uid in chain:
+            suid = str(uid or "")
+            if not suid or suid == exclude_uid:
+                continue
+            item = uid_map.get(suid)
+            if not isinstance(item, dict):
+                continue
+            itype = str(item.get("type") or "").lower()
+            ifile = str(item.get("file") or "")
+            if itype == "script" or suid == "Script" or ifile.lower().endswith(".js"):
+                return ifile or "Script.js"
+    for item in items:
+        iuid = str(item.get("uid") or "")
+        if exclude_uid and iuid == exclude_uid:
+            continue
+        itype = str(item.get("type") or "").lower()
+        ifile = str(item.get("file") or "")
+        if itype == "script" or iuid == "Script" or ifile == "Script.js":
+            return ifile or "Script.js"
+    return "Script.js"
 
 
 def try_hot_reload_verge_runtime(
@@ -351,7 +387,7 @@ def try_hot_reload_verge_runtime(
     *,
     force: bool = False,
 ) -> bool:
-    """将 Clash Verge 当前生效配置重新应用 `Script.js`（及订阅局部 `option.script`）并通过
+    """将 Clash Verge 当前生效配置重新应用订阅局部 `option.script` 与全局扩展脚本并通过
     `PUT /configs?force=true` 内存热加载到运行中的 `verge-mihomo`，无需等待用户手工点「订阅 -> 刷新」。
     """
     import shutil
@@ -360,42 +396,29 @@ def try_hot_reload_verge_runtime(
 
     node_bin = shutil.which("node")
     if not node_bin:
+        logger.warning("verge hot-reload skipped: node binary not found in PATH")
         return False
 
     target_dir = verge_dir
     if target_dir is None:
         target_dir = discover_clash_verge_config().source_dir
     if target_dir is None or not target_dir.is_dir():
+        logger.warning("verge hot-reload skipped: Clash Verge directory not found")
         return False
 
     verge_runtime_yaml = target_dir / "clash-verge.yaml"
-    global_script_js = target_dir / "profiles" / "Script.js"
-    if not verge_runtime_yaml.is_file() or not global_script_js.is_file():
+    if not verge_runtime_yaml.is_file():
+        logger.warning("verge hot-reload skipped: missing %s", verge_runtime_yaml)
         return False
 
-    api = APIBackend(paths)
-    try:
-        groups_map = api.get_groups()
-    except Exception:
-        return False
-
-    if (
-        not force
-        and "AI-MANUAL-KEEPALIVE" in groups_map
-        and "AI-GEMINI-KEEPALIVE" in groups_map
-    ):
-        return True
-
-    raw_base = load_yaml_file(verge_runtime_yaml)
-    if not isinstance(raw_base, dict) or not raw_base.get("proxies"):
-        return False
-
-    script_paths: list[Path] = [global_script_js.resolve()]
     profile_name = "VergeProfile"
+    prof_script_uid = ""
+    prof_script_path: Path | None = None
+    global_script_filename = "Script.js"
     profiles_yaml = target_dir / "profiles.yaml"
     if profiles_yaml.is_file():
-        raw_profiles = load_yaml_file(profiles_yaml)
-        if isinstance(raw_profiles, dict):
+        raw_profiles = _safe_load_yaml_dict(profiles_yaml)
+        if raw_profiles:
             current_uid = str(raw_profiles.get("current") or "")
             items = [it for it in (raw_profiles.get("items") or []) if isinstance(it, dict)]
             uid_map = {str(it.get("uid") or ""): it for it in items if it.get("uid")}
@@ -407,8 +430,44 @@ def try_hot_reload_verge_runtime(
                 prof_script_item = uid_map.get(prof_script_uid)
                 if isinstance(prof_script_item, dict) and prof_script_item.get("file"):
                     cand_js = (target_dir / "profiles" / str(prof_script_item["file"])).resolve()
-                    if cand_js.is_file() and cand_js not in script_paths:
-                        script_paths.append(cand_js)
+                    if cand_js.is_file():
+                        prof_script_path = cand_js
+            global_script_filename = _resolve_verge_global_script_filename(
+                raw_profiles,
+                exclude_uid=prof_script_uid,
+            )
+
+    global_script_js = target_dir / "profiles" / global_script_filename
+    if not global_script_js.is_file():
+        logger.warning("verge hot-reload skipped: missing global script %s", global_script_js)
+        return False
+
+    api = APIBackend(paths)
+    try:
+        groups_map = api.get_groups()
+    except Exception as exc:
+        logger.warning("verge hot-reload skipped: failed to query controller groups: %s", exc)
+        return False
+
+    if (
+        not force
+        and "AI-MANUAL-KEEPALIVE" in groups_map
+        and "AI-GEMINI-KEEPALIVE" in groups_map
+    ):
+        return True
+
+    raw_base = _safe_load_yaml_dict(verge_runtime_yaml)
+    if not raw_base or not raw_base.get("proxies"):
+        logger.warning("verge hot-reload skipped: empty or unreadable %s", verge_runtime_yaml)
+        return False
+
+    # 订阅局部脚本先于全局脚本执行，确保全局 AI 规则不被局部脚本抢占、代理重名被全局脚本统一去重
+    script_paths: list[Path] = []
+    if prof_script_path is not None:
+        script_paths.append(prof_script_path)
+    resolved_global = global_script_js.resolve()
+    if resolved_global not in script_paths:
+        script_paths.append(resolved_global)
 
     try:
         selectors = api.selector_now()
@@ -447,11 +506,27 @@ def try_hot_reload_verge_runtime(
                 timeout=15.0,
             )
             new_cfg = json.loads(out_json.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        logger.warning("verge hot-reload failed while executing preprocess scripts: %s", exc)
         return False
 
     if not isinstance(new_cfg, dict):
+        logger.warning("verge hot-reload failed: preprocess scripts returned non-dict config")
         return False
+
+    # 兜底按名称去重 proxies，避免重复热重载时局部脚本追加的同名回环代理导致 mihomo PUT /configs 拒绝
+    raw_new_proxies = new_cfg.get("proxies")
+    if isinstance(raw_new_proxies, list):
+        deduped_proxies: list[Any] = []
+        seen_proxy_names: set[str] = set()
+        for proxy in raw_new_proxies:
+            if isinstance(proxy, dict) and proxy.get("name"):
+                pname = str(proxy["name"])
+                if pname in seen_proxy_names:
+                    continue
+                seen_proxy_names.add(pname)
+            deduped_proxies.append(proxy)
+        new_cfg["proxies"] = deduped_proxies
 
     rp_map = new_cfg.get("rule-providers")
     if isinstance(rp_map, dict):
@@ -471,14 +546,15 @@ def try_hot_reload_verge_runtime(
     try:
         payload_yaml = yaml.safe_dump(new_cfg, allow_unicode=True, sort_keys=False)
         api.request("PUT", "/configs?force=true", {"path": "", "payload": payload_yaml})
-    except Exception:
+    except Exception as exc:
+        logger.warning("verge hot-reload PUT /configs failed: %s", exc)
         return False
 
     if selectors:
         try:
             api.restore_selectors(selectors)
-        except Exception:
-            pass
+        except (Exception, SystemExit) as exc:
+            logger.warning("verge hot-reload restore_selectors warning: %s", exc)
     try:
         api.delay_test("H2-KEEPALIVE", "http://cp.cloudflare.com/generate_204", 2000)
     except Exception:
@@ -564,10 +640,11 @@ def _load_daemon_state(paths: AppPaths) -> dict[str, Any]:
 def _save_daemon_state(paths: AppPaths, state: dict[str, Any]) -> None:
     path = verge_daemon_state_file(paths)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_text(
+            path,
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            mode=0o600,
+        )
     except OSError:
         pass
 
@@ -575,7 +652,7 @@ def _save_daemon_state(paths: AppPaths, state: dict[str, Any]) -> None:
 def _is_pid_alive(pid: int | None) -> bool:
     if not pid or pid <= 0:
         return False
-    if os.name == "nt":
+    if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes
 
@@ -588,7 +665,8 @@ def _is_pid_alive(pid: int | None) -> bool:
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
-            return False
+            # ERROR_ACCESS_DENIED (5): 进程存在但当前非提权终端无权打开句柄（如高权限计划任务）
+            return ctypes.get_last_error() == 5
         try:
             exit_code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
@@ -613,12 +691,22 @@ def _record_daemon_heartbeat(
     now: float,
     sampled_connections: int,
     tick_report: VergeTickReport | None = None,
+    update_pid: bool = True,
+    keepalive_error: str | None = None,
 ) -> None:
     state = _load_daemon_state(paths)
-    state["pid"] = os.getpid()
+    if update_pid:
+        state["pid"] = os.getpid()
     state["updated_at"] = now
     state["last_sample_ts"] = now
     state["sampled_connections"] = sampled_connections
+    if keepalive_error is not None:
+        if keepalive_error:
+            state["last_keepalive_error"] = keepalive_error
+            state["last_keepalive_error_ts"] = now
+        else:
+            state.pop("last_keepalive_error", None)
+            state.pop("last_keepalive_error_ts", None)
 
     watch_runs = int(state.get("watch_runs") or 0)
     rebalance_runs = int(state.get("rebalance_runs") or 0)
@@ -673,7 +761,10 @@ class VergeDaemonService:
         report.sampled_connections = len(idle_map)
 
         watch_svc = AIWatchService(self.paths)
-        report.watch_report = watch_svc.watch(dry_run=dry_run)
+        try:
+            report.watch_report = watch_svc.watch(dry_run=dry_run)
+        except (Exception, SystemExit) as exc:
+            report.warnings.append(f"ai-watch 异常: {exc}")
 
         if run_rebalance:
             try:
@@ -683,17 +774,22 @@ class VergeDaemonService:
                 )
             except APIUnavailableError as exc:
                 report.warnings.append(str(exc))
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 report.warnings.append(f"rebalance 跳过: {exc}")
         _record_daemon_heartbeat(
             self.paths,
             now=time.time(),
             sampled_connections=report.sampled_connections,
             tick_report=report,
+            update_pid=False,
         )
         return report
 
-    def _start_embedded_keepalive_thread(self) -> Any:
+    def _start_embedded_keepalive_thread(
+        self,
+        *,
+        on_error: Callable[[str], None] | None = None,
+    ) -> Any:
         import asyncio
         import threading
 
@@ -730,8 +826,13 @@ class VergeDaemonService:
                         require_system_trust=True,
                     )
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("embedded keepalive thread exited with error: %s", exc)
+                if on_error is not None:
+                    try:
+                        on_error(str(exc))
+                    except Exception:
+                        pass
 
         thread = threading.Thread(target=_worker, name="cproxy-keepalive-gw", daemon=True)
         thread.start()
@@ -754,7 +855,22 @@ class VergeDaemonService:
         sample_sec = max(1.0, min(float(sample_interval), watch_sec))
 
         eff_keepalive = (max_ticks is None and not dry_run) if enable_keepalive is None else bool(enable_keepalive)
-        keepalive_thread = self._start_embedded_keepalive_thread() if eff_keepalive else None
+        keepalive_backoff = 15.0
+        keepalive_max_backoff = 300.0
+        external_keepalive_recheck_sec = 30.0
+        keepalive_started_ts = 0.0
+        next_keepalive_attempt_ts = 0.0
+        last_keepalive_error: list[str | None] = [None]
+
+        def _record_ka_error(msg: str) -> None:
+            last_keepalive_error[0] = msg
+
+        keepalive_thread: Any = None
+        if eff_keepalive:
+            keepalive_started_ts = time.time()
+            keepalive_thread = self._start_embedded_keepalive_thread(on_error=_record_ka_error)
+            if keepalive_thread is None:
+                next_keepalive_attempt_ts = keepalive_started_ts + external_keepalive_recheck_sec
 
         last_watch_ts = 0.0
         last_rebalance_ts = 0.0
@@ -765,8 +881,26 @@ class VergeDaemonService:
         try:
             while max_ticks is None or ticks < max_ticks:
                 now = time.time()
-                if eff_keepalive and (keepalive_thread is None or not keepalive_thread.is_alive()):
-                    keepalive_thread = self._start_embedded_keepalive_thread()
+                if eff_keepalive:
+                    if keepalive_thread is not None and not keepalive_thread.is_alive():
+                        # 线程异常退出：记录错误并执行指数退避，避免 3s 高频重启死循环
+                        if (now - keepalive_started_ts) >= 60.0:
+                            keepalive_backoff = 15.0
+                        if not last_keepalive_error[0]:
+                            last_keepalive_error[0] = "keepalive thread exited unexpectedly"
+                        next_keepalive_attempt_ts = now + keepalive_backoff
+                        keepalive_backoff = min(keepalive_max_backoff, keepalive_backoff * 2.0)
+                        keepalive_thread = None
+                    if keepalive_thread is None and now >= next_keepalive_attempt_ts:
+                        keepalive_started_ts = now
+                        keepalive_thread = self._start_embedded_keepalive_thread(on_error=_record_ka_error)
+                        if keepalive_thread is None:
+                            # 已有独立保活进程在运行：降低探测频次，避免每 3s 建连探活
+                            last_keepalive_error[0] = ""
+                            keepalive_backoff = 15.0
+                            next_keepalive_attempt_ts = now + external_keepalive_recheck_sec
+                        else:
+                            last_keepalive_error[0] = ""
                 idle_map = sample_connections_activity(self.paths, api, now=now)
                 if eff_keepalive and (now - last_keepalive_mount_check_ts) >= 60.0:
                     last_keepalive_mount_check_ts = now
@@ -789,20 +923,24 @@ class VergeDaemonService:
                 if due_watch or due_rebalance:
                     tick_report = VergeTickReport(timestamp=now, sampled_connections=len(idle_map))
                     if due_watch:
-                        tick_report.watch_report = AIWatchService(self.paths).watch(dry_run=dry_run)
+                        try:
+                            tick_report.watch_report = AIWatchService(self.paths).watch(dry_run=dry_run)
+                        except (Exception, SystemExit) as exc:
+                            tick_report.warnings.append(f"ai-watch 异常: {exc}")
                         last_watch_ts = time.time()
                     if due_rebalance:
                         _record_daemon_heartbeat(
                             self.paths,
                             now=time.time(),
                             sampled_connections=len(idle_map),
+                            keepalive_error=last_keepalive_error[0],
                         )
                         try:
                             tick_report.rebalance_report = RebalanceService(self.paths).rebalance(
                                 dry_run=dry_run,
                                 external_only=True,
                             )
-                        except Exception as exc:
+                        except (Exception, SystemExit) as exc:
                             tick_report.warnings.append(str(exc))
                         last_rebalance_ts = time.time()
                 _record_daemon_heartbeat(
@@ -810,6 +948,7 @@ class VergeDaemonService:
                     now=time.time(),
                     sampled_connections=len(idle_map),
                     tick_report=tick_report,
+                    keepalive_error=last_keepalive_error[0],
                 )
                 if tick_report is not None and on_tick is not None:
                     try:
@@ -1054,7 +1193,10 @@ def collect_scheduler_telemetry(
 
     timers_ok = bool(installed_timers and "cproxy-ai-watch.timer" in active_timers)
     heartbeat_fresh = heartbeat_age_sec is not None and heartbeat_age_sec <= max_heartbeat_age_sec
-    daemon_ok = bool(heartbeat_fresh and (pid_alive or timers_ok or heartbeat_age_sec <= 60.0))
+    daemon_ok = bool(
+        heartbeat_fresh
+        and (pid_alive or timers_ok or (heartbeat_age_sec is not None and heartbeat_age_sec <= 60.0))
+    )
     configured = bool(
         scheduler_mode != "none"
         or bool(read_config(paths).get("verge-mode"))
@@ -1364,11 +1506,13 @@ def collect_ai_egress_deep_status(
             continue
         leaf = resolve_current_leaf(groups_map or {}, gname) or str(getattr(gobj, "current", "") or "-")
         iepl = is_iepl_node(leaf, paths) if leaf and leaf != "-" else False
-        gs = watch_state.get(gname) if isinstance(watch_state.get(gname), dict) else {}
-        cooldown_map = gs.get("cooldown") if isinstance(gs, dict) and isinstance(gs.get("cooldown"), dict) else {}
+        raw_gs = watch_state.get(gname)
+        gs: dict[str, Any] = raw_gs if isinstance(raw_gs, dict) else {}
+        raw_cd = gs.get("cooldown")
+        cooldown_map: dict[str, Any] = raw_cd if isinstance(raw_cd, dict) else {}
         active_cooldowns = sum(
             1
-            for k, v in cooldown_map.items()
+            for _k, v in cooldown_map.items()
             if isinstance(v, (int, float)) and (ts - float(v)) < COOLDOWN_SECONDS
         )
         cooled_set = {
@@ -1521,7 +1665,7 @@ def check_verge_effectiveness(
                         leaf_node=leaf,
                         delay_ms=delay_ms,
                         alive=alive,
-                        is_iepl=is_iepl_node(leaf) if leaf and leaf != "-" else False,
+                        is_iepl=is_iepl_node(leaf, paths) if leaf and leaf != "-" else False,
                         active_connections=conn_counts.get(gname, 0),
                         last_verdict=str(last_verdicts.get(gname) or "-"),
                     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -22,6 +23,7 @@ from ...services.diagnostics import DiagnosticsService
 from ...services.query import QueryService
 from ..ai_status import IDLE, chain_markup, exit_line_or_idle, mode_markup
 from ..widgets import NavigationDataTable as DataTable
+from ..widgets import coerce_worker_error, escape_markup, safe_call_from_thread
 
 
 class AIRouteScreen(Widget):
@@ -83,9 +85,9 @@ class AIRouteScreen(Widget):
     def _refresh_route_worker(self) -> None:
         try:
             groups = QueryService(self.paths).get_ai_status_groups()
-            self.app.call_from_thread(self._apply_route, groups, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._apply_route, None, exc)
+            safe_call_from_thread(self, self._apply_route, groups, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._apply_route, None, coerce_worker_error(exc))
 
     def _paint_route(self, *, mode: str, active: str, gemini: str, standby: str, chain: str) -> None:
         """一次写完五个标签——三条分支（报错/未配置/正常）都要整屏刷新。"""
@@ -99,8 +101,10 @@ class AIRouteScreen(Widget):
             self.query_one(widget_id, Label).update(text)
 
     def _apply_route(self, groups: dict | None, error: Exception | None) -> None:
+        if not self.is_mounted:
+            return
         if error is not None or groups is None:
-            label = "API 不可访问" if isinstance(error, APIUnavailableError) else f"错误: {error}"
+            label = "API 不可访问" if isinstance(error, APIUnavailableError) else f"错误: {escape_markup(error)}"
             self._paint_route(mode=f"[#fb7185]{label}[/]", active=IDLE, gemini=IDLE, standby=IDLE, chain=IDLE)
             return
         try:
@@ -122,7 +126,13 @@ class AIRouteScreen(Widget):
                 chain=chain_markup(route),
             )
         except Exception as e:
-            self.query_one("#ai-route-mode", Label).update(f"[#fb7185]错误: {e}[/]")
+            self._paint_route(
+                mode=f"[#fb7185]错误: {escape_markup(e)}[/]",
+                active=IDLE,
+                gemini=IDLE,
+                standby=IDLE,
+                chain=IDLE,
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-ai-refresh":
@@ -145,8 +155,8 @@ class AIRouteScreen(Widget):
     def _probe_ai_worker(self) -> None:
         try:
             report = DiagnosticsService(self.paths).run_ai_probe(on_result=self._probe_result_from_worker)
-        except Exception as exc:
-            self._call_from_probe_thread(self._fail_probe_ai, exc)
+        except (Exception, SystemExit) as exc:
+            self._call_from_probe_thread(self._fail_probe_ai, coerce_worker_error(exc))
             return
         self._call_from_probe_thread(self._finish_probe_ai, report)
 
@@ -154,9 +164,7 @@ class AIRouteScreen(Widget):
         self._call_from_probe_thread(self._apply_probe_result, item)
 
     def _call_from_probe_thread(self, callback, *args) -> None:
-        try:
-            self.app.call_from_thread(callback, *args)
-        except Exception:
+        if not safe_call_from_thread(self, callback, *args):
             self._probe_running = False
 
     def _apply_probe_result(self, item: AIProbeResult) -> None:
@@ -165,12 +173,12 @@ class AIRouteScreen(Widget):
         probe_table = self.query_one("#ai-probe-table", DataTable)
         status = "[#a3e635]● 正常[/]" if item.ok else "[#fb7185]○ 失败[/]"
         # 成功时显示探测地址而非 HTTP 401/403（可达但需鉴权，摆在「正常」旁像故障码）
-        detail = item.url if item.ok else (item.detail or item.url)
+        detail = Text(item.url if item.ok else (item.detail or item.url))
         if item.name in probe_table.rows:
             probe_table.update_cell(item.name, "status", status, update_width=True)
             probe_table.update_cell(item.name, "detail", detail, update_width=True)
         else:
-            probe_table.add_row(item.name, status, detail, key=item.name)
+            probe_table.add_row(Text(item.name), status, detail, key=item.name)
 
     def _finish_probe_ai(self, report) -> None:
         if not self.is_mounted:
@@ -187,7 +195,9 @@ class AIRouteScreen(Widget):
         ok_count = sum(1 for item in report.results if item.ok)
         total = len(report.results)
 
-        if ok_count == total:
+        if total == 0:
+            probe_status = "[#8b98aa]○ 无探测目标[/]"
+        elif ok_count == total:
             probe_status = f"[#a3e635]● {ok_count}/{total} 正常[/]"
         elif ok_count == 0:
             probe_status = f"[#fb7185]○ {ok_count}/{total} 失败[/]"
@@ -196,16 +206,16 @@ class AIRouteScreen(Widget):
         self.query_one("#ai-probe-status", Label).update(probe_status)
         self.query_one("#btn-ai-probe", Button).disabled = False
         self._probe_running = False
-        self.notify("探测完成", severity="information")
+        self.notify("探测完成", severity="information", markup=False)
 
     def _fail_probe_ai(self, error: Exception) -> None:
         if not self.is_mounted:
             self._probe_running = False
             return
-        self.query_one("#ai-probe-status", Label).update(f"[#fb7185]探测失败: {error}[/]")
+        self.query_one("#ai-probe-status", Label).update(f"[#fb7185]探测失败: {escape_markup(error)}[/]")
         self.query_one("#btn-ai-probe", Button).disabled = False
         self._probe_running = False
-        self.notify(f"探测失败: {error}", severity="error")
+        self.notify(f"探测失败: {error}", severity="error", markup=False)
 
     def action_switch_us_sg(self) -> None:
         self.query_one("#ai-route-mode", Label).update("[#f6c177]切换中…[/]")
@@ -220,7 +230,8 @@ class AIRouteScreen(Widget):
             auto = groups.get("AI-AUTO")
 
             if manual is None or auto is None:
-                self.app.call_from_thread(
+                safe_call_from_thread(
+                    self,
                     self._finish_switch,
                     "",
                     "",
@@ -239,7 +250,8 @@ class AIRouteScreen(Widget):
             else:
                 target = ai_manual_toggle_target(list(manual.candidates), active_group_name)
                 if not target:
-                    self.app.call_from_thread(
+                    safe_call_from_thread(
+                        self,
                         self._finish_switch,
                         "",
                         "",
@@ -248,16 +260,20 @@ class AIRouteScreen(Widget):
                     return
                 service.switch_group(AI_MANUAL_GROUP, target)
 
-            self.app.call_from_thread(self._finish_switch, active_group_name, target, None)
+            safe_call_from_thread(self, self._finish_switch, active_group_name, target, None)
 
-        except Exception as exc:
-            self.app.call_from_thread(self._finish_switch, "", "", exc)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._finish_switch, "", "", coerce_worker_error(exc))
 
     def _finish_switch(self, active: str, target: str, error: Exception | None) -> None:
+        if not self.is_mounted:
+            return
         if error is None:
-            self.notify(f"已切换: {active} → {target}", severity="information")
+            self.notify(f"已切换: {active} → {target}", severity="information", markup=False)
             self.refresh_data()
         elif isinstance(error, APIUnavailableError):
-            self.notify("API 不可访问", severity="error")
+            self.query_one("#ai-route-mode", Label).update("[#fb7185]API 不可访问[/]")
+            self.notify("API 不可访问", severity="error", markup=False)
         else:
-            self.notify(f"切换失败: {error}", severity="error")
+            self.query_one("#ai-route-mode", Label).update(f"[#fb7185]切换失败: {escape_markup(error)}[/]")
+            self.notify(f"切换失败: {error}", severity="error", markup=False)

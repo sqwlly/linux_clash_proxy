@@ -40,16 +40,27 @@ class ProviderScorecard:
     high_mult_count: int
     score: int
     grade: str
+    live_data: bool = True
+    untested_nodes: int = 0
+
+    @property
+    def tested_nodes(self) -> int:
+        return max(0, self.total_nodes - self.untested_nodes)
 
     @property
     def alive_rate(self) -> float:
-        return (self.alive_nodes / self.total_nodes * 100.0) if self.total_nodes > 0 else 0.0
+        if not self.live_data:
+            return 0.0
+        denom = self.tested_nodes
+        return (self.alive_nodes / denom * 100.0) if denom > 0 else 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "total_nodes": self.total_nodes,
             "alive_nodes": self.alive_nodes,
+            "untested_nodes": self.untested_nodes,
+            "live_data": self.live_data,
             "alive_rate": round(self.alive_rate, 1),
             "avg_delay_ms": self.avg_delay_ms,
             "median_delay_ms": self.median_delay_ms,
@@ -70,10 +81,16 @@ def _compute_score_and_grade(
     regions: int,
     dedicated: int,
     ai_ready: int,
+    *,
+    tested: int | None = None,
+    live_data: bool = True,
 ) -> tuple[int, str]:
     if total == 0:
         return 0, "C"
-    alive_ratio = alive / total
+    effective_tested = total if tested is None else tested
+    if not live_data or effective_tested == 0:
+        return 0, "-"
+    alive_ratio = alive / effective_tested
     # 存活率占 45 分
     score = alive_ratio * 45.0
     # 延迟表现占 25 分（<=150ms 满分，>=800ms 0分）
@@ -104,26 +121,38 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
     """评估主订阅与各附加订阅的健康度评分卡。"""
     rfile = runtime_file(paths)
     cfile = config_file(paths)
-    data = load_yaml_file(rfile) if rfile.exists() else load_yaml_file(cfile)
+    try:
+        data = load_yaml_file(rfile) if rfile.exists() else load_yaml_file(cfile)
+    except Exception:
+        data = {}
     if not isinstance(data, dict):
         data = {}
 
     extra_names: list[str] = []
-    for item in data.get("subscriptions") or []:
-        if isinstance(item, dict):
-            n = str(item.get("name") or "").strip()
-            if n and n not in extra_names:
-                extra_names.append(n)
+    raw_subs = data.get("subscriptions")
+    if isinstance(raw_subs, list):
+        for item in raw_subs:
+            if isinstance(item, dict):
+                n = str(item.get("name") or "").strip()
+                if n and n not in extra_names:
+                    extra_names.append(n)
+    match_extra_names = sorted(extra_names, key=lambda name: -len(name))
 
+    raw_proxies_field = data.get("proxies")
     raw_proxies = [
         str(p.get("name"))
-        for p in (data.get("proxies") or [])
-        if isinstance(p, dict) and p.get("name") and not is_panel_info_node(str(p.get("name")))
+        for p in (raw_proxies_field if isinstance(raw_proxies_field, list) else [])
+        if isinstance(p, dict)
+        and p.get("name")
+        and str(p.get("name")) != "H2-KEEPALIVE"
+        and not is_panel_info_node(str(p.get("name")))
     ]
 
     live_groups = {}
+    live_data = False
     try:
         live_groups = APIBackend(paths).get_groups(request_timeout=1.5)
+        live_data = bool(live_groups)
     except APIUnavailableError:
         pass
 
@@ -133,7 +162,7 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
 
     for node_name in raw_proxies:
         matched_extra = None
-        for extra in extra_names:
+        for extra in match_extra_names:
             if node_name == extra or node_name.startswith(f"{extra} "):
                 matched_extra = extra
                 break
@@ -147,6 +176,7 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
         if not nodes:
             continue
         alive_count = 0
+        untested_count = 0
         delays: list[int] = []
         regions: set[str] = set()
         dedicated_count = 0
@@ -162,9 +192,16 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
             if tag.is_high_multiplier:
                 high_mult_count += 1
 
+            if not live_data:
+                untested_count += 1
+                continue
+
             entry = live_groups.get(name)
             delay = entry.delay if entry is not None else None
             alive = entry.alive if entry is not None else None
+            if entry is None or (delay is None and alive is not False):
+                untested_count += 1
+                continue
             is_ok = (
                 delay is not None
                 and 0 < delay < HEALTH_CHECK_TIMEOUT_MS
@@ -175,13 +212,11 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
                 delays.append(delay)
                 if tag.region in AI_CORE_REGIONS and delay < 500 and not tag.is_high_multiplier:
                     ai_ready_count += 1
-            elif not live_groups and alive is not False:
-                # API 未运行时按静态节点数估算存活
-                alive_count += 1
 
         avg_d = round(sum(delays) / len(delays)) if delays else None
         med_d = round(median(delays)) if delays else None
         min_d = min(delays) if delays else None
+        tested_count = len(nodes) - untested_count
         score, grade = _compute_score_and_grade(
             len(nodes),
             alive_count,
@@ -189,6 +224,8 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
             len(regions),
             dedicated_count,
             ai_ready_count,
+            tested=tested_count,
+            live_data=live_data,
         )
         cards.append(
             ProviderScorecard(
@@ -204,6 +241,8 @@ def evaluate_providers(paths: AppPaths) -> list[ProviderScorecard]:
                 high_mult_count=high_mult_count,
                 score=score,
                 grade=grade,
+                live_data=live_data,
+                untested_nodes=untested_count,
             )
         )
     return cards

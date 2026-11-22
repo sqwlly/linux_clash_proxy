@@ -9,11 +9,12 @@ def run_tui(paths: AppPaths | None = None) -> None:
     try:
         from .tui.app import run_tui as _run_tui
     except ModuleNotFoundError as exc:
-        if exc.name == "textual":
+        missing = exc.name or ""
+        if missing == "textual" or missing.startswith("textual."):
             print(
                 "错误: TUI 可选依赖 Textual 尚未安装。\n"
-                "请执行: pipx inject cproxy 'textual>=5.0'\n"
-                "或从仓库安装: pipx install '/path/to/clash_proxy[tui]'",
+                "请安装 TUI 可选依赖: pip install 'cproxy[tui]'（或仓库内 pip install '.[tui]'）\n"
+                "若使用 pipx，可执行: pipx inject cproxy 'textual>=5.0'",
                 file=sys.stderr,
             )
             raise SystemExit(1) from None

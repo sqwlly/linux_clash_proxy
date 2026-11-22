@@ -9,7 +9,7 @@
 - `AI-MANUAL` 稳定性兜底：组类型由 `select` 改为 `fallback`（故障转移），手动固定的节点挂掉后 mihomo 自动切到下一个存活节点；候选列表按「`ai-manual-prefer` 钉选 → 实测稳定度序 → 静态地区」三级排序
 - `cproxy ai-rebalance`：多轮探测 `AI-MANUAL` 全部叶子，按 `rank_key`（成功↑/失败↓/最大延迟↓/平均延迟↓/抖动↓/历史惩罚↓）实测稳定度重排并持久化到 `ai-manual-order.json`，随后重渲染并热重载；配套 `cproxy-ai-rebalance.timer`（30 分钟周期）自动驱动
 - 实时网速监控：TUI 仪表盘「实时流量」卡片升级为「实时网速」（下载/上传显示瞬时速率，新增累计量行，连接数不变），并新增 `cproxy speed` 命令（一次性测速 + `--watch` 持续刷新 + `--interval` + `--raw`）；复用 mihomo `/connections` 全局累计计数器做差分，重启归零自动钳位
-- AI 出口快速自愈看门狗：新增 `cproxy ai-watch`（配套 `cproxy-ai-watch.timer`，2 分钟周期），对当前 codex/Gemini 出口做**语义探测**——识别 Gemini 的「location not supported」地区门禁（此前 4xx 一律判 ok，测不出「节点通但 AI 用不了」）——连续 2 次语义失败即切到下一个好节点，10 分钟冷却期抗抖，状态持久化到 `ai-watch.json`
+- AI 出口快速自愈看门狗：新增 `cproxy ai-watch`（配套 `cproxy-ai-watch.timer`，20 秒周期），对当前 codex/Gemini 出口做**语义探测**——识别 Gemini 的「location not supported」地区门禁（此前 4xx 一律判 ok，测不出「节点通但 AI 用不了」）——连续 2 次语义失败即切到下一个好节点，10 分钟冷却期抗抖，状态持久化到 `ai-watch.json`
 
 ### 移除
 
@@ -28,7 +28,7 @@
 - `ai-rebalance` 排序加重历史失败惩罚权重，平滑单轮 codex 探测噪声（削弱「一轮 5/5、下一轮 1/5」的名次翻转）；当候选集未变且前 5 名顺序完全一致时抑制尾部 1 轮样本抖动触发的无意义重写与热重载；若当前 `AI-MANUAL` 出口在多轮实测中已不稳定而榜首稳定，重排后主动切到榜首叶子
 - `cproxy render --apply`（及 `cproxy-refresh.service` 15 分钟定时任务与 `bootstrap`）：当磁盘 `runtime.yaml` 落后于运行实例时自动热重载并同步 `runtime_hash` 指纹，消除配置变更后 `status`/`doctor` 长期报「配置时效: 待刷新」的盲区
 - `probe_history.jsonl` 限制最多保留最近 200 条记录（原子截断），防止 30 分钟周期定时任务让探测历史无限膨胀
-- `agy` 热更新残留适配：`cproxy ai-watch`（2 分钟周期）自动回收终端闲置满 30 分钟且无活跃任务子进程的 `agy.<timestamp>.old` 残留进程（保护当前调用链与活跃终端），消除旧实例长期后台轮询 `daily-cloudcode-pa.googleapis.com` 抢占流式连接配额的问题；`runtime.py` 新增 `PROCESS-NAME-REGEX,^agy\.[0-9]+\.old,AI-MANUAL` 兜底热更新窗口期路由；`traffic.py` 自动剥离 `(deleted)` 并将 `agy.<timestamp>.old` 归并回 `agy`
+- `agy` 热更新残留适配：`cproxy ai-watch`（20 秒周期）自动回收终端闲置满 30 分钟且无活跃任务子进程的 `agy.<timestamp>.old` 残留进程（保护当前调用链与活跃终端），消除旧实例长期后台轮询 `daily-cloudcode-pa.googleapis.com` 抢占流式连接配额的问题；`runtime.py` 新增 `PROCESS-NAME-REGEX,^agy\.[0-9]+\.old,AI-MANUAL` 兜底热更新窗口期路由；`traffic.py` 自动剥离 `(deleted)` 并将 `agy.<timestamp>.old` 归并回 `agy`
 
 ### 修复
 

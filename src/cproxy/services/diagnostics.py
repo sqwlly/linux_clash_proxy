@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import http.client
+import ipaddress
 import socket
 import time
 import zlib
 from collections.abc import Callable, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .. import __version__
 from ..backend.api import APIBackend
@@ -18,8 +21,10 @@ from ..backend.models import (
     GroupCheckReport,
 )
 from ..backend.process import ProcessBackend
+from ..backend.runtime import HEALTH_CHECK_TIMEOUT_MS
 from ..config import AppPaths, read_config
 from ..geodata import check_country_mmdb
+from ..names import resolve_group_alias
 from ..proxyenv import proxy_http_url
 
 DEFAULT_TEST_URL = "https://cp.cloudflare.com/generate_204"
@@ -87,7 +92,31 @@ GOOGLE_GEO_BLOCKED_URL_MARKERS = (
     "unsupported-country",
 )
 
+GOOGLE_GEO_BLOCKED_HOSTS = (
+    "google.com.hk",
+    "google.cn",
+)
+
 _ERROR_BODY_MAX_BYTES = 4096
+_MAX_CONNECTIVITY_READ_BYTES = 65536
+_MAX_IP_CHECK_READ_BYTES = 256
+
+
+def _is_valid_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """阻止重定向跳往 file://、ftp:// 等非 http(s) 协议。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_valid_http_url(newurl):
+            raise URLError(f"拒绝重定向到非 HTTP(S) 地址: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _config_list(config: dict, key: str, defaults: Iterable[str]) -> list[str]:
@@ -99,14 +128,18 @@ def _config_list(config: dict, key: str, defaults: Iterable[str]) -> list[str]:
 
 def _config_int(config: dict, key: str, default: int) -> int:
     value = config.get(key, default)
+    if isinstance(value, bool):
+        return max(1, default)
     try:
-        return int(value)
+        return max(1, int(value))
     except (TypeError, ValueError):
-        return default
+        return max(1, default)
 
 
 def _config_str(config: dict, key: str, default: str) -> str:
-    value = config.get(key, default)
+    value = config.get(key)
+    if value is None:
+        return default
     text = str(value).strip()
     return text or default
 
@@ -118,7 +151,8 @@ def _proxy_opener(paths: AppPaths):
                 "http": proxy_http_url(paths),
                 "https": proxy_http_url(paths),
             }
-        )
+        ),
+        _SafeRedirectHandler(),
     )
 
 
@@ -162,31 +196,41 @@ def _is_geo_blocked(body: str) -> bool:
     return any(marker in body for marker in GEO_BLOCK_MARKERS)
 
 
+def _url_indicates_geo_blocked(url_text: str) -> bool:
+    url_lower = str(url_text or "").strip().lower()
+    if not url_lower:
+        return False
+    if any(marker in url_lower for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
+        return True
+    try:
+        host = (urlparse(url_lower).hostname or "").rstrip(".")
+    except ValueError:
+        host = ""
+    if host and any(host == blocked or host.endswith(f".{blocked}") for blocked in GOOGLE_GEO_BLOCKED_HOSTS):
+        return True
+    return False
+
+
 def _headers_or_url_indicate_geo_blocked(headers: object, final_url: str = "") -> bool:
     """检查响应最终 URL 或 GWS Set-Cookie 是否暴露 Google CN（送中）/ HK 地区限制。"""
-    url_lower = str(final_url or "").lower()
-    if url_lower and any(marker in url_lower for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
+    if _url_indicates_geo_blocked(final_url):
         return True
     if headers is None:
         return False
     cookies: list[str] = []
     get_all = getattr(headers, "get_all", None)
+    getter = getattr(headers, "get", None)
     if callable(get_all):
         raw_list = get_all("Set-Cookie")
         if raw_list:
             cookies.extend(str(item) for item in raw_list if item)
-    else:
-        getter = getattr(headers, "get", None)
-        if callable(getter):
-            val = getter("Set-Cookie")
-            if val:
-                cookies.append(str(val))
-            loc = getter("Location")
-            if loc and any(marker in str(loc).lower() for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
-                return True
-    if hasattr(headers, "get"):
-        loc = headers.get("Location")  # type: ignore[union-attr]
-        if loc and any(marker in str(loc).lower() for marker in GOOGLE_GEO_BLOCKED_URL_MARKERS):
+    elif callable(getter):
+        val = getter("Set-Cookie")
+        if val:
+            cookies.append(str(val))
+    if callable(getter):
+        loc = getter("Location")
+        if loc and _url_indicates_geo_blocked(str(loc)):
             return True
     if cookies:
         joined = " ; ".join(cookies).lower()
@@ -205,7 +249,12 @@ def _probe_target(opener, url: str, timeout: int, retries: int) -> tuple[str, st
     `retries` 与 `timeout` 由调用方按场景决定：面板用紧预算（快），看门狗用宽预算
     （避免把慢节点误判成坏节点）。最坏耗时 ≈ `timeout × (retries+1) + Σ退避`。
     """
-    for attempt in range(retries + 1):
+    if not _is_valid_http_url(url):
+        return PROBE_DEAD, "无效的 URL（仅支持 http/https）"
+    effective_timeout = max(1, int(timeout))
+    effective_retries = max(0, int(retries))
+
+    for attempt in range(effective_retries + 1):
         request = Request(
             url,
             headers={
@@ -214,7 +263,7 @@ def _probe_target(opener, url: str, timeout: int, retries: int) -> tuple[str, st
             },
         )
         try:
-            with opener.open(request, timeout=timeout) as response:
+            with opener.open(request, timeout=effective_timeout) as response:
                 status = _safe_attr(response, "status", response.getcode())
                 resp_headers = _safe_attr(response, "headers", None)
                 resp_url = str(_safe_attr(response, "url", "") or "")
@@ -222,23 +271,29 @@ def _probe_target(opener, url: str, timeout: int, retries: int) -> tuple[str, st
                     return PROBE_GEO_BLOCKED, "位置不支持（Google 判定 CN/HK 地区门禁）"
             return PROBE_OK, f"HTTP {status}" if status else "成功"
         except HTTPError as exc:
-            if 300 <= exc.code < 400:
-                if _headers_or_url_indicate_geo_blocked(
-                    _safe_attr(exc, "headers", None), str(_safe_attr(exc, "url", "") or "")
-                ):
-                    return PROBE_GEO_BLOCKED, "位置不支持（地区门禁重定向）"
-                return PROBE_OK, f"HTTP {exc.code}"
-            if 400 <= exc.code < 500:
-                if _headers_or_url_indicate_geo_blocked(_safe_attr(exc, "headers", None)) or _is_geo_blocked(
-                    _read_error_body(exc)
-                ):
-                    return PROBE_GEO_BLOCKED, "位置不支持（地区门禁）"
-                return PROBE_OK, f"HTTP {exc.code}"
-            if attempt == retries:
-                return PROBE_DEAD, f"HTTP {exc.code}"
+            try:
+                if 300 <= exc.code < 400:
+                    if _headers_or_url_indicate_geo_blocked(
+                        _safe_attr(exc, "headers", None), str(_safe_attr(exc, "url", "") or "")
+                    ):
+                        return PROBE_GEO_BLOCKED, "位置不支持（地区门禁重定向）"
+                    return PROBE_OK, f"HTTP {exc.code}"
+                if 400 <= exc.code < 500:
+                    if _headers_or_url_indicate_geo_blocked(
+                        _safe_attr(exc, "headers", None), str(_safe_attr(exc, "url", "") or "")
+                    ) or _is_geo_blocked(_read_error_body(exc)):
+                        return PROBE_GEO_BLOCKED, "位置不支持（地区门禁）"
+                    return PROBE_OK, f"HTTP {exc.code}"
+                if attempt == effective_retries:
+                    return PROBE_DEAD, f"HTTP {exc.code}"
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
             time.sleep(_probe_backoff(attempt))
-        except (URLError, OSError) as exc:
-            if attempt == retries:
+        except (URLError, OSError, http.client.HTTPException) as exc:
+            if attempt == effective_retries:
                 return PROBE_DEAD, _probe_failure_detail(exc)
             time.sleep(_probe_backoff(attempt))
 
@@ -285,12 +340,20 @@ class DiagnosticsService:
         groups = self.api.get_groups()
         group = groups.get(group_name)
         if not group:
+            from .query import QueryService
+
+            match_group = QueryService(self.paths).match_rule_group()
+            aliased = resolve_group_alias(group_name, groups.keys(), match_group=match_group)
+            if aliased:
+                group_name = aliased
+                group = groups.get(group_name)
+        if not group:
             from .switch_tree import suggest_groups_from_names
 
             hint = suggest_groups_from_names(group_name, list(groups.keys()))
             raise SystemExit(f"错误: 未找到代理组或节点: {group_name}\n{hint}")
 
-        url = str(config.get("test-url", DEFAULT_TEST_URL))
+        url = _config_str(config, "test-url", DEFAULT_TEST_URL)
         timeout = _config_int(config, "test-timeout", DEFAULT_TEST_TIMEOUT)
         results: list[DelayCheckResult] = []
         members = group.candidates or [group_name]
@@ -298,8 +361,14 @@ class DiagnosticsService:
         for index, member in enumerate(members, start=1):
             try:
                 payload = self.api.delay_test(str(member), url, timeout)
-                delay = payload.get("delay")
-                results.append(DelayCheckResult(name=str(member), ok=True, delay=int(delay) if delay is not None else None))
+                raw_delay = payload.get("delay") if isinstance(payload, dict) else None
+                delay = (
+                    int(raw_delay)
+                    if raw_delay is not None and not isinstance(raw_delay, bool)
+                    else None
+                )
+                ok = delay is not None and 0 < delay < HEALTH_CHECK_TIMEOUT_MS
+                results.append(DelayCheckResult(name=str(member), ok=ok, delay=delay))
             except Exception:
                 results.append(DelayCheckResult(name=str(member), ok=False, delay=None))
             if on_progress is not None:
@@ -321,21 +390,29 @@ class DiagnosticsService:
         results.append(check_country_mmdb(self.paths))
 
         for url in connectivity_urls:
+            if not _is_valid_http_url(url):
+                results.append(ConnectivityCheckResult(name=url, ok=False, detail="无效的 URL"))
+                continue
             try:
                 with opener.open(url, timeout=timeout) as response:
-                    response.read()
+                    response.read(_MAX_CONNECTIVITY_READ_BYTES)
                 results.append(ConnectivityCheckResult(name=url, ok=True, detail="成功"))
             except Exception:
                 results.append(ConnectivityCheckResult(name=url, ok=False, detail="失败"))
 
         exit_ip: str | None = None
         for url in ip_urls:
+            if not _is_valid_http_url(url):
+                continue
             try:
                 with opener.open(url, timeout=timeout) as response:
-                    value = response.read().decode("utf-8").strip()
+                    value = response.read(_MAX_IP_CHECK_READ_BYTES).decode("utf-8", errors="replace").strip()
                 if value:
-                    exit_ip = value
-                    break
+                    try:
+                        exit_ip = str(ipaddress.ip_address(value))
+                        break
+                    except ValueError:
+                        continue
             except Exception:
                 continue
 

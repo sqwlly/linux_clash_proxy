@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tarfile
+import tempfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,20 +24,41 @@ def build_support_bundle(paths: AppPaths, output_path: Path | None = None) -> Pa
     bundle_path = output_path or paths.state_dir / f"cproxy-support-{created_at.strftime('%Y%m%dT%H%M%SZ')}.tar.gz"
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with tarfile.open(bundle_path, "w:gz") as archive:
-        _add_json(
-            archive,
-            "manifest.json",
-            {
-                "created_at": created_at.isoformat(),
-                "redaction": "keys matching secret/token/password/credential/authorization and URL queries are redacted",
-            },
-        )
-        _add_json(archive, "status.json", get_status(paths).__dict__)
-        _add_yaml_file(archive, "config.redacted.yaml", config_file(paths))
-        _add_yaml_file(archive, "runtime.redacted.yaml", runtime_file(paths))
-        _add_text_file(archive, "audit.redacted.jsonl", audit_log_file(paths), max_lines=1000)
-        _add_text_file(archive, "log.tail.redacted.txt", log_file(paths), max_lines=500)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{bundle_path.name}.", suffix=".tmp", dir=bundle_path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        os.close(fd)
+        fd = -1
+
+        with tarfile.open(tmp_path, "w:gz") as archive:
+            _add_json(
+                archive,
+                "manifest.json",
+                {
+                    "created_at": created_at.isoformat(),
+                    "redaction": "sensitive keys, auth headers, URL userinfo/tokens/queries are redacted",
+                },
+            )
+            try:
+                status_payload: dict[str, Any] = dict(get_status(paths).__dict__)
+            except Exception as exc:
+                status_payload = {"error": redact_text(str(exc))}
+            _add_json(archive, "status.json", status_payload)
+            _add_yaml_file(archive, "config.redacted.yaml", config_file(paths))
+            _add_yaml_file(archive, "runtime.redacted.yaml", runtime_file(paths))
+            _add_text_file(archive, "audit.redacted.jsonl", audit_log_file(paths), max_lines=1000)
+            _add_text_file(archive, "log.tail.redacted.txt", log_file(paths), max_lines=500)
+
+        if os.name != "nt":
+            os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, bundle_path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return bundle_path
 
@@ -48,7 +72,12 @@ def _add_yaml_file(archive: tarfile.TarFile, name: str, path: Path) -> None:
     if not path.exists():
         _add_bytes(archive, name, b"")
         return
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw_text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        data = yaml.safe_load(raw_text) or {}
+    except yaml.YAMLError:
+        _add_bytes(archive, name, redact_text(raw_text).encode("utf-8"))
+        return
     text = yaml.safe_dump(redact_value(data), allow_unicode=True, sort_keys=False)
     _add_bytes(archive, name, text.encode("utf-8"))
 
@@ -57,9 +86,10 @@ def _add_text_file(archive: tarfile.TarFile, name: str, path: Path, max_lines: i
     if not path.exists():
         _add_bytes(archive, name, b"")
         return
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    text = "\n".join(_redact_log_line(line, parse_json=name.endswith(".jsonl")) for line in lines[-max_lines:])
-    text += "\n" if lines else ""
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        tail = [line.rstrip("\r\n") for line in deque(fh, maxlen=max_lines)]
+    text = "\n".join(_redact_log_line(line, parse_json=name.endswith(".jsonl")) for line in tail)
+    text += "\n" if tail else ""
     _add_bytes(archive, name, text.encode("utf-8"))
 
 

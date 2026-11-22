@@ -40,35 +40,69 @@ SWITCH_REGION_LABELS = {
     "OTHER": "其他",
 }
 REGION_PATTERNS: dict[str, tuple[str, ...]] = {
-    "HK": (r"🇭🇰", r"香港", r"Hong\s*Kong", r"\bHKG?\b", r"\bHK\d"),
-    "JP": (r"🇯🇵", r"日本", r"东京", r"東京", r"大阪", r"Japan", r"Tokyo", r"Osaka", r"\bJPN?\b", r"\bJP\d"),
-    "KR": (r"🇰🇷", r"韩国", r"韓國", r"首尔", r"首爾", r"釜山", r"Korea", r"Seoul", r"\bKOR?\b", r"\bKR\b", r"\bKR\d"),
-    "SG": (r"🇸🇬", r"新加坡", r"狮城", r"獅城", r"Singapore", r"\bSGP?\b", r"\bSG\d"),
+    "HK": (
+        r"🇭🇰", r"香港", r"Hong\s*Kong",
+        r"(?<![A-Za-z0-9])HKG?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])HK\d",
+    ),
+    "JP": (
+        r"🇯🇵", r"日本", r"东京", r"東京", r"大阪", r"Japan", r"Tokyo", r"Osaka",
+        r"(?<![A-Za-z0-9])JPN?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])JP\d",
+    ),
+    "KR": (
+        r"🇰🇷", r"韩国", r"韓國", r"首尔", r"首爾", r"釜山", r"Korea", r"Seoul",
+        r"(?<![A-Za-z0-9])KOR?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])KR(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])KR\d",
+    ),
+    "SG": (
+        r"🇸🇬", r"新加坡", r"狮城", r"獅城", r"Singapore",
+        r"(?<![A-Za-z0-9])SGP?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])SG\d",
+    ),
     "TW": (
         r"🇹🇼", r"台湾", r"台灣", r"台北", r"新北", r"彰化", r"高雄",
-        r"Taiwan", r"Taipei", r"Hinet", r"\bTWN?\b", r"\bTW\d",
+        r"Taiwan", r"Taipei", r"Hinet",
+        r"(?<![A-Za-z0-9])TWN?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])TW\d",
     ),
     "US": (
         r"🇺🇸", r"美国", r"美國", r"洛杉矶", r"圣何塞", r"硅谷", r"西雅图", r"纽约", r"芝加哥", r"达拉斯",
         r"United States", r"America", r"Los Angeles", r"San Jose", r"Silicon Valley", r"Seattle",
-        r"\bUSA?\b", r"\bUS\d", r"\bLAX\b", r"\bSJC\b", r"\bSEA\b",
+        r"(?<![A-Za-z0-9])USA?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])US\d",
+        r"(?<![A-Za-z0-9])LAX(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])SJC(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])SEA(?![A-Za-z0-9])",
     ),
     "AU": (
         r"🇦🇺", r"澳大利亚", r"澳洲", r"悉尼", r"雪梨", r"墨尔本",
-        r"Australia", r"Sydney", r"\bAUS?\b", r"\bAU\b", r"\bAU\d",
+        r"Australia", r"Sydney",
+        r"(?<![A-Za-z0-9])AUS?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])AU(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])AU\d",
     ),
-    "BR": (r"🇧🇷", r"巴西", r"圣保罗", r"聖保羅", r"Brazil", r"Sao Paulo", r"\bBRA?\b", r"\bBR\b", r"\bBR\d"),
-    "AE": (r"🇦🇪", r"迪拜", r"杜拜", r"阿联酋", r"阿聯酋", r"Dubai", r"UAE", r"\bAE\b"),
+    "BR": (
+        r"🇧🇷", r"巴西", r"圣保罗", r"聖保羅", r"Brazil", r"Sao Paulo",
+        r"(?<![A-Za-z0-9])BRA?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])BR(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])BR\d",
+    ),
+    "AE": (
+        r"🇦🇪", r"迪拜", r"杜拜", r"阿联酋", r"阿聯酋", r"Dubai", r"UAE",
+        r"(?<![A-Za-z0-9])AE(?![A-Za-z0-9])",
+    ),
     "DE": (
         r"🇩🇪", r"德国", r"德國", r"法兰克福", r"法蘭克福", r"慕尼黑",
-        r"Germany", r"Frankfurt", r"\bDEU?\b", r"\bDE\b", r"\bDE\d",
+        r"Germany", r"Frankfurt",
+        r"(?<![A-Za-z0-9])DEU(?![A-Za-z0-9])",
+        r"(?-i:(?<![A-Za-z0-9])DE(?![A-Za-z0-9]))",
+        r"(?-i:(?<![A-Za-z0-9])DE\d)",
     ),
-    "FR": (r"🇫🇷", r"法国", r"法國", r"巴黎", r"France", r"Paris", r"\bFRA?\b", r"\bFR\b", r"\bFR\d"),
+    "FR": (
+        r"🇫🇷", r"法国", r"法國", r"巴黎", r"France", r"Paris",
+        r"(?<![A-Za-z0-9])FRA?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])FR(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])FR\d",
+    ),
     "GB": (
         r"🇬🇧", r"英国", r"英國", r"伦敦", r"倫敦",
-        r"Britain", r"United Kingdom", r"London", r"England", r"\bUK\b", r"(?<!\d\s)(?<!\d)\bGBR?\b", r"\bGB\d",
+        r"Britain", r"United Kingdom", r"London", r"England",
+        r"(?<![A-Za-z0-9])UK(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])UK\d",
+        r"(?<!\d\s)(?<!\d)(?<![A-Za-z0-9])GBR?(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])GB\d",
     ),
-    "IN": (r"🇮🇳", r"印度", r"孟买", r"India", r"Mumbai", r"\bIND?\b", r"\bIN\d"),
+    "IN": (
+        r"🇮🇳", r"印度", r"孟买", r"India", r"Mumbai",
+        r"(?<![A-Za-z0-9])IND(?![A-Za-z0-9])",
+        r"(?-i:(?<![A-Za-z0-9])IN(?![A-Za-z0-9]))",
+        r"(?-i:(?<![A-Za-z0-9])IN\d)",
+    ),
 }
 
 
@@ -121,6 +155,31 @@ def match_region(proxy_name: str) -> str:
     return "OTHER"
 
 
+def _parse_host_port(hostport: str, uri: str) -> tuple[str, int]:
+    text = hostport.strip()
+    if text.startswith("["):
+        end_bracket = text.find("]")
+        if end_bracket == -1 or end_bracket + 1 >= len(text) or text[end_bracket + 1] != ":":
+            raise ValueError(f"分享链接 IPv6 主机或端口非法: {uri[:48]}")
+        host = text[1:end_bracket].strip()
+        port_str = text[end_bracket + 2 :].strip()
+    else:
+        if ":" not in text:
+            raise ValueError(f"分享链接缺少端口: {uri[:48]}")
+        host, port_str = text.rsplit(":", 1)
+        host = host.strip()
+        port_str = port_str.strip()
+    if not host:
+        raise ValueError(f"分享链接缺少主机: {uri[:48]}")
+    try:
+        port = int(port_str)
+    except ValueError as exc:
+        raise ValueError(f"分享链接端口非法: {uri[:48]}") from exc
+    if not (1 <= port <= 65535):
+        raise ValueError(f"分享链接端口超出范围 (1-65535): {port}")
+    return host, port
+
+
 def _split_share_uri(uri: str) -> tuple[str, str, str, str, str, dict[str, str]]:
     """拆分分享链接为 (scheme, userinfo, host, port, 节点名, params)。"""
     scheme, rest = uri.split("://", 1)
@@ -135,8 +194,8 @@ def _split_share_uri(uri: str) -> tuple[str, str, str, str, str, dict[str, str]]
     if "@" not in rest:
         raise ValueError(f"分享链接缺少用户信息: {uri[:48]}")
     userinfo, hostport = rest.rsplit("@", 1)
-    host, port = hostport.rsplit(":", 1)
-    return scheme, userinfo, host, port, name, dict(parse_qsl(query))
+    host, port = _parse_host_port(hostport, uri)
+    return scheme, userinfo, host, str(port), name, dict(parse_qsl(query))
 
 
 def _parse_vless(uri: str) -> dict:
@@ -265,14 +324,14 @@ def _parse_ss(uri: str) -> dict:
                 userinfo = _b64_decode_text(userinfo)
             except Exception as exc:
                 raise ValueError(f"ss 用户信息解码失败: {uri[:48]}") from exc
-    if ":" not in userinfo or ":" not in hostport:
+    if ":" not in userinfo:
         raise ValueError(f"ss 分享链接格式非法: {uri[:48]}")
     method, password = userinfo.split(":", 1)
-    host, port = hostport.rsplit(":", 1)
+    host, port = _parse_host_port(hostport, uri)
     return {
         "type": "ss",
         "server": host,
-        "port": int(port),
+        "port": port,
         "cipher": method,
         "password": password,
         "udp": True,
@@ -293,17 +352,24 @@ def _parse_vmess(uri: str) -> tuple[str, dict]:
     if not isinstance(payload, dict):
         raise ValueError(f"vmess 负载不是 JSON 对象: {uri[:48]}")
     name = str(payload.get("ps") or fallback_name or "").strip()
-    host = str(payload.get("add") or "").strip()
-    port = int(payload.get("port") or 0)
+    host = str(payload.get("add") or "").strip().strip("[]")
+    try:
+        port = int(payload.get("port") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"vmess 端口非法: {uri[:48]}") from exc
     uuid_ = str(payload.get("id") or "").strip()
-    if not name or not host or port <= 0 or not uuid_:
-        raise ValueError(f"vmess 缺少必填字段: {uri[:48]}")
+    if not name or not host or not (1 <= port <= 65535) or not uuid_:
+        raise ValueError(f"vmess 缺少必填字段或端口非法: {uri[:48]}")
+    try:
+        alter_id = int(payload.get("aid") or 0)
+    except (TypeError, ValueError):
+        alter_id = 0
     proxy: dict = {
         "type": "vmess",
         "server": host,
         "port": port,
         "uuid": uuid_,
-        "alterId": int(payload.get("aid") or 0),
+        "alterId": alter_id,
         "cipher": str(payload.get("scy") or "auto"),
         "udp": True,
     }
@@ -356,45 +422,28 @@ _LINK_PARSERS = {
 def parse_share_link(uri: str) -> tuple[str, dict] | None:
     """解析单条分享链接为 (节点名, mihomo proxy dict)；未知协议返回 None，
     已知协议但格式非法时抛 ValueError。"""
-    scheme = uri.split("://", 1)[0].lower()
+    cleaned = uri.strip()
+    if "://" not in cleaned:
+        return None
+    scheme = cleaned.split("://", 1)[0].lower()
     if scheme == "vmess":
-        return _parse_vmess(uri.strip())
+        return _parse_vmess(cleaned)
     parser = _LINK_PARSERS.get(scheme)
     if parser is None:
         return None
-    proxy = parser(uri.strip())
-    if "#" in uri:
-        name = unquote(uri.strip().split("#", 1)[1]).strip()
+    proxy = parser(cleaned)
+    if "#" in cleaned:
+        name = unquote(cleaned.split("#", 1)[1]).strip()
     else:
         name = ""
     if not name:
-        raise ValueError(f"分享链接缺少节点名: {uri[:48]}")
+        raise ValueError(f"分享链接缺少节点名: {cleaned[:48]}")
     return name, proxy
 
 
-def parse_subscription_payload(raw: bytes) -> dict:
-    """解析订阅响应：优先按 Clash/Mihomo YAML 全量配置，失败后按
-    base64 分享链接列表解码。返回至少含 proxies 列表的 dict。"""
-    text = raw.decode("utf-8", errors="replace").strip()
-    data = None
-    try:
-        loaded = yaml.safe_load(text)
-        if isinstance(loaded, dict):
-            data = loaded
-    except yaml.YAMLError:
-        data = None
-    if isinstance(data, dict) and "proxies" in data:
-        if data.get("proxies"):
-            return data
-        raise ValueError("错误: 订阅配置的 proxies 为空")
-
-    compact = "".join(text.split())
-    try:
-        decoded = base64.b64decode(compact + "=" * (-len(compact) % 4)).decode("utf-8", errors="replace")
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("错误: 订阅内容不是有效的 Clash YAML 或 base64 节点列表") from exc
-    proxies: list = []
-    for line in decoded.splitlines():
+def _parse_share_link_lines(content: str) -> list[dict]:
+    proxies: list[dict] = []
+    for line in content.splitlines():
         line = line.strip()
         if "://" not in line:
             continue
@@ -408,6 +457,42 @@ def parse_subscription_payload(raw: bytes) -> dict:
         name, proxy = parsed
         proxy["name"] = name
         proxies.append(proxy)
+    return proxies
+
+
+def parse_subscription_payload(raw: bytes) -> dict:
+    """解析订阅响应：优先按 Clash/Mihomo YAML 全量配置，失败后按
+    base64 / 纯文本分享链接列表解码。返回至少含 proxies 列表的 dict。"""
+    text = raw.decode("utf-8", errors="replace").strip()
+    data = None
+    try:
+        loaded = yaml.safe_load(text)
+        if isinstance(loaded, dict):
+            data = loaded
+    except yaml.YAMLError:
+        data = None
+    if isinstance(data, dict) and "proxies" in data:
+        proxies_val = data.get("proxies")
+        if not isinstance(proxies_val, list):
+            raise ValueError("错误: 订阅配置的 proxies 不是有效的列表")
+        if proxies_val:
+            return data
+        raise ValueError("错误: 订阅配置的 proxies 为空")
+
+    compact = "".join(text.split())
+    decoded = ""
+    b64_ok = False
+    try:
+        decoded = _b64_decode_text(compact)
+        b64_ok = True
+    except (binascii.Error, ValueError):
+        b64_ok = False
+
+    proxies = _parse_share_link_lines(decoded) if b64_ok else []
     if not proxies:
+        proxies = _parse_share_link_lines(text)
+    if not proxies:
+        if not b64_ok:
+            raise ValueError("错误: 订阅内容不是有效的 Clash YAML 或 base64 节点列表")
         raise ValueError("错误: 订阅内容不是有效的 Clash YAML，且 base64 解码后未找到可用节点")
     return {"proxies": proxies}

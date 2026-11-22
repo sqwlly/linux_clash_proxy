@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -82,10 +85,23 @@ def load_active_bans(paths: AppPaths, *, now: float | None = None) -> list[BanEn
 
 def _save_bans(path: Path, entries: list[BanEntry]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     payload = [entry.to_dict() for entry in entries]
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            if sys.platform != "win32":
+                os.fchmod(fh.fileno(), 0o600)
+            fh.write(data)
+            fh.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def matches_ban_pattern(node_name: str, pattern: str) -> bool:
@@ -95,7 +111,8 @@ def matches_ban_pattern(node_name: str, pattern: str) -> bool:
         return False
     if needle.lower() in node_name.lower():
         return True
-    if normalize_name(needle).lower() in normalize_name(node_name).lower():
+    norm_needle = normalize_name(needle).lower()
+    if norm_needle and norm_needle in normalize_name(node_name).lower():
         return True
     return bool(match_candidates_fuzzy(needle, [node_name]))
 
@@ -132,7 +149,12 @@ def add_ban(
     if not cleaned:
         raise ValueError("错误: 屏蔽模式不能为空")
     current = time.time() if now is None else now
-    expires_at = (current + float(hours) * 3600.0) if (hours is not None and hours > 0) else None
+    expires_at: float | None = None
+    if hours is not None:
+        hours_val = float(hours)
+        if not math.isfinite(hours_val) or hours_val <= 0:
+            raise ValueError("错误: hours 必须为大于 0 的有限数值")
+        expires_at = current + hours_val * 3600.0
     new_entry = BanEntry(
         pattern=cleaned,
         reason=str(reason or "").strip(),
@@ -167,10 +189,11 @@ def remove_ban(
         return []
     removed: list[BanEntry] = []
     kept: list[BanEntry] = []
+    norm_needle = normalize_name(needle).lower()
     for entry in active:
         if (
             entry.pattern.lower() == needle.lower()
-            or normalize_name(entry.pattern).lower() == normalize_name(needle).lower()
+            or (norm_needle and normalize_name(entry.pattern).lower() == norm_needle)
             or matches_ban_pattern(entry.pattern, needle)
         ):
             removed.append(entry)

@@ -775,6 +775,11 @@ def test_refresh_waits_for_api_and_continues_after_unknown_group(tmp_path: Path)
     service.process = _FakeRunningProcess()
     service.query = query
     service.diagnostics = _FakeDiagnostics(check)
+    service._api_factory = lambda _paths: type(
+        "_DownAPI",
+        (),
+        {"reload_config": lambda self, _p: (_ for _ in ()).throw(RuntimeError("api down"))},
+    )()
 
     report = service.refresh(groups=["NOPE", "SSRDOG"])
 
@@ -802,6 +807,11 @@ def test_refresh_raises_when_api_never_ready(tmp_path: Path, monkeypatch):
     service.process = _FakeRunningProcess()
     service.query = _FakeRoutingQuery({}, _FakeAPI(failures_before_ready=10**9))
     service.diagnostics = _FakeDiagnostics(GroupCheckReport(group_name="SSRDOG", results=[]))
+    service._api_factory = lambda _paths: type(
+        "_DownAPI",
+        (),
+        {"reload_config": lambda self, _p: (_ for _ in ()).throw(RuntimeError("api down"))},
+    )()
 
     with pytest.raises(RuntimeError, match="未就绪"):
         service.refresh(groups=["SSRDOG"])

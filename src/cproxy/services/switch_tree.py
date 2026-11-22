@@ -6,11 +6,12 @@ CLI `cproxy switch`、TUI 代理页、人读的 `list-groups` / `list-nodes` 共
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..backend.models import ProxyGroup
 from ..backend.runtime import (
     AI_AUTO_GROUP,
+    AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     AI_REGION_JP,
     AI_REGION_SG,
@@ -45,6 +46,7 @@ AUTO_DISPLAY = {
 }
 ENTRY_DEFAULT = "默认流量"
 ENTRY_AI = "AI 出口"
+ENTRY_GEMINI = "Gemini 出口"
 ENTRY_GLOBAL = "全局"
 DIM_STYLE = "\033[2m"
 REGION_LABEL_VALUES = frozenset(SWITCH_REGION_LABELS.values())
@@ -124,6 +126,8 @@ def display_entry(name: str, match_group: str | None) -> str:
         return ENTRY_DEFAULT
     if name == AI_MANUAL_GROUP:
         return ENTRY_AI
+    if name == AI_GEMINI_GROUP:
+        return ENTRY_GEMINI
     if name == "GLOBAL":
         return ENTRY_GLOBAL
     return name
@@ -152,6 +156,29 @@ def level_title(children: tuple[SwitchChoice, ...] | list[SwitchChoice]) -> str:
     return "选择节点"
 
 
+def _disambiguate_displays(choices: list[SwitchChoice]) -> list[SwitchChoice]:
+    counts: dict[str, int] = {}
+    for choice in choices:
+        counts[choice.display] = counts.get(choice.display, 0) + 1
+    if not any(count > 1 for count in counts.values()):
+        return choices
+    result: list[SwitchChoice] = []
+    used: set[str] = set()
+    for choice in choices:
+        disp = choice.display
+        if counts[disp] > 1:
+            suffix = choice.key if choice.key != disp else "直连节点"
+            candidate = f"{disp} ({suffix})"
+            seq = 2
+            while candidate in used:
+                candidate = f"{disp} ({suffix} #{seq})"
+                seq += 1
+            disp = candidate
+        used.add(disp)
+        result.append(replace(choice, display=disp) if disp != choice.display else choice)
+    return result
+
+
 def build_switch_tree(
     groups: dict[str, ProxyGroup],
     *,
@@ -163,10 +190,11 @@ def build_switch_tree(
     extra = list(extra_names or [])
     delay_map = delays or {}
     selectable = {name for name, group in groups.items() if _is_selectable(group)}
-    # AI-MANUAL 已改为 fallback（故障转移）类型，但仍允许手动指定节点：
-    # mihomo fallback 尊重手动选择直到节点挂。放行以便 switch 树/交互选择继续列出它。
-    if AI_MANUAL_GROUP in groups:
-        selectable.add(AI_MANUAL_GROUP)
+    # AI-MANUAL / AI-GEMINI 已改为 fallback（故障转移）类型，但仍允许手动指定节点：
+    # mihomo fallback 尊重手动选择直到节点挂。放行以便 switch 树/交互选择继续列出它们。
+    for ai_fallback_group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+        if ai_fallback_group in groups:
+            selectable.add(ai_fallback_group)
     skip = _entry_skip_names(extra)
     ordered: list[str] = []
     seen: set[str] = set()
@@ -179,6 +207,7 @@ def build_switch_tree(
 
     add(match_group)
     add(AI_MANUAL_GROUP)
+    add(AI_GEMINI_GROUP)
     for name in extra:
         add(name)
     add("GLOBAL")
@@ -209,7 +238,7 @@ def build_switch_tree(
                 group_name=name,
             )
         )
-    return tuple(entries)
+    return tuple(_disambiguate_displays(entries))
 
 
 def iter_choices(entries: tuple[SwitchChoice, ...] | list[SwitchChoice]):
@@ -273,11 +302,11 @@ def _suggest_group_hints(query: str, entries: tuple[SwitchChoice, ...]) -> str:
     for entry in entries:
         display = entry.display.lower()
         key = entry.key.lower()
-        if needle and needle in display:
+        if needle and (display.startswith(needle) or key.startswith(needle)):
             scored.append((0, entry))
-        elif needle and needle in key:
+        elif needle and needle in display:
             scored.append((1, entry))
-        elif needle and (display.startswith(needle) or key.startswith(needle)):
+        elif needle and needle in key:
             scored.append((2, entry))
         else:
             scored.append((3, entry))
@@ -301,9 +330,9 @@ def suggest_groups_from_names(query: str, names: list[str]) -> str:
     scored: list[tuple[int, str]] = []
     for name in names:
         lower = name.lower()
-        if needle and needle in lower:
+        if needle and lower.startswith(needle):
             scored.append((0, name))
-        elif needle and lower.startswith(needle):
+        elif needle and needle in lower:
             scored.append((1, name))
         else:
             scored.append((2, name))
@@ -317,6 +346,8 @@ def _entry_role(name: str, match_group: str | None) -> str:
         return "决定其余流量"
     if name == AI_MANUAL_GROUP:
         return "决定 AI 出口"
+    if name == AI_GEMINI_GROUP:
+        return "决定 Gemini 出口"
     if name == "GLOBAL":
         return "绕过规则"
     return ""
@@ -349,7 +380,10 @@ def _is_nested_group(name: str, groups: dict[str, ProxyGroup]) -> bool:
 
 
 def _internal_nested_names(nested: list[str], groups: dict[str, ProxyGroup]) -> set[str]:
-    """被同级其它子组引用的组（如 AI-US 挂在 AI-AUTO 下），不在这一层再列一遍。"""
+    """被同级其它子组引用的**非手动**内部池（如 AI-US 挂在 AI-AUTO 下），不在这一层再列一遍。
+
+    绝不隐藏可手动选择的子组，也不在互引用成环（A<->B）时把两边同时隐藏。
+    """
     covered: set[str] = set()
     nested_set = set(nested)
     for name in nested:
@@ -357,8 +391,14 @@ def _internal_nested_names(nested: list[str], groups: dict[str, ProxyGroup]) -> 
         if child is None:
             continue
         for member in child.candidates:
-            if member in nested_set and member != name:
-                covered.add(member)
+            if member not in nested_set or member == name:
+                continue
+            target = groups.get(member)
+            if target is None or _is_selectable(target):
+                continue
+            if name in (target.candidates or []) and name in covered:
+                continue
+            covered.add(member)
     return covered
 
 
@@ -415,7 +455,6 @@ def _children_of(
             leaves.append(cand)
 
     choices: list[SwitchChoice] = []
-    seen_displays: set[str] = set()
     for name in _order_nested(nested, parent_name, groups):
         child = groups[name]
         display = display_child(name, extra_names)
@@ -432,9 +471,9 @@ def _children_of(
                 SwitchChoice(
                     key=name,
                     display=display,
-                    annotation=f"{len(child.candidates)} 个节点",
+                    annotation=f"{len(node_children)} 个节点",
                     annotation_style=DIM_STYLE,
-                    drillable=True,
+                    drillable=bool(node_children),
                     current=(group.current == name),
                     path=((parent_name, name),),
                     children=node_children,
@@ -455,7 +494,6 @@ def _children_of(
                     group_name=parent_name,
                 )
             )
-        seen_displays.add(display)
 
     buckets: dict[str, list[str]] = {}
     for leaf in leaves:
@@ -468,8 +506,6 @@ def _children_of(
             if not members:
                 continue
             label = SWITCH_REGION_LABELS.get(region, region)
-            if label in seen_displays:
-                continue
             current_node = group.current if group.current in members else None
             node_children = _node_choices(
                 parent_name,
@@ -479,11 +515,13 @@ def _children_of(
                 prefix=(),
                 current=current_node,
             )
+            if not node_children:
+                continue
             choices.append(
                 SwitchChoice(
                     key=label,
                     display=label,
-                    annotation=f"{len(members)} 个节点",
+                    annotation=f"{len(node_children)} 个节点",
                     annotation_style=DIM_STYLE,
                     drillable=True,
                     current=(current_node is not None) or (current_region == region),
@@ -492,7 +530,6 @@ def _children_of(
                     group_name=parent_name,
                 )
             )
-            seen_displays.add(label)
     else:
         for leaf in leaves:
             delay = resolve_delay(leaf, groups, delays)
@@ -514,7 +551,7 @@ def _children_of(
         rest = [choice for choice in choices if choice not in auto]
         rest.sort(key=lambda choice: {"日本": 0, "美国": 1, "新加坡": 2}.get(choice.display, 99))
         choices = rest + auto
-    return tuple(choices)
+    return tuple(_disambiguate_displays(choices))
 
 
 def _node_choices(

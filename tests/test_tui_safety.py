@@ -104,7 +104,7 @@ def test_system_proxy_shell_changes_require_confirmation_and_are_reversible(tmp_
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(0.1)
             screen = app.query_one(SystemProxyScreen)
-            status = app.query_one("#proxy-action-status", Label)
+            status = app.query_one("#system-proxy-action-status", Label)
 
             screen._write_shell_config(shell_rc, "127.0.0.1:7890", status)
             assert shell_rc.read_text(encoding="utf-8") == "export KEEP=1\n"
@@ -131,7 +131,7 @@ def test_system_proxy_export_button_does_not_mutate_parent_environment(tmp_path,
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(0.1)
             await pilot.click("#btn-set-all")
-            assert "TUI 无法修改父进程环境" in str(app.query_one("#proxy-action-status", Label).render())
+            assert "TUI 无法修改父进程环境" in str(app.query_one("#system-proxy-action-status", Label).render())
 
     asyncio.run(run_case())
     assert dict(os.environ) == before

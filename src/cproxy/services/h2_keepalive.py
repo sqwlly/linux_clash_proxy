@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import http
+import ipaddress
+import json
 import os
 import re
 import shutil
 import ssl
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 DEFAULT_KEEPALIVE_HOST = "127.0.0.1"
@@ -45,6 +51,9 @@ LEAF_SAN_VERSION = "v2:googleapis+chatgpt+openai"
 CA_COMMON_NAME = "cproxy Local H2 Keepalive CA"
 
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+H2_MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024
+_MAX_H1_TRAILER_BYTES = 65536
+STATS_FLUSH_INTERVAL_SEC = 0.25
 PING_INTERVAL_SEC = 4.5
 H2_PING_INTERVAL_SEC = 25.0
 H2_MAX_PINGS_WITHOUT_DATA = 18
@@ -53,6 +62,11 @@ SSE_DOWNSTREAM_KEEPALIVE_SEC = 45.0
 WS_IDLE_PING_INTERVAL_SEC = 35.0
 WS_PRE_REPLY_TURN_TIMEOUT_SEC = 600.0
 WS_POST_REPLY_TURN_TIMEOUT_SEC = 180.0
+
+_SYSTEM_CA_ANCHOR_PATHS = (
+    Path("/etc/pki/ca-trust/source/anchors/cproxy-h2-ca.crt"),
+    Path("/usr/local/share/ca-certificates/cproxy-h2-ca.crt"),
+)
 
 _WS_TERMINAL_EVENT_MARKERS = (
     b'"response.completed"',
@@ -69,8 +83,31 @@ _SS_BYTES_RCV_RE = re.compile(r"\bbytes_received:(\d+)\b")
 _SS_BYTES_SENT_RE = re.compile(r"\bbytes_sent:(\d+)\b")
 
 
+def _atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            if sys.platform != "win32":
+                os.fchmod(fh.fileno(), mode)
+            fh.write(data)
+            fh.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
+
+
 def is_windows_admin() -> bool:
-    if os.name != "nt":
+    if sys.platform != "win32":
         return False
     try:
         import ctypes
@@ -88,7 +125,7 @@ def _is_posix_root() -> bool:
 def _is_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             import ctypes
             from ctypes import wintypes
@@ -132,7 +169,7 @@ def is_local_ca_trusted(ca_crt: Path) -> bool:
     except Exception:
         return False
 
-    if os.name == "nt" and hasattr(ssl, "enum_certificates"):
+    if sys.platform == "win32" and hasattr(ssl, "enum_certificates"):
         try:
             for der_bytes, encoding_type, _trust in ssl.enum_certificates("ROOT"):
                 if encoding_type == "x509_asn" and der_bytes == target_der:
@@ -141,10 +178,7 @@ def is_local_ca_trusted(ca_crt: Path) -> bool:
             pass
         return False
 
-    for anchor in (
-        Path("/etc/pki/ca-trust/source/anchors/cproxy-h2-ca.crt"),
-        Path("/usr/local/share/ca-certificates/cproxy-h2-ca.crt"),
-    ):
+    for anchor in _SYSTEM_CA_ANCHOR_PATHS:
         try:
             if anchor.is_file() and ssl.PEM_cert_to_DER_cert(anchor.read_text(encoding="utf-8")) == target_der:
                 return True
@@ -168,11 +202,22 @@ def _leaf_cert_needs_renewal(leaf_crt: Path, san_marker: Path) -> bool:
         not_after = getattr(cert, "not_valid_after_utc", None)
         if not_after is None:
             not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
-        if not_after - datetime.now(timezone.utc) < timedelta(days=30):
-            return True
-    except Exception:
+        return (not_after - datetime.now(timezone.utc)) < timedelta(days=30)
+    except ImportError:
         pass
-    return False
+    except Exception:
+        return True
+    try:
+        proc = subprocess.run(
+            ["openssl", "x509", "-checkend", str(30 * 86400), "-noout", "-in", str(leaf_crt)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+        return proc.returncode != 0
+    except Exception:
+        return False
 
 
 def _generate_certs_with_cryptography(
@@ -193,6 +238,7 @@ def _generate_certs_with_cryptography(
         return False
 
     now = datetime.now(timezone.utc)
+    ca_priv: Any
     if need_ca:
         ca_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, CA_COMMON_NAME)])
@@ -224,14 +270,16 @@ def _generate_certs_with_cryptography(
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski), critical=False)
             .sign(private_key=ca_priv, algorithm=hashes.SHA256())
         )
-        ca_key_path.write_bytes(
+        _atomic_write_bytes(
+            ca_key_path,
             ca_priv.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.TraditionalOpenSSL,
                 encryption_algorithm=serialization.NoEncryption(),
-            )
+            ),
+            mode=0o600,
         )
-        ca_crt_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+        _atomic_write_bytes(ca_crt_path, ca_cert.public_bytes(serialization.Encoding.PEM), mode=0o644)
     else:
         ca_priv = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
         ca_cert = x509.load_pem_x509_certificate(ca_crt_path.read_bytes())
@@ -244,7 +292,7 @@ def _generate_certs_with_cryptography(
             ca_ski_ext = ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
             aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski_ext)
         except Exception:
-            aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_priv.public_key())  # type: ignore[arg-type]
+            aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_priv.public_key())
 
         leaf_cert = (
             x509.CertificateBuilder()
@@ -273,17 +321,29 @@ def _generate_certs_with_cryptography(
             .add_extension(x509.SubjectAlternativeName([x509.DNSName(h) for h in LEAF_CERT_SANS]), critical=False)
             .add_extension(leaf_ski, critical=False)
             .add_extension(aki, critical=False)
-            .sign(private_key=ca_priv, algorithm=hashes.SHA256())  # type: ignore[arg-type]
+            .sign(private_key=ca_priv, algorithm=hashes.SHA256())
         )
-        leaf_key_path.write_bytes(
+        _atomic_write_bytes(
+            leaf_key_path,
             leaf_priv.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.TraditionalOpenSSL,
                 encryption_algorithm=serialization.NoEncryption(),
-            )
+            ),
+            mode=0o600,
         )
-        leaf_crt_path.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
+        _atomic_write_bytes(leaf_crt_path, leaf_cert.public_bytes(serialization.Encoding.PEM), mode=0o644)
     return True
+
+
+def _make_temp_file(parent: Path, prefix: str, suffix: str, *, mode: int = 0o600) -> Path:
+    fd, tmp_name = tempfile.mkstemp(dir=parent, prefix=prefix, suffix=suffix)
+    try:
+        if sys.platform != "win32":
+            os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+    return Path(tmp_name)
 
 
 def _generate_certs_with_openssl(
@@ -297,81 +357,110 @@ def _generate_certs_with_openssl(
     need_leaf: bool,
 ) -> None:
     if need_ca:
-        subprocess.run(
-            [
-                "openssl",
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                str(ca_key_path),
-                "-out",
-                str(ca_crt_path),
-                "-days",
-                "3650",
-                "-subj",
-                f"/CN={CA_COMMON_NAME}",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        tmp_ca_key = _make_temp_file(tls_dir, ".cproxy-h2-ca.key.", ".tmp", mode=0o600)
+        tmp_ca_crt = _make_temp_file(tls_dir, ".cproxy-h2-ca.crt.", ".tmp", mode=0o644)
+        try:
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(tmp_ca_key),
+                    "-out",
+                    str(tmp_ca_crt),
+                    "-days",
+                    "3650",
+                    "-subj",
+                    f"/CN={CA_COMMON_NAME}",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if sys.platform != "win32":
+                os.chmod(tmp_ca_key, 0o600)
+                os.chmod(tmp_ca_crt, 0o644)
+            os.replace(tmp_ca_key, ca_key_path)
+            os.replace(tmp_ca_crt, ca_crt_path)
+        except BaseException:
+            for p in (tmp_ca_key, tmp_ca_crt):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
 
     if need_leaf:
-        csr_path = tls_dir / "cloudcode.csr"
-        ext_path = tls_dir / "cloudcode.ext"
-        san_csv = ",".join(f"DNS:{h}" for h in LEAF_CERT_SANS)
-        ext_path.write_text(
-            "authorityKeyIdentifier=keyid,issuer\n"
-            "basicConstraints=critical,CA:FALSE\n"
-            "keyUsage = critical, digitalSignature, keyEncipherment\n"
-            "extendedKeyUsage = serverAuth\n"
-            f"subjectAltName = {san_csv}\n",
-            encoding="utf-8",
-        )
-        subprocess.run(
-            [
-                "openssl",
-                "req",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                str(leaf_key_path),
-                "-out",
-                str(csr_path),
-                "-subj",
-                f"/CN={CLOUDCODE_HOST}",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            [
-                "openssl",
-                "x509",
-                "-req",
-                "-in",
-                str(csr_path),
-                "-CA",
-                str(ca_crt_path),
-                "-CAkey",
-                str(ca_key_path),
-                "-CAcreateserial",
-                "-out",
-                str(leaf_crt_path),
-                "-days",
-                "365",
-                "-extfile",
-                str(ext_path),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        tmp_csr = _make_temp_file(tls_dir, ".cloudcode.csr.", ".tmp", mode=0o600)
+        tmp_ext = _make_temp_file(tls_dir, ".cloudcode.ext.", ".tmp", mode=0o600)
+        tmp_leaf_key = _make_temp_file(tls_dir, ".cloudcode.key.", ".tmp", mode=0o600)
+        tmp_leaf_crt = _make_temp_file(tls_dir, ".cloudcode.crt.", ".tmp", mode=0o644)
+        try:
+            san_csv = ",".join(f"DNS:{h}" for h in LEAF_CERT_SANS)
+            tmp_ext.write_text(
+                "authorityKeyIdentifier=keyid,issuer\n"
+                "basicConstraints=critical,CA:FALSE\n"
+                "keyUsage = critical, digitalSignature, keyEncipherment\n"
+                "extendedKeyUsage = serverAuth\n"
+                f"subjectAltName = {san_csv}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(tmp_leaf_key),
+                    "-out",
+                    str(tmp_csr),
+                    "-subj",
+                    f"/CN={CLOUDCODE_HOST}",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-req",
+                    "-in",
+                    str(tmp_csr),
+                    "-CA",
+                    str(ca_crt_path),
+                    "-CAkey",
+                    str(ca_key_path),
+                    "-CAcreateserial",
+                    "-out",
+                    str(tmp_leaf_crt),
+                    "-days",
+                    "365",
+                    "-extfile",
+                    str(tmp_ext),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if sys.platform != "win32":
+                os.chmod(tmp_leaf_key, 0o600)
+                os.chmod(tmp_leaf_crt, 0o644)
+            os.replace(tmp_leaf_key, leaf_key_path)
+            os.replace(tmp_leaf_crt, leaf_crt_path)
+        finally:
+            for p in (tmp_csr, tmp_ext, tmp_leaf_key, tmp_leaf_crt):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _install_system_ca_trust(
@@ -380,10 +469,10 @@ def _install_system_ca_trust(
     *,
     allow_user_prompt: bool = False,
 ) -> None:
-    if os.name == "nt":
+    if sys.platform == "win32":
         if is_local_ca_trusted(ca_crt):
             if not trust_marker.exists():
-                trust_marker.write_text(str(time.time()), encoding="utf-8")
+                _atomic_write_text(trust_marker, str(time.time()), mode=0o600)
             return
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if is_windows_admin():
@@ -405,7 +494,7 @@ def _install_system_ca_trust(
                 creationflags=creationflags,
             )
         if is_local_ca_trusted(ca_crt):
-            trust_marker.write_text(str(time.time()), encoding="utf-8")
+            _atomic_write_text(trust_marker, str(time.time()), mode=0o600)
         return
 
     if not _is_posix_root():
@@ -424,9 +513,9 @@ def _install_system_ca_trust(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            trust_marker.write_text(str(time.time()), encoding="utf-8")
+            _atomic_write_text(trust_marker, str(time.time()), mode=0o600)
         elif not trust_marker.exists():
-            trust_marker.write_text(str(anchor_file.stat().st_mtime), encoding="utf-8")
+            _atomic_write_text(trust_marker, str(anchor_file.stat().st_mtime), mode=0o600)
     elif deb_dir.is_dir():
         anchor_file = deb_dir / "cproxy-h2-ca.crt"
         need_update = not anchor_file.exists() or anchor_file.read_bytes() != ca_crt.read_bytes()
@@ -438,9 +527,9 @@ def _install_system_ca_trust(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            trust_marker.write_text(str(time.time()), encoding="utf-8")
+            _atomic_write_text(trust_marker, str(time.time()), mode=0o600)
         elif not trust_marker.exists():
-            trust_marker.write_text(str(anchor_file.stat().st_mtime), encoding="utf-8")
+            _atomic_write_text(trust_marker, str(anchor_file.stat().st_mtime), mode=0o600)
 
 
 def ensure_local_ca_and_leaf_cert(
@@ -453,7 +542,12 @@ def ensure_local_ca_and_leaf_cert(
 
     返回 `(ca_cert_path, leaf_cert_path, leaf_key_path, trust_installed_mtime)`。
     """
-    tls_dir.mkdir(parents=True, exist_ok=True)
+    tls_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        try:
+            os.chmod(tls_dir, 0o700)
+        except OSError:
+            pass
     ca_key = tls_dir / "cproxy-h2-ca.key"
     ca_crt = tls_dir / "cproxy-h2-ca.crt"
     leaf_key = tls_dir / "cloudcode.key"
@@ -483,14 +577,22 @@ def ensure_local_ca_and_leaf_cert(
                 need_ca=need_ca,
                 need_leaf=need_leaf,
             )
-        san_marker.write_text(f"{LEAF_SAN_VERSION}\n", encoding="utf-8")
+        _atomic_write_text(san_marker, f"{LEAF_SAN_VERSION}\n", mode=0o644)
+
+    if sys.platform != "win32":
+        for key_path in (ca_key, leaf_key):
+            if key_path.exists():
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
 
     if install_system_trust:
         _install_system_ca_trust(ca_crt, trust_marker, allow_user_prompt=allow_user_prompt)
 
-    anchor_file = Path("/etc/pki/ca-trust/source/anchors/cproxy-h2-ca.crt")
+    anchor_file = next((p for p in _SYSTEM_CA_ANCHOR_PATHS if p.exists()), None)
 
-    if anchor_file.exists():
+    if anchor_file is not None:
         trust_mtime = anchor_file.stat().st_mtime
     elif trust_marker.exists():
         try:
@@ -525,7 +627,7 @@ def client_prefers_passthrough(
     系统根证书池；对于 CA 安装前已启动的旧 `agy` 进程，自动走透明 TCP 直通避免报证书未知错误，
     而新启动的 `agy` 进程（或显式配置了 `SSL_CERT_FILE` 的进程）自动启用 TLS 终结与 H2 PING 保活。
     """
-    if os.name == "nt":
+    if sys.platform == "win32":
         return False
     try:
         proc = subprocess.run(
@@ -571,10 +673,12 @@ def client_prefers_passthrough(
 
 
 async def _pipe_raw(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    eof_reached = False
     try:
         while True:
             chunk = await reader.read(65536)
             if not chunk:
+                eof_reached = True
                 break
             writer.write(chunk)
             await writer.drain()
@@ -582,7 +686,10 @@ async def _pipe_raw(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) 
         pass
     finally:
         try:
-            writer.close()
+            if eof_reached and writer.can_write_eof():
+                writer.write_eof()
+            else:
+                writer.close()
         except Exception:
             pass
 
@@ -599,6 +706,12 @@ _KEEPALIVE_STAT_INT_FIELDS = (
 )
 _KEEPALIVE_GAUGE_FIELDS = frozenset({"active_sessions", "active_passthrough"})
 
+_STATS_LOCK = threading.Lock()
+_STATS_PENDING_DELTAS: dict[Path, dict[str, int]] = {}
+_STATS_PENDING_OVERRIDES: dict[Path, dict[str, int]] = {}
+_STATS_LAST_FLUSH: dict[Path, float] = {}
+_STATS_FLUSH_TASKS: dict[Path, asyncio.Task[None]] = {}
+
 
 def h2_keepalive_stats_file(state_dir: Path) -> Path:
     return state_dir / "h2-keepalive-stats.json"
@@ -611,8 +724,6 @@ def _default_keepalive_stats() -> dict[str, int | float]:
 
 
 def load_h2_keepalive_stats(state_dir: Path) -> dict[str, int | float]:
-    import json
-
     path = h2_keepalive_stats_file(state_dir)
     if not path.exists():
         return _default_keepalive_stats()
@@ -631,6 +742,55 @@ def load_h2_keepalive_stats(state_dir: Path) -> dict[str, int | float]:
     return _default_keepalive_stats()
 
 
+def _queue_h2_keepalive_stats(
+    stats_path: Path,
+    *,
+    deltas: dict[str, int] | None = None,
+    overrides: dict[str, int] | None = None,
+) -> None:
+    resolved = stats_path.resolve()
+    with _STATS_LOCK:
+        if overrides:
+            ov_map = _STATS_PENDING_OVERRIDES.setdefault(resolved, {})
+            d_map = _STATS_PENDING_DELTAS.get(resolved)
+            for field_name, val in overrides.items():
+                ov_map[field_name] = max(0, int(val)) if field_name in _KEEPALIVE_GAUGE_FIELDS else int(val)
+                if d_map is not None:
+                    d_map.pop(field_name, None)
+        if deltas:
+            cur_ov = _STATS_PENDING_OVERRIDES.get(resolved)
+            d_map = _STATS_PENDING_DELTAS.setdefault(resolved, {})
+            for field_name, delta in deltas.items():
+                if cur_ov is not None and field_name in cur_ov:
+                    nxt = cur_ov[field_name] + int(delta)
+                    cur_ov[field_name] = max(0, nxt) if field_name in _KEEPALIVE_GAUGE_FIELDS else nxt
+                else:
+                    d_map[field_name] = d_map.get(field_name, 0) + int(delta)
+
+
+def _flush_h2_keepalive_stats_sync(stats_path: Path) -> None:
+    resolved = stats_path.resolve()
+    with _STATS_LOCK:
+        deltas = _STATS_PENDING_DELTAS.pop(resolved, None)
+        overrides = _STATS_PENDING_OVERRIDES.pop(resolved, None)
+        if not deltas and not overrides:
+            return
+        try:
+            cur = load_h2_keepalive_stats(stats_path.parent)
+            if overrides:
+                for field_name, val in overrides.items():
+                    cur[field_name] = max(0, int(val)) if field_name in _KEEPALIVE_GAUGE_FIELDS else int(val)
+            if deltas:
+                for field_name, delta in deltas.items():
+                    val = int(cur.get(field_name) or 0) + int(delta)
+                    cur[field_name] = max(0, val) if field_name in _KEEPALIVE_GAUGE_FIELDS else val
+            cur["updated_at"] = time.time()
+            _atomic_write_text(stats_path, json.dumps(cur, ensure_ascii=False), mode=0o600)
+            _STATS_LAST_FLUSH[resolved] = time.monotonic()
+        except Exception:
+            pass
+
+
 def _update_h2_keepalive_stats(
     stats_path: Path | None,
     *,
@@ -640,27 +800,85 @@ def _update_h2_keepalive_stats(
     if stats_path is None:
         return
     try:
-        import json
-
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
-        cur = load_h2_keepalive_stats(stats_path.parent)
-        if deltas:
-            for field, delta in deltas.items():
-                val = int(cur.get(field) or 0) + int(delta)
-                cur[field] = max(0, val) if field in _KEEPALIVE_GAUGE_FIELDS else val
-        if overrides:
-            for field, val in overrides.items():
-                cur[field] = max(0, int(val)) if field in _KEEPALIVE_GAUGE_FIELDS else int(val)
-        cur["updated_at"] = time.time()
-        tmp = stats_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, stats_path)
+        _queue_h2_keepalive_stats(stats_path, deltas=deltas, overrides=overrides)
+        _flush_h2_keepalive_stats_sync(stats_path)
     except Exception:
         pass
 
 
 def _record_h2_keepalive_stat(stats_path: Path | None, field: str, delta: int = 1) -> None:
     _update_h2_keepalive_stats(stats_path, deltas={field: delta})
+
+
+async def _update_h2_keepalive_stats_async(
+    stats_path: Path | None,
+    *,
+    deltas: dict[str, int] | None = None,
+    overrides: dict[str, int] | None = None,
+) -> None:
+    if stats_path is None:
+        return
+    _queue_h2_keepalive_stats(stats_path, deltas=deltas, overrides=overrides)
+    try:
+        await asyncio.to_thread(_flush_h2_keepalive_stats_sync, stats_path)
+    except Exception:
+        pass
+
+
+def _schedule_h2_keepalive_stats_flush(
+    stats_path: Path | None,
+    *,
+    deltas: dict[str, int] | None = None,
+    overrides: dict[str, int] | None = None,
+) -> None:
+    if stats_path is None:
+        return
+    _queue_h2_keepalive_stats(stats_path, deltas=deltas, overrides=overrides)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _flush_h2_keepalive_stats_sync(stats_path)
+        return
+    resolved = stats_path.resolve()
+    existing = _STATS_FLUSH_TASKS.get(resolved)
+    if existing is not None and not existing.done() and existing.get_loop() is loop:
+        return
+
+    async def _deferred_flush() -> None:
+        try:
+            with _STATS_LOCK:
+                last_ts = _STATS_LAST_FLUSH.get(resolved, 0.0)
+            wait_sec = max(0.0, STATS_FLUSH_INTERVAL_SEC - (time.monotonic() - last_ts))
+            if wait_sec > 0:
+                await asyncio.sleep(wait_sec)
+            await asyncio.to_thread(_flush_h2_keepalive_stats_sync, stats_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            if _STATS_FLUSH_TASKS.get(resolved) is asyncio.current_task():
+                _STATS_FLUSH_TASKS.pop(resolved, None)
+
+    _STATS_FLUSH_TASKS[resolved] = loop.create_task(_deferred_flush())
+
+
+async def _flush_pending_stats_on_exit(stats_path: Path | None) -> None:
+    if stats_path is None:
+        return
+    resolved = stats_path.resolve()
+    task = _STATS_FLUSH_TASKS.pop(resolved, None)
+    if task is not None and not task.done():
+        try:
+            if task.get_loop() is asyncio.get_running_loop():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        except Exception:
+            pass
+    try:
+        await asyncio.to_thread(_flush_h2_keepalive_stats_sync, stats_path)
+    except Exception:
+        pass
 
 
 async def _forward_h2_frames_with_ping(
@@ -681,7 +899,7 @@ async def _forward_h2_frames_with_ping(
         raise ValueError("Invalid HTTP/2 client preface")
     upstream_w.write(preface)
     await upstream_w.drain()
-    _record_h2_keepalive_stat(stats_path, "h2_sessions", 1)
+    await _update_h2_keepalive_stats_async(stats_path, deltas={"h2_sessions": 1})
 
     upstream_lock = asyncio.Lock()
     client_lock = asyncio.Lock()
@@ -698,6 +916,8 @@ async def _forward_h2_frames_with_ping(
             while True:
                 hdr = await client_r.readexactly(9)
                 length = int.from_bytes(hdr[0:3], "big")
+                if length > H2_MAX_FRAME_PAYLOAD_BYTES:
+                    raise ValueError(f"HTTP/2 client frame payload {length} exceeds limit")
                 ftype = hdr[3]
                 stream_id = int.from_bytes(hdr[5:9], "big") & 0x7FFFFFFF
                 payload = await client_r.readexactly(length) if length else b""
@@ -722,6 +942,8 @@ async def _forward_h2_frames_with_ping(
             while True:
                 hdr = await upstream_r.readexactly(9)
                 length = int.from_bytes(hdr[0:3], "big")
+                if length > H2_MAX_FRAME_PAYLOAD_BYTES:
+                    raise ValueError(f"HTTP/2 upstream frame payload {length} exceeds limit")
                 ftype = hdr[3]
                 flags = hdr[4]
                 stream_id = int.from_bytes(hdr[5:9], "big") & 0x7FFFFFFF
@@ -773,27 +995,29 @@ async def _forward_h2_frames_with_ping(
                             state["pings_without_data"] = int(state["pings_without_data"]) + 1
                             sent_ping = True
                     if sent_ping:
-                        _record_h2_keepalive_stat(stats_path, "pings_sent", 1)
+                        _schedule_h2_keepalive_stats_flush(stats_path, deltas={"pings_sent": 1})
         except Exception:
             pass
 
-    io_tasks = [
-        asyncio.create_task(c2u()),
-        asyncio.create_task(u2c()),
-    ]
+    c2u_task = asyncio.create_task(c2u())
+    u2c_task = asyncio.create_task(u2c())
     pinger_task = asyncio.create_task(pinger())
+    all_tasks = (c2u_task, u2c_task, pinger_task)
     try:
-        done, pending = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait(
+            (c2u_task, u2c_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         for t in done:
             if not t.cancelled():
                 t.exception()
-        for t in pending:
-            t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
     finally:
-        pinger_task.cancel()
-        await asyncio.gather(pinger_task, return_exceptions=True)
+        state["closed"] = True
+        for t in all_tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await _flush_pending_stats_on_exit(stats_path)
 
 
 def build_ws_masked_ping(payload: bytes, mask_key: bytes | None = None) -> bytes:
@@ -837,7 +1061,7 @@ async def _forward_ws_frames_with_ping(
     并在模型长思考/上下文压缩静默期按 `ping_interval` (4.5s) 注入掩码 Ping 控制帧，在轮次间空闲期按
     `idle_ping_interval` (35s) 维持长连接存活，同时吸收对应的 `cproxy*` Pong 帧，彻底消除 80s connIdle 10054 断流。
     """
-    _record_h2_keepalive_stat(stats_path, "ws_sessions", 1)
+    await _update_h2_keepalive_stats_async(stats_path, deltas={"ws_sessions": 1})
     upstream_lock = asyncio.Lock()
     client_lock = asyncio.Lock()
     now0 = time.monotonic()
@@ -977,23 +1201,31 @@ async def _forward_ws_frames_with_ping(
                         upstream_w.write(ping_frame)
                         await upstream_w.drain()
                     state["last_io"] = time.monotonic()
-                    _update_h2_keepalive_stats(stats_path, deltas={"pings_sent": 1, "ws_pings_sent": 1})
+                    _schedule_h2_keepalive_stats_flush(
+                        stats_path, deltas={"pings_sent": 1, "ws_pings_sent": 1}
+                    )
         except Exception:
             pass
 
-    tasks = [
-        asyncio.create_task(c2u()),
-        asyncio.create_task(u2c()),
-        asyncio.create_task(pinger()),
-    ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for t in done:
-        if not t.cancelled():
-            t.exception()
-    for t in pending:
-        t.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    c2u_task = asyncio.create_task(c2u())
+    u2c_task = asyncio.create_task(u2c())
+    pinger_task = asyncio.create_task(pinger())
+    all_tasks = (c2u_task, u2c_task, pinger_task)
+    try:
+        done, _pending = await asyncio.wait(
+            (c2u_task, u2c_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in done:
+            if not t.cancelled():
+                t.exception()
+    finally:
+        state["closed"] = True
+        for t in all_tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await _flush_pending_stats_on_exit(stats_path)
 
 
 async def _forward_http1_or_ws_with_ping(
@@ -1013,12 +1245,12 @@ async def _forward_http1_or_ws_with_ping(
         req_hdr = await asyncio.wait_for(client_r.readuntil(b"\r\n\r\n"), timeout=30.0)
     except asyncio.IncompleteReadError as exc:
         if exc.partial:
-            _record_h2_keepalive_stat(stats_path, "http1_sessions", 1)
+            await _update_h2_keepalive_stats_async(stats_path, deltas={"http1_sessions": 1})
             upstream_w.write(exc.partial)
             await upstream_w.drain()
         return
     except asyncio.LimitOverrunError:
-        _record_h2_keepalive_stat(stats_path, "http1_sessions", 1)
+        await _update_h2_keepalive_stats_async(stats_path, deltas={"http1_sessions": 1})
         await asyncio.gather(
             _pipe_raw(client_r, upstream_w),
             _pipe_raw(upstream_r, client_w),
@@ -1035,7 +1267,7 @@ async def _forward_http1_or_ws_with_ping(
     await upstream_w.drain()
 
     if not _is_websocket_upgrade_request(req_hdr):
-        _record_h2_keepalive_stat(stats_path, "http1_sessions", 1)
+        await _update_h2_keepalive_stats_async(stats_path, deltas={"http1_sessions": 1})
         await asyncio.gather(
             _pipe_raw(client_r, upstream_w),
             _pipe_raw(upstream_r, client_w),
@@ -1046,12 +1278,12 @@ async def _forward_http1_or_ws_with_ping(
         resp_hdr = await asyncio.wait_for(upstream_r.readuntil(b"\r\n\r\n"), timeout=60.0)
     except asyncio.IncompleteReadError as exc:
         if exc.partial:
-            _record_h2_keepalive_stat(stats_path, "http1_sessions", 1)
+            await _update_h2_keepalive_stats_async(stats_path, deltas={"http1_sessions": 1})
             client_w.write(exc.partial)
             await client_w.drain()
         return
     except (asyncio.LimitOverrunError, TimeoutError):
-        _record_h2_keepalive_stat(stats_path, "http1_sessions", 1)
+        await _update_h2_keepalive_stats_async(stats_path, deltas={"http1_sessions": 1})
         await asyncio.gather(
             _pipe_raw(client_r, upstream_w),
             _pipe_raw(upstream_r, client_w),
@@ -1072,7 +1304,7 @@ async def _forward_http1_or_ws_with_ping(
             stats_path=stats_path,
         )
     else:
-        _record_h2_keepalive_stat(stats_path, "http1_sessions", 1)
+        await _update_h2_keepalive_stats_async(stats_path, deltas={"http1_sessions": 1})
         await asyncio.gather(
             _pipe_raw(client_r, upstream_w),
             _pipe_raw(upstream_r, client_w),
@@ -1148,6 +1380,7 @@ class _H1H2StreamContext:
     tail_bytes: bytes = b""
     last_client_io: float = 0.0
     trailers: list[tuple[bytes, bytes]] = field(default_factory=list)
+    trailer_bytes: int = 0
 
 
 async def _bridge_http1_client_to_h2_upstream(
@@ -1214,7 +1447,7 @@ async def _bridge_http1_client_to_h2_upstream(
     if init_bytes:
         upstream_w.write(init_bytes)
         await upstream_w.drain()
-    _record_h2_keepalive_stat(stats_path, "h2_sessions", 1)
+    await _update_h2_keepalive_stats_async(stats_path, deltas={"h2_sessions": 1})
 
     h2_lock = asyncio.Lock()
     client_lock = asyncio.Lock()
@@ -1289,10 +1522,14 @@ async def _bridge_http1_client_to_h2_upstream(
                         prev_k, prev_v = parsed_headers[-1]
                         parsed_headers[-1] = (prev_k, prev_v + b" " + line.strip())
                         continue
+                    if line.lstrip().startswith(b":"):
+                        raise ValueError("Pseudo-header forbidden in HTTP/1.1 request")
                     if b":" not in line:
                         continue
                     k_raw, v_raw = line.split(b":", 1)
                     k_lc = k_raw.strip().lower()
+                    if k_lc.startswith(b":"):
+                        raise ValueError("Pseudo-header forbidden in HTTP/1.1 request")
                     if k_lc:
                         parsed_headers.append((k_lc, v_raw.strip()))
 
@@ -1311,8 +1548,18 @@ async def _bridge_http1_client_to_h2_upstream(
                     elif k_lc == b"transfer-encoding":
                         if b"chunked" in v_val.lower():
                             req_chunked = True
-                    elif k_lc == b"content-length" and req_content_length is None:
-                        req_content_length = max(0, int(v_val))
+                    elif k_lc == b"content-length":
+                        cl_parts = [p.strip() for p in v_val.split(b",")]
+                        if not cl_parts or any(not p or not p.isdigit() for p in cl_parts):
+                            raise ValueError("Invalid Content-Length header")
+                        for p in cl_parts:
+                            parsed_cl = int(p)
+                            if req_content_length is not None and req_content_length != parsed_cl:
+                                raise ValueError("Conflicting duplicate Content-Length headers")
+                            req_content_length = parsed_cl
+
+                if req_chunked:
+                    req_content_length = None
 
                 client_close = (b"close" in conn_tokens) or (
                     http_ver == b"HTTP/1.0" and b"keep-alive" not in conn_tokens
@@ -1343,10 +1590,18 @@ async def _bridge_http1_client_to_h2_upstream(
                     (b":path", path),
                 ]
                 te_trailers_added = False
+                cl_added = False
                 for k_lc, v_val in parsed_headers:
                     if k_lc == b"host" or k_lc.startswith(b":"):
                         continue
                     if k_lc in _H1_HOP_BY_HOP_HEADERS or k_lc in extra_hop:
+                        continue
+                    if k_lc == b"content-length":
+                        if req_chunked:
+                            continue
+                        if not cl_added and req_content_length is not None:
+                            h2_headers.append((b"content-length", str(req_content_length).encode("ascii")))
+                            cl_added = True
                         continue
                     if k_lc == b"te":
                         te_parts = [p.strip().lower() for p in v_val.split(b",")]
@@ -1383,16 +1638,28 @@ async def _bridge_http1_client_to_h2_upstream(
                         if not size_line:
                             raise EOFError("Unexpected EOF in chunked request body")
                         size_hex = size_line.split(b";", 1)[0].strip()
+                        if not size_hex or any(b not in b"0123456789abcdefABCDEF" for b in size_hex):
+                            raise ValueError("Invalid chunk size in HTTP/1.1 request")
                         chunk_len = int(size_hex, 16)
+                        if chunk_len < 0:
+                            raise ValueError("Negative chunk size in HTTP/1.1 request")
                         if chunk_len == 0:
                             req_trailers: list[tuple[bytes, bytes]] = []
+                            req_trailer_bytes = 0
                             while True:
                                 tr_line = await client_r.readline()
                                 if not tr_line or tr_line in (b"\r\n", b"\n"):
                                     break
+                                req_trailer_bytes += len(tr_line)
+                                if req_trailer_bytes > _MAX_H1_TRAILER_BYTES:
+                                    raise ValueError("HTTP/1.1 chunked trailers exceed size limit")
+                                if tr_line.lstrip().startswith(b":"):
+                                    raise ValueError("Pseudo-header forbidden in HTTP/1.1 trailers")
                                 if b":" in tr_line:
                                     tk, tv = tr_line.split(b":", 1)
                                     tk_lc = tk.strip().lower()
+                                    if tk_lc.startswith(b":"):
+                                        raise ValueError("Pseudo-header forbidden in HTTP/1.1 trailers")
                                     if tk_lc and tk_lc not in _H1_HOP_BY_HOP_HEADERS:
                                         req_trailers.append((tk_lc, tv.strip()))
                             st.req_body_complete = True
@@ -1459,6 +1726,9 @@ async def _bridge_http1_client_to_h2_upstream(
                             conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
                         elif isinstance(ev, (WindowUpdated, RemoteSettingsChanged)):
                             wake_flow = True
+                        elif isinstance(ev, ConnectionTerminated):
+                            state["goaway"] = True
+                            wake_flow = True
                     out = conn.data_to_send()
                     if out:
                         upstream_w.write(out)
@@ -1500,6 +1770,7 @@ async def _bridge_http1_client_to_h2_upstream(
                         resp_hdrs: list[bytes] = []
                         cl_val: int | None = None
                         is_event_stream = False
+                        content_encodings: list[bytes] = []
                         for hk, hv in ev.headers:
                             hk_lc = hk.lower()
                             if hk == b":status":
@@ -1509,6 +1780,11 @@ async def _bridge_http1_client_to_h2_upstream(
                             else:
                                 if hk_lc == b"content-type" and b"text/event-stream" in hv.lower():
                                     is_event_stream = True
+                                if hk_lc == b"content-encoding":
+                                    for enc in hv.split(b","):
+                                        enc_lc = enc.strip().lower()
+                                        if enc_lc:
+                                            content_encodings.append(enc_lc)
                                 if hk_lc == b"content-length" and cl_val is None:
                                     try:
                                         cl_val = max(0, int(hv.strip()))
@@ -1534,7 +1810,8 @@ async def _bridge_http1_client_to_h2_upstream(
                             st.expected_length = None
                             resp_hdrs.append(b"Transfer-Encoding: chunked")
 
-                        st.is_sse = status_int == 200 and is_event_stream and st.use_chunked
+                        is_unencoded_sse = not content_encodings or all(enc == b"identity" for enc in content_encodings)
+                        st.is_sse = status_int == 200 and is_event_stream and st.use_chunked and is_unencoded_sse
                         resp_hdrs.append(b"Connection: close" if st.client_close else b"Connection: keep-alive")
                         phrase = _http_status_phrase(status_b)
                         block = (
@@ -1575,8 +1852,13 @@ async def _bridge_http1_client_to_h2_upstream(
                         st = active_streams.get(ev.stream_id)
                         if st is not None:
                             for hk, hv in ev.headers:
-                                if not hk.startswith(b":") and hk.lower() not in _H1_HOP_BY_HOP_HEADERS:
-                                    st.trailers.append((hk, hv))
+                                if hk.startswith(b":") or hk.lower() in _H1_HOP_BY_HOP_HEADERS:
+                                    continue
+                                entry_size = len(hk) + len(hv) + 4
+                                if st.trailer_bytes + entry_size > _MAX_H1_TRAILER_BYTES:
+                                    break
+                                st.trailer_bytes += entry_size
+                                st.trailers.append((hk, hv))
 
                     elif isinstance(ev, PingAckReceived):
                         if sse_keepalive_interval > 0 and ev.ping_data.startswith(b"cproxy"):
@@ -1640,17 +1922,20 @@ async def _bridge_http1_client_to_h2_upstream(
                         return
 
                     elif isinstance(ev, ConnectionTerminated):
-                        state["goaway"] = True
+                        async with h2_lock:
+                            state["goaway"] = True
                         flow_event.set()
-                        if int(ev.error_code) != 0:
+                        err_code = int(ev.error_code) if ev.error_code is not None else 0
+                        if err_code != 0:
                             for sid in list(active_streams):
                                 rst_st = active_streams.pop(sid, None)
                                 if rst_st is not None and not rst_st.done_fut.done():
                                     rst_st.done_fut.set_result(False)
                             state["closed"] = True
                             return
+                        last_sid = int(ev.last_stream_id) if ev.last_stream_id is not None else 0
                         rejected = [
-                            sid for sid in list(active_streams) if sid > int(ev.last_stream_id)
+                            sid for sid in list(active_streams) if sid > last_sid
                         ]
                         for sid in rejected:
                             rst_st = active_streams.pop(sid, None)
@@ -1678,11 +1963,10 @@ async def _bridge_http1_client_to_h2_upstream(
                 await asyncio.sleep(tick)
                 if state["closed"] or state["goaway"]:
                     break
-                if active_streams and (
-                    client_r.at_eof()
-                    or client_r.exception() is not None
-                    or client_w.is_closing()
-                ):
+                client_read_broken = client_r.exception() is not None or (
+                    client_r.at_eof() and any(not st.req_body_complete for st in active_streams.values())
+                )
+                if active_streams and (client_read_broken or client_w.is_closing()):
                     state["closed"] = True
                     flow_event.set()
                     for st in list(active_streams.values()):
@@ -1715,27 +1999,80 @@ async def _bridge_http1_client_to_h2_upstream(
                             state["pings_without_data"] = int(state["pings_without_data"]) + 1
                             sent_ping = True
                     if sent_ping:
-                        _record_h2_keepalive_stat(stats_path, "pings_sent", 1)
+                        _schedule_h2_keepalive_stats_flush(stats_path, deltas={"pings_sent": 1})
         except Exception:
             pass
 
-    io_tasks = [
-        asyncio.create_task(c2u()),
-        asyncio.create_task(u2c()),
-    ]
+    c2u_task = asyncio.create_task(c2u())
+    u2c_task = asyncio.create_task(u2c())
     pinger_task = asyncio.create_task(pinger())
+    all_tasks = (c2u_task, u2c_task, pinger_task)
     try:
-        done, pending = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait(
+            (c2u_task, u2c_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         for t in done:
             if not t.cancelled():
                 t.exception()
-        for t in pending:
-            t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
     finally:
-        pinger_task.cancel()
-        await asyncio.gather(pinger_task, return_exceptions=True)
+        state["closed"] = True
+        flow_event.set()
+        for t in all_tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await _flush_pending_stats_on_exit(stats_path)
+
+
+def _parse_connect_authority(authority: str) -> tuple[str, int]:
+    """解析并校验 HTTP CONNECT authority（支持域名、IPv4 与 `[IPv6]:port`）。"""
+    raw = authority.strip()
+    if not raw or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise ValueError("Invalid CONNECT authority")
+    if raw.startswith("["):
+        bracket_end = raw.find("]")
+        if bracket_end <= 1:
+            raise ValueError("Malformed IPv6 CONNECT authority")
+        host_part = raw[1:bracket_end]
+        rest = raw[bracket_end + 1 :]
+        if not rest:
+            port_str = ""
+        elif rest.startswith(":"):
+            port_str = rest[1:]
+        else:
+            raise ValueError("Malformed IPv6 CONNECT port separator")
+        try:
+            ip_obj = ipaddress.IPv6Address(host_part)
+        except ValueError as exc:
+            raise ValueError("Invalid IPv6 address in CONNECT") from exc
+        host = str(ip_obj)
+    else:
+        if ":" in raw:
+            host_part, port_str = raw.rsplit(":", 1)
+            if ":" in host_part:
+                raise ValueError("Unbracketed IPv6 address in CONNECT")
+        else:
+            host_part, port_str = raw, ""
+        host = host_part.strip().lower()
+        if not host or any(ch in host for ch in ("/", "\\", "@", "?", "#")):
+            raise ValueError("Invalid host in CONNECT")
+        try:
+            encoded_host = host.encode("idna")
+        except UnicodeError as exc:
+            raise ValueError("Invalid IDNA host in CONNECT") from exc
+        if not encoded_host or len(encoded_host) > 255:
+            raise ValueError("CONNECT host exceeds 255 bytes")
+
+    if not port_str:
+        port = 443
+    else:
+        if not port_str.isascii() or not port_str.isdigit():
+            raise ValueError("Invalid port in CONNECT")
+        port = int(port_str)
+    if not (1 <= port <= 65535):
+        raise ValueError("CONNECT port out of range 1..65535")
+    return host, port
 
 
 async def _connect_upstream_socks5(
@@ -1745,13 +2082,30 @@ async def _connect_upstream_socks5(
     target_port: int,
 ) -> bool:
     """通过 SOCKS5 协议向上游 mihomo mixed-port 发起建连（以区分于客户端 HTTP CONNECT / TUN 入站）。"""
+    if not (1 <= target_port <= 65535):
+        return False
     writer.write(b"\x05\x01\x00")
     await writer.drain()
     auth_resp = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
     if auth_resp != b"\x05\x00":
         return False
-    host_bytes = target_host.encode("idna")
-    req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + target_port.to_bytes(2, "big")
+    addr_part: bytes
+    try:
+        ip_obj = ipaddress.ip_address(target_host)
+    except ValueError:
+        try:
+            host_bytes = target_host.encode("idna")
+        except UnicodeError:
+            return False
+        if not host_bytes or len(host_bytes) > 255:
+            return False
+        addr_part = b"\x03" + bytes([len(host_bytes)]) + host_bytes
+    else:
+        if isinstance(ip_obj, ipaddress.IPv4Address):
+            addr_part = b"\x01" + ip_obj.packed
+        else:
+            addr_part = b"\x04" + ip_obj.packed
+    req = b"\x05\x01\x00" + addr_part + target_port.to_bytes(2, "big")
     writer.write(req)
     await writer.drain()
     hdr = await asyncio.wait_for(reader.readexactly(4), timeout=15.0)
@@ -1858,39 +2212,50 @@ class H2KeepaliveProxy:
                 client_w.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
                 await client_w.drain()
                 return
-            host_port = parts[1]
-            target_host, _, port_str = host_port.partition(":")
-            target_host = target_host.strip().lower()
-            target_port = int(port_str) if port_str.isdigit() else 443
+            try:
+                target_host, target_port = _parse_connect_authority(parts[1])
+            except ValueError:
+                client_w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                await client_w.drain()
+                return
 
             now_mono = time.monotonic()
             host_cooldown = self._passthrough_until.get(target_host, 0.0) > now_mono
-            ca_blocked = self.require_system_trust and not self.is_ca_trusted()
+            ca_blocked = self.require_system_trust and not (
+                self._ca_trusted_cached or await asyncio.to_thread(self.is_ca_trusted)
+            )
             passthrough = (
                 ca_blocked
                 or host_cooldown
                 or target_host not in KEEPALIVE_HOSTS
                 or target_port != 443
-                or client_prefers_passthrough(self.trust_installed_mtime, self.upstream_port)
             )
+            if not passthrough and target_host in H1_TO_H2_HOSTS:
+                passthrough = await asyncio.to_thread(
+                    client_prefers_passthrough,
+                    self.trust_installed_mtime,
+                    self.upstream_port,
+                )
 
-            upstream_r, upstream_w = await asyncio.wait_for(
+            upstream_r, up_w = await asyncio.wait_for(
                 asyncio.open_connection(self.upstream_host, self.upstream_port),
                 timeout=10.0,
             )
+            upstream_w = up_w
             if self.upstream_protocol == "socks5":
-                ok = await _connect_upstream_socks5(upstream_r, upstream_w, target_host, target_port)
+                ok = await _connect_upstream_socks5(upstream_r, up_w, target_host, target_port)
                 if not ok:
                     client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     await client_w.drain()
                     return
             else:
+                formatted_host = f"[{target_host}]" if ":" in target_host else target_host
                 connect_req = (
-                    f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-                    f"Host: {target_host}:{target_port}\r\n\r\n"
+                    f"CONNECT {formatted_host}:{target_port} HTTP/1.1\r\n"
+                    f"Host: {formatted_host}:{target_port}\r\n\r\n"
                 ).encode("ascii")
-                upstream_w.write(connect_req)
-                await upstream_w.drain()
+                up_w.write(connect_req)
+                await up_w.drain()
                 up_resp = await asyncio.wait_for(upstream_r.readuntil(b"\r\n\r\n"), timeout=15.0)
                 if b" 200 " not in up_resp.split(b"\r\n", 1)[0]:
                     client_w.write(up_resp)
@@ -1903,57 +2268,39 @@ class H2KeepaliveProxy:
             if passthrough:
                 if target_host in KEEPALIVE_HOSTS:
                     counted_active_pass = True
-                    _update_h2_keepalive_stats(
+                    await _update_h2_keepalive_stats_async(
                         self.stats_path,
                         deltas={"passthrough_sessions": 1, "active_passthrough": 1},
                     )
                 await asyncio.gather(
-                    _pipe_raw(client_r, upstream_w),
+                    _pipe_raw(client_r, up_w),
                     _pipe_raw(upstream_r, client_w),
                 )
                 return
 
-            loop = asyncio.get_running_loop()
             try:
-                client_tls_t = await loop.start_tls(
-                    client_w.transport,
-                    client_w._protocol,
-                    self.server_ssl,
-                    server_side=True,
-                )
+                await client_w.start_tls(self.server_ssl)
             except ssl.SSLError:
                 return
-            client_w._transport = client_tls_t
-            client_r._transport = client_tls_t
-            client_w._protocol._over_ssl = True
 
-            cli_ssl_obj = client_tls_t.get_extra_info("ssl_object")
+            cli_ssl_obj = client_w.get_extra_info("ssl_object")
             cli_alpn = cli_ssl_obj.selected_alpn_protocol() if cli_ssl_obj else None
             want_h2 = cli_alpn == "h2" or (target_host in H1_TO_H2_HOSTS and _has_hyper_h2())
             up_ssl_ctx = self.client_ssl if want_h2 else self.client_ssl_h1
 
-            up_tls_t = await loop.start_tls(
-                upstream_w.transport,
-                upstream_w._protocol,
-                up_ssl_ctx,
-                server_side=False,
-                server_hostname=target_host,
-            )
-            upstream_w._transport = up_tls_t
-            upstream_r._transport = up_tls_t
-            upstream_w._protocol._over_ssl = True
+            await up_w.start_tls(up_ssl_ctx, server_hostname=target_host)
 
             counted_active_tls = True
-            _record_h2_keepalive_stat(self.stats_path, "active_sessions", 1)
+            await _update_h2_keepalive_stats_async(self.stats_path, deltas={"active_sessions": 1})
 
-            ssl_obj = up_tls_t.get_extra_info("ssl_object")
+            ssl_obj = up_w.get_extra_info("ssl_object")
             alpn = ssl_obj.selected_alpn_protocol() if ssl_obj else None
             if cli_alpn == "h2" and alpn == "h2":
                 await _forward_h2_frames_with_ping(
                     client_r,
                     client_w,
                     upstream_r,
-                    upstream_w,
+                    up_w,
                     ping_interval=self.h2_ping_interval,
                     stats_path=self.stats_path,
                 )
@@ -1962,7 +2309,7 @@ class H2KeepaliveProxy:
                     client_r,
                     client_w,
                     upstream_r,
-                    upstream_w,
+                    up_w,
                     target_host=target_host,
                     ping_interval=self.h2_ping_interval,
                     idle_ping_interval=self.idle_ping_interval,
@@ -1974,18 +2321,25 @@ class H2KeepaliveProxy:
                     client_r,
                     client_w,
                     upstream_r,
-                    upstream_w,
+                    up_w,
                     ping_interval=self.ping_interval,
                     idle_ping_interval=self.idle_ping_interval,
                     stats_path=self.stats_path,
                 )
-        except BaseException:
+        except Exception:
             pass
         finally:
+            dec_deltas: dict[str, int] = {}
             if counted_active_tls:
-                _record_h2_keepalive_stat(self.stats_path, "active_sessions", -1)
+                dec_deltas["active_sessions"] = -1
             if counted_active_pass:
-                _record_h2_keepalive_stat(self.stats_path, "active_passthrough", -1)
+                dec_deltas["active_passthrough"] = -1
+            if dec_deltas and self.stats_path is not None:
+                _queue_h2_keepalive_stats(self.stats_path, deltas=dec_deltas)
+                try:
+                    await asyncio.to_thread(_flush_h2_keepalive_stats_sync, self.stats_path)
+                except Exception:
+                    pass
             for w in (client_w, upstream_w):
                 if w is not None:
                     try:
@@ -2029,18 +2383,32 @@ async def run_h2_keepalive_server(
         stats_path=stats_path,
     )
     server = await asyncio.start_server(proxy.handle_client, listen_host, listen_port, limit=262144)
+    my_pid = str(os.getpid())
     if pid_path is not None:
         try:
-            pid_path.parent.mkdir(parents=True, exist_ok=True)
-            pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-            _update_h2_keepalive_stats(
+            _atomic_write_text(pid_path, f"{my_pid}\n", mode=0o600)
+            await _update_h2_keepalive_stats_async(
                 stats_path,
                 overrides={"active_sessions": 0, "active_passthrough": 0},
             )
         except OSError:
             pass
-    async with server:
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        active = list(proxy._active_tasks)
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+        await _flush_pending_stats_on_exit(stats_path)
+        if pid_path is not None:
+            try:
+                if pid_path.exists() and pid_path.read_text(encoding="utf-8").strip() == my_pid:
+                    pid_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def h2_keepalive_pid_file(state_dir: Path) -> Path:
@@ -2079,9 +2447,15 @@ def ensure_h2_keepalive_daemon(
     upstream_port: int = DEFAULT_UPSTREAM_PROXY_PORT,
 ) -> bool:
     """确保本地 H2/WebSocket PING 保活网关守护进程已在后台监听。"""
-    import sys
+    try:
+        listen_port_int = int(listen_port)
+        upstream_port_int = int(upstream_port)
+    except (TypeError, ValueError):
+        return False
+    if not (1 <= listen_port_int <= 65535) or not (1 <= upstream_port_int <= 65535):
+        return False
 
-    if is_h2_keepalive_running(state_dir, port=listen_port):
+    if is_h2_keepalive_running(state_dir, port=listen_port_int):
         return True
     state_dir.mkdir(parents=True, exist_ok=True)
     log_path = state_dir / "h2-keepalive.log"
@@ -2089,7 +2463,7 @@ def ensure_h2_keepalive_daemon(
     tls_dir = data_dir / "tls"
 
     exe_path = Path(sys.executable)
-    if os.name == "nt":
+    if sys.platform == "win32":
         daemon_candidate = exe_path.parent / "cproxy-daemon.exe"
         if daemon_candidate.is_file():
             exe_path = daemon_candidate
@@ -2098,27 +2472,33 @@ def ensure_h2_keepalive_daemon(
         "import asyncio; from pathlib import Path; "
         "from cproxy.services.h2_keepalive import run_h2_keepalive_server; "
         f"asyncio.run(run_h2_keepalive_server(Path({str(tls_dir)!r}), "
-        f"listen_port={listen_port}, upstream_port={upstream_port}, "
+        f"listen_port={listen_port_int}, upstream_port={upstream_port_int}, "
         f"pid_path=Path({str(pid_path)!r})))"
     )
-    popen_kwargs: dict[str, object] = {}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
-            subprocess, "DETACHED_PROCESS", 0
-        )
-    else:
-        popen_kwargs["start_new_session"] = True
     try:
         with log_path.open("a", encoding="utf-8") as log_handle:
-            subprocess.Popen(
-                [str(exe_path), "-c", code],
-                stdout=log_handle,
-                stderr=log_handle,
-                **popen_kwargs,  # type: ignore[arg-type]
-            )
+            if sys.platform == "win32":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                    subprocess, "DETACHED_PROCESS", 0
+                )
+                subprocess.Popen(
+                    [str(exe_path), "-c", code],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    creationflags=creationflags,
+                )
+            else:
+                subprocess.Popen(
+                    [str(exe_path), "-c", code],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    start_new_session=True,
+                )
         for _ in range(25):
             time.sleep(0.1)
-            if is_h2_keepalive_running(state_dir, port=listen_port):
+            if is_h2_keepalive_running(state_dir, port=listen_port_int):
                 return True
     except Exception:
         return False

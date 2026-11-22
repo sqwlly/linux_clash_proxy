@@ -75,7 +75,7 @@ render 与探测。输出中的订阅地址会脱敏。
 ## legacy 入口（已退役）
 
 `proxy.sh` 工作流已于 2026-09-11 停用，并于 **2026-10-17 从仓库删除**（退役阶段 3，仓库侧）；
-生产入口是 cproxy 用户级链路（见 [README 的生产入口识别](README.md#生产入口识别)）。
+生产入口是 cproxy 用户级链路（见 [README 快速开始](README.md#快速开始)）。
 本节保留的对照表仅供**从旧入口迁移**时参考。
 
 - 仓库内已无 legacy 代码：`proxy.sh`、`update_config.sh`、其 helper 脚本、
@@ -93,8 +93,8 @@ legacy 子命令与 cproxy **绝大多数同名同义**——`status`、`switch`
 | `clash-proxy import-subscription <url>` | `cproxy refresh`（订阅更新→渲染→热重载→探测） |
 | `clash-proxy menu` | `cproxy tui` |
 
-> ⚠️ `/usr/local/bin/cproxy-update` 名字形似 cproxy 的子命令，实际是 legacy 残留——
-> 不要把它当成 cproxy 的一部分。
+> ⚠️ 历史上曾存在的 `/usr/local/bin/cproxy-update` 名字形似 cproxy 子命令，实际属于已退役的
+> legacy 工作流（现已随阶段 3 清理）；请统一使用 `cproxy refresh` 更新订阅。
 
 若 `cproxy status` 显示 `运行配置    待刷新`，说明用户级 runtime 尚未初始化
 （它读 `~/.local/share/cproxy/runtime.yaml`），与 legacy 入口无关。
@@ -275,7 +275,8 @@ cproxy list-nodes "AI-MANUAL" --raw
 手动切换：
 
 ```bash
-cproxy switch "AI-MANUAL" "AI-AUTO"
+cproxy switch                         # 交互式选择用途入口与节点
+cproxy switch "AI-MANUAL" "<节点名>"   # 直接切换指定组到目标节点
 ```
 
 检查延迟：
@@ -315,7 +316,7 @@ cproxy probe-stable-node --raw                    # TSV 格式，适合脚本消
 选项：
 
 - `group`（位置参数，默认 `AI-MANUAL`）：目标代理组
-- `--profile`：`codex`（默认）/ `chatgpt` / `github` / `claude`，预设探测 URL 和策略
+- `--profile`：`codex`（默认）/ `chatgpt` / `github` / `claude` / `gemini`，预设探测 URL 和策略
 - `--strategy`：`conservative` / `balanced` / `aggressive`，覆盖 profile 默认策略
 - `--url`：自定义探测 URL
 - `--rounds`：探测轮数（默认由策略决定，conservative 为 5 轮）

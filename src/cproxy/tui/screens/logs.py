@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import os
 import threading
 
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.document._edit import Edit
 from textual.widget import Widget
 from textual.widgets import Button, Checkbox, Label
 
 from ...config import AppPaths, log_file
 from ..widgets import NavigationTextArea as TextArea
+from ..widgets import escape_markup, safe_call_from_thread
 
 
 class LogsScreen(Widget):
     INITIAL_LINE_LIMIT = 500
     FOLLOW_LINE_LIMIT = 1000
+    INITIAL_READ_MAX_BYTES = 256 * 1024
+    _PARTIAL_FLUSH_LIMIT = 64 * 1024
 
     BINDINGS = [
         Binding("c", "clear_logs", "清空视图"),
@@ -27,9 +31,13 @@ class LogsScreen(Widget):
         super().__init__(**kwargs)
         self.paths = paths
         self._following = True
+        self._paused_by_hide = False
         self._stop_event = threading.Event()
         self._tail_thread: threading.Thread | None = None
+        self._pos_lock = threading.Lock()
         self._last_pos = 0
+        self._last_ino: int | None = None
+        self._partial_bytes = b""
         self._log_lines: list[str] = []
 
     def compose(self) -> ComposeResult:
@@ -46,7 +54,7 @@ class LogsScreen(Widget):
 
     def on_mount(self) -> None:
         log_path = log_file(self.paths)
-        self.query_one("#log-file-label", Label).update(f"[#8b98aa]{log_path}[/]")
+        self.query_one("#log-file-label", Label).update(f"[#8b98aa]{escape_markup(log_path)}[/]")
 
         viewer = self.query_one("#log-viewer", TextArea)
         try:
@@ -57,63 +65,128 @@ class LogsScreen(Widget):
         if not list(self.app.query("#main-tabs")):
             self.refresh_data()
 
+    def on_hide(self) -> None:
+        self._paused_by_hide = True
+
+    def on_show(self) -> None:
+        if not self._paused_by_hide:
+            return
+        self._paused_by_hide = False
+        if self._following:
+            self.refresh_data()
+
     def on_unmount(self) -> None:
         self._stop_event.set()
         if self._tail_thread and self._tail_thread.is_alive():
             self._tail_thread.join(timeout=0.1)
 
     def _load_logs(self) -> None:
-        log_path = log_file(self.paths)
-        viewer = self.query_one("#log-viewer", TextArea)
+        self._load_logs_worker()
 
+    @work(thread=True, exclusive=True, group="logs-load")
+    def _load_logs_worker(self) -> None:
+        log_path = log_file(self.paths)
         if not log_path.exists():
-            self._log_lines = []
-            viewer.load_text(f"日志文件不存在: {log_path}")
+            with self._pos_lock:
+                self._last_pos = 0
+                self._last_ino = None
+                self._partial_bytes = b""
+            safe_call_from_thread(self, self._apply_loaded_logs, [], f"日志文件不存在: {log_path}")
             return
 
         try:
-            content = log_path.read_text(encoding="utf-8", errors="replace")
+            with log_path.open("rb") as fh:
+                st = os.fstat(fh.fileno())
+                truncated_head = st.st_size > self.INITIAL_READ_MAX_BYTES
+                if truncated_head:
+                    fh.seek(st.st_size - self.INITIAL_READ_MAX_BYTES)
+                raw = fh.read()
+                end_pos = fh.tell()
+                inode = st.st_ino
+
+            content = raw.decode("utf-8", errors="replace")
+            if truncated_head and "\n" in content:
+                content = content.split("\n", 1)[1]
             lines = content.splitlines()
             if len(lines) > self.INITIAL_LINE_LIMIT:
-                lines = lines[-self.INITIAL_LINE_LIMIT:]
+                lines = lines[-self.INITIAL_LINE_LIMIT :]
 
-            self._log_lines = lines
-            viewer.load_text("\n".join(lines))
-            self._last_pos = log_path.stat().st_size
+            with self._pos_lock:
+                self._last_pos = end_pos
+                self._last_ino = inode
+                self._partial_bytes = b""
 
-            if self._following:
-                viewer.move_cursor((len(lines), 0))
+            safe_call_from_thread(self, self._apply_loaded_logs, lines, None)
+        except Exception as exc:
+            safe_call_from_thread(self, self._apply_loaded_logs, [], f"读取日志失败: {exc}")
 
-        except Exception as e:
+    def _apply_loaded_logs(self, lines: list[str], placeholder: str | None) -> None:
+        if not self.is_mounted:
+            return
+        viewer = self.query_one("#log-viewer", TextArea)
+        if placeholder is not None:
             self._log_lines = []
-            viewer.load_text(f"读取日志失败: {e}")
+            viewer.load_text(placeholder)
+            return
+
+        self._log_lines = lines
+        viewer.load_text("\n".join(lines))
+        if self._following:
+            viewer.move_cursor((len(lines), 0))
 
     def _start_tail(self) -> None:
         if self._tail_thread and self._tail_thread.is_alive():
             return
 
-        def tail_loop():
+        def tail_loop() -> None:
             log_path = log_file(self.paths)
             while not self._stop_event.wait(1):
-                if not self._following:
-                    continue
-                if not log_path.exists():
+                if not self._following or self._paused_by_hide or not self.is_mounted:
                     continue
 
                 try:
-                    current_size = log_path.stat().st_size
-                    if current_size > self._last_pos:
-                        with log_path.open("r", encoding="utf-8", errors="replace") as f:
-                            f.seek(self._last_pos)
-                            new_content = f.read()
-                            self._last_pos = current_size
+                    with log_path.open("rb") as fh:
+                        st = os.fstat(fh.fileno())
+                        with self._pos_lock:
+                            last_pos = self._last_pos
+                            last_ino = self._last_ino
 
+                        if (last_ino is not None and st.st_ino != last_ino) or st.st_size < last_pos:
+                            with self._pos_lock:
+                                self._last_pos = 0
+                                self._last_ino = st.st_ino
+                                self._partial_bytes = b""
+                            safe_call_from_thread(self, self._load_logs)
+                            continue
+
+                        if st.st_size <= last_pos:
+                            continue
+
+                        fh.seek(last_pos)
+                        chunk = fh.read()
+                        new_pos = fh.tell()
+
+                        emit_bytes = b""
+                        with self._pos_lock:
+                            buf = self._partial_bytes + chunk
+                            if b"\n" in buf:
+                                complete, remainder = buf.rsplit(b"\n", 1)
+                                self._partial_bytes = remainder
+                                emit_bytes = complete + b"\n"
+                            elif len(buf) > self._PARTIAL_FLUSH_LIMIT:
+                                self._partial_bytes = b""
+                                emit_bytes = buf
+                            else:
+                                self._partial_bytes = buf
+                            self._last_pos = new_pos
+                            self._last_ino = st.st_ino
+
+                    if emit_bytes:
+                        new_content = emit_bytes.decode("utf-8", errors="replace")
                         if new_content.strip():
-                            self.app.call_from_thread(self._append_log, new_content)
-                    elif current_size < self._last_pos:
-                        self._last_pos = 0
-                        self.app.call_from_thread(self._load_logs)
-
+                            safe_call_from_thread(self, self._append_log, new_content)
+                except FileNotFoundError:
+                    continue
                 except Exception:
                     pass
 
@@ -125,12 +198,14 @@ class LogsScreen(Widget):
         self._start_tail()
 
     def _append_log(self, content: str) -> None:
+        if not self.is_mounted:
+            return
         viewer = self.query_one("#log-viewer", TextArea)
         new_lines = content.rstrip().splitlines()
         if not new_lines:
             return
         if len(new_lines) > self.FOLLOW_LINE_LIMIT:
-            new_lines = new_lines[-self.FOLLOW_LINE_LIMIT:]
+            new_lines = new_lines[-self.FOLLOW_LINE_LIMIT :]
 
         # 文档内容正常时等于 "\n".join(self._log_lines)（无结尾换行）；占位文本
         # （文件不存在/读取失败）与清空后的空状态靠整体重建回到该不变式
@@ -140,11 +215,11 @@ class LogsScreen(Widget):
             viewer.load_text("\n".join(self._log_lines))
         else:
             if overflow > 0:
-                viewer.edit(Edit("", (0, 0), (overflow, 0), maintain_selection_offset=True))
+                viewer.replace("", (0, 0), (overflow, 0), maintain_selection_offset=True)
                 del self._log_lines[:overflow]
             insert_at = (len(self._log_lines) - 1, len(self._log_lines[-1]))
             text = "\n" + "\n".join(new_lines)
-            viewer.edit(Edit(text, insert_at, insert_at, maintain_selection_offset=False))
+            viewer.replace(text, insert_at, insert_at, maintain_selection_offset=False)
             self._log_lines.extend(new_lines)
 
         if self._following:

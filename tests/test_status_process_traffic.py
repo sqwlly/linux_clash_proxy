@@ -17,7 +17,10 @@ CODEX_RELATIVE_PATH = (
     "versions/node/v22.23.1/lib/node_modules/@openai/.codex-qWKjdDCx"
     "/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
 )
-LONG_CODEX_PATH = str(Path.home() / CODEX_RELATIVE_PATH)
+
+
+def _long_codex_path() -> str:
+    return str(Path.home() / CODEX_RELATIVE_PATH)
 
 
 def _write_config(tmp_path: Path) -> None:
@@ -76,14 +79,15 @@ def _run_status(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
 def test_shorten_path_keeps_home_relative_when_it_fits():
     from cproxy.cli_render import _shorten_path
 
+    long_codex_path = _long_codex_path()
     assert _shorten_path("/usr/bin/curl", 46) == "/usr/bin/curl"
-    assert _shorten_path(LONG_CODEX_PATH, 200) == f"~/{CODEX_RELATIVE_PATH}"
+    assert _shorten_path(long_codex_path, 200) == f"~/{CODEX_RELATIVE_PATH}"
 
 
 def test_shorten_path_compresses_long_path_keeping_identifying_tail():
     from cproxy.cli_render import _shorten_path
 
-    shortened = _shorten_path(LONG_CODEX_PATH, 46)
+    shortened = _shorten_path(_long_codex_path(), 46)
     # 噪声段（versions/node/vX/lib/node_modules/vendor/平台三元组/bin）被跳过
     for noise in ("node_modules", "vendor", "x86_64", "versions"):
         assert noise not in shortened
@@ -159,9 +163,10 @@ def test_process_table_uses_chain_split_bar(monkeypatch, capsys):
 def test_process_display_label_is_full_path_without_width():
     from cproxy.cli_render import _process_display_label
 
+    long_codex_path = _long_codex_path()
     # 不传 width 时维持“完整路径 + 剥离 (deleted)”的既有语义
-    assert _process_display_label(f"{LONG_CODEX_PATH} (deleted)") == LONG_CODEX_PATH
-    assert _process_display_label(f"{LONG_CODEX_PATH} (deleted)", width=46).endswith("/codex")
+    assert _process_display_label(f"{long_codex_path} (deleted)") == long_codex_path
+    assert _process_display_label(f"{long_codex_path} (deleted)", width=46).endswith("/codex")
 
 
 # ------------------------------------------------------------------ 单元：格式化
@@ -363,13 +368,14 @@ def test_runtime_metrics_self_process_is_readable(tmp_path):
 
 
 def test_status_splits_process_traffic_by_chain(tmp_path: Path):
+    long_codex_path = _long_codex_path()
     _write_config(tmp_path)
     _seed_today(
         tmp_path,
         [
             ("/usr/bin/curl", "DIRECT", 800, 80),
             ("/usr/bin/python3", "AI-MANUAL -> Node1", 3000, 150),
-            (LONG_CODEX_PATH, "AI-MANUAL -> Node1", 100, 100),
+            (long_codex_path, "AI-MANUAL -> Node1", 100, 100),
         ],
     )
 
@@ -392,7 +398,7 @@ def test_status_splits_process_traffic_by_chain(tmp_path: Path):
     assert "150 B" in out
     assert "0 B" in out
     # 超长路径被压缩后展示
-    assert LONG_CODEX_PATH not in out
+    assert long_codex_path not in out
     assert "…/@openai/codex-linux-x64/codex" in out
 
 

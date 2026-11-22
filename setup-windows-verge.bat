@@ -11,7 +11,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\windows\in
 set EXIT_CODE=%ERRORLEVEL%
 
 echo.
-if "%1"=="" (
+if "%~1"=="" (
     pause
 )
 exit /b %EXIT_CODE%

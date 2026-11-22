@@ -10,10 +10,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from ..backend.api import APIBackend, APIUnavailableError
+from ..backend.api import APIBackend
+from ..backend.models import ProxyGroup
 from ..backend.process import ProcessBackend
-from ..backend.runtime import AI_GEMINI_GROUP, AI_MANUAL_GROUP, RuntimeBackend, resolve_ai_leaf
-from ..config import AppPaths
+from ..backend.runtime import AI_GEMINI_GROUP, AI_MANUAL_GROUP, resolve_ai_leaf
+from ..config import AppPaths, load_yaml_file, runtime_file
 from .node_tags import parse_node_tag
 
 PROMPT_FORMATS = ("compact", "full", "tmux")
@@ -47,20 +48,54 @@ def _is_proxy_env_active() -> bool:
     return False
 
 
+def _groups_from_runtime_yaml(paths: AppPaths) -> dict[str, ProxyGroup]:
+    rfile = runtime_file(paths)
+    if not rfile.exists():
+        return {}
+    data = load_yaml_file(rfile)
+    if not isinstance(data, dict):
+        return {}
+    raw_groups = data.get("proxy-groups")
+    if not isinstance(raw_groups, list):
+        return {}
+    groups: dict[str, ProxyGroup] = {}
+    for item in raw_groups:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        raw_proxies = item.get("proxies")
+        candidates = [str(p) for p in raw_proxies if p] if isinstance(raw_proxies, list) else []
+        groups[name] = ProxyGroup(
+            name=name,
+            type=str(item.get("type") or ""),
+            current=candidates[0] if candidates else "-",
+            candidates=candidates,
+        )
+    return groups
+
+
 def collect_prompt_snapshot(paths: AppPaths) -> PromptSnapshot:
     env_active = _is_proxy_env_active()
-    running = ProcessBackend(paths).is_running()
-    if not running:
-        return PromptSnapshot(running=False, proxy_env_active=env_active)
-
-    groups = {}
+    groups: dict[str, ProxyGroup] = {}
+    running = False
     try:
         groups = APIBackend(paths).get_groups(request_timeout=_PROMPT_API_TIMEOUT)
-    except APIUnavailableError:
+        running = True
+    except Exception:
         try:
-            groups = RuntimeBackend(paths).get_groups()
+            running = ProcessBackend(paths).is_running()
         except Exception:
-            groups = {}
+            running = False
+        if running:
+            try:
+                groups = _groups_from_runtime_yaml(paths)
+            except Exception:
+                groups = {}
+
+    if not running:
+        return PromptSnapshot(running=False, proxy_env_active=env_active)
 
     ai_node = resolve_ai_leaf(groups, AI_MANUAL_GROUP) if AI_MANUAL_GROUP in groups else "-"
     gemini_node = resolve_ai_leaf(groups, AI_GEMINI_GROUP) if AI_GEMINI_GROUP in groups else "-"
@@ -91,5 +126,6 @@ def format_prompt(snapshot: PromptSnapshot, fmt: str = "compact", *, raw: bool =
             return f"[🌐{env_mark} AI:{ai_label} · Gem:{gem_label}]"
         return f"[🌐{env_mark} AI:{ai_label}]"
     if fmt == "tmux":
-        return f"#[fg=green]🌐{env_mark} {ai_label}#[default]"
+        safe_ai = ai_label.replace("#", "##")
+        return f"#[fg=green]🌐{env_mark} {safe_ai}#[default]"
     return f"[🌐{env_mark} {ai_label}]"

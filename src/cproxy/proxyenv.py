@@ -70,7 +70,7 @@ def run_with_proxy(paths: AppPaths, command: list[str]) -> int:
 
 def run_proxy_shell(paths: AppPaths, shell_args: list[str]) -> int:
     shell_args = _strip_remainder_separator(shell_args)
-    shell_bin = os.environ.get("SHELL", "/bin/bash")
+    shell_bin = os.environ.get("SHELL") or "/bin/bash"
     env = os.environ.copy()
     env.update(proxy_env_map(paths))
     argv = [shell_bin, *(shell_args or ["-l"])]

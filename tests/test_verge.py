@@ -48,6 +48,18 @@ def _paths(tmp_path: Path) -> AppPaths:
 
 def test_windows_default_paths_and_env_override(tmp_path, monkeypatch):
     if sys.platform == "win32":
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "empty-home"))
+        monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+        for var in (
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "CPROXY_CONFIG_DIR",
+            "CPROXY_DATA_DIR",
+            "CPROXY_STATE_DIR",
+        ):
+            monkeypatch.delenv(var, raising=False)
         assert default_paths().config_dir == tmp_path / "appdata" / "cproxy"
     monkeypatch.setenv("CPROXY_CONFIG_DIR", str(tmp_path / "custom-cfg"))
     monkeypatch.setenv("CPROXY_DATA_DIR", str(tmp_path / "custom-data"))
@@ -497,7 +509,7 @@ def test_windows_daemon_uses_dedicated_process_name():
     assert "New-ScheduledTaskAction -Execute $DaemonExe" in script
     assert 'WshShell.Run """$DaemonExe"" -m cproxy.cli verge daemon' in script
     assert "Start-Process -FilePath $DaemonExe" in script
-    assert "& $DaemonExe -m cproxy.cli verge once --no-rebalance" in script
+    assert "& $PythonExe -m cproxy.cli verge once --no-rebalance" in script
     assert "Name LIKE 'python%.exe' OR Name = 'cproxy-daemon.exe'" in script
     assert "Stop-ScheduledTask -TaskName $TaskName" in script
     assert '$env:PYTHONIOENCODING = "utf-8"' in script
@@ -1240,7 +1252,8 @@ def test_try_hot_reload_verge_runtime_compiles_scripts_and_preserves_egress(tmp_
     assert groups["AI-MANUAL"]["proxies"][0] == "🇺🇸 US 02"
     assert "MITM-LOCAL" not in groups["AI-MANUAL"]["proxies"]
     assert loaded["rule-providers"]["Apple"]["path"] == "ruleset/Apple.yaml"
-    assert loaded["rules"][0] == "PROCESS-NAME,steam.exe,DIRECT"
+    assert loaded["rules"][0] == "DOMAIN-SUFFIX,google.com,AI-GEMINI"
+    assert "PROCESS-NAME,steam.exe,DIRECT" in loaded["rules"]
 
 
 def test_keepalive_multi_protocol_telemetry_and_summary(tmp_path, monkeypatch):
@@ -1779,7 +1792,6 @@ def test_h2_keepalive_default_intervals_strike_cap_and_sse_boundary_heartbeat(tm
     async def _run():
         nonlocal too_many_pings_triggered
 
-        c2p_r, c2p_w = asyncio.StreamReader(), None
         # 使用真实本地 loopback TCP 管道连接 client <-> bridge <-> mock GFE H2 server
         bridge_tasks: list[asyncio.Task[None]] = []
 

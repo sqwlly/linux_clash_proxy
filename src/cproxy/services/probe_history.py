@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import tempfile
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +41,7 @@ def load_history_penalties(
     if not history_path.is_file():
         return {}
 
-    recent_lines: deque[str] = deque(maxlen=HISTORY_LOOKBACK * 4)
+    recent_lines: deque[str] = deque(maxlen=MAX_HISTORY_LINES)
     try:
         with history_path.open(encoding="utf-8") as fh:
             for line in fh:
@@ -111,6 +115,73 @@ def load_history_rows(history_path: Path, limit: int) -> list[dict]:
     return rows[-limit:]
 
 
+@contextmanager
+def _history_lock(lock_path: Path, *, timeout: float = 5.0) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        import fcntl
+
+        with lock_path.open("a+b") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    else:
+        deadline = time.monotonic() + timeout
+        acquired_fd: int | None = None
+        while True:
+            try:
+                acquired_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                break
+            except FileExistsError:
+                try:
+                    if (time.time() - lock_path.stat().st_mtime) > 30.0:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            except OSError:
+                break
+        try:
+            yield
+        finally:
+            if acquired_fd is not None:
+                try:
+                    os.close(acquired_fd)
+                except OSError:
+                    pass
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def _atomic_write_history(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            if sys.platform != "win32":
+                os.fchmod(fh.fileno(), 0o600)
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def record_probe_history(
     history_path: Path,
     *,
@@ -152,20 +223,15 @@ def record_probe_history(
         "nodes": nodes,
     }
     entry_line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
-    existing_lines: list[str] = []
-    if history_path.is_file():
-        try:
-            with history_path.open(encoding="utf-8") as fh:
-                existing_lines = [line if line.endswith("\n") else line + "\n" for line in fh if line.strip()]
-        except OSError:
-            existing_lines = []
+    lock_path = history_path.with_name(f"{history_path.name}.lock")
+    with _history_lock(lock_path):
+        existing_lines: list[str] = []
+        if history_path.is_file():
+            try:
+                with history_path.open(encoding="utf-8") as fh:
+                    existing_lines = [line if line.endswith("\n") else line + "\n" for line in fh if line.strip()]
+            except OSError:
+                existing_lines = []
 
-    if len(existing_lines) + 1 <= MAX_HISTORY_LINES:
-        with history_path.open("a", encoding="utf-8") as fh:
-            fh.write(entry_line)
-        return
-
-    trimmed = (existing_lines + [entry_line])[-MAX_HISTORY_LINES:]
-    tmp_path = history_path.with_suffix(".tmp")
-    tmp_path.write_text("".join(trimmed), encoding="utf-8")
-    os.replace(tmp_path, history_path)
+        trimmed = (existing_lines + [entry_line])[-MAX_HISTORY_LINES:]
+        _atomic_write_history(history_path, "".join(trimmed))

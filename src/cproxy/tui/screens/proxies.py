@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from textual import work
+from rich.text import Text
+from textual import events, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
 from textual.widgets import Button, Label
+from textual.worker import get_current_worker
 
 from ...api import APIUnavailableError
+from ...audit import write_audit_event
 from ...backend.models import ProxyGroup
 from ...config import AppPaths, read_config
 from ...process import restart_process
@@ -19,12 +22,13 @@ from ...services.query import QueryService
 from ...services.switch_tree import SwitchChoice, build_switch_tree, extra_subscription_names
 from ..ai_status import delay_text
 from ..widgets import NavigationDataTable as DataTable
+from ..widgets import coerce_worker_error, escape_markup, safe_call_from_thread
 
 _PLACEHOLDER_KEY = "__placeholder__"
 _ERROR_KEY = "__error__"
 
 
-def _sync_table_rows(table: DataTable, rows: Mapping[str, tuple[str, ...]]) -> None:
+def _sync_table_rows(table: DataTable, rows: Mapping[str, tuple[str | Text, ...]]) -> None:
     """按 row key 增量同步表格内容：更新变化单元格、补充新行、移除消失行。
 
     相比 clear() 后整表重建，光标位置、滚动偏移与选择状态都得以保留。
@@ -43,11 +47,17 @@ def _sync_table_rows(table: DataTable, rows: Mapping[str, tuple[str, ...]]) -> N
             table.add_row(*cells, key=key)
 
 
+def _node_cell(label: str, *, active: bool) -> Text:
+    if active:
+        return Text.assemble(("● ", "#a3e635"), label)
+    return Text(f"  {label}")
+
+
 class ProxiesScreen(Widget):
     BINDINGS = [
         Binding("enter", "activate_row", "打开/选择", priority=True),
-        Binding("right", "focus_nodes", "节点", priority=True),
-        Binding("left", "focus_groups", "分组", priority=True),
+        Binding("right", "focus_nodes", "节点"),
+        Binding("left", "focus_groups", "分组"),
         Binding("escape", "back", "返回", priority=True),
         Binding("s", "select_node", "切换"),
         Binding("t", "test_delay", "测速"),
@@ -65,6 +75,8 @@ class ProxiesScreen(Widget):
         self._current_entry: SwitchChoice | None = None
         self._drilled: SwitchChoice | None = None
         self._api_available = False
+        self._pending_restart = False
+        self._restart_running = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -84,7 +96,8 @@ class ProxiesScreen(Widget):
                         yield Button("重启", id="btn-restart-proxy", classes="action-button danger-button")
                     yield Label(
                         "↑↓ 移动  ←/Esc 返回  → 进入  Enter 下钻或切换",
-                        id="proxy-action-status", classes="action-status",
+                        id="proxy-action-status",
+                        classes="action-status",
                     )
 
     def on_mount(self) -> None:
@@ -105,8 +118,8 @@ class ProxiesScreen(Widget):
         nodes_table.show_header = True
         nodes_table.navigation_previous_handler = self.action_focus_groups
 
-
     def refresh_data(self) -> None:
+        self._pending_restart = False
         self.query_one("#api-status", Label).update("[#f6c177]刷新中…[/]")
         self._load_groups()
 
@@ -129,16 +142,18 @@ class ProxiesScreen(Widget):
                 extra_names=extra,
                 delays=delays,
             )
-            self.app.call_from_thread(self._apply_groups, context, tree, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._apply_groups, None, (), str(exc))
+            safe_call_from_thread(self, self._apply_groups, context, tree, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._apply_groups, None, (), str(coerce_worker_error(exc)))
 
     def _apply_groups(self, context, tree, error: str | None) -> None:
+        if not self.is_mounted:
+            return
         groups_table = self.query_one("#groups-table", DataTable)
         if error is not None or context is None:
             self._api_available = False
             self._update_api_status()
-            _sync_table_rows(groups_table, {_ERROR_KEY: (f"错误: {error}", "─")})
+            _sync_table_rows(groups_table, {_ERROR_KEY: (Text(f"错误: {error}"), "─")})
             return
 
         self._api_available = context.api_available
@@ -147,11 +162,11 @@ class ProxiesScreen(Widget):
         self._drilled = None
         self._update_api_status()
 
-        rows: dict[str, tuple[str, str]] = {}
+        rows: dict[str, tuple[str | Text, str | Text]] = {}
         for entry in self._tree_entries:
             group = context.groups.get(entry.key)
             current = group.current if group else "─"
-            rows[entry.key] = (entry.display, current or "─")
+            rows[entry.key] = (Text(entry.display), Text(current or "─"))
         if not rows:
             rows[_PLACEHOLDER_KEY] = ("[#8b98aa]没有可显示的代理组[/]", "─")
         _sync_table_rows(groups_table, rows)
@@ -185,21 +200,31 @@ class ProxiesScreen(Widget):
             return self._current_entry.children
         return ()
 
+    def _active_real_group(self) -> ProxyGroup | None:
+        if self._drilled is not None:
+            drilled_group = next((group for group in self._groups if group.name == self._drilled.key), None)
+            if drilled_group is not None:
+                return drilled_group
+        return self._current_group
+
+    def _is_virtual_bucket_drilled(self) -> bool:
+        return self._drilled is not None and not any(g.name == self._drilled.key for g in self._groups)
+
     def _update_nodes_table(self) -> None:
         nodes_table = self.query_one("#nodes-table", DataTable)
         previous_node = self._current_node_key(nodes_table)
 
         current_label = self.query_one("#current-node", Label)
-        rows: dict[str, tuple[str, str]] = {}
+        rows: dict[str, tuple[str | Text, str | Text]] = {}
 
         if not self._current_group:
             current_label.update("[#8b98aa]尚未选择分组[/]")
             rows[_PLACEHOLDER_KEY] = ("[#8b98aa]选择分组后查看节点[/]", "─")
         else:
             if self._drilled is not None:
-                current_label.update(f"[#a3e635]● {self._drilled.display}[/]")
+                current_label.update(f"[#a3e635]● {escape_markup(self._drilled.display)}[/]")
             else:
-                current_label.update(f"[#a3e635]● {self._current_group.current}[/]")
+                current_label.update(f"[#a3e635]● {escape_markup(self._current_group.current)}[/]")
             choices = self._visible_choices()
             if not choices:
                 for node in self._current_group.candidates:
@@ -207,12 +232,13 @@ class ProxiesScreen(Widget):
                     delay = "─"
                     if is_current and isinstance(self._current_group.delay, int):
                         delay = delay_text(self._current_group.delay)
-                    prefix = "[#a3e635]●[/] " if is_current else "  "
-                    rows[node] = (f"{prefix}{node}", delay)
+                    rows[node] = (_node_cell(node, active=is_current), delay)
             else:
                 for choice in choices:
-                    prefix = "[#a3e635]●[/] " if choice.current else "  "
-                    rows[choice.key] = (f"{prefix}{choice.display}", choice.annotation or "─")
+                    rows[choice.key] = (
+                        _node_cell(choice.display, active=choice.current),
+                        Text(choice.annotation or "─"),
+                    )
 
         _sync_table_rows(nodes_table, rows)
 
@@ -227,6 +253,8 @@ class ProxiesScreen(Widget):
         self._move_nodes_cursor(preferred)
 
     def _set_current_group(self, group_name: str, focus_nodes: bool) -> None:
+        if group_name in {_PLACEHOLDER_KEY, _ERROR_KEY}:
+            return
         self._drilled = None
         self._current_entry = next((entry for entry in self._tree_entries if entry.key == group_name), None)
         for group in self._groups:
@@ -260,13 +288,24 @@ class ProxiesScreen(Widget):
         if event.data_table.id != "groups-table":
             return
         group_name = str(event.row_key.value)
-        self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]已选分组: {group_name}[/]")
+        if group_name in {_PLACEHOLDER_KEY, _ERROR_KEY}:
+            return
+        self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]已选分组: {escape_markup(group_name)}[/]")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "groups-table":
             self._set_current_group(str(event.row_key.value), focus_nodes=True)
         elif event.data_table.id == "nodes-table":
             self.action_select_node()
+
+    def on_key(self, event: events.Key) -> None:
+        focused = getattr(self.app, "focused", None)
+        if isinstance(focused, Button) and event.key in {"left", "right"}:
+            if event.key == "right":
+                self.app.action_focus_next()
+            else:
+                self.app.action_focus_previous()
+            event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-switch-node":
@@ -302,6 +341,7 @@ class ProxiesScreen(Widget):
         self._set_current_group(str(row.key.value), focus_nodes=focus_nodes)
 
     def action_back(self) -> None:
+        self._pending_restart = False
         focused = getattr(self.app, "focused", None)
         if self._drilled is not None and isinstance(focused, DataTable) and focused.id == "nodes-table":
             self._drilled = None
@@ -314,29 +354,35 @@ class ProxiesScreen(Widget):
         else:
             for tabbed in self.app.query("#main-tabs"):
                 for child in tabbed.walk_children():
-                    if child.__class__.__name__ == "ContentTabs":
+                    if child.__class__.__name__ == "ContentTabs" and isinstance(child, Widget):
                         child.focus()
                         return
-                tabbed.focus()
+                if isinstance(tabbed, Widget):
+                    tabbed.focus()
                 return
 
     def action_select_node(self) -> None:
+        self._pending_restart = False
         if not self._current_group:
             return
 
         nodes_table = self.query_one("#nodes-table", DataTable)
-        if nodes_table.cursor_row is None:
+        if nodes_table.cursor_row is None or nodes_table.cursor_row >= len(nodes_table.ordered_rows):
             self.query_one("#proxy-action-status", Label).update("[#f6c177]尚未选择节点[/]")
             return
 
         row = nodes_table.ordered_rows[nodes_table.cursor_row]
         node_name = str(row.key.value)
+        if node_name in {_PLACEHOLDER_KEY, _ERROR_KEY}:
+            self.query_one("#proxy-action-status", Label).update("[#f6c177]尚未选择节点[/]")
+            return
+
         choice = next((item for item in self._visible_choices() if item.key == node_name), None)
         if choice is not None and choice.drillable:
             self._drilled = choice
             self._update_nodes_table()
             self.query_one("#nodes-table", DataTable).focus()
-            self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]已进入 {choice.display}[/]")
+            self.query_one("#proxy-action-status", Label).update(f"[#8b98aa]已进入 {escape_markup(choice.display)}[/]")
             return
 
         if not self._api_available:
@@ -347,15 +393,17 @@ class ProxiesScreen(Widget):
 
         path = list(choice.path) if choice is not None else [(self._current_group.name, node_name)]
         if not path:
-            self.notify(f"[{self._current_group.name}] 该项不能直接切换", severity="warning")
+            self.notify(f"[{self._current_group.name}] 该项不能直接切换", severity="warning", markup=False)
             return
 
-        if choice is None and str(self._current_group.type).lower() not in {"selector", "select"}:
-            self.notify(f"分组 [{self._current_group.name}] 不支持手动切换", severity="warning")
+        if choice is None and str(self._current_group.type).lower() not in {"selector", "select", "fallback"}:
+            self.notify(f"分组 [{self._current_group.name}] 不支持手动切换", severity="warning", markup=False)
             return
 
         group_name, target_name = path[-1]
-        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在切换 {group_name} → {target_name}…[/]")
+        self.query_one("#proxy-action-status", Label).update(
+            f"[#f6c177]正在切换 {escape_markup(group_name)} → {escape_markup(target_name)}…[/]"
+        )
         if len(path) == 1:
             self._switch_node(path[0][0], path[0][1])
         else:
@@ -365,34 +413,46 @@ class ProxiesScreen(Widget):
     def _switch_node(self, group_name: str, node_name: str) -> None:
         try:
             QueryService(self.paths).switch_group(group_name, node_name)
-            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, exc)
+            safe_call_from_thread(self, self._finish_switch_node, group_name, node_name, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._finish_switch_node, group_name, node_name, coerce_worker_error(exc))
 
     @work(thread=True, exclusive=True, group="proxy-action")
     def _switch_path(self, path: list[tuple[str, str]]) -> None:
         group_name, node_name = path[-1]
         try:
             QueryService(self.paths).switch_path(path)
-            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._finish_switch_node, group_name, node_name, exc)
+            safe_call_from_thread(self, self._finish_switch_node, group_name, node_name, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._finish_switch_node, group_name, node_name, coerce_worker_error(exc))
 
     def _finish_switch_node(self, group_name: str, node_name: str, error: Exception | None) -> None:
+        if not self.is_mounted:
+            return
         status = self.query_one("#proxy-action-status", Label)
         if error is None:
-            status.update(f"[#a3e635]已切换 {group_name} → {node_name}[/]")
-            self.notify(f"已切换: {group_name} → {node_name}", severity="information")
+            status.update(f"[#a3e635]已切换 {escape_markup(group_name)} → {escape_markup(node_name)}[/]")
+            self.notify(f"已切换: {group_name} → {node_name}", severity="information", markup=False)
             self.refresh_data()
         elif isinstance(error, APIUnavailableError):
             status.update("[#fb7185]API 不可访问[/]")
-            self.notify("API 不可访问", severity="error")
+            self.notify("API 不可访问", severity="error", markup=False)
         else:
-            status.update(f"[#fb7185]切换失败: {error}[/]")
-            self.notify(f"切换失败: {error}", severity="error")
+            status.update(f"[#fb7185]切换失败: {escape_markup(error)}[/]")
+            self.notify(f"切换失败: {error}", severity="error", markup=False)
 
     def action_restart_proxy(self) -> None:
-        self.query_one("#proxy-action-status", Label).update("[#f6c177]正在生成配置并重启…[/]")
+        if self._restart_running:
+            return
+        status = self.query_one("#proxy-action-status", Label)
+        if not self._pending_restart:
+            self._pending_restart = True
+            status.update("[#f6c177]重启会中断现有连接；请再次点击“重启”确认[/]")
+            return
+        self._pending_restart = False
+        self._restart_running = True
+        self.query_one("#btn-restart-proxy", Button).disabled = True
+        status.update("[#f6c177]正在生成配置并重启…[/]")
         self._restart_proxy()
 
     @work(thread=True, exclusive=True, group="proxy-action")
@@ -400,50 +460,81 @@ class ProxiesScreen(Widget):
         try:
             runtime_path = render_runtime(self.paths)
             pid = restart_process(self.paths)
-            self.app.call_from_thread(self._finish_restart, runtime_path, pid, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._finish_restart, None, None, exc)
+            write_audit_event(
+                self.paths,
+                action="proxy_restart",
+                target=str(runtime_path),
+                result="ok",
+                detail={"pid": pid},
+            )
+            if not safe_call_from_thread(self, self._finish_restart, runtime_path, pid, None):
+                self._restart_running = False
+        except (Exception, SystemExit) as exc:
+            err = coerce_worker_error(exc)
+            try:
+                write_audit_event(
+                    self.paths,
+                    action="proxy_restart",
+                    target="mihomo",
+                    result="error",
+                    detail={"error": str(err)},
+                )
+            except Exception:
+                pass
+            if not safe_call_from_thread(self, self._finish_restart, None, None, err):
+                self._restart_running = False
 
     def _finish_restart(self, runtime_path, pid: int | None, error: Exception | None) -> None:
+        self._restart_running = False
+        if not self.is_mounted:
+            return
+        self.query_one("#btn-restart-proxy", Button).disabled = False
         status = self.query_one("#proxy-action-status", Label)
         if error is None:
-            status.update(f"[#a3e635]已重启 PID {pid}；运行配置 {runtime_path}[/]")
+            status.update(f"[#a3e635]已重启 PID {escape_markup(pid)}；运行配置 {escape_markup(runtime_path)}[/]")
             self.refresh_data()
         else:
-            status.update(f"[#fb7185]重启失败: {error}[/]")
-            self.notify(f"重启失败: {error}", severity="error")
+            status.update(f"[#fb7185]重启失败: {escape_markup(error)}[/]")
+            self.notify(f"重启失败: {error}", severity="error", markup=False)
 
     def action_test_delay(self) -> None:
+        self._pending_restart = False
         if not self._current_group:
             return
-        group_name = self._drilled.key if self._drilled is not None else self._current_group.name
-        current_name = self._current_group.current
-        if self._drilled is not None:
-            drilled_group = next((group for group in self._groups if group.name == self._drilled.key), None)
-            if drilled_group is not None:
-                current_name = drilled_group.current
-        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在测速: {group_name}…[/]")
+        target_group = self._active_real_group()
+        if target_group is None:
+            return
+        group_name = target_group.name
+        current_name = target_group.current
+        self.query_one("#proxy-action-status", Label).update(f"[#f6c177]正在测速: {escape_markup(group_name)}…[/]")
         self._test_delay(group_name, current_name)
 
     @work(thread=True, exclusive=True, group="proxy-action")
     def _test_delay(self, group_name: str, current_name: str | None) -> None:
+        worker = get_current_worker()
+
         def on_progress(done: int, total: int, node_name: str, delay: int | None) -> None:
-            try:
-                self.app.call_from_thread(self._on_test_progress, group_name, current_name, done, total, node_name, delay)
-            except Exception:
-                # 界面已卸载或应用正在关闭，丢弃进度即可
-                pass
+            if worker.is_cancelled or not self.is_mounted:
+                return
+            safe_call_from_thread(
+                self, self._on_test_progress, group_name, current_name, done, total, node_name, delay
+            )
 
         try:
             report = DiagnosticsService(self.paths).test_group(group_name, on_progress=on_progress)
-            self.app.call_from_thread(self._finish_test_delay, group_name, current_name, report, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._finish_test_delay, group_name, current_name, None, exc)
+            if worker.is_cancelled or not self.is_mounted:
+                return
+            safe_call_from_thread(self, self._finish_test_delay, group_name, current_name, report, None)
+        except (Exception, SystemExit) as exc:
+            if worker.is_cancelled or not self.is_mounted:
+                return
+            safe_call_from_thread(
+                self, self._finish_test_delay, group_name, current_name, None, coerce_worker_error(exc)
+            )
 
     def _delay_view_matches(self, group_name: str) -> bool:
-        if self._drilled is not None:
-            return self._drilled.key == group_name
-        return self._current_group is not None and self._current_group.name == group_name
+        active = self._active_real_group()
+        return active is not None and active.name == group_name
 
     @staticmethod
     def _format_delay_cell(delay: int | None) -> str:
@@ -464,9 +555,11 @@ class ProxiesScreen(Widget):
         node_name: str,
         delay: int | None,
     ) -> None:
+        if not self.is_mounted:
+            return
         result_text = f"{delay}ms" if delay else "失败"
         self.query_one("#proxy-action-status", Label).update(
-            f"[#f6c177]正在测速 {done}/{total} · {node_name} · {result_text}[/]"
+            f"[#f6c177]正在测速 {done}/{total} · {escape_markup(node_name)} · {result_text}[/]"
         )
         if not self._delay_view_matches(group_name):
             return
@@ -474,27 +567,36 @@ class ProxiesScreen(Widget):
         delay_cell = self._format_delay_cell(delay)
         if node_name in nodes_table.rows:
             nodes_table.update_cell(node_name, "delay", delay_cell, update_width=True)
-        else:
-            prefix = "[#a3e635]●[/] " if node_name == current_name else "  "
-            nodes_table.add_row(f"{prefix}{node_name}", delay_cell, key=node_name)
+        elif not self._is_virtual_bucket_drilled():
+            nodes_table.add_row(_node_cell(node_name, active=(node_name == current_name)), delay_cell, key=node_name)
 
     def _finish_test_delay(self, group_name: str, current_name: str | None, report, error: Exception | None) -> None:
+        if not self.is_mounted:
+            return
         status = self.query_one("#proxy-action-status", Label)
         if error is not None:
             message = "API 不可访问" if isinstance(error, APIUnavailableError) else f"测速失败: {error}"
-            status.update(f"[#fb7185]{message}[/]")
-            self.notify(message, severity="error")
+            status.update(f"[#fb7185]{escape_markup(message)}[/]")
+            self.notify(message, severity="error", markup=False)
             return
 
-        self.query_one("#current-node", Label).update(f"[#a3e635]● {current_name}[/]")
         if self._delay_view_matches(group_name):
+            if self._drilled is not None and self._is_virtual_bucket_drilled():
+                display_current = self._drilled.display
+            else:
+                display_current = current_name or "─"
+            self.query_one("#current-node", Label).update(f"[#a3e635]● {escape_markup(display_current)}[/]")
             nodes_table = self.query_one("#nodes-table", DataTable)
+            virtual_bucket = self._is_virtual_bucket_drilled()
             for result in report.results:
                 delay_cell = self._format_delay_cell(result.delay if (result.ok and result.delay) else None)
                 if result.name in nodes_table.rows:
                     nodes_table.update_cell(result.name, "delay", delay_cell, update_width=True)
-                else:
-                    prefix = "[#a3e635]●[/] " if result.name == current_name else "  "
-                    nodes_table.add_row(f"{prefix}{result.name}", delay_cell, key=result.name)
-        status.update(f"[#a3e635]测速完成: {group_name}[/]")
-        self.notify(f"测速完成: {group_name}", severity="information")
+                elif not virtual_bucket:
+                    nodes_table.add_row(
+                        _node_cell(result.name, active=(result.name == current_name)),
+                        delay_cell,
+                        key=result.name,
+                    )
+        status.update(f"[#a3e635]测速完成: {escape_markup(group_name)}[/]")
+        self.notify(f"测速完成: {group_name}", severity="information", markup=False)

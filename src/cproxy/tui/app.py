@@ -6,6 +6,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.theme import Theme
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Checkbox,
@@ -243,7 +244,7 @@ class CProxyApp(App):
                 self.action_focus_previous()
             event.stop()
 
-    def action_back(self) -> None:
+    async def action_back(self) -> None:
         tabbed = self.query_one(TabbedContent)
         focused = self.focused
         if tabbed.active == "proxies" and isinstance(focused, DataTable) and focused.id == "nodes-table":
@@ -255,7 +256,7 @@ class CProxyApp(App):
     def _focus_top_tabs(self) -> None:
         tabbed = self.query_one(TabbedContent)
         for child in tabbed.walk_children():
-            if child.__class__.__name__ == "ContentTabs":
+            if child.__class__.__name__ == "ContentTabs" and isinstance(child, Widget):
                 child.focus()
                 return
         tabbed.focus()

@@ -113,7 +113,7 @@ def _candidate_matches_token(candidate: str, folded_lower: str, token: str) -> b
     if token in folded_lower or token in candidate.lower():
         return True
     tag = parse_node_tag(candidate)
-    if token.isdigit():
+    if token.isascii() and token.isdigit():
         wanted_idx = f"{int(token):02d}" if int(token) < 100 else str(int(token))
         if tag.index == wanted_idx:
             return True

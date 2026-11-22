@@ -46,10 +46,31 @@ function Assert-NativeSuccess([string]$Step) {
 if ($Uninstall) {
     Write-Host "[1/3] 正在停止运行中的旁路守护进程..." -ForegroundColor Cyan
     Stop-ExistingVergeDaemon
-    Write-Host "[2/3] 正在移除计划任务与开机启动项..." -ForegroundColor Cyan
+    Write-Host "[2/3] 正在移除计划任务、开机启动项与守护进程副本..." -ForegroundColor Cyan
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     if (Test-Path $StartupVbs) {
         Remove-Item $StartupVbs -Force -ErrorAction SilentlyContinue
+    }
+    $PyForUninstall = Get-Command python.exe -ErrorAction SilentlyContinue
+    if (-not $PyForUninstall) {
+        $PyForUninstall = Get-Command py.exe -ErrorAction SilentlyContinue
+    }
+    if ($PyForUninstall) {
+        try {
+            $PyExePath = & $PyForUninstall.Source -c "import sys; print(sys.executable)" 2>$null
+            if ($PyExePath) {
+                $DaemonCopy = Join-Path (Split-Path -Parent $PyExePath.Trim()) "cproxy-daemon.exe"
+                if (Test-Path $DaemonCopy) {
+                    Remove-Item $DaemonCopy -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {
+            # 忽略卸载清理时的非致命错误
+        }
+    }
+    $DaemonCmd = Get-Command cproxy-daemon.exe -ErrorAction SilentlyContinue
+    if ($DaemonCmd -and (Test-Path $DaemonCmd.Source)) {
+        Remove-Item $DaemonCmd.Source -Force -ErrorAction SilentlyContinue
     }
     Write-Host "[3/3] 已完成卸载: $TaskName" -ForegroundColor Green
     exit 0
@@ -103,7 +124,15 @@ Assert-NativeSuccess "Clash Verge 旁路集成"
 Write-Host "==> [3/4] 正在注册后台常驻守护进程 ($TaskName)..." -ForegroundColor Cyan
 Stop-ExistingVergeDaemon
 $DaemonExe = Join-Path $PythonDir "cproxy-daemon.exe"
-Copy-Item -Path $PythonwExe -Destination $DaemonExe -Force
+try {
+    Copy-Item -Path $PythonwExe -Destination $DaemonExe -Force -ErrorAction Stop
+} catch [System.UnauthorizedAccessException] {
+    Write-Warning "无权写入 $PythonDir，将直接使用 $PythonwExe 运行后台守护进程。"
+    $DaemonExe = $PythonwExe
+} catch {
+    Write-Warning "无法创建守护进程副本 $DaemonExe（$($_.Exception.Message)），将直接使用 $PythonwExe。"
+    $DaemonExe = $PythonwExe
+}
 
 $RegisteredTaskOk = $false
 try {
@@ -135,7 +164,7 @@ WshShell.Run """$DaemonExe"" -m cproxy.cli verge daemon", 0, False
 
 # 5. 执行一次初始状态检查与调度健康核验
 Write-Host "==> [4/4] 正在验证与 Clash Verge 内核的调度健康状态..." -ForegroundColor Cyan
-& $DaemonExe -m cproxy.cli verge once --no-rebalance
+& $PythonExe -m cproxy.cli verge once --no-rebalance
 Assert-NativeSuccess "首轮 AI 看护"
 $StatusReady = $false
 for ($Attempt = 0; $Attempt -lt 15; $Attempt++) {

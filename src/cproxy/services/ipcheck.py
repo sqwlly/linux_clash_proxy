@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import http.client
 import json
+import math
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -16,6 +18,7 @@ from ..proxyenv import proxy_http_url
 IPOK_API = "https://ipok.io/api/ip"
 DEFAULT_TIMEOUT = 30
 DEFAULT_CHECK_GROUP = "CyberGuard"
+MAX_IPOK_RESPONSE_BYTES = 1_048_576
 
 RISK_BANDS: tuple[tuple[int, str], ...] = (
     (20, "纯净"),
@@ -45,10 +48,30 @@ def risk_verdict(risk: int | None) -> str:
 
 
 def _to_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 @dataclass(frozen=True)
@@ -106,21 +129,27 @@ def _text(payload: dict[str, Any], *keys: str, default: str = "-") -> str:
 
 
 def parse_report(payload: dict[str, Any]) -> IpPurityReport:
-    geo = payload.get("geo") or {}
-    breakdown = payload.get("riskBreakdown") or {}
-    blocklist = payload.get("blocklist") or {}
-    shared = payload.get("sharedUsers") or {}
-    intel = payload.get("intel") or {}
-    datacenter = intel.get("datacenter") or {}
+    if not isinstance(payload, dict):
+        raise IpCheckError("错误: ipok.io 返回格式异常（期望 JSON 对象）")
+    geo = _as_dict(payload.get("geo"))
+    breakdown = _as_dict(payload.get("riskBreakdown"))
+    blocklist = _as_dict(payload.get("blocklist"))
+    shared = _as_dict(payload.get("sharedUsers"))
+    intel = _as_dict(payload.get("intel"))
+    datacenter = _as_dict(intel.get("datacenter"))
     risk = _to_int(payload.get("risk"))
     services = [
         ServiceStatus(str(item.get("key", "?")), str(item.get("status", "unknown")))
-        for item in payload.get("services") or []
+        for item in _as_list(payload.get("services"))
         if isinstance(item, dict)
     ]
     sources = [
-        SourceScore(str(item.get("source", "?")), int(item.get("risk") or 0), float(item.get("weight") or 0))
-        for item in breakdown.get("contributors") or []
+        SourceScore(
+            str(item.get("source", "?")),
+            _to_int(item.get("risk")) or 0,
+            _to_float(item.get("weight")) or 0.0,
+        )
+        for item in _as_list(breakdown.get("contributors"))
         if isinstance(item, dict)
     ]
     return IpPurityReport(
@@ -134,9 +163,9 @@ def parse_report(payload: dict[str, Any]) -> IpPurityReport:
         native_type=_text(payload, "nativeType", default="unknown"),
         risk=risk,
         verdict=risk_verdict(risk),
-        signals=[str(item) for item in payload.get("signals") or []],
+        signals=[str(item) for item in _as_list(payload.get("signals"))],
         sources=sources,
-        blocklist_listed=[str(item) for item in blocklist.get("listed") or []],
+        blocklist_listed=[str(item) for item in _as_list(blocklist.get("listed"))],
         blocklist_checked=_to_int(blocklist.get("checked")) or 0,
         shared_users=str(shared.get("range") or ""),
         shared_quality=str(shared.get("quality") or ""),
@@ -157,7 +186,8 @@ class IpCheckService:
         opener = build_opener(ProxyHandler({"http": proxy_http_url(self.paths), "https": proxy_http_url(self.paths)}))
         try:
             with opener.open(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                raw = response.read(MAX_IPOK_RESPONSE_BYTES)
+                payload = json.loads(raw.decode("utf-8"))
         except HTTPError as exc:
             if exc.code == 429:
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -166,8 +196,11 @@ class IpCheckService:
             if exc.code == 400:
                 raise IpCheckError(f"错误: ipok.io 拒绝了请求参数（检查 IP 格式: {ip or '-'}）") from exc
             raise IpCheckError(f"错误: ipok.io 返回 HTTP {exc.code}") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (URLError, OSError, http.client.HTTPException, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise IpCheckError(f"错误: ipok.io 请求失败: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise IpCheckError("错误: ipok.io 返回格式异常（期望 JSON 对象）")
+        return payload
 
     def check(
         self,

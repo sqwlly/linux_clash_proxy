@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${BINDIR:-${PREFIX}/bin}"
 
@@ -94,10 +93,13 @@ while [ "$#" -gt 0 ]; do
 done
 
 require_cmd() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        echo "错误: 缺少依赖命令: $1" >&2
-        exit 1
-    fi
+    local cmd
+    for cmd in "$@"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo "错误: 缺少依赖命令: $cmd" >&2
+            exit 1
+        fi
+    done
 }
 
 detect_arch() {
@@ -114,7 +116,9 @@ detect_arch() {
 installed_version() {
     local bin="${BINDIR}/mihomo"
     [ -x "$bin" ] || return 1
-    "$bin" -v 2>/dev/null | sed -n 's/^Mihomo Meta \(v[^ ]*\).*/\1/p' | head -1
+    local out
+    out="$("$bin" -v 2>/dev/null)" || return 1
+    printf '%s\n' "$out" | awk '/^Mihomo Meta v/{if (!found) {print $3; found=1}}'
 }
 
 download_asset() {
@@ -155,7 +159,7 @@ action_check() {
 }
 
 action_fetch_hash() {
-    require_cmd curl
+    require_cmd curl sha256sum
     CLEANUP_DIR="$(mktemp -d)"
     echo "下载 ${FETCH_VERSION} 资产以计算哈希..." >&2
     download_asset "$FETCH_VERSION" "${CLEANUP_DIR}/mihomo.gz"
@@ -172,7 +176,7 @@ EOF
 
 action_install() {
     resolve_version_and_sha
-    require_cmd curl
+    require_cmd curl sha256sum gunzip
 
     local current
     current="$(installed_version || true)"
@@ -186,6 +190,15 @@ action_install() {
         echo "[dry-run] 下载地址: ${BASE_URL}/${VERSION}/mihomo-linux-$(detect_arch)-${VERSION}.gz"
         echo "[dry-run] 期望 sha256: ${SHA256}"
         return 0
+    fi
+
+    if [ ! -d "$BINDIR" ]; then
+        echo "错误: 目录不存在: ${BINDIR}" >&2
+        exit 1
+    fi
+    if [ ! -w "$BINDIR" ]; then
+        echo "错误: 无权限写入 ${BINDIR}，请使用 sudo 运行" >&2
+        exit 1
     fi
 
     CLEANUP_DIR="$(mktemp -d)"
@@ -211,15 +224,6 @@ action_install() {
         exit 1
     fi
 
-    if [ ! -d "$BINDIR" ]; then
-        echo "错误: 目录不存在: ${BINDIR}" >&2
-        exit 1
-    fi
-    if [ ! -w "$BINDIR" ]; then
-        echo "错误: 无权限写入 ${BINDIR}，请使用 sudo 运行" >&2
-        exit 1
-    fi
-
     # 先写入临时文件再 rename，避免覆盖正在运行的二进制导致 ETXTBSY
     STAGED_FILE="$(mktemp "${BINDIR}/.mihomo.new.XXXXXX")"
     cp "${CLEANUP_DIR}/mihomo" "$STAGED_FILE"
@@ -227,7 +231,10 @@ action_install() {
     mv -f "$STAGED_FILE" "${BINDIR}/mihomo"
     STAGED_FILE=""
 
-    echo "mihomo 已安装: ${current:-未安装} -> $("${BINDIR}/mihomo" -v | head -1)"
+    local installed_line
+    installed_line="$("${BINDIR}/mihomo" -v 2>/dev/null || true)"
+    installed_line="${installed_line%%$'\n'*}"
+    echo "mihomo 已安装: ${current:-未安装} -> ${installed_line}"
     if pidof mihomo >/dev/null 2>&1; then
         echo "提示: mihomo 正在运行，重启服务后生效（systemctl --user restart cproxy.service 或 cproxy restart）"
     fi

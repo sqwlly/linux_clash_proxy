@@ -151,10 +151,8 @@ def format_bytes(size: int | float) -> str:
 
 # 链路是否走直连。mihomo 以字面量 DIRECT 表示直连出站；若某分组当前选中的节点就是
 # DIRECT，链路形如 "Group -> ... -> DIRECT"，该流量同样不经代理，所以判据是
-# **链路末端动作**为 DIRECT。原实现用 `chain LIKE '%DIRECT%'` 子串匹配，有两个问题：
-# SQLite 的 LIKE 对 ASCII 大小写不敏感（"direct" 也算直连），且名字里含 direct 的
-# 代理节点（如 "DIRECT-US"）会被误判为直连。
-_DIRECT_CHAIN = "(chain = 'DIRECT' OR chain LIKE '% -> DIRECT')"
+# **链路末端动作**为 DIRECT。使用 SQLite 区分大小写的 GLOB 避免把名为 "Direct" 的代理误判为直连。
+_DIRECT_CHAIN = "(chain = 'DIRECT' OR chain GLOB '* -> DIRECT')"
 
 # 按进程聚合全量流量并拆出代理部分。不做直连过滤：直连常占绝大多数，
 # 只统计代理会漏掉主要消耗方（“仅代理”视角改由 proxy_* 两列体现）。
@@ -222,31 +220,50 @@ class TrafficService:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.executescript(_SCHEMA)
+        try:
+            mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+            current_mode = str(mode_row[0]).lower() if mode_row else ""
+            if current_mode != "wal":
+                conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('traffic_samples', 'traffic_process_samples', 'connections_seen')"
+            )
+        }
+        if len(existing_tables) < 3:
+            conn.executescript(_SCHEMA)
         # 旧库迁移：connections_seen 补 process 列
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(connections_seen)")}
         if "process" not in columns:
             conn.execute("ALTER TABLE connections_seen ADD COLUMN process TEXT NOT NULL DEFAULT ''")
-        canonical_agy = _resolve_agy_process_label()
-        if canonical_agy != "agy":
-            rows_to_merge = conn.execute(
-                "SELECT day, hour, chain, download, upload FROM traffic_process_samples WHERE process = 'agy'"
-            ).fetchall()
-            if rows_to_merge:
-                with conn:
-                    for r in rows_to_merge:
-                        conn.execute(
-                            """
-                            INSERT INTO traffic_process_samples (day, hour, process, chain, download, upload)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT (day, hour, process, chain) DO UPDATE SET
-                                download = download + excluded.download,
-                                upload = upload + excluded.upload
-                            """,
-                            (r["day"], r["hour"], canonical_agy, r["chain"], r["download"], r["upload"]),
-                        )
-                    conn.execute("DELETE FROM traffic_process_samples WHERE process = 'agy'")
         return conn
+
+    @staticmethod
+    def _merge_legacy_agy_rows(db: sqlite3.Connection, canonical_agy: str) -> None:
+        if not canonical_agy or canonical_agy == "agy":
+            return
+        rows_to_merge = db.execute(
+            "SELECT day, hour, chain, download, upload FROM traffic_process_samples WHERE process = 'agy'"
+        ).fetchall()
+        if not rows_to_merge:
+            return
+        for r in rows_to_merge:
+            db.execute(
+                """
+                INSERT INTO traffic_process_samples (day, hour, process, chain, download, upload)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (day, hour, process, chain) DO UPDATE SET
+                    download = download + excluded.download,
+                    upload = upload + excluded.upload
+                """,
+                (r["day"], r["hour"], canonical_agy, r["chain"], r["download"], r["upload"]),
+            )
+        db.execute("DELETE FROM traffic_process_samples WHERE process = 'agy'")
 
     def collect(self) -> CollectResult:
         payload = self.api.get_connections()
@@ -258,6 +275,7 @@ class TrafficService:
         now_text = now.isoformat(timespec="seconds")
 
         with closing(self._connect()) as db, db:
+            self._merge_legacy_agy_rows(db, agy_label)
             seen = {
                 row["id"]: row
                 for row in db.execute("SELECT * FROM connections_seen")
@@ -324,13 +342,16 @@ class TrafficService:
                     (conn_id, host, rule, chain, download, upload, now_text, now_text, process),
                 )
 
-            closed_ids = set(seen) - active_ids
+            closed_ids = sorted(set(seen) - active_ids)
             if closed_ids:
-                placeholders = ",".join("?" for _ in closed_ids)
-                db.execute(
-                    f"DELETE FROM connections_seen WHERE id IN ({placeholders})",
-                    tuple(sorted(closed_ids)),
-                )
+                chunk_size = 500
+                for offset in range(0, len(closed_ids), chunk_size):
+                    batch = closed_ids[offset : offset + chunk_size]
+                    placeholders = ",".join("?" for _ in batch)
+                    db.execute(
+                        f"DELETE FROM connections_seen WHERE id IN ({placeholders})",
+                        tuple(batch),
+                    )
             cutoff = (now - SEEN_RETENTION).isoformat(timespec="seconds")
             db.execute("DELETE FROM connections_seen WHERE last_seen < ?", (cutoff,))
             db.execute(
@@ -360,7 +381,7 @@ class TrafficService:
         since = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
         until = now.strftime("%Y-%m-%d")
 
-        with closing(self._connect()) as db, db:
+        with closing(self._connect()) as db:
             dimensions: dict[str, list[TrafficRow]] = {}
             wanted = [dimension] if dimension in DIMENSIONS else list(DIMENSIONS)
             for name in wanted:
@@ -412,7 +433,7 @@ class TrafficService:
         since = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
         until = now.strftime("%Y-%m-%d")
 
-        with closing(self._connect()) as db, db:
+        with closing(self._connect()) as db:
             rows = db.execute(
                 f"""
                 SELECT host AS label, SUM(download) AS download, SUM(upload) AS upload
@@ -464,7 +485,7 @@ class TrafficService:
         since = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
         until = now.strftime("%Y-%m-%d")
 
-        with closing(self._connect()) as db, db:
+        with closing(self._connect()) as db:
             return _process_breakdown(db, since, until, top)
 
     def _dimension_rows(

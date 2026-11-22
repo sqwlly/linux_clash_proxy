@@ -72,7 +72,7 @@ ANSI_RED = "\033[31m"
 ANSI_CYAN = "\033[36m"
 ANSI_MAGENTA = "\033[35m"
 
-POSITIVE_STATUSES = {"正常", "运行中", "可访问", "已就绪"}
+POSITIVE_STATUSES = {"正常", "运行中", "可访问", "已就绪", "已启用"}
 WARNING_STATUSES = {"部分异常", "待刷新", "未知"}
 NEGATIVE_STATUSES = {"失败", "异常", "未运行", "不可访问"}
 
@@ -81,6 +81,7 @@ STATUS_ICONS = {
     "运行中": "●",
     "可访问": "✓",
     "已就绪": "✓",
+    "已启用": "✓",
     "部分异常": "!",
     "待刷新": "!",
     "未知": "?",
@@ -278,7 +279,7 @@ TableCell = tuple[str, tuple[str, ...]]
 def _table_widths(headers: list[str], rows: list[list[TableCell]]) -> list[int]:
     """逐列宽度（取表头与所有单元格文本的最大显示宽度）。"""
     return [
-        max(_display_width(headers[i]), *(_display_width(row[i][0]) for row in rows))
+        max([_display_width(headers[i]), *(_display_width(row[i][0]) for row in rows)])
         for i in range(len(headers))
     ]
 
@@ -625,7 +626,7 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
                 active_procs = []
         probe_report = run_ai_probe(default_paths())
         route = _resolve_ai_route(groups)
-    probe_ok = all(item.ok for item in probe_report.results)
+    probe_ok = bool(probe_report.results) and all(item.ok for item in probe_report.results)
     probe_status = _probe_summary_status(probe_report)
 
     if json_output:
@@ -782,6 +783,8 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
 
 
 def _probe_summary_status(report: AIProbeReport) -> str:
+    if not report.results:
+        return "未知"
     ok_count = sum(1 for item in report.results if item.ok)
     if ok_count == len(report.results):
         return "正常"
@@ -992,7 +995,9 @@ def _render_rounded_table(
         return
     aligns = aligns or ["l"] * len(headers)
     widths = _table_widths(headers, rows)
-    b = lambda s: _style(s, ANSI_DIM)
+
+    def b(s: str) -> str:
+        return _style(s, ANSI_DIM)
 
     def fmt_row(row: list[TableCell]) -> str:
         cells = []
@@ -1105,7 +1110,10 @@ def _render_ai_egress_topology(egress_details: dict, gemini_summary: str) -> Non
     leaf_clean = _strip_flag_chars(leaf_raw) or "AI-GEMINI 节点"
 
     w1, w2, w3, w4 = 14, 20, 22, 14
-    b = lambda s: _style(s, ANSI_DIM)
+
+    def b(s: str) -> str:
+        return _style(s, ANSI_DIM)
+
     arr_top = f"   {_style('HTTP', ANSI_DIM)}    "
     arr_mid = _style(" ────────▸ ", ANSI_GREEN)
     arr_bot_1 = f"   {_style(':7890', ANSI_DIM)}   "
@@ -1391,7 +1399,7 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
 
 def _render_group_check(report: GroupCheckReport, raw: bool, json_output: bool = False) -> int:
     if json_output:
-        ok = all(item.ok for item in report.results)
+        ok = bool(report.results) and all(item.ok for item in report.results)
         emit_json(
             "test-group",
             {
@@ -1409,7 +1417,7 @@ def _render_group_check(report: GroupCheckReport, raw: bool, json_output: bool =
     if raw:
         for item in report.results:
             print(f"{item.name}: {item.delay}ms" if item.ok and item.delay is not None else f"{item.name}: 失败")
-        return 0 if all(item.ok for item in report.results) else 1
+        return 0 if (bool(report.results) and all(item.ok for item in report.results)) else 1
 
     ok_items = [item for item in report.results if item.ok and item.delay is not None]
     best = min(ok_items, key=lambda item: item.delay or 0) if ok_items else None
@@ -1429,13 +1437,13 @@ def _render_group_check(report: GroupCheckReport, raw: bool, json_output: bool =
             print(f"{_status_label('正常')}  {padded_name}  {item.delay}ms")
         else:
             print(f"{_status_label('失败')}  {padded_name}  -")
-    return 0 if len(ok_items) == len(report.results) else 1
+    return 0 if (bool(report.results) and len(ok_items) == len(report.results)) else 1
 
 
 def _render_connectivity_report(report: ConnectivityReport, json_output: bool = False) -> int:
     passed = sum(1 for item in report.results if item.ok)
+    ok = bool(report.results) and passed == len(report.results)
     if json_output:
-        ok = passed == len(report.results)
         emit_json(
             "test",
             {
@@ -1463,11 +1471,11 @@ def _render_connectivity_report(report: ConnectivityReport, json_output: bool = 
             print(f"{_status_label('正常')}  {padded_name}  {item.detail}")
         else:
             print(f"{_status_label('失败')}  {padded_name}  {item.detail}")
-    if passed != len(report.results):
+    if not ok:
         print()
         _print_section("建议操作")
         print("执行 cproxy doctor 查看本地配置与进程状态。")
-    return 0 if passed == len(report.results) else 1
+    return 0 if ok else 1
 
 
 def _render_logs(lines: int, follow: bool) -> int:
@@ -1544,10 +1552,7 @@ def _run_bootstrap(subscription_url: str | None = None) -> int:
         print("已从订阅初始化配置（订阅地址已隐藏）")
     print(f"运行配置: {runtime_path}")
     print(f"代理进程: 运行中 (PID: {pid})")
-    if geodata_check.ok:
-        print(f"GeoIP: {geodata_check.detail}")
-    else:
-        print(f"GeoIP: {geodata_check.detail}")
+    print(f"GeoIP: {geodata_check.detail}")
     return 0
 
 
@@ -1680,11 +1685,11 @@ def _render_snapshots(paths, raw: bool, as_json: bool = False) -> int:
             size = format_bytes(entry.stat().st_size)
             rows.append((kind, name, rel_time, f"[{tier}]", size))
 
-        kind_width = max((_display_width(r[0]) for r in rows), default=4)
-        name_width = max((_display_width(r[1]) for r in rows), default=4)
-        time_width = max((_display_width(r[2]) for r in rows), default=6)
-        tier_width = max((_display_width(r[3]) for r in rows), default=6)
-        size_width = max((_display_width(r[4]) for r in rows), default=6)
+        kind_width = max([_display_width("类型"), *(_display_width(r[0]) for r in rows)])
+        name_width = max([_display_width("快照文件名"), *(_display_width(r[1]) for r in rows)])
+        time_width = max([_display_width("生成时间"), *(_display_width(r[2]) for r in rows)])
+        tier_width = max([_display_width("保留阶梯"), *(_display_width(r[3]) for r in rows)])
+        size_width = max([_display_width("大小"), *(_display_width(r[4]) for r in rows)])
 
         kind_header = _pad_right("类型", kind_width)
         name_header = _pad_right("快照文件名", name_width)
@@ -1708,17 +1713,17 @@ def _render_colored_diff(diff_lines: Sequence[str], max_lines: int = 40) -> None
     for line in diff_lines:
         count += 1
         if count > max_lines:
-            print(f"{ANSI_DIM}… (余下 {len(diff_lines) - max_lines} 行差异已折叠){ANSI_RESET}")
+            print(_style(f"… (余下 {len(diff_lines) - max_lines} 行差异已折叠)", ANSI_DIM))
             break
         text = line.rstrip("\r\n")
         if text.startswith("---") or text.startswith("+++"):
-            print(f"{ANSI_BOLD}{text}{ANSI_RESET}")
+            print(_style(text, ANSI_BOLD))
         elif text.startswith("@@"):
-            print(f"\033[36m{text}{ANSI_RESET}")
+            print(_style(text, ANSI_CYAN))
         elif text.startswith("+"):
-            print(f"\033[32m{text}{ANSI_RESET}")
+            print(_style(text, ANSI_GREEN))
         elif text.startswith("-"):
-            print(f"\033[31m{text}{ANSI_RESET}")
+            print(_style(text, ANSI_RED))
         else:
             print(text)
 
@@ -1874,14 +1879,19 @@ def _run_rollback(paths, name: str | None) -> int:
 
 
 def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False) -> int:
+    warnings = [
+        f"附加订阅 {item.name}: {item.detail or item.status}"
+        for item in report.extra_subscriptions
+        if item.status == "失败"
+    ]
+    if report.subscription == "失败":
+        warnings.insert(0, report.subscription_detail or "主订阅更新失败")
+    for item in report.groups:
+        if item.action == "失败":
+            warnings.append(f"分组 {item.group}: {item.detail or item.action}")
+    exit_code = 0 if not warnings else 1
+
     if json_output:
-        warnings = [
-            f"附加订阅 {item.name}: {item.detail or item.status}"
-            for item in report.extra_subscriptions
-            if item.status == "失败"
-        ]
-        if report.subscription == "失败":
-            warnings.insert(0, report.subscription_detail or "主订阅更新失败")
         emit_json(
             "refresh",
             report,
@@ -1889,7 +1899,7 @@ def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False)
             warnings=warnings,
             recommended_actions=["cproxy doctor"] if warnings else [],
         )
-        return 0 if not warnings else 1
+        return exit_code
     if raw:
         print(f"subscription={report.subscription} detail={report.subscription_detail}")
         for extra in report.extra_subscriptions:
@@ -1898,7 +1908,7 @@ def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False)
         print(f"restarted={report.restarted} hot_reloaded={report.hot_reloaded}")
         for item in report.groups:
             print(f"{item.group}: {item.action} current={item.current or '-'} target={item.target or '-'} {item.detail}")
-        return 0
+        return exit_code
 
     _print_section("摘要")
     # 旧版用裸 `f"订阅更新: ..."` 拼接，长 detail 时会撞列；
@@ -1935,7 +1945,7 @@ def _render_refresh(report: RefreshReport, raw: bool, json_output: bool = False)
             if item.detail:
                 line += f"  {item.detail}"
             print(line)
-    return 0
+    return exit_code
 
 
 def _format_history_time(ts_val: Any) -> str:
@@ -2016,12 +2026,14 @@ def _render_ai_connections(paths, raw: bool) -> int:
         print("未发现 ChatGPT/Claude/Gemini/Antigravity/GitHub 相关活动连接")
         return 0
 
-    host_width = max((_display_width(conn.host) for conn in connections), default=12)
-    host_width = max(host_width, _display_width("目标域名"))
-    print(f"{_pad_right('目标域名', host_width)}  {'连接数':<10}  出口链路")
+    host_width = max([_display_width("目标域名"), *(_display_width(conn.host) for conn in connections)])
+    count_width = max(
+        [_display_width("连接数"), 10, *(_display_width(f"{conn.count} active") for conn in connections)]
+    )
+    print(f"{_pad_right('目标域名', host_width)}  {_pad_right('连接数', count_width)}  出口链路")
     for conn in connections:
         active_label = f"{conn.count} active"
-        styled_active = _style(f"{active_label:<10}", ANSI_GREEN)
+        styled_active = _style(_pad_right(active_label, count_width), ANSI_GREEN)
         print(f"{_pad_right(conn.host, host_width)}  {styled_active}  {conn.route}")
     return 0
 
@@ -2159,12 +2171,18 @@ _PATH_NOISE_RE = re.compile(r"^(?:v\d+(?:\.\d+)*|(?:x86_64|aarch64|arm64|i686|am
 
 def _home_relative(text: str) -> str:
     home = str(Path.home())
-    if not home or home == "/":
+    if not home or home in {"/", "\\"}:
         return text
-    if text == home:
+    norm_text = text.replace("\\", "/")
+    norm_home = home.replace("\\", "/").rstrip("/")
+    if not norm_home:
+        return text
+    if norm_text == norm_home:
         return "~"
-    if text.startswith(home + "/"):
-        return "~" + text[len(home):]
+    if norm_text.startswith(norm_home + "/"):
+        sep = "\\" if ("\\" in text and "/" not in text) else "/"
+        rest = norm_text[len(norm_home) :]
+        return "~" + (rest.replace("/", "\\") if sep == "\\" else rest)
     return text
 
 
@@ -2178,7 +2196,7 @@ def _shorten_path(text: str, width: int) -> str:
     """把超长路径压进 ``width`` 显示宽度，尽量保留有辨识度的尾段。
 
     先做 ``$HOME`` → ``~``；仍超宽时从尾部回升段落，跳过噪声段
-    （``node_modules`` / ``bin`` / 版本号 / 平台三元组等），前缀 ``…/``。
+    （``node_modules`` / ``bin`` / 版本号 / 平台三元组等），前缀 ``…/``（Windows 为 ``…\\``）。
     """
     if not text or text == "-":
         return text
@@ -2187,20 +2205,21 @@ def _shorten_path(text: str, width: int) -> str:
     if _display_width(display) <= width:
         return display
 
-    parts = display.split("/")
+    sep = "\\" if ("\\" in display and "/" not in display) else "/"
+    parts = display.replace("\\", "/").split("/")
     if len(parts) <= 1:
         return display
 
     tail = [parts[-1]]
-    # parts[0] 是根标记（绝对路径的空串，或 `~`），与末段一起不进候选循环
+    # parts[0] 是根标记（绝对路径的空串/盘符，或 `~`），与末段一起不进候选循环
     for segment in reversed(parts[1:-1]):
         if _is_noise_segment(segment):
             continue
-        candidate = "…/" + "/".join([segment, *tail])
+        candidate = f"…{sep}" + sep.join([segment, *tail])
         if _display_width(candidate) > width:
             break
         tail.insert(0, segment)
-    result = "…/" + "/".join(tail)
+    result = f"…{sep}" + sep.join(tail)
     if _display_width(result) <= width:
         return result
 
@@ -2890,6 +2909,10 @@ def _run_rule(
                 },
             )
             return 0
+        if raw:
+            for item in removed:
+                print(f"RULE_REMOVED\t{item.format_mihomo_rule()}\tcomment={item.comment or '-'}")
+            return 0
         if not removed:
             print(f"未找到匹配的自定义规则: {target or '全部'}")
             return 0
@@ -2975,9 +2998,10 @@ def _render_benchmark(paths: AppPaths, *, raw: bool = False, as_json: bool = Fal
         return 0
     if raw:
         for card in cards:
+            avg_raw = card.avg_delay_ms if card.avg_delay_ms is not None else "-"
             print(
                 f"BENCHMARK\t{card.name}\tgrade={card.grade}\tscore={card.score}"
-                f"\talive={card.alive_nodes}/{card.total_nodes}\tavg_ms={card.avg_delay_ms or '-'}"
+                f"\talive={card.alive_nodes}/{card.total_nodes}\tavg_ms={avg_raw}"
                 f"\tregions={card.regions_count}\tdedicated={card.dedicated_count}\tai_ready={card.ai_ready_count}"
             )
         return 0
@@ -2988,18 +3012,27 @@ def _render_benchmark(paths: AppPaths, *, raw: bool = False, as_json: bool = Fal
         return 0
     rows: list[list[TableCell]] = []
     for card in cards:
-        grade_color = (
-            (ANSI_GREEN, ANSI_BOLD)
-            if card.grade in {"S", "A"}
-            else ((ANSI_YELLOW,) if card.grade == "B" else (ANSI_RED,))
-        )
+        if not card.live_data or card.grade == "-":
+            grade_color: tuple[str, ...] = (ANSI_DIM,)
+            grade_str = "- (离线)" if not card.live_data else "- (未测)"
+            alive_str = f"-/{card.total_nodes} (离线)" if not card.live_data else f"-/{card.total_nodes} (未测)"
+        else:
+            grade_color = (
+                (ANSI_GREEN, ANSI_BOLD)
+                if card.grade in {"S", "A"}
+                else ((ANSI_YELLOW,) if card.grade == "B" else (ANSI_RED,))
+            )
+            grade_str = f"{card.grade} ({card.score})"
+            alive_str = f"{card.alive_nodes}/{card.tested_nodes} ({card.alive_rate:.0f}%)"
+            if card.untested_nodes:
+                alive_str += f" · 未测 {card.untested_nodes}"
         avg_str = f"{card.avg_delay_ms} ms" if card.avg_delay_ms is not None else "-"
         min_str = f"{card.min_delay_ms} ms" if card.min_delay_ms is not None else "-"
         rows.append(
             [
                 (card.name, (ANSI_BOLD,)),
-                (f"{card.grade} ({card.score})", grade_color),
-                (f"{card.alive_nodes}/{card.total_nodes} ({card.alive_rate:.0f}%)", ()),
+                (grade_str, grade_color),
+                (alive_str, ()),
                 (avg_str, ()),
                 (min_str, (ANSI_DIM,)),
                 (str(card.regions_count), ()),
@@ -3023,6 +3056,7 @@ def _run_export(
     as_json: bool = False,
 ) -> int:
     import json as _json
+    import tempfile as _tempfile
 
     import yaml as _yaml
 
@@ -3035,11 +3069,24 @@ def _run_export(
     if output:
         out_path = Path(output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        if out_path.suffix.lower() == ".json" or as_json:
+        if out_path.suffix.lower() == ".json":
             text = _json.dumps(bundle, ensure_ascii=False, indent=2) + "\n"
         else:
             text = _yaml.safe_dump(bundle, allow_unicode=True, sort_keys=False, default_flow_style=False)
-        out_path.write_text(text, encoding="utf-8")
+        fd, tmp_name = _tempfile.mkstemp(dir=str(out_path.parent), prefix=f".{out_path.name}.", suffix=".tmp")
+        tmp_path = Path(tmp_name)
+        try:
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp_path, out_path)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         if as_json:
             emit_json("export", {"output": str(out_path), "redacted": redact})
         else:

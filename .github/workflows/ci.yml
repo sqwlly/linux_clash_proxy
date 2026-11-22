@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +25,9 @@ jobs:
 
       - name: Type check
         run: mypy src/
+
+      - name: Verify Clash Verge script copies stay in sync
+        run: diff -u scripts/clash-verge-script.js src/cproxy/data/verge/clash-verge-script.js
 
       - name: Python tests
         run: PYTHONPATH="src:." python -m pytest -q
@@ -75,3 +80,13 @@ jobs:
           results_file: scorecard.sarif
           results_format: sarif
           publish_results: false
+
+      - name: Upload supply-chain artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-reports
+          path: |
+            sbom.cdx.json
+            scorecard.sarif
+          if-no-files-found: warn

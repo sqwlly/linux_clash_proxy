@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 from argparse import Namespace
@@ -7,6 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .api import APIBackend, APIUnavailableError
+from .backend.runtime import delay_state
 from .cli_render import (
     _accent,
     _print_section,
@@ -100,6 +102,8 @@ def _run_speed(args: Namespace) -> int:
 
     meter = RateMeter()
     interval = max(0.5, float(args.interval))
+    isatty_fn = getattr(sys.stdout, "isatty", None)
+    is_tty = bool(callable(isatty_fn) and isatty_fn()) and os.environ.get("TERM", "") != "dumb"
     try:
         while True:
             try:
@@ -113,15 +117,20 @@ def _run_speed(args: Namespace) -> int:
             if rate is not None:
                 if args.raw:
                     print(f"{rate.download_bps:.1f} {rate.upload_bps:.1f}", flush=True)
+                elif is_tty:
+                    print(
+                        f"\r\x1b[K↓ {format_rate(rate.download_bps)}   ↑ {format_rate(rate.upload_bps)}",
+                        end="",
+                        flush=True,
+                    )
                 else:
                     print(
-                        f"\r↓ {format_rate(rate.download_bps)}   ↑ {format_rate(rate.upload_bps)}  ",
-                        end="",
+                        f"↓ {format_rate(rate.download_bps)}   ↑ {format_rate(rate.upload_bps)}",
                         flush=True,
                     )
             time.sleep(interval)
     except KeyboardInterrupt:
-        if not args.raw:
+        if not args.raw and is_tty:
             print()
         return 0
 
@@ -196,7 +205,13 @@ def _print_verge_status(rep, *, raw: bool = False) -> None:
         if not eg.present:
             print(f"{eg.group:<12} 未挂载")
             continue
-        delay_str = f"{eg.delay_ms} ms" if eg.delay_ms and eg.delay_ms > 0 else "未测速"
+        d_state = delay_state(eg.delay_ms)
+        if d_state == "ok":
+            delay_str = f"{eg.delay_ms} ms"
+        elif d_state == "timeout":
+            delay_str = "超时"
+        else:
+            delay_str = "未测速"
         line_tag = "专线/IEPL 风险" if eg.is_iepl else "非专线独立 IP"
         verdict_label = verdict_labels.get(eg.last_verdict, eg.last_verdict)
         print(f"{eg.group:<12} {eg.leaf_node}")
@@ -245,7 +260,7 @@ def _run_verge(args: Namespace) -> int:
     if action == "status":
         status_rep = check_verge_effectiveness(paths)
         if args.json:
-            emit_json("verge", status_rep, warnings=status_rep.remedies)
+            emit_json("verge", status_rep, ok=status_rep.overall_effective, warnings=status_rep.remedies)
         else:
             _print_verge_status(status_rep, raw=args.raw)
         return 0 if status_rep.overall_effective else 1
@@ -345,12 +360,20 @@ def _run_verge(args: Namespace) -> int:
             f"采样间隔: {args.sample_interval}s · 看护间隔: {args.watch_interval}s · "
             f"重排间隔: {args.rebalance_interval}s"
         )
+
+    def _on_tick(tick) -> None:
+        if args.json:
+            emit_json("verge", tick, ok=not tick.warnings, warnings=tick.warnings)
+            sys.stdout.flush()
+        else:
+            _print_verge_tick(tick, raw=args.raw)
+
     return svc.run_daemon(
         watch_interval=args.watch_interval,
         rebalance_interval=args.rebalance_interval,
         sample_interval=args.sample_interval,
         dry_run=args.dry_run,
-        on_tick=lambda tick: _print_verge_tick(tick, raw=args.raw),
+        on_tick=_on_tick,
     )
 
 
@@ -449,6 +472,8 @@ def run(argv: list[str] | None = None) -> int:
                             api.reload_config(str(runtime_path))
                             process.mark_runtime_applied(runtime_path)
                             print("已热重载运行配置")
+                        else:
+                            print("检测到活跃 AI 连接，已暂缓热重载（稍后可重新执行 cproxy render --apply 或 cproxy restart）")
             return 0
         if args.command == "tun":
             if args.action == "status" and args.apply:
@@ -635,7 +660,24 @@ def run(argv: list[str] | None = None) -> int:
                 )
             except APIUnavailableError:
                 # 定时任务在代理未运行时无需报错：跳过本轮，下一轮再排
-                print("代理未运行，跳过稳定度重排")
+                if args.raw:
+                    print("REBALANCE\tSKIPPED\tapi_unavailable")
+                else:
+                    print("代理未运行，跳过稳定度重排")
+                return 0
+            if args.raw:
+                print(
+                    f"REBALANCE\tmanual={len(rebalance_report.ordered)}\t"
+                    f"gemini={len(rebalance_report.gemini_ordered)}\t"
+                    f"rerendered={str(rebalance_report.rerendered).lower()}\t"
+                    f"hot_reloaded={str(rebalance_report.hot_reloaded).lower()}\t"
+                    f"switched={rebalance_report.switched_to or '-'}\t"
+                    f"gemini_switched={rebalance_report.gemini_switched_to or '-'}"
+                )
+                for index, name in enumerate(rebalance_report.ordered, start=1):
+                    print(f"MANUAL_NODE\t{index}\t{name}")
+                for index, name in enumerate(rebalance_report.gemini_ordered, start=1):
+                    print(f"GEMINI_NODE\t{index}\t{name}")
                 return 0
             print(_section_heading("结果"))
             print(f"稳定度排序（{len(rebalance_report.ordered)} 个节点）:")
@@ -658,7 +700,19 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "ai-watch":
             watch_report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)
             if not watch_report.results:
-                print("代理未运行，跳过 AI 出口看护")
+                if args.raw:
+                    print("WATCH\tSKIPPED\tnot_running")
+                else:
+                    print("代理未运行，跳过 AI 出口看护")
+                return 0
+            if args.raw:
+                for item in watch_report.results:
+                    print(
+                        f"WATCH\t{item.group}\t{item.verdict}\t{item.current or '-'}\t"
+                        f"{item.target or '-'}\tswitched={'true' if item.switched else 'false'}"
+                    )
+                if watch_report.reaped_pids:
+                    print("REAPED_PIDS\t" + ",".join(str(pid) for pid in watch_report.reaped_pids))
                 return 0
             print(_section_heading("AI 出口看护"))
             for item in watch_report.results:
@@ -676,6 +730,7 @@ def run(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "h2-keepalive":
             import asyncio
+
             from .services.h2_keepalive import (
                 ensure_h2_keepalive_daemon,
                 h2_keepalive_pid_file,
@@ -690,7 +745,10 @@ def run(argv: list[str] | None = None) -> int:
                     listen_port=args.port,
                     upstream_port=args.upstream_port,
                 )
-                print(f"H2 保活网关: {'已就绪' if ok else '启动失败'} (127.0.0.1:{args.port})")
+                if args.raw:
+                    print(f"H2_KEEPALIVE\t{'ok' if ok else 'failed'}\t127.0.0.1:{args.port}")
+                else:
+                    print(f"H2 保活网关: {'已就绪' if ok else '启动失败'} (127.0.0.1:{args.port})")
                 return 0 if ok else 1
             asyncio.run(
                 run_h2_keepalive_server(
@@ -972,7 +1030,11 @@ def _explain_switch_usage(entries) -> None:
 
 
 def main() -> None:
-    raise SystemExit(run(sys.argv[1:]))
+    try:
+        raise SystemExit(run(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
 from ..config import (
@@ -36,6 +37,8 @@ from .diagnostics import (
 from .probe import (
     GEMINI_GEO_BLOCKED_TTL_SECONDS,
     STREAM_FRAGILE_TTL_SECONDS,
+    _advisory_file_lock,
+    _atomic_write_text,
     clear_gemini_geo_blocked_node,
     invalidate_probe_state_cache,
     is_gemini_geo_blocked,
@@ -105,15 +108,11 @@ AI_STREAM_HOSTS = frozenset(
 )
 
 
-_LAST_SOCKET_QUEUE_MAP: dict[str, tuple[int, int]] = {}
-
-
-def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[int, int]]:
-    """通过 `ss -tnpi` 获取本地代理端口（默认 :7890）各客户端源端口的 `(lastsnd_ms, lastrcv_ms)`，
-    并同步记录各套接字的内核队列深度 `(recv_q_bytes, send_q_bytes)`。"""
+def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, Any]:
+    """通过 `ss -tnpi` 获取本地代理端口（默认 :7890）各客户端源端口的
+    `(lastsnd_ms, lastrcv_ms, recv_q_bytes, send_q_bytes)` 4-tuple。"""
     import subprocess
 
-    _LAST_SOCKET_QUEUE_MAP.clear()
     try:
         proc = subprocess.run(
             ["ss", "-tnpi", f"( sport = :{int(mixed_port)} )"],
@@ -127,7 +126,7 @@ def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[in
     except Exception:
         return {}
 
-    idle_map: dict[str, tuple[int, int]] = {}
+    idle_map: dict[str, tuple[int, int, int, int]] = {}
     pending_port: str | None = None
     pending_queues: tuple[int, int] = (0, 0)
     for raw_line in proc.stdout.splitlines():
@@ -150,8 +149,12 @@ def get_local_proxy_socket_idle_ms(mixed_port: int = 7890) -> dict[str, tuple[in
             m_snd = _SS_LASTSND_RE.search(line)
             m_rcv = _SS_LASTRCV_RE.search(line)
             if m_snd is not None and m_rcv is not None:
-                idle_map[pending_port] = (int(m_snd.group(1)), int(m_rcv.group(1)))
-                _LAST_SOCKET_QUEUE_MAP[pending_port] = pending_queues
+                idle_map[pending_port] = (
+                    int(m_snd.group(1)),
+                    int(m_rcv.group(1)),
+                    pending_queues[0],
+                    pending_queues[1],
+                )
             pending_port = None
     return idle_map
 
@@ -160,14 +163,32 @@ def _unpack_socket_timings(
     timings: tuple[int, ...] | None,
     src_port: str = "",
 ) -> tuple[int, int, int, int] | None:
+    _ = src_port
     if timings is None or len(timings) < 2:
         return None
     lastsnd_ms = int(timings[0])
     lastrcv_ms = int(timings[1])
     if len(timings) >= 4:
         return lastsnd_ms, lastrcv_ms, max(0, int(timings[2])), max(0, int(timings[3]))
-    q = _LAST_SOCKET_QUEUE_MAP.get(src_port, (0, 0))
-    return lastsnd_ms, lastrcv_ms, q[0], q[1]
+    return lastsnd_ms, lastrcv_ms, 0, 0
+
+
+def _resolve_socket_idle_map(
+    paths: AppPaths,
+    connections: list[dict],
+    mixed_port: int,
+    candidate_ports: set[str],
+) -> dict[str, tuple[int, ...]]:
+    """优先使用本地代理端口的内核 TCP 时序；若任意候选端口缺失（如 TUN 模式入站），
+    自动合并 `track_connections_idle_ms()` 的字节差分时序以防漏保护。"""
+    raw_idle = get_local_proxy_socket_idle_ms(mixed_port)
+    idle_map: dict[str, tuple[int, ...]] = dict(raw_idle) if isinstance(raw_idle, dict) else {}
+    if not idle_map or any(port not in idle_map for port in candidate_ports):
+        tracked = track_connections_idle_ms(paths, connections)
+        for port, timings in tracked.items():
+            if port not in idle_map:
+                idle_map[port] = timings
+    return idle_map
 
 
 _MEM_CONN_ACTIVITY: dict[str, dict[str, float | int | str]] = {}
@@ -193,10 +214,7 @@ def _save_conn_activity(paths: AppPaths | None, data: dict[str, dict[str, float 
         return
     path = conn_activity_state_file(paths)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_write_text(path, json.dumps(data, ensure_ascii=False), mode=0o600)
     except OSError:
         pass
 
@@ -245,7 +263,11 @@ def track_connections_idle_ms(
             snd_ts = float(prev.get("snd_ts") or ts_now)
             rcv_ts = float(prev.get("rcv_ts") or ts_now)
             turn_ts = float(prev.get("turn_ts") or 0.0)
-            turn_down = int(prev.get("turn_down") if prev.get("turn_down") is not None else prev_down)
+            raw_turn_down = prev.get("turn_down")
+            try:
+                turn_down = int(raw_turn_down) if raw_turn_down is not None else prev_down
+            except (TypeError, ValueError):
+                turn_down = prev_down
             delta_up = upload - prev_up
             delta_down = download - prev_down
             if delta_up >= 2_000:
@@ -547,9 +569,12 @@ def reap_idle_gemini_connections(
     except Exception:
         mixed_port = 7890
 
-    idle_map = get_local_proxy_socket_idle_ms(mixed_port)
-    if not idle_map:
-        idle_map = track_connections_idle_ms(paths, connections)
+    idle_map = _resolve_socket_idle_map(
+        paths,
+        connections,
+        mixed_port,
+        {src_port for _cid, _up, _down, src_port, _stale in candidates},
+    )
     if not idle_map:
         return []
 
@@ -641,9 +666,12 @@ def has_active_ai_transfer(
     except Exception:
         mixed_port = 7890
 
-    idle_map = get_local_proxy_socket_idle_ms(mixed_port)
-    if not idle_map:
-        idle_map = track_connections_idle_ms(paths, connections)
+    idle_map = _resolve_socket_idle_map(
+        paths,
+        connections,
+        mixed_port,
+        {src_port for src_port, _up, _down in ports_to_check},
+    )
     if not idle_map:
         return False
 
@@ -756,7 +784,7 @@ def reap_stale_agy_processes(
         if ppid is not None:
             children_by_ppid.setdefault(ppid, []).append((pid, cmdline))
 
-        if uid is not None and uid != uid_target:
+        if uid != uid_target:
             continue
         try:
             exe_target = os.readlink(entry / "exe")
@@ -776,11 +804,20 @@ def reap_stale_agy_processes(
         ]
         if active_children:
             continue
+        fd0_path = entry / "fd" / "0"
         try:
-            tty_stat = os.stat(entry / "fd" / "0")
+            fd0_target = os.readlink(fd0_path)
         except OSError:
-            tty_stat = None
-        if tty_stat is not None and (ts_now - float(tty_stat.st_atime)) < idle_seconds:
+            continue
+        if fd0_target == "/dev/null" or fd0_target.startswith(("pipe:", "socket:", "anon_inode:")):
+            continue
+        try:
+            if os.path.realpath(fd0_path) == "/dev/null":
+                continue
+            tty_stat = os.stat(fd0_path)
+        except OSError:
+            continue
+        if tty_stat is None or (ts_now - float(tty_stat.st_atime)) < idle_seconds:
             continue
         if not dry_run:
             try:
@@ -830,13 +867,89 @@ def _load_state(paths: AppPaths) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _save_state(paths: AppPaths, state: dict) -> None:
+def _merge_timestamp_map(
+    disk_raw: Any,
+    state_raw: Any,
+    cleared: dict[str, float] | None = None,
+) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    if isinstance(disk_raw, dict):
+        for k, v in disk_raw.items():
+            if k and isinstance(v, (int, float)):
+                merged[str(k)] = float(v)
+    if isinstance(state_raw, dict):
+        for k, v in state_raw.items():
+            if k and isinstance(v, (int, float)):
+                key = str(k)
+                merged[key] = max(merged.get(key, 0.0), float(v))
+    if cleared:
+        for k, cleared_at in cleared.items():
+            existing_ts = merged.get(k)
+            if existing_ts is not None and existing_ts <= cleared_at:
+                merged.pop(k, None)
+    return merged
+
+
+def _save_state(
+    paths: AppPaths,
+    state: dict,
+    *,
+    cleared_geo_blocked: dict[str, float] | None = None,
+    cleared_stream_fragile: dict[str, float] | None = None,
+) -> None:
     path = ai_watch_state_file(paths)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-    invalidate_probe_state_cache()
+    lock_path = path.with_name(f"{path.name}.lock")
+    with _advisory_file_lock(lock_path):
+        disk: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    disk = loaded
+            except (OSError, ValueError):
+                disk = {}
+
+        merged: dict[str, Any] = dict(disk)
+        for k, v in state.items():
+            if k == "gemini_geo_blocked":
+                merged[k] = _merge_timestamp_map(disk.get(k), v, cleared_geo_blocked)
+            elif k == "stream_fragile":
+                merged[k] = _merge_timestamp_map(disk.get(k), v, cleared_stream_fragile)
+            elif k == "last_rebalance_ts":
+                merged[k] = max(float(disk.get(k) or 0.0), float(v or 0.0))
+            elif k in ("rebalance_runs", "watch_runs", "total_switches", "total_reaped_connections"):
+                merged[k] = max(int(disk.get(k) or 0), int(v or 0))
+            elif k == "last_verdicts" and isinstance(v, dict) and isinstance(disk.get(k), dict):
+                merged[k] = {**disk[k], **v}
+            else:
+                merged[k] = v
+
+        if cleared_geo_blocked and "gemini_geo_blocked" not in state and "gemini_geo_blocked" in disk:
+            merged["gemini_geo_blocked"] = _merge_timestamp_map(disk.get("gemini_geo_blocked"), None, cleared_geo_blocked)
+        if cleared_stream_fragile and "stream_fragile" not in state and "stream_fragile" in disk:
+            merged["stream_fragile"] = _merge_timestamp_map(disk.get("stream_fragile"), None, cleared_stream_fragile)
+
+        _atomic_write_text(path, json.dumps(merged, ensure_ascii=False), mode=0o600)
+        invalidate_probe_state_cache()
+
+
+def _prune_cooldown(gs: dict, now: float) -> dict[str, float]:
+    raw = gs.get("cooldown")
+    if not isinstance(raw, dict):
+        gs["cooldown"] = {}
+        return gs["cooldown"]
+    pruned: dict[str, float] = {}
+    for k, v in raw.items():
+        if not k:
+            continue
+        try:
+            ts = float(v)
+        except (TypeError, ValueError):
+            continue
+        if (now - ts) < COOLDOWN_SECONDS:
+            pruned[str(k)] = ts
+    gs["cooldown"] = pruned
+    return pruned
 
 
 def _group_state(state: dict, group: str) -> dict:
@@ -917,10 +1030,15 @@ def _discover_agy_log_files(log_dir: Path | None) -> list[Path]:
             found.extend(d.glob("language_server*.log"))
         except OSError:
             continue
-    try:
-        return sorted(found, key=lambda p: (p.stat().st_mtime, p.name))
-    except OSError:
-        return found
+    with_mtime: list[tuple[float, str, Path]] = []
+    for p in found:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        with_mtime.append((mtime, p.name, p))
+    with_mtime.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in with_mtime]
 
 
 _AGY_GLOG_TS_RE = re.compile(_AGY_GLOG_PREFIX)
@@ -1186,10 +1304,19 @@ def detect_recent_codex_retry_failure(
     import sqlite3
 
     ts_now = time.time() if now is None else now
+    db_entries: list[tuple[float, str, Path]] = []
     try:
-        dbs = sorted(codex_dir.glob("logs_*.sqlite"), key=lambda p: (p.stat().st_mtime, p.name))
+        raw_dbs = list(codex_dir.glob("logs_*.sqlite"))
     except OSError:
         return False, since_ts, ""
+    for p in raw_dbs:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        db_entries.append((mtime, p.name, p))
+    db_entries.sort(key=lambda item: (item[0], item[1]))
+    dbs = [item[2] for item in db_entries]
     if not dbs:
         return False, since_ts, ""
 
@@ -1198,7 +1325,7 @@ def detect_recent_codex_retry_failure(
 
     for db_path in reversed(dbs[-2:]):
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+            conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)
             try:
                 cur = conn.cursor()
                 cur.execute(
@@ -1352,29 +1479,31 @@ def _promote_gemini_order_head(
     if not order_path.exists():
         return
     try:
-        data = json.loads(order_path.read_text(encoding="utf-8"))
-        if not isinstance(data, list) or not data:
-            return
-        rest = [str(item) for item in data if item and str(item) != target]
-        if sink_tail and demote and str(demote) != target:
-            sink_node = str(demote)
-            non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != sink_node]
-            static_tail = [x for x in rest if is_static_iepl_node(x, paths) and x != sink_node]
-            updated = [target] + non_static + static_tail + ([sink_node] if sink_node in rest else [])
-        else:
-            demote_node = (
-                str(demote)
-                if (demote and str(demote) != target and not is_static_iepl_node(str(demote), paths))
-                else None
-            )
-            non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != demote_node]
-            if demote_node and demote_node in rest:
-                non_static.append(demote_node)
-            static_tail = [x for x in rest if is_static_iepl_node(x, paths)]
-            updated = [target] + non_static + static_tail
-        if updated == data:
-            return
-        order_path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+        lock_path = order_path.with_name(f"{order_path.name}.lock")
+        with _advisory_file_lock(lock_path):
+            data = json.loads(order_path.read_text(encoding="utf-8"))
+            if not isinstance(data, list) or not data:
+                return
+            rest = [str(item) for item in data if item and str(item) != target]
+            if sink_tail and demote and str(demote) != target:
+                sink_node = str(demote)
+                non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != sink_node]
+                static_tail = [x for x in rest if is_static_iepl_node(x, paths) and x != sink_node]
+                updated = [target] + non_static + static_tail + ([sink_node] if sink_node in rest else [])
+            else:
+                demote_node = (
+                    str(demote)
+                    if (demote and str(demote) != target and not is_static_iepl_node(str(demote), paths))
+                    else None
+                )
+                non_static = [x for x in rest if not is_static_iepl_node(x, paths) and x != demote_node]
+                if demote_node and demote_node in rest:
+                    non_static.append(demote_node)
+                static_tail = [x for x in rest if is_static_iepl_node(x, paths)]
+                updated = [target] + non_static + static_tail
+            if updated == data:
+                return
+            _atomic_write_text(order_path, json.dumps(updated, ensure_ascii=False), mode=0o600)
     except (OSError, ValueError):
         pass
 
@@ -1429,8 +1558,18 @@ class AIWatchService:
         with probe_paths_context(self.paths):
             state = _load_state(self.paths)
             now = time.time()
+            cleared_geo_blocked: dict[str, float] = {}
             for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
-                report.results.append(self._watch_group(groups, group, state, now, dry_run))
+                report.results.append(
+                    self._watch_group(
+                        groups,
+                        group,
+                        state,
+                        now,
+                        dry_run,
+                        cleared_geo_blocked=cleared_geo_blocked,
+                    )
+                )
             gemini_res = next((r for r in report.results if r.group == AI_GEMINI_GROUP), None)
             gemini_leaf = (gemini_res.target or gemini_res.current) if gemini_res else None
             manual_res = next((r for r in report.results if r.group == AI_MANUAL_GROUP), None)
@@ -1457,7 +1596,11 @@ class AIWatchService:
                 for r in report.results:
                     verdicts[r.group] = r.verdict
                 state["last_verdicts"] = verdicts
-                _save_state(self.paths, state)
+                _save_state(
+                    self.paths,
+                    state,
+                    cleared_geo_blocked=cleared_geo_blocked or None,
+                )
                 try:
                     from ..backend.process import ProcessBackend
                     from ..config import runtime_file
@@ -1489,6 +1632,8 @@ class AIWatchService:
         state: dict,
         now: float,
         dry_run: bool,
+        *,
+        cleared_geo_blocked: dict[str, float] | None = None,
     ) -> WatchGroupResult:
         group_obj = groups.get(group)
         if group_obj is None:
@@ -1500,6 +1645,7 @@ class AIWatchService:
             )
         current = resolve_current_leaf(groups, group)
         gs = _group_state(state, group)
+        _prune_cooldown(gs, now)
         previous_active = gs.get("last_active")
         if previous_active and current and previous_active != current:
             gs["busy_defer_count"] = 0
@@ -1678,6 +1824,8 @@ class AIWatchService:
                 if isinstance(gb_map, dict) and current in gb_map:
                     gb_map.pop(current, None)
                     state["gemini_geo_blocked"] = gb_map
+                if cleared_geo_blocked is not None:
+                    cleared_geo_blocked[current] = now
                 clear_gemini_geo_blocked_node(self.paths, current)
             cooldown_map = gs.get("cooldown", {})
             other_group_name = (
@@ -1701,6 +1849,8 @@ class AIWatchService:
             )
             on_soft_unhealthy = (
                 ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+                and not active_busy
+                and not group_busy
                 and bool(current)
                 and (
                     is_iepl_node(current, self.paths)
@@ -1785,7 +1935,7 @@ class AIWatchService:
                         result.target = cand_1x
                         result.detail = "migrated_off_iepl"
                         return result
-                    except Exception:
+                    except (Exception, SystemExit):
                         pass
             if (
                 passive_dead_switch
@@ -1798,7 +1948,7 @@ class AIWatchService:
                 if callable(api_switch):
                     try:
                         api_switch(group, current)
-                    except Exception:
+                    except (Exception, SystemExit):
                         pass
             gs["fail_node"] = None
             gs["fail_count"] = 0
@@ -1857,7 +2007,7 @@ class AIWatchService:
                             self.query.switch_group(group, target, drop_connections=should_drop)
                         except TypeError:
                             self.query.switch_group(group, target)
-                except Exception:
+                except (Exception, SystemExit):
                     # 切换失败（目标在 fallback 中 alive=False 或 API 抖动）：将目标记入冷却期避免下轮死循环重试同一节点
                     gs.setdefault("cooldown", {})[target] = now
                     return result
@@ -1967,9 +2117,7 @@ class AIWatchService:
         cooled_healthy_non_iepl: list[tuple[int, float, int, str]] = []
         candidates = [c for c in group.candidates if c and not is_panel_info_node(str(c))]
         group_name = getattr(group, "name", "")
-        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and any(
-            c and is_iepl_node(str(c), self.paths) for c in candidates
-        )
+        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
         if is_managed_ai:
             other_group = (
                 AI_GEMINI_GROUP
@@ -2022,6 +2170,8 @@ class AIWatchService:
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:
                 if (
                     is_managed_ai
+                    and entry is not None
+                    and entry.alive is True
                     and not is_static_iepl_node(str(cand), self.paths)
                     and not is_geo_quarantined
                     and not is_dead
@@ -2030,7 +2180,11 @@ class AIWatchService:
                     cooled_healthy_non_iepl.append((dyn_tier, float(ts), idx, str(cand)))
                 continue
             if is_dead:
-                if fallback_leaf is None and not is_geo_quarantined:
+                if (
+                    fallback_leaf is None
+                    and not is_geo_quarantined
+                    and not (is_managed_ai and is_static_iepl_node(str(cand), self.paths))
+                ):
                     fallback_leaf = str(cand)
                 continue
             if (
@@ -2039,7 +2193,9 @@ class AIWatchService:
                 cooled_healthy_non_iepl.sort()
                 return cooled_healthy_non_iepl[0][3]
             return str(cand)
+        if fallback_leaf is not None:
+            return fallback_leaf
         if cooled_healthy_non_iepl:
             cooled_healthy_non_iepl.sort()
             return cooled_healthy_non_iepl[0][3]
-        return fallback_leaf
+        return None

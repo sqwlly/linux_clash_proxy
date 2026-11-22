@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, config_file, runtime_file
+from ..config import (
+    AppPaths,
+    _YamlLoader,
+    ai_gemini_order_file,
+    ai_manual_order_file,
+    atomic_write_bytes,
+    atomic_write_text,
+    config_file,
+    runtime_file,
+)
 from ..services.nodelist import (
     SUBSCRIPTION_REGION_ORDER,
     SWITCH_REGION_LABELS,
@@ -23,10 +34,13 @@ AI_AUTO_GROUP = "AI-AUTO"
 AI_US_GROUP = "AI-US"
 AI_SG_GROUP = "AI-SG"
 AI_GEMINI_GROUP = "AI-GEMINI"
+AI_MANUAL_KEEPALIVE_GROUP = "AI-MANUAL-KEEPALIVE"
+AI_GEMINI_KEEPALIVE_GROUP = "AI-GEMINI-KEEPALIVE"
 AI_REGION_JP = "🇯🇵 Japan"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
 TEST_URL = "https://cp.cloudflare.com/generate_204"
+KEEPALIVE_TEST_URL = "http://cp.cloudflare.com/generate_204"
 # 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported；韩/台/英低延迟区排欧陆/南美前）
 AI_GEMINI_REGION_ORDER = ("KR", "TW", "GB", "DE", "FR", "BR", "AE", "AU")
 AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_AUTO_GROUP})
@@ -145,6 +159,8 @@ RESERVED_MATCH_NAMES = frozenset(
         AI_US_GROUP,
         AI_SG_GROUP,
         AI_GEMINI_GROUP,
+        AI_MANUAL_KEEPALIVE_GROUP,
+        AI_GEMINI_KEEPALIVE_GROUP,
         AI_REGION_JP,
         AI_REGION_US,
         AI_REGION_SG,
@@ -313,8 +329,8 @@ def _match_group_name(rules: list | None) -> str | None:
     if not isinstance(rules, list):
         return None
     for rule in reversed(rules):
-        text = str(rule)
-        if text.startswith("MATCH,"):
+        text = str(rule).strip()
+        if text.upper().startswith(("MATCH,", "FINAL,")):
             return text.split(",", 1)[1].strip() or None
     return None
 
@@ -579,7 +595,9 @@ def _order_manual_candidates(
 
 def _strip_panel_members(group: dict) -> None:
     members = group.get("proxies") or []
-    group["proxies"] = [member for member in members if not is_panel_info_node(str(member))]
+    cleaned = [member for member in members if not is_panel_info_node(str(member))]
+    if cleaned:
+        group["proxies"] = cleaned
 
 
 def _sanitize_auto_groups(groups: list) -> None:
@@ -592,11 +610,14 @@ def _sanitize_auto_groups(groups: list) -> None:
        超时并引发 fallback 误切换。将非 AI 组的 300s 周期错峰为互质素数周期可根除碰撞。
     """
     managed_ai = {AI_US_GROUP, AI_SG_GROUP, AI_AUTO_GROUP, AI_MANUAL_GROUP, AI_GEMINI_GROUP}
+    keepalive_groups = {AI_MANUAL_KEEPALIVE_GROUP, AI_GEMINI_KEEPALIVE_GROUP}
     stagger_idx = 0
     for group in groups:
         if not isinstance(group, dict):
             continue
         name = str(group.get("name") or "")
+        if name in keepalive_groups:
+            continue
         gtype = str(group.get("type") or "").lower()
         if name not in AUTO_POLICY_NAMES and gtype not in AUTO_GROUP_TYPES:
             continue
@@ -697,6 +718,7 @@ def _reshape_match_country_groups(data: dict, groups: list, group_map: dict[str,
 
     nodes = _collect_match_nodes(match_group, group_map, data.get("proxies"), extra_names)
     region_group_names: list[str] = []
+    grouped_nodes: set[str] = set()
     if nodes:
         buckets: dict[str, list[str]] = {}
         for node in nodes:
@@ -713,15 +735,22 @@ def _reshape_match_country_groups(data: dict, groups: list, group_map: dict[str,
                 injected = {"name": label, "type": "select", "proxies": list(region_members)}
                 groups.append(injected)
                 group_map[label] = injected
+                grouped_nodes.update(region_members)
+                region_group_names.append(label)
             elif str(existing.get("type") or "").lower() in SELECTABLE_GROUP_TYPES and existing is not match_group:
                 existing["proxies"] = list(region_members)
-            else:
-                continue
-            region_group_names.append(label)
+                grouped_nodes.update(region_members)
+                region_group_names.append(label)
+            elif existing is not match_group:
+                # 保留订阅原有的同名非 select 组（如 url-test/fallback），不覆盖其定义也不丢失引用
+                region_group_names.append(label)
+                existing_members = {str(m) for m in (existing.get("proxies") or [])}
+                grouped_nodes.update(m for m in region_members if m in existing_members)
 
     auto_members: list[str] = []
     special_members: list[str] = []
     leftover_nested: list[str] = []
+    ungrouped_leaves: list[str] = []
     for member in members:
         if is_panel_info_node(member):
             continue
@@ -737,12 +766,15 @@ def _reshape_match_country_groups(data: dict, groups: list, group_map: dict[str,
             if member in {AI_US_GROUP, AI_SG_GROUP, AI_REGION_JP, AI_REGION_US, AI_REGION_SG}:
                 continue
             leftover_nested.append(member)
+        elif member not in grouped_nodes:
+            ungrouped_leaves.append(member)
 
     rebuilt: list[str] = []
-    for member in auto_members + leftover_nested + region_group_names + special_members:
+    for member in auto_members + leftover_nested + region_group_names + ungrouped_leaves + special_members:
         if member not in rebuilt:
             rebuilt.append(member)
-    match_group["proxies"] = rebuilt
+    if rebuilt:
+        match_group["proxies"] = rebuilt
 
 
 def _sanitize_dns_fallback_filter(data: dict) -> None:
@@ -756,6 +788,7 @@ def _sanitize_dns_fallback_filter(data: dict) -> None:
         fallback_filter.pop("geosite", None)
 
 
+_WS_CACHE_LOCK = threading.Lock()
 _WS_TLS_PROBE_CACHE: dict[tuple[str, int, str], tuple[float, int | None]] = {}
 _WS_CDN_IP_RANK_CACHE: dict[tuple[tuple[str, ...], int, str], tuple[float, list[str]]] = {}
 _WS_TLS_CACHE_TTL = 300.0
@@ -768,7 +801,8 @@ def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 2.5
 
     now = time.time()
     cache_key = (ip, port, sni)
-    cached = _WS_TLS_PROBE_CACHE.get(cache_key)
+    with _WS_CACHE_LOCK:
+        cached = _WS_TLS_PROBE_CACHE.get(cache_key)
     if cached is not None and (now - cached[0]) < _WS_TLS_CACHE_TTL:
         return cached[1]
     t0 = time.time()
@@ -799,7 +833,8 @@ def _tls_handshake_latency_ms(ip: str, port: int, sni: str, timeout: float = 2.5
                 sock.close()
             except OSError:
                 pass
-    _WS_TLS_PROBE_CACHE[cache_key] = (time.time(), latency)
+    with _WS_CACHE_LOCK:
+        _WS_TLS_PROBE_CACHE[cache_key] = (time.time(), latency)
     return latency
 
 
@@ -830,8 +865,12 @@ def _ws_cdn_ip_log_penalties(
         rt_path = runtime_file(paths)
         if rt_path.exists():
             rt_text = rt_path.read_text(encoding="utf-8", errors="ignore")
+            rt_servers = set(_extract_proxy_servers(rt_text).values())
             for ip in ips:
-                if ip in rt_text:
+                if rt_servers:
+                    if ip in rt_servers:
+                        active_ips.add(ip)
+                elif re.search(rf"(?<![0-9.]){re.escape(ip)}(?![0-9.])", rt_text):
                     active_ips.add(ip)
     except OSError:
         pass
@@ -940,7 +979,8 @@ def _resolve_healthy_ws_cdn_ips(
         return []
     now = time.time()
     rank_key = (ips, port, sni)
-    cached_rank = _WS_CDN_IP_RANK_CACHE.get(rank_key)
+    with _WS_CACHE_LOCK:
+        cached_rank = _WS_CDN_IP_RANK_CACHE.get(rank_key)
     if cached_rank is not None and (now - cached_rank[0]) < _WS_TLS_CACHE_TTL:
         return list(cached_rank[1])
 
@@ -948,8 +988,9 @@ def _resolve_healthy_ws_cdn_ips(
     eff_rounds = max(1, int(rounds))
     for r in range(eff_rounds):
         if r > 0:
-            for ip in ips:
-                _WS_TLS_PROBE_CACHE.pop((ip, port, sni), None)
+            with _WS_CACHE_LOCK:
+                for ip in ips:
+                    _WS_TLS_PROBE_CACHE.pop((ip, port, sni), None)
         with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
             latencies = list(pool.map(lambda ip: (ip, _tls_handshake_latency_ms(ip, port, sni)), ips))
         for ip, ms in latencies:
@@ -975,7 +1016,7 @@ def _resolve_healthy_ws_cdn_ips(
         return []
     min_total_err = min(total_errors.get(ip, 0) for ip in alive_ips)
 
-    scored: list[tuple[tuple[int, int, int, int, int, int, int, int, int, int, str], str]] = []
+    scored: list[tuple[tuple[int, int, int, int, int, int, int, int, int, int, int, str], str]] = []
     for ip in alive_ips:
         samples = samples_by_ip[ip]
         succ = len(samples)
@@ -1022,7 +1063,8 @@ def _resolve_healthy_ws_cdn_ips(
         scored.append((sort_key, ip))
     scored.sort(key=lambda item: item[0])
     result = [ip for _k, ip in scored]
-    _WS_CDN_IP_RANK_CACHE[rank_key] = (time.time(), result)
+    with _WS_CACHE_LOCK:
+        _WS_CDN_IP_RANK_CACHE[rank_key] = (time.time(), result)
     return list(result)
 
 
@@ -1110,8 +1152,9 @@ def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
     from ..services.ai_watch import has_any_inflight_ai_connection
     from .process import ProcessBackend
 
-    _WS_TLS_PROBE_CACHE.clear()
-    _WS_CDN_IP_RANK_CACHE.clear()
+    with _WS_CACHE_LOCK:
+        _WS_TLS_PROBE_CACHE.clear()
+        _WS_CDN_IP_RANK_CACHE.clear()
     rt_path = runtime_file(paths)
     process = ProcessBackend(paths)
     was_stale = process.is_runtime_stale(rt_path) if rt_path.exists() else False
@@ -1128,10 +1171,6 @@ def refresh_ws_cdn_ips_if_changed(paths: AppPaths) -> bool:
             for name, old_ip in old_servers.items()
         )
         if not recovering_from_104 and has_any_inflight_ai_connection(paths):
-            if not servers_changed and not memory_drift_104 and (
-                old_text == new_text or is_only_ai_group_order_change(old_text, new_text)
-            ):
-                process.mark_runtime_applied(rt_path)
             return False
         return process.reload_if_running(rt_path)
     if (
@@ -1158,21 +1197,14 @@ def _optimize_ws_cdn_servers(
     paths: AppPaths | None = None,
 ) -> None:
     """将 443 端口 Cloudflare WebSocket 节点的拥塞共享入口域名替换为节点独立 ws-opts.headers.Host，
-    并在启用 probe_tls 时自动剔除 TLS 黑洞 IP、将健康 Anycast IP 确定性分摊到各 WebSocket 节点。
-
-    1. 部分机场（如 cyberguard.*）把全部 1X WebSocket 节点的 `server` 指向同一个旧优选域名
-       （解析到单一高延迟 IP `172.64.146.118`）；而节点自带的 `ws-opts.headers.Host`
-       （如 `cgkr1.cyberguard-u1s1.art`，属 `servername` 的合法子域）解析到双栈 Anycast 池。
-    2. 当 CDN 子域返回多个 Anycast IPv4（例如同时返回 `104.21.87.131` 与 `172.67.143.95`）时，
-       自动过滤掉 TLS 握手超时的黑洞 IP，并将存活的健康 IP 按确定性顺序分摊钉选到各节点，
-       既消除 mihomo 每次建连的出站 DNS 阻塞与配置文件哈希抖动，又避免多组探测流量打在同一单点 IP 上触发 GFW 限流。
+    并在启用 probe_tls 时自动剔除 TLS 黑洞 IP、将健康 Anycast IP 钉选到各 WebSocket 节点。
     """
     if not isinstance(proxies, list):
         return
     if probe_tls:
-        _WS_TLS_PROBE_CACHE.clear()
-        _WS_CDN_IP_RANK_CACHE.clear()
-    ws_idx = 0
+        with _WS_CACHE_LOCK:
+            _WS_TLS_PROBE_CACHE.clear()
+            _WS_CDN_IP_RANK_CACHE.clear()
     for proxy in proxies:
         if not isinstance(proxy, dict):
             continue
@@ -1206,7 +1238,6 @@ def _optimize_ws_cdn_servers(
             )
             if healthy_ips:
                 proxy["server"] = healthy_ips[0]
-        ws_idx += 1
 
 
 OPENAI_CLOUDFLARE_ANYCAST_IP = "172.64.155.209"
@@ -1215,7 +1246,6 @@ OPENAI_DIRECT_HOSTS: dict[str, str] = {
     "*.chatgpt.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
     "+.chatgpt.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
     "api.openai.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
-    "+.openai.com": OPENAI_CLOUDFLARE_ANYCAST_IP,
 }
 
 
@@ -1242,6 +1272,33 @@ def _inject_openai_cloudflare_hosts(data: dict) -> None:
         for proxy in proxies:
             if isinstance(proxy, dict) and str(proxy.get("type") or "").strip().lower() == "vless":
                 proxy.setdefault("ip-version", "ipv4")
+
+
+def _chinamax_fallback_paths() -> list[Path]:
+    """ChinaMax.yml 离线数据源候选路径（包内数据 → 仓库根目录）。"""
+    return [
+        Path(__file__).resolve().parents[1] / "data" / "ruleset" / "ChinaMax.yml",
+        Path(__file__).resolve().parents[3] / "ruleset" / "ChinaMax.yml",
+    ]
+
+
+def _ensure_chinamax_ruleset(data_dir: Path) -> Path:
+    """确保 data_dir/ruleset/ChinaMax.yml 存在，防止全新 CPROXY_DATA_DIR 上 mihomo 启动失败。"""
+    target = data_dir / "ruleset" / "ChinaMax.yml"
+    try:
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+    except OSError:
+        pass
+    for src in _chinamax_fallback_paths():
+        try:
+            if src.is_file() and src.stat().st_size > 0:
+                atomic_write_bytes(target, src.read_bytes(), mode=0o644)
+                return target
+        except OSError:
+            continue
+    atomic_write_text(target, "payload: []\n", mode=0o644)
+    return target
 
 
 class RuntimeBackend:
@@ -1292,7 +1349,13 @@ class RuntimeBackend:
         target_path = runtime_file(self.paths)
 
         with source_path.open("r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
+            raw_data = yaml.load(fh, Loader=_YamlLoader)
+        if raw_data is None:
+            data: dict = {}
+        elif isinstance(raw_data, dict):
+            data = raw_data
+        else:
+            raise ValueError(f"配置文件格式无效（顶层必须是 YAML 映射）: {source_path}")
 
         _sanitize_dns_fallback_filter(data)
         _optimize_ws_cdn_servers(
@@ -1329,6 +1392,13 @@ class RuntimeBackend:
         if "ChinaMax" not in rule_providers:
             rule_providers["ChinaMax"] = dict(CHINAMAX_PROVIDER)
         data["rule-providers"] = rule_providers
+        chinamax_cfg = rule_providers.get("ChinaMax")
+        if (
+            isinstance(chinamax_cfg, dict)
+            and str(chinamax_cfg.get("type") or "").lower() == "file"
+            and str(chinamax_cfg.get("path") or "").lstrip("./") == "ruleset/ChinaMax.yml"
+        ):
+            _ensure_chinamax_ruleset(self.paths.data_dir)
 
         secret = APIBackend(self.paths).api_secret()
         if secret:
@@ -1448,8 +1518,12 @@ class RuntimeBackend:
             + [AI_AUTO_GROUP]
         )
 
+        from ..services.h2_keepalive import DEFAULT_KEEPALIVE_PORT, is_h2_keepalive_running
+
+        h2_keepalive_active = is_h2_keepalive_running(self.paths.state_dir)
+
         # 互质错峰测速间隔：避免多个 fallback 组在同一毫秒并发测速同一节点引发队尾超时与误切换
-        ai_groups = [
+        ai_groups: list[dict] = [
             {"name": AI_US_GROUP, "type": "fallback", "proxies": us_ordered, "url": TEST_URL, "interval": 283},
             {"name": AI_SG_GROUP, "type": "fallback", "proxies": sg_ordered, "url": TEST_URL, "interval": 293},
             {"name": AI_AUTO_GROUP, "type": "fallback", "proxies": [AI_US_GROUP, AI_SG_GROUP], "url": TEST_URL, "interval": 307},
@@ -1462,8 +1536,37 @@ class RuntimeBackend:
                 "interval": 313,
             },
         ]
+        if h2_keepalive_active:
+            ai_groups.extend(
+                [
+                    {
+                        "name": AI_MANUAL_KEEPALIVE_GROUP,
+                        "type": "fallback",
+                        "proxies": ["H2-KEEPALIVE", AI_MANUAL_GROUP],
+                        "url": KEEPALIVE_TEST_URL,
+                        "interval": 15,
+                        "lazy": False,
+                    },
+                    {
+                        "name": AI_GEMINI_KEEPALIVE_GROUP,
+                        "type": "fallback",
+                        "proxies": ["H2-KEEPALIVE", AI_GEMINI_GROUP],
+                        "url": KEEPALIVE_TEST_URL,
+                        "interval": 15,
+                        "lazy": False,
+                    },
+                ]
+            )
 
-        managed_names = {AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP, AI_GEMINI_GROUP}
+        managed_names = {
+            AI_MANUAL_GROUP,
+            AI_AUTO_GROUP,
+            AI_US_GROUP,
+            AI_SG_GROUP,
+            AI_GEMINI_GROUP,
+            AI_MANUAL_KEEPALIVE_GROUP,
+            AI_GEMINI_KEEPALIVE_GROUP,
+        }
         filtered_groups = [group for group in groups if not (isinstance(group, dict) and group.get("name") in managed_names)]
 
         insert_after = None
@@ -1477,9 +1580,6 @@ class RuntimeBackend:
         else:
             filtered_groups = filtered_groups[: insert_after + 1] + ai_groups + filtered_groups[insert_after + 1 :]
 
-        from ..services.h2_keepalive import DEFAULT_KEEPALIVE_PORT, is_h2_keepalive_running
-
-        h2_keepalive_active = is_h2_keepalive_running(self.paths.state_dir)
         raw_proxies = data.get("proxies")
         if isinstance(raw_proxies, list):
             raw_proxies = [
@@ -1496,10 +1596,13 @@ class RuntimeBackend:
                 )
             data["proxies"] = raw_proxies
 
-        h2_keepalive_rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE"
+        h2_keepalive_rule = (
+            "AND,((OR,((DOMAIN,daily-cloudcode-pa.googleapis.com),(DOMAIN,aicode.googleapis.com))),"
+            f"(NETWORK,TCP),(NOT,((IN-TYPE,SOCKS5)))),{AI_GEMINI_KEEPALIVE_GROUP}"
+        )
         codex_keepalive_rule = (
             "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),"
-            "(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE"
+            f"(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),{AI_MANUAL_KEEPALIVE_GROUP}"
         )
         ai_rules = [
             # Google / Gemini / Antigravity —— 必须排在 PROCESS-NAME,agy 之前，
@@ -1572,7 +1675,7 @@ class RuntimeBackend:
 
         match_grp = _match_group_name(rules)
         user_custom_rules = [
-            entry.format_mihomo_rule(match_group=match_grp)
+            entry.format_mihomo_rule(match_group=match_grp or "DIRECT")
             for entry in load_custom_rules(self.paths)
         ]
 
@@ -1586,6 +1689,8 @@ class RuntimeBackend:
             # 末尾 no-resolve 版本已兜底
             "GEOIP,CN,DIRECT",
             "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE",
+            "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE",
+            "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE",
             h2_keepalive_rule,
             codex_keepalive_rule,
         }
@@ -1609,7 +1714,7 @@ class RuntimeBackend:
 
         match_index = None
         for idx, rule in enumerate(clean_rules):
-            if isinstance(rule, str) and rule.startswith("MATCH,"):
+            if isinstance(rule, str) and rule.strip().upper().startswith(("MATCH,", "FINAL,")):
                 match_index = idx
                 break
 
@@ -1637,7 +1742,5 @@ class RuntimeBackend:
             return target_path
         # 覆盖运行配置前自动留快照，供 cproxy rollback 回滚
         snapshot_file(self.paths, target_path, "runtime")
-        tmp_path = target_path.with_suffix(".tmp")
-        tmp_path.write_text(rendered, encoding="utf-8")
-        os.replace(tmp_path, target_path)
+        atomic_write_text(target_path, rendered, mode=0o600)
         return target_path

@@ -12,12 +12,14 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from ..config import AppPaths, read_config
 from ..redaction import redact_text
@@ -27,17 +29,111 @@ def notify_state_file(paths: AppPaths) -> Path:
     return paths.state_dir / "notify.json"
 
 
+def _atomic_write_private(path: Path, content: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(content)
+        if os.name != "nt":
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_webhook_url(url: str) -> str:
+    cleaned = str(url or "").strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("错误: Webhook URL 必须使用 http/https 协议且包含合法主机名")
+    return cleaned
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Any:
+        raise HTTPError(req.full_url, code, f"Webhook redirects are disabled (HTTP {code})", headers, fp)
+
+    def http_error_302(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+    ) -> Any:
+        raise HTTPError(req.full_url, code, f"Webhook redirects are disabled (HTTP {code})", headers, fp)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def _format_redacted_netloc(parsed: Any) -> str:
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    hostport = f"{host}:{port}" if port is not None else host
+    if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
+        return f"[REDACTED]@{hostport}"
+    return hostport or str(parsed.netloc or "")
+
+
 def _mask_webhook_url(url: str) -> str:
-    text = redact_text(url.strip())
-    parsed = urlparse(text)
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
     if not parsed.scheme or not parsed.netloc:
-        return text
+        return redact_text(raw)
+
+    netloc = _format_redacted_netloc(parsed)
+    host_lower = (parsed.hostname or "").lower()
     segments = [seg for seg in parsed.path.split("/") if seg]
-    if len(segments) >= 2 and len(segments[-1]) > 6:
-        segments[-1] = segments[-1][:4] + "***"
-        masked_path = "/" + "/".join(segments)
-        return f"{parsed.scheme}://{parsed.netloc}{masked_path}"
-    return text
+    masked_telegram = False
+
+    for idx, seg in enumerate(segments):
+        seg_lower = seg.lower()
+        if seg_lower.startswith("bot") and len(seg) > 3 and (
+            "telegram" in host_lower or ":" in seg or seg[3:4].isdigit()
+        ):
+            segments[idx] = "bot[REDACTED]"
+            masked_telegram = True
+
+    if len(segments) == 1:
+        if not masked_telegram:
+            segments[0] = "[REDACTED]"
+    elif len(segments) >= 2 and not masked_telegram:
+        lower_segs = [s.lower() for s in segments]
+        if "services" in lower_segs and "slack" in host_lower:
+            pos = lower_segs.index("services")
+            segments = segments[: pos + 1] + ["[REDACTED]"]
+        elif "webhooks" in lower_segs:
+            pos = lower_segs.index("webhooks")
+            segments = segments[: pos + 1] + ["[REDACTED]"]
+        elif len(segments[-1]) > 0:
+            segments[-1] = "[REDACTED]"
+
+    masked_path = ("/" + "/".join(segments)) if segments else ""
+    query_suffix = "?..." if parsed.query else ""
+    return redact_text(f"{parsed.scheme}://{netloc}{masked_path}{query_suffix}")
 
 
 @dataclass(frozen=True)
@@ -120,13 +216,12 @@ def save_notify_config(
 ) -> NotifyConfig:
     current = load_notify_config(paths)
     new_url = current.webhook_url if webhook_url is None else webhook_url.strip()
+    if webhook_url is not None and new_url:
+        new_url = _validate_webhook_url(new_url)
     new_desktop = current.desktop if desktop is None else bool(desktop)
     path = notify_state_file(paths)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     payload = {"webhook_url": new_url, "desktop": new_desktop}
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_private(path, json.dumps(payload, ensure_ascii=False, indent=2), mode=0o600)
     return load_notify_config(paths)
 
 
@@ -192,21 +287,28 @@ def send_notification(
                 sent = True
             except Exception as exc:
                 if raise_on_error and not cfg.webhook_url:
-                    raise RuntimeError(f"错误: 桌面通知发送失败: {exc}") from exc
+                    raise RuntimeError(f"错误: 桌面通知发送失败: {redact_text(str(exc))}") from exc
         elif raise_on_error and not cfg.webhook_url:
             raise RuntimeError("错误: 未找到 notify-send 命令，无法发送桌面通知")
 
     if cfg.webhook_url:
-        kind = detect_webhook_kind(cfg.webhook_url)
-        payload = _build_webhook_payload(kind, cfg.webhook_url, title, message, event)
+        try:
+            validated_url = _validate_webhook_url(cfg.webhook_url)
+        except ValueError as exc:
+            if raise_on_error:
+                raise RuntimeError(str(exc)) from exc
+            return sent
+
+        kind = detect_webhook_kind(validated_url)
+        payload = _build_webhook_payload(kind, validated_url, title, message, event)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = Request(
-            cfg.webhook_url,
+            validated_url,
             data=body,
             headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "cproxy-notify/1.1"},
             method="POST",
         )
-        opener = build_opener(ProxyHandler({}))
+        opener = build_opener(ProxyHandler({}), _NoRedirectHandler())
         try:
             with opener.open(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", 200)
@@ -216,6 +318,6 @@ def send_notification(
                     raise RuntimeError(f"错误: Webhook 返回异常状态码 HTTP {status}")
         except Exception as exc:
             if raise_on_error:
-                raise RuntimeError(f"错误: Webhook 推送失败: {exc}") from exc
+                raise RuntimeError(f"错误: Webhook 推送失败: {redact_text(str(exc))}") from exc
 
     return sent

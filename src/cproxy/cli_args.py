@@ -32,6 +32,7 @@ _TRANSLATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^unrecognized arguments: (.+)$"), r"无法识别的参数: \1"),
     (re.compile(r"^argument (.+?): expected one argument$"), r"参数 \1 需要一个取值"),
     (re.compile(r"^argument (.+?): invalid int value: (.+)$"), r"参数 \1 需要整数，收到: \2"),
+    (re.compile(r"^argument (.+?): invalid float value: (.+)$"), r"参数 \1 需要数字，收到: \2"),
     (re.compile(r"^argument (.+?): not allowed with argument (.+)$"), r"参数 \1 不能与 \2 同时使用"),
     (re.compile(r"^argument (.+?): ignored explicit argument (.+)$"), r"参数 \1 不接受取值: \2"),
     (re.compile(r"^expected one argument$"), r"需要提供一个取值"),

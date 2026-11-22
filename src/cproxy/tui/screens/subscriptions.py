@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -13,21 +15,66 @@ from textual.widgets import Button, Label
 
 from ...backend.runtime import RuntimeBackend
 from ...config import AppPaths, config_file, read_config
+from ...redaction import redact_text
 from ...services.refresh import RefreshService, preview_subscription
 from ..widgets import NavigationDataTable as DataTable
 from ..widgets import NavigationInput as Input
 from ..widgets import NavigationTextArea as TextArea
+from ..widgets import coerce_worker_error, escape_markup, safe_call_from_thread
+
+_TOKEN_SEGMENT_RE = re.compile(
+    r"^(?:"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|[0-9a-fA-F]{12,}"
+    r"|(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9._~-]{10,}"
+    r"|[A-Za-z0-9_-]{20,}"
+    r")$"
+)
+_TOKEN_PREFIX_SEGMENTS = frozenset({"token", "key", "secret", "auth", "link", "s"})
+
+
+def _redact_path_segments(path: str) -> str:
+    if not path:
+        return path
+    parts = path.split("/")
+    redacted_parts: list[str] = []
+    prev_lower = ""
+    for part in parts:
+        if not part:
+            redacted_parts.append(part)
+            continue
+        if prev_lower in _TOKEN_PREFIX_SEGMENTS or _TOKEN_SEGMENT_RE.match(part):
+            redacted_parts.append("...")
+        else:
+            redacted_parts.append(part)
+        prev_lower = part.lower()
+    result = "/".join(redacted_parts)
+    if len(result) > 24 and "..." not in result:
+        result = result[:12] + "..." + result[-8:]
+    return result
 
 
 def redact_subscription_url(url: str) -> str:
     parsed = urlsplit(url)
     if not parsed.scheme or not parsed.netloc:
-        return url[:80] + ("..." if len(url) > 80 else "")
-    path = parsed.path
-    if len(path) > 24:
-        path = path[:12] + "..." + path[-8:]
+        cleaned = redact_text(url)
+        return cleaned[:80] + ("..." if len(cleaned) > 80 else "")
+
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if host:
+        netloc = f"{host}:{port}" if port is not None else host
+    else:
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+
+    path = _redact_path_segments(parsed.path)
     query = "..." if parsed.query else ""
-    return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
+    return urlunsplit((parsed.scheme, netloc, path, query, ""))
 
 
 def subscription_group_rows(config: dict) -> list[tuple[str, str, str, str]]:
@@ -55,6 +102,7 @@ class SubscriptionsScreen(Widget):
         super().__init__(**kwargs)
         self.paths = paths
         self._subscription_running = False
+        self._pending_apply_key: tuple[str, str, str] | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -108,32 +156,57 @@ class SubscriptionsScreen(Widget):
         self._load_current_info()
 
     def _load_current_info(self) -> None:
+        self._load_current_info_worker()
+
+    @work(thread=True, exclusive=True, group="subscription-info")
+    def _load_current_info_worker(self) -> None:
         try:
             config = read_config(self.paths)
             config_path = config_file(self.paths)
-
-            proxies = config.get("proxies", [])
-            groups = config.get("proxy-groups", [])
             group_rows = subscription_group_rows(config)
+            safe_call_from_thread(self, self._apply_current_info, config_path, config, group_rows, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._apply_current_info, None, None, [], coerce_worker_error(exc))
 
-            info_text = "\n".join(
-                [
-                    f"[#8b98aa]路径[/]\n{config_path}",
-                    f"[#8b98aa]节点[/] {len(proxies)}",
-                    f"[#8b98aa]分组[/] {len(groups)}",
-                    f"[#8b98aa]端口[/] {config.get('mixed-port', '─')}",
-                    f"[#8b98aa]模式[/] {config.get('mode', '─')}",
-                ]
-            )
-            self.query_one("#sub-current-info", Label).update(info_text)
-            groups_table = self.query_one("#sub-groups-table", DataTable)
-            groups_table.clear()
-            for row in group_rows:
-                groups_table.add_row(*row, key=row[0])
-            if not group_rows:
-                groups_table.add_row("没有分组", "─", "0", "─")
-        except Exception as e:
-            self.query_one("#sub-current-info", Label).update(f"[#fb7185]错误: {e}[/]")
+    def _apply_current_info(
+        self,
+        config_path: Path | None,
+        config: dict | None,
+        group_rows: list[tuple[str, str, str, str]],
+        error: Exception | None,
+    ) -> None:
+        if not self.is_mounted:
+            return
+        if error is not None or config is None or config_path is None:
+            redacted = redact_text(str(error)) if error is not None else "无法读取配置"
+            self.query_one("#sub-current-info", Label).update(f"[#fb7185]错误: {escape_markup(redacted)}[/]")
+            return
+
+        proxies = config.get("proxies", [])
+        groups = config.get("proxy-groups", [])
+        proxy_count = len(proxies) if isinstance(proxies, list) else 0
+        group_count = len(groups) if isinstance(groups, list) else 0
+
+        info_text = "\n".join(
+            [
+                f"[#8b98aa]路径[/]\n{escape_markup(config_path)}",
+                f"[#8b98aa]节点[/] {proxy_count}",
+                f"[#8b98aa]分组[/] {group_count}",
+                f"[#8b98aa]端口[/] {escape_markup(config.get('mixed-port', '─'))}",
+                f"[#8b98aa]模式[/] {escape_markup(config.get('mode', '─'))}",
+            ]
+        )
+        self.query_one("#sub-current-info", Label).update(info_text)
+        groups_table = self.query_one("#sub-groups-table", DataTable)
+        groups_table.clear()
+        for name, group_type, count, parents in group_rows:
+            groups_table.add_row(Text(name), Text(group_type), count, Text(parents), key=name)
+        if not group_rows:
+            groups_table.add_row("没有分组", "─", "0", "─")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in {"sub-url-input", "sub-group-input", "sub-attach-input"}:
+            self._pending_apply_key = None
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-sub-preview":
@@ -153,14 +226,36 @@ class SubscriptionsScreen(Widget):
 
         url = url_input.value.strip()
         if not url:
+            self._pending_apply_key = None
             output.load_text("请输入订阅 URL")
             return
 
         group = group_input.value.strip()
         attach_to = attach_input.value.strip()
         if attach_to and not group:
+            self._pending_apply_key = None
             output.load_text("填写挂载目标时，也必须填写附加订阅分组名。")
             return
+
+        if dry_run:
+            self._pending_apply_key = None
+        else:
+            apply_key = (url, group, attach_to)
+            if self._pending_apply_key != apply_key:
+                self._pending_apply_key = apply_key
+                output.load_text(
+                    "\n".join(
+                        [
+                            "将应用订阅并更新运行配置:",
+                            f"URL: {redact_subscription_url(url)}",
+                            f"分组: {group or '主订阅'}",
+                            "",
+                            "请再次点击“应用”确认。",
+                        ]
+                    )
+                )
+                return
+            self._pending_apply_key = None
 
         action = "正在预览订阅…" if dry_run else "正在应用订阅…"
         self._render_subscription_progress(action, url, "下载并解析订阅…" if dry_run else "下载订阅并合并配置…")
@@ -169,7 +264,7 @@ class SubscriptionsScreen(Widget):
             self._set_subscription_busy(True)
             self._run_subscription_import(url, group, attach_to, dry_run)
         except Exception as e:
-            output.load_text(f"错误: {e}")
+            output.load_text(f"错误: {redact_text(str(e))}")
             self._set_subscription_busy(False)
 
     def _render_subscription_progress(self, action: str, url: str, stage: str) -> None:
@@ -224,7 +319,11 @@ class SubscriptionsScreen(Widget):
                     target_text = "\n未挂载（与默认流量同级，切此订阅不会改 MATCH）"
                 else:
                     target_text = ""
-                extra_text = f"\n附加订阅: {extra.status}（{extra.detail}）" if extra is not None else ""
+                extra_text = (
+                    f"\n附加订阅: {extra.status}（{redact_text(str(extra.detail))}）"
+                    if extra is not None
+                    else ""
+                )
                 output_text = (
                     f"应用: {'附加订阅已更新' if group else report.subscription}\n"
                     f"分组: {group or '主订阅'}{target_text}{extra_text}\n"
@@ -234,8 +333,9 @@ class SubscriptionsScreen(Widget):
                 )
                 imported = report.subscription != "失败"
             self._call_from_subscription_thread(self._finish_import_subscription, output_text, imported)
-        except Exception as exc:
-            self._call_from_subscription_thread(self._fail_subscription_command, f"错误: {exc}")
+        except (Exception, SystemExit) as exc:
+            err_text = redact_text(str(coerce_worker_error(exc)))
+            self._call_from_subscription_thread(self._fail_subscription_command, f"错误: {err_text}")
 
     def _finish_import_subscription(self, output_text: str, imported: bool) -> None:
         if not self.is_mounted:
@@ -245,7 +345,7 @@ class SubscriptionsScreen(Widget):
         self._set_subscription_busy(False)
         if imported:
             self._load_current_info()
-            self.notify("订阅已应用", severity="information")
+            self.notify("订阅已应用", severity="information", markup=False)
 
     def _fail_subscription_command(self, output_text: str) -> None:
         if not self.is_mounted:
@@ -255,6 +355,7 @@ class SubscriptionsScreen(Widget):
         self._set_subscription_busy(False)
 
     def _update_config(self) -> None:
+        self._pending_apply_key = None
         output = self.query_one("#sub-output", TextArea)
         config_path = config_file(self.paths)
 
@@ -271,7 +372,7 @@ class SubscriptionsScreen(Widget):
             self._set_subscription_busy(True)
             self._run_validate_config()
         except Exception as e:
-            output.load_text(f"错误: {e}")
+            output.load_text(f"错误: {redact_text(str(e))}")
             self._set_subscription_busy(False)
 
     @work(thread=True, exclusive=True, group="subscription-ops")
@@ -286,8 +387,9 @@ class SubscriptionsScreen(Widget):
                 runtime_path = RuntimeBackend(paths).render_runtime()
                 output_text = f"验证通过\n隔离运行配置: {runtime_path}\n当前运行配置未修改。"
             self._call_from_subscription_thread(self._finish_validate_config, output_text)
-        except Exception as e:
-            self._call_from_subscription_thread(self._fail_subscription_command, f"验证失败: {e}")
+        except (Exception, SystemExit) as exc:
+            err_text = redact_text(str(coerce_worker_error(exc)))
+            self._call_from_subscription_thread(self._fail_subscription_command, f"验证失败: {err_text}")
 
     def _finish_validate_config(self, output_text: str) -> None:
         if not self.is_mounted:
@@ -297,9 +399,7 @@ class SubscriptionsScreen(Widget):
         self._set_subscription_busy(False)
 
     def _call_from_subscription_thread(self, callback, *args) -> None:
-        try:
-            self.app.call_from_thread(callback, *args)
-        except Exception:
+        if not safe_call_from_thread(self, callback, *args):
             self._subscription_running = False
 
     def _set_subscription_busy(self, busy: bool) -> None:

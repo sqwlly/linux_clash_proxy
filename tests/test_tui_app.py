@@ -5,14 +5,27 @@ from textual.widgets import Button, Checkbox, DataTable, Input, Switch, TextArea
 from cproxy.config import AppPaths
 from cproxy.tui.app import CProxyApp
 
+_ISOLATED_CONFIG = (
+    "mixed-port: 7890\n"
+    "external-controller: 127.0.0.1:9\n"
+    "proxy-groups: []\n"
+    "proxies: []\n"
+    "rules: []\n"
+)
 
-def test_tui_app_bracket_keys_switch_top_tabs(tmp_path):
+
+def _isolated_paths(tmp_path, *, with_runtime: bool = False) -> AppPaths:
     paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
     paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    (paths.config_dir / "config.yaml").write_text(_ISOLATED_CONFIG, encoding="utf-8")
+    if with_runtime:
+        paths.data_dir.mkdir(parents=True, exist_ok=True)
+        (paths.data_dir / "runtime.yaml").write_text(_ISOLATED_CONFIG, encoding="utf-8")
+    return paths
+
+
+def test_tui_app_bracket_keys_switch_top_tabs(tmp_path):
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -31,17 +44,7 @@ def test_tui_app_bracket_keys_switch_top_tabs(tmp_path):
 
 
 def test_tui_app_down_from_top_tabs_enters_active_tab(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
-    (paths.data_dir / "runtime.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path, with_runtime=True)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -58,12 +61,7 @@ def test_tui_app_down_from_top_tabs_enters_active_tab(tmp_path):
 
 
 def test_tui_app_arrow_keys_switch_top_tabs_when_tabbar_is_focused(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -80,17 +78,7 @@ def test_tui_app_arrow_keys_switch_top_tabs_when_tabbar_is_focused(tmp_path):
 
 
 def test_tui_app_escape_returns_from_content_to_top_tabs(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
-    (paths.data_dir / "runtime.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path, with_runtime=True)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -110,12 +98,7 @@ def test_tui_app_escape_returns_from_content_to_top_tabs(tmp_path):
 
 
 def test_tui_app_up_down_move_between_form_controls(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -136,12 +119,7 @@ def test_tui_app_up_down_move_between_form_controls(tmp_path):
 
 
 def test_tui_app_up_down_move_between_system_proxy_switches(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -162,17 +140,7 @@ def test_tui_app_up_down_move_between_system_proxy_switches(tmp_path):
 
 
 def test_tui_app_config_page_toolbar_and_editor_are_reachable(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
-    (paths.data_dir / "runtime.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path, with_runtime=True)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -200,13 +168,7 @@ def test_tui_app_config_page_toolbar_and_editor_are_reachable(tmp_path):
 
 
 def test_tui_app_logs_page_toolbar_and_viewer_are_reachable(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -232,12 +194,7 @@ def test_tui_app_logs_page_toolbar_and_viewer_are_reachable(tmp_path):
 
 
 def test_tui_app_new_enterprise_tabs_are_keyboard_reachable(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case(tab_id: str, selector: str):
         app = CProxyApp(paths)
@@ -255,17 +212,7 @@ def test_tui_app_new_enterprise_tabs_are_keyboard_reachable(tmp_path):
 
 
 def test_tui_app_ga_layout_smoke_80_and_120_columns(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
-    (paths.data_dir / "runtime.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path, with_runtime=True)
 
     async def run_case(size):
         app = CProxyApp(paths)
@@ -288,12 +235,7 @@ def test_tui_app_ga_layout_smoke_80_and_120_columns(tmp_path):
 
 
 def test_tui_app_subscription_buttons_are_reachable_from_inputs(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -320,12 +262,7 @@ def test_tui_app_subscription_buttons_are_reachable_from_inputs(tmp_path):
 
 
 def test_tui_app_ai_table_boundary_reaches_toolbar(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = CProxyApp(paths)
@@ -349,17 +286,7 @@ def test_tui_app_ai_table_boundary_reaches_toolbar(tmp_path):
 
 
 def test_tui_app_escape_steps_back_through_nodes_page(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
-    paths.config_dir.mkdir(parents=True, exist_ok=True)
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    (paths.config_dir / "config.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
-    (paths.data_dir / "runtime.yaml").write_text(
-        "mixed-port: 7890\nproxy-groups: []\nproxies: []\nrules: []\n",
-        encoding="utf-8",
-    )
+    paths = _isolated_paths(tmp_path, with_runtime=True)
 
     async def run_case():
         app = CProxyApp(paths)

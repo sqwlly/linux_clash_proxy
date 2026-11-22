@@ -2,8 +2,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+INSTALL_MODE=""
+TMP_MMDB=""
+
+cleanup_tmp() {
+    if [ -n "${TMP_MMDB:-}" ]; then
+        rm -f "$TMP_MMDB"
+    fi
+}
+trap cleanup_tmp EXIT
 
 package_target() {
     if [ "${CPROXY_INSTALL_TUI:-1}" = "0" ]; then
@@ -42,7 +51,7 @@ install_with_pip() {
 }
 
 install_runtime_dependencies() {
-    local specs=("PyYAML>=6" "requests>=2" "tqdm>=4" "urllib3>=2.7.0" "idna>=3.15" "h2>=4")
+    local specs=("PyYAML>=6" "requests>=2" "tqdm>=4" "urllib3>=2.7.0" "idna>=3.15" "h2>=4" "cryptography>=42")
     if [ "${CPROXY_INSTALL_TUI:-1}" != "0" ]; then
         specs+=("textual>=5.0")
     fi
@@ -66,6 +75,37 @@ install_system_wide() {
     fi
 }
 
+run_cproxy() {
+    local pipx_venv_py="${PIPX_HOME:-$HOME/.local/pipx}/venvs/cproxy/bin/python"
+    local pipx_bin="${PIPX_BIN_DIR:-$HOME/.local/bin}/cproxy"
+    local python_dir
+    python_dir="$(cd "$(dirname -- "$(command -v python3)")" && pwd)"
+
+    if [ "$INSTALL_MODE" = "pipx" ]; then
+        if [ -x "$pipx_venv_py" ]; then
+            "$pipx_venv_py" -m cproxy.cli "$@"
+            return $?
+        fi
+        if [ -x "$pipx_bin" ]; then
+            "$pipx_bin" "$@"
+            return $?
+        fi
+    elif [ "$INSTALL_MODE" = "user" ]; then
+        if [ -x "${HOME}/.local/bin/cproxy" ]; then
+            "${HOME}/.local/bin/cproxy" "$@"
+            return $?
+        fi
+    elif [ "$INSTALL_MODE" = "system" ]; then
+        if [ -x "${python_dir}/cproxy" ]; then
+            "${python_dir}/cproxy" "$@"
+            return $?
+        fi
+    fi
+
+    PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+        python3 -m cproxy.cli "$@"
+}
+
 ensure_geodata() {
     local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
     local mmdb_path="${data_home}/cproxy/country.mmdb"
@@ -86,22 +126,24 @@ ensure_geodata() {
     fi
 
     if [ "${CPROXY_GEODATA_DOWNLOAD:-1}" != "0" ]; then
-        local tmp_mmdb="${mmdb_path}.tmp.$$"
+        TMP_MMDB="${mmdb_path}.tmp.$$"
         local downloaded=0
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --max-time 120 -o "$tmp_mmdb" "$mmdb_url" && downloaded=1
+            curl -fsSL --max-time 120 -o "$TMP_MMDB" "$mmdb_url" && downloaded=1
         fi
         if [ "$downloaded" = "0" ] && command -v wget >/dev/null 2>&1; then
-            wget -q -O "$tmp_mmdb" "$mmdb_url" && downloaded=1
+            wget -q -O "$TMP_MMDB" "$mmdb_url" && downloaded=1
         fi
         # 下载到临时文件并做基本完整性检查（country.mmdb 正常为数 MB），
         # 通过后原子替换，避免中断产生的残缺文件被下次运行当成有效数据
-        if [ "$downloaded" = "1" ] && [ "$(stat -c %s "$tmp_mmdb" 2>/dev/null || echo 0)" -gt 1000000 ]; then
-            mv -f "$tmp_mmdb" "$mmdb_path"
+        if [ "$downloaded" = "1" ] && [ "$(stat -c %s "$TMP_MMDB" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+            mv -f "$TMP_MMDB" "$mmdb_path"
+            TMP_MMDB=""
             echo "GeoIP 数据: 已从 ${mmdb_url} 下载到 ${mmdb_path}"
             return 0
         fi
-        rm -f "$tmp_mmdb"
+        rm -f "$TMP_MMDB"
+        TMP_MMDB=""
     fi
 
     echo "警告: 未检测到 GeoIP 数据文件: ${mmdb_path}" >&2
@@ -109,10 +151,34 @@ ensure_geodata() {
     echo "提示: 可手动放置该文件后再运行 cproxy test" >&2
 }
 
+ensure_ruleset() {
+    local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local ruleset_dir="${data_home}/cproxy/ruleset"
+    local dst="${ruleset_dir}/ChinaMax.yml"
+    local src="${ROOT_DIR}/ruleset/ChinaMax.yml"
+
+    if [ -f "$dst" ]; then
+        echo "规则集数据: ${dst}"
+        return 0
+    fi
+    if [ -f "$src" ]; then
+        mkdir -p "$ruleset_dir"
+        cp "$src" "$dst"
+        echo "规则集数据: 已从 ${src} 安装到 ${dst}"
+    fi
+}
+
 add_logrotate_cron() {
     local config_path="$1"
     local pattern="$2"
-    local cron_job="0 */6 * * * /usr/sbin/logrotate ${config_path} >/dev/null 2>&1"
+    local state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+    local cron_job
+    if [ "$(id -u)" = "0" ]; then
+        cron_job="0 */6 * * * /usr/sbin/logrotate '${config_path}' >/dev/null 2>&1"
+    else
+        mkdir -p "${state_home}/cproxy"
+        cron_job="0 */6 * * * /usr/sbin/logrotate -s '${state_home}/cproxy/logrotate.status' '${config_path}' >/dev/null 2>&1"
+    fi
 
     if ! command -v crontab >/dev/null 2>&1; then
         echo "警告: 未检测到 crontab，跳过日志轮转定时任务配置" >&2
@@ -120,8 +186,18 @@ add_logrotate_cron() {
     fi
 
     if ! crontab -l 2>/dev/null | grep -q "${pattern}"; then
-        (crontab -l 2>/dev/null | grep -v "${pattern}"; echo "$cron_job") | crontab - 2>/dev/null || true
-        echo "日志轮转定时任务: 已添加"
+        local existing_cron
+        existing_cron="$(crontab -l 2>/dev/null || true)"
+        if {
+            if [ -n "$existing_cron" ]; then
+                printf '%s\n' "$existing_cron" | grep -v "${pattern}" || true
+            fi
+            printf '%s\n' "$cron_job"
+        } | crontab - 2>/dev/null; then
+            echo "日志轮转定时任务: 已添加"
+        else
+            echo "警告: 添加日志轮转定时任务失败，请手动检查 crontab 权限" >&2
+        fi
     fi
 }
 
@@ -146,8 +222,14 @@ setup_logrotate() {
         return 0
     fi
 
-    sed -e "s|{{LOG_FILE}}|${log_file}|g" \
-        "${ROOT_DIR}/logrotate.conf.template" > "${logrotate_conf}"
+    CPROXY_LOG_FILE_REPL="${log_file}" awk '{
+        repl = ENVIRON["CPROXY_LOG_FILE_REPL"]
+        target = "{{LOG_FILE}}"
+        while ((idx = index($0, target)) > 0) {
+            $0 = substr($0, 1, idx - 1) repl substr($0, idx + length(target))
+        }
+        print
+    }' "${ROOT_DIR}/logrotate.conf.template" > "${logrotate_conf}"
 
     echo "日志轮转配置: ${logrotate_conf}"
 
@@ -162,6 +244,7 @@ main() {
     if [ "$(id -u)" = "0" ]; then
         echo "检测到 root：使用系统级安装（/usr/local），与 systemd 服务保持同一副本"
         install_system_wide
+        INSTALL_MODE="system"
     elif command -v pipx >/dev/null 2>&1; then
         pipx_bin="$(command -v pipx)"
         python_bin="$(command -v python3)"
@@ -174,29 +257,31 @@ main() {
         # 否则回退到 pip 安装，避免误用系统级 pipx 造成环境错配。
         if [ "${pipx_dir}" = "${python_dir}" ] || [ "${pipx_dir}" = "${first_path_entry}" ]; then
             if install_with_pipx; then
-                :
+                INSTALL_MODE="pipx"
             else
                 echo "警告: pipx 安装失败，改用用户 pip 安装" >&2
                 install_with_pip
+                INSTALL_MODE="user"
             fi
         else
             install_with_pip
+            INSTALL_MODE="user"
         fi
     else
         install_with_pip
+        INSTALL_MODE="user"
     fi
 
-    PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
-        python3 -m cproxy.cli init >/dev/null
+    run_cproxy init >/dev/null
 
     ensure_geodata
+    ensure_ruleset
 
     setup_logrotate
 
-    if PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
-        CPROXY_LEGACY_ROOT="${ROOT_DIR}" \
+    if CPROXY_LEGACY_ROOT="${ROOT_DIR}" \
         CPROXY_NONINTERACTIVE=1 \
-        python3 -m cproxy.cli bootstrap; then
+        run_cproxy bootstrap; then
         echo "一键部署: 完成"
     else
         echo "警告: 一键部署未完成，可稍后手动执行 cproxy bootstrap" >&2

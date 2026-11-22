@@ -6,7 +6,7 @@ import unicodedata
 def display_width(value: object) -> int:
     width = 0
     for char in str(value):
-        if unicodedata.combining(char):
+        if unicodedata.combining(char) or unicodedata.category(char) in {"Mn", "Me", "Cf"}:
             continue
         width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
     return width

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-import shutil
+import tempfile
 from pathlib import Path
 
 from .config import AppPaths, read_config
@@ -19,6 +19,26 @@ rules: []
 DEFAULT_LEGACY_ROOT = Path("/root/clash_proxy")
 
 
+def _atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+        if os.name != "nt":
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def init_user_layout(paths: AppPaths) -> Path:
     paths.config_dir.mkdir(parents=True, exist_ok=True)
     paths.data_dir.mkdir(parents=True, exist_ok=True)
@@ -26,7 +46,7 @@ def init_user_layout(paths: AppPaths) -> Path:
 
     config_file = paths.config_dir / "config.yaml"
     if not config_file.exists():
-        config_file.write_text(DEFAULT_CONFIG, encoding="utf-8")
+        _atomic_write_bytes(config_file, DEFAULT_CONFIG.encode("utf-8"), mode=0o600)
 
     return config_file
 
@@ -41,7 +61,7 @@ def migrate_from_legacy(paths: AppPaths, legacy_root: Path) -> Path:
     paths.state_dir.mkdir(parents=True, exist_ok=True)
 
     target = paths.config_dir / "config.yaml"
-    shutil.copyfile(legacy_config, target)
+    _atomic_write_bytes(target, legacy_config.read_bytes(), mode=0o600)
     return target
 
 

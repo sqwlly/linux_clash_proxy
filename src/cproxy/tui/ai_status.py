@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from ..backend.runtime import AI_GEMINI_GROUP, AIExit, AIRoute, delay_state
 from ..names import normalize_name
+from .widgets import escape_markup
 
 _ACCENT = "#f6c177"
 _NODE = "#5eead4"
@@ -40,7 +41,7 @@ def delay_text(delay: int | None) -> str:
     `history` 里的 5000 是探测超时哨兵、0 是未测得，都不是真实延迟——照毫秒展示会把
     「超时」渲染成「很快」（CLI 面板用同一套判定，见 `backend.runtime.delay_state`）。
     """
-    if not isinstance(delay, int):
+    if not isinstance(delay, int) or isinstance(delay, bool):
         return "未测得"
     return {"ok": f"{delay}ms", "timeout": "超时", "unknown": "未测得"}[delay_state(delay)]
 
@@ -50,8 +51,10 @@ def exit_line(exit_: AIExit) -> str:
 
     延迟不是 ok 时不附健康标记：`超时 · 正常` 这种组合自相矛盾。
     """
-    parts = [f"{exit_.group} → {normalize_name(exit_.node)} ({delay_text(exit_.delay)})"]
-    if isinstance(exit_.delay, int) and delay_state(exit_.delay) == "ok":
+    group_text = escape_markup(exit_.group)
+    node_text = escape_markup(normalize_name(exit_.node))
+    parts = [f"{group_text} → {node_text} ({delay_text(exit_.delay)})"]
+    if isinstance(exit_.delay, int) and not isinstance(exit_.delay, bool) and delay_state(exit_.delay) == "ok":
         parts.append(alive_markup(exit_.alive))
     return " ".join(parts)
 
@@ -75,12 +78,12 @@ def chain_markup(route: AIRoute) -> str:
     lines = [f"[{_CHAIN_ROOT}]通用 AI-MANUAL[/]"]
     if route.auto_mode:
         lines.append(f"└─ [{_ACCENT}]AI-AUTO[/]")
-        lines.append(f"   └─ [{_NODE}]{route.pool}[/]")
-        lines.append(f"      └─ [{_OK}]{normalize_name(route.active.node)}[/]")
+        lines.append(f"   └─ [{_NODE}]{escape_markup(route.pool)}[/]")
+        lines.append(f"      └─ [{_OK}]{escape_markup(normalize_name(route.active.node))}[/]")
     else:
-        lines.append(f"└─ [{_OK}]{normalize_name(route.active.node)}[/]")
+        lines.append(f"└─ [{_OK}]{escape_markup(normalize_name(route.active.node))}[/]")
     if route.gemini is not None:
         lines.append("")
-        lines.append(f"[{_CHAIN_ROOT}]Gemini {AI_GEMINI_GROUP}[/]")
-        lines.append(f"└─ [{_OK}]{normalize_name(route.gemini.node)}[/]")
+        lines.append(f"[{_CHAIN_ROOT}]Gemini {escape_markup(AI_GEMINI_GROUP)}[/]")
+        lines.append(f"└─ [{_OK}]{escape_markup(normalize_name(route.gemini.node))}[/]")
     return "\n".join(lines)

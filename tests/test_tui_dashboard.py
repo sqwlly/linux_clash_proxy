@@ -10,6 +10,16 @@ from cproxy.config import AppPaths
 from cproxy.tui.screens.dashboard import DashboardScreen
 
 
+def _isolated_paths(tmp_path) -> AppPaths:
+    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "config.yaml").write_text(
+        "mixed-port: 7890\nexternal-controller: 127.0.0.1:9\n",
+        encoding="utf-8",
+    )
+    return paths
+
+
 class _TabbedApp(App):
     def __init__(self, paths):
         super().__init__()
@@ -26,7 +36,7 @@ class _TabbedApp(App):
 def test_dashboard_ai_cards_render_resolved_exit(ai_route_groups, tmp_path):
     """仪表盘 AI 卡片此前只读组自身的 delay——fixed fallback 组恒空，于是永远显示 `─`
     与 `?`；现在走统一的解析，延迟与健康都取自出口节点。"""
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _TabbedApp(paths)
@@ -51,7 +61,7 @@ def test_dashboard_ai_cards_render_resolved_exit(ai_route_groups, tmp_path):
 
 
 def test_dashboard_ai_cards_keep_placeholder_when_groups_missing(tmp_path):
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _TabbedApp(paths)
@@ -75,7 +85,7 @@ def test_dashboard_timer_pauses_when_tab_hidden_and_resumes_on_show(monkeypatch,
         original_refresh(self)
 
     monkeypatch.setattr(DashboardScreen, "refresh_data", counting_refresh)
-    paths = AppPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
+    paths = _isolated_paths(tmp_path)
 
     async def run_case():
         app = _TabbedApp(paths)

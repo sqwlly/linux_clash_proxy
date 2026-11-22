@@ -7,10 +7,19 @@ name = "cproxy"
 version = "1.1.0"
 description = "User-level CLI for managing Mihomo proxy workflows"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6", "requests>=2", "tqdm>=4", "urllib3>=2.7.0", "idna>=3.15", "h2>=4"]
+dependencies = [
+    "PyYAML>=6",
+    "requests>=2",
+    "tqdm>=4",
+    "urllib3>=2.7.0",
+    "idna>=3.15",
+    "h2>=4",
+    "cryptography>=42",
+]
 
 [project.optional-dependencies]
 tui = ["textual>=5.0"]
+keyring = ["keyring>=24"]
 
 [project.scripts]
 cproxy = "cproxy.cli:main"
@@ -25,6 +34,10 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py311"
@@ -42,7 +55,3 @@ select = ["E", "F", "W", "I"]
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "cproxy.tui.*"
-disable_error_code = ["unused-coroutine", "attr-defined", "override"]

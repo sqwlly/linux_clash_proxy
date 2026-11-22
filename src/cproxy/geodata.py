@@ -14,8 +14,17 @@ def country_mmdb_path(paths: AppPaths) -> Path:
 
 def check_country_mmdb(paths: AppPaths) -> ConnectivityCheckResult:
     path = country_mmdb_path(paths)
-    if path.is_file():
-        return ConnectivityCheckResult(name="GeoIP 数据", ok=True, detail=f"已找到 {path}")
+    try:
+        if path.is_file():
+            if path.stat().st_size > 0:
+                return ConnectivityCheckResult(name="GeoIP 数据", ok=True, detail=f"已找到 {path}")
+            return ConnectivityCheckResult(
+                name="GeoIP 数据",
+                ok=False,
+                detail=f"{COUNTRY_MMDB_NAME} 为空文件，请重新放置到 {path}",
+            )
+    except OSError:
+        pass
     return ConnectivityCheckResult(
         name="GeoIP 数据",
         ok=False,

@@ -8,6 +8,8 @@ from threading import Thread
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
+import pytest
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
 
@@ -116,6 +118,7 @@ def _start_server(handler):
     return server, thread
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX /bin/bash 子进程测试")
 def test_diagnostics_and_proxy_commands(tmp_path: Path):
     api_server, api_thread = _start_server(_ApiHandler)
     proxy_server, proxy_thread = _start_server(_ProxyHandler)
@@ -217,6 +220,7 @@ ip-check-urls:
         proxy_thread.join()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX /bin/bash 子进程测试")
 def test_diagnostics_report_missing_geodata(tmp_path: Path):
     api_server, api_thread = _start_server(_ApiHandler)
     proxy_server, proxy_thread = _start_server(_ProxyHandler)

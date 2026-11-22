@@ -203,6 +203,7 @@ def test_status_prefers_tls_controller_when_configured(tmp_path: Path):
     assert snapshot.controller == "127.0.0.1:9443"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell script process test")
 def test_status_reports_ai_route_mode_and_delay_when_api_available(tmp_path: Path):
     state = {
         "AI-MANUAL": {
@@ -360,6 +361,7 @@ rules:
             thread.join()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell script process test")
 def test_start_stop_restart_manage_user_process(tmp_path: Path, request):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC_DIR)
@@ -484,6 +486,7 @@ rules:
     assert "状态: 未运行" in status_stopped.stdout
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell script process test")
 def test_stop_does_not_kill_unowned_process_from_stale_pidfile(tmp_path: Path):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC_DIR)
@@ -564,6 +567,7 @@ def test_start_refuses_when_mixed_port_already_listening(tmp_path: Path):
         listener.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell script process test")
 def test_restart_succeeds_when_user_cproxy_service_is_active(tmp_path: Path, monkeypatch):
     """`cproxy.service` 就是 cproxy 自身（`ExecStart=cproxy start` / `ExecReload=cproxy restart`）。
 

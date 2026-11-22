@@ -10,8 +10,8 @@ _cproxy() {
     local -a candidates
     # CURRENT 从 1 起算（1 = 命令名本身），__complete 期望 0 起的下标
     # ${(f)...} 按行切分：节点名可能含空格、emoji 与 `丨`
-    candidates=(${(f)"$(cproxy __complete $((CURRENT - 1)) ${words[@]} 2>/dev/null)"})
-    compadd -- $candidates
+    candidates=(${(f)"$(cproxy __complete $((CURRENT - 1)) "${words[@]}" 2>/dev/null)"})
+    (( ${#candidates[@]} )) && compadd -- "${candidates[@]}"
 }
 
 _cproxy "$@"

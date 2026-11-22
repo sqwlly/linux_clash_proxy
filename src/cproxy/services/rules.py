@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from ..config import AppPaths, custom_rules_file
+from ..config import AppPaths, atomic_write_text, custom_rules_file
 
 RULE_TYPE_ALIASES: dict[str, str] = {
     "suffix": "DOMAIN-SUFFIX",
@@ -32,6 +31,7 @@ RULE_TYPE_ALIASES: dict[str, str] = {
     "proc": "PROCESS-NAME",
     "process-name": "PROCESS-NAME",
 }
+VALID_RULE_TYPES: frozenset[str] = frozenset(RULE_TYPE_ALIASES.values())
 
 POLICY_SHORTHANDS: dict[str, str] = {
     "ai": "AI-MANUAL",
@@ -69,7 +69,10 @@ class CustomRuleEntry:
     created_at: str = ""
 
     def format_mihomo_rule(self, match_group: str | None = None) -> str:
-        resolved_policy = (match_group or "DIRECT") if self.policy == "MATCH_DEFAULT" else self.policy
+        if self.policy == "MATCH_DEFAULT":
+            resolved_policy = match_group if match_group else "MATCH_DEFAULT"
+        else:
+            resolved_policy = self.policy
         if self.rule_type in {"IP-CIDR", "IP-CIDR6"}:
             return f"{self.rule_type},{self.value},{resolved_policy},no-resolve"
         return f"{self.rule_type},{self.value},{resolved_policy}"
@@ -100,7 +103,13 @@ def load_custom_rules(paths: AppPaths) -> list[CustomRuleEntry]:
         rtype = str(item.get("rule_type") or "").strip().upper()
         val = str(item.get("value") or "").strip()
         pol = str(item.get("policy") or "").strip()
-        if not (rtype and val and pol):
+        if (
+            rtype not in VALID_RULE_TYPES
+            or not val
+            or not pol
+            or any(ch in val for ch in (",", "\r", "\n"))
+            or any(ch in pol for ch in (",", "\r", "\n"))
+        ):
             continue
         entries.append(
             CustomRuleEntry(
@@ -116,11 +125,8 @@ def load_custom_rules(paths: AppPaths) -> list[CustomRuleEntry]:
 
 def save_custom_rules(paths: AppPaths, entries: list[CustomRuleEntry]) -> None:
     path = custom_rules_file(paths)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     payload = [entry.to_dict() for entry in entries]
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2), mode=0o600)
 
 
 def _normalize_policy(policy: str | None) -> str:
@@ -130,13 +136,42 @@ def _normalize_policy(policy: str | None) -> str:
     return POLICY_SHORTHANDS.get(raw.lower(), raw)
 
 
+def _validate_and_normalize_rule(rtype: str, val: str, pol: str) -> tuple[str, str, str]:
+    norm_type = str(rtype or "").strip().upper()
+    if norm_type not in VALID_RULE_TYPES:
+        raise ValueError(f"错误: 不支持的规则类型: {rtype}")
+    norm_val = str(val or "").strip()
+    norm_pol = str(pol or "").strip()
+    if not norm_val or any(ch in norm_val for ch in (",", "\r", "\n")):
+        raise ValueError(f"错误: 规则匹配目标无效: {val!r}")
+    if not norm_pol or any(ch in norm_pol for ch in (",", "\r", "\n")):
+        raise ValueError(f"错误: 规则策略目标无效: {pol!r}")
+
+    if norm_type in {"DOMAIN-SUFFIX", "DOMAIN", "DOMAIN-KEYWORD"}:
+        norm_val = norm_val.lower().strip().lstrip(".")
+        if norm_type == "DOMAIN-SUFFIX" and norm_val.startswith("www.") and norm_val.count(".") >= 2:
+            norm_val = norm_val[4:]
+        if not norm_val:
+            raise ValueError("错误: 规则匹配目标不能为空")
+    elif norm_type in {"IP-CIDR", "IP-CIDR6"}:
+        net = ipaddress.ip_network(norm_val, strict=False)
+        norm_type = "IP-CIDR6" if net.version == 6 else "IP-CIDR"
+        norm_val = str(net)
+
+    return norm_type, norm_val, norm_pol
+
+
 def _infer_type_and_value(target: str, explicit_type: str | None = None) -> tuple[str, str]:
     raw = str(target or "").strip()
     if not raw:
         raise ValueError("错误: 规则匹配目标不能为空")
+    if any(ch in raw for ch in (",", "\r", "\n")):
+        raise ValueError(f"错误: 规则匹配目标无效: {target!r}")
 
     if explicit_type:
         rtype = RULE_TYPE_ALIASES.get(explicit_type.strip().lower(), explicit_type.strip().upper())
+        if rtype not in VALID_RULE_TYPES:
+            raise ValueError(f"错误: 不支持的规则类型: {explicit_type}")
     else:
         rtype = ""
 
@@ -160,15 +195,7 @@ def _infer_type_and_value(target: str, explicit_type: str | None = None) -> tupl
         except ValueError:
             rtype = "DOMAIN-SUFFIX"
 
-    if rtype in {"DOMAIN-SUFFIX", "DOMAIN", "DOMAIN-KEYWORD"}:
-        raw = raw.lower().strip().lstrip(".")
-        if rtype == "DOMAIN-SUFFIX" and raw.startswith("www.") and raw.count(".") >= 2:
-            raw = raw[4:]
-    elif rtype in {"IP-CIDR", "IP-CIDR6"}:
-        net = ipaddress.ip_network(raw, strict=False)
-        rtype = "IP-CIDR6" if net.version == 6 else "IP-CIDR"
-        raw = str(net)
-
+    rtype, raw, _ = _validate_and_normalize_rule(rtype, raw, "DIRECT")
     return rtype, raw
 
 
@@ -182,14 +209,26 @@ def add_custom_rule(
 ) -> CustomRuleEntry:
     """添加或更新一条自定义分流规则（也支持直接传入完整规则串如 `DOMAIN-SUFFIX,foo.com,DIRECT`）。"""
     raw = str(target or "").strip()
+    if not raw or "\r" in raw or "\n" in raw:
+        raise ValueError("错误: 规则匹配目标不能为空或包含换行符")
     parts = [p.strip() for p in raw.split(",")]
-    if len(parts) >= 3 and parts[0].upper() in set(RULE_TYPE_ALIASES.values()):
+    if len(parts) >= 3 and parts[0].upper() in VALID_RULE_TYPES:
+        if len(parts) > 4 or (len(parts) == 4 and parts[3].lower() != "no-resolve"):
+            raise ValueError(f"错误: 规则格式无效: {raw!r}")
+        if rule_type:
+            explicit = RULE_TYPE_ALIASES.get(rule_type.strip().lower(), rule_type.strip().upper())
+            if explicit not in VALID_RULE_TYPES:
+                raise ValueError(f"错误: 不支持的规则类型: {rule_type}")
         rtype = parts[0].upper()
         val = parts[1]
-        pol = _normalize_policy(policy or parts[2])
+        pol = _normalize_policy(policy if (policy is not None and str(policy).strip()) else parts[2])
     else:
+        if "," in raw:
+            raise ValueError(f"错误: 规则格式无效: {raw!r}")
         rtype, val = _infer_type_and_value(raw, rule_type)
         pol = _normalize_policy(policy)
+
+    rtype, val, pol = _validate_and_normalize_rule(rtype, val, pol)
 
     new_entry = CustomRuleEntry(
         rule_type=rtype,
@@ -223,16 +262,31 @@ def remove_custom_rule(
         return []
     removed: list[CustomRuleEntry] = []
     kept: list[CustomRuleEntry] = []
-    for idx, entry in enumerate(existing, start=1):
-        if (
-            str(idx) == needle
-            or entry.value.lower() == needle
-            or entry.format_mihomo_rule().lower() == needle
-            or needle in entry.value.lower()
-        ):
-            removed.append(entry)
+    if needle.isascii() and needle.isdigit():
+        target_idx = int(needle)
+        for idx, entry in enumerate(existing, start=1):
+            if idx == target_idx:
+                removed.append(entry)
+            else:
+                kept.append(entry)
+    else:
+        exact_matches = [
+            entry
+            for entry in existing
+            if entry.value.lower() == needle or entry.format_mihomo_rule().lower() == needle
+        ]
+        if exact_matches:
+            for entry in existing:
+                if entry.value.lower() == needle or entry.format_mihomo_rule().lower() == needle:
+                    removed.append(entry)
+                else:
+                    kept.append(entry)
         else:
-            kept.append(entry)
+            for entry in existing:
+                if needle in entry.value.lower():
+                    removed.append(entry)
+                else:
+                    kept.append(entry)
     if removed:
         save_custom_rules(paths, kept)
     return removed

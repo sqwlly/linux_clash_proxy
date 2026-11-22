@@ -1,9 +1,13 @@
 [Unit]
 Description=Daily cproxy subscription update (refresh with bootstrap)
-Documentation=file:/root/clash_proxy/README.md
+After=network-online.target cproxy.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/cproxy refresh
+TimeoutStartSec=120s
+NoNewPrivileges=yes
+PrivateTmp=yes
 # refresh 自带 bootstrap：代理未运行时先用现有 runtime 拉起再拉订阅，
 # 无需代理环境变量

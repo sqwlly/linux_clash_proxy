@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import AppPaths, config_file, runtime_file
+from .config import AppPaths, atomic_write_bytes, config_file, runtime_file
 
 SNAPSHOT_KEEP = 10
 SNAPSHOT_DIR_NAME = "snapshots"
@@ -78,12 +77,18 @@ def snapshot_file(
 
     target_dir = snapshots_dir(paths)
     target_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(target_dir, 0o700)
+        except OSError:
+            pass
 
+    source_bytes = source.read_bytes()
     if deduplicate:
         latest = _latest_snapshot(target_dir, kind)
         if latest is not None and latest.is_file():
             try:
-                if source.read_bytes() == latest.read_bytes():
+                if source_bytes == latest.read_bytes():
                     return latest
             except OSError:
                 pass
@@ -91,9 +96,8 @@ def snapshot_file(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     # 强制 .yaml 后缀，与 _prune/list_snapshots 的 glob 保持一致
     target = target_dir / f"{kind}-{stamp}.yaml"
-    shutil.copyfile(source, target)
-    # 快照可能含明文 secret，权限收紧
-    os.chmod(target, 0o600)
+    # 快照可能含明文 secret，原子写入并强制 0600 权限
+    atomic_write_bytes(target, source_bytes, mode=0o600)
     _prune(target_dir, kind)
     return target
 
@@ -130,14 +134,13 @@ def _evaluate_tier_retention(
 
     # 阶段 2：时间阶梯采样（Tiered Retention Ladder）
     # - 最近 SNAPSHOT_KEEP (10) 个：基础受保护层（无论生成多频繁都保留）
-    # - 1 小时内：全量保留
-    # - 1 小时 ~ 24 小时：每小时保留最新的 1 个
+    # - 24 小时内（超出基础层）：每小时保留最新的 1 个
     # - 24 小时 ~ 7 天：每天保留最新的 1 个
     # - 7 天 ~ 30 天：每周保留最新的 1 个
     # - 超过 30 天：淘汰清理
     hourly_seen: set[tuple[int, int, int, int]] = set()
     daily_seen: set[tuple[int, int, int]] = set()
-    # 周桶是 (ISO 年, ISO 周数) 两元组——原先注解写成三元组，与 add 的实参不符
+    # 周桶是 (ISO 年, ISO 周数) 两元组
     weekly_seen: set[tuple[int, int]] = set()
 
     for idx, item in enumerate(deduped_candidates):
@@ -149,22 +152,24 @@ def _evaluate_tier_retention(
                 item_time = current_time
 
         age = current_time - item_time
+        iso_cal = item_time.isocalendar()
+        week_key = (int(iso_cal[0]), int(iso_cal[1]))
 
         # 保护层 1：最新 SNAPSHOT_KEEP 个快照无条件保留
         if idx < SNAPSHOT_KEEP:
             kept.append(item)
             hourly_seen.add((item_time.year, item_time.month, item_time.day, item_time.hour))
             daily_seen.add((item_time.year, item_time.month, item_time.day))
-            weekly_seen.add((item_time.year, item_time.isocalendar()[1]))
+            weekly_seen.add(week_key)
             continue
 
-        # 保护层 2：1 ~ 24 小时内，每小时保留最新 1 个
+        # 保护层 2：24 小时内，每小时保留最新 1 个
         if age <= timedelta(hours=24):
             hour_bucket = (item_time.year, item_time.month, item_time.day, item_time.hour)
             if hour_bucket not in hourly_seen:
                 hourly_seen.add(hour_bucket)
                 daily_seen.add((item_time.year, item_time.month, item_time.day))
-                weekly_seen.add((item_time.year, item_time.isocalendar()[1]))
+                weekly_seen.add(week_key)
                 kept.append(item)
             else:
                 pruned.append(item)
@@ -175,7 +180,7 @@ def _evaluate_tier_retention(
             day_bucket = (item_time.year, item_time.month, item_time.day)
             if day_bucket not in daily_seen:
                 daily_seen.add(day_bucket)
-                weekly_seen.add((item_time.year, item_time.isocalendar()[1]))
+                weekly_seen.add(week_key)
                 kept.append(item)
             else:
                 pruned.append(item)
@@ -183,9 +188,8 @@ def _evaluate_tier_retention(
 
         # 保护层 4：7 天 ~ 30 天内，每周保留最新 1 个
         if age <= timedelta(days=30):
-            week_bucket = (item_time.year, item_time.isocalendar()[1])
-            if week_bucket not in weekly_seen:
-                weekly_seen.add(week_bucket)
+            if week_key not in weekly_seen:
+                weekly_seen.add(week_key)
                 kept.append(item)
             else:
                 pruned.append(item)
@@ -275,8 +279,7 @@ def restore_snapshot(paths: AppPaths, snapshot: Path) -> Path:
     if not snapshot.is_file():
         raise FileNotFoundError(f"快照不存在: {snapshot}")
     target = target_getter(paths)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(snapshot, target)
+    atomic_write_bytes(target, snapshot.read_bytes(), mode=0o600)
     return target
 
 

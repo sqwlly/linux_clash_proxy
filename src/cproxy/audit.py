@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -32,8 +33,21 @@ def write_audit_event(
             "detail": detail or {},
         }
     )
-    with audit_log_file(paths).open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    log_path = audit_log_file(paths)
+    if os.name != "nt":
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(line)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    else:
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
 
     if _journald_enabled(paths):
         _write_journald_event(event)

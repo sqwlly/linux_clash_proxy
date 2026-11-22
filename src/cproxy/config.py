@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import os
+import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,10 +17,57 @@ try:
 except ImportError:  # pragma: no cover
     from yaml import SafeLoader as _YamlLoader  # type: ignore[assignment]
 
-# 路径 → (content hash, 解析结果)。config.yaml / runtime.yaml 有 50–60KB 代理列表，
+# 路径 → ((mtime_ns, size, sha256), 解析结果)。config.yaml / runtime.yaml 有 50–60KB 代理列表，
 # 纯 Python SafeLoader 每次约 120ms；一次 CLI 里 request() 会读配置三遍。
-# 读文件本身只要 0ms 量级，用内容哈希判断是否需要再 parse。
-_YAML_CACHE: dict[str, tuple[int, Any]] = {}
+# 读文件本身只要 0ms 量级，用元数据 + SHA-256 判断是否需要再 parse，并返回深拷贝避免调用方污染缓存。
+_YAML_CACHE_LOCK = threading.Lock()
+_YAML_CACHE: dict[str, tuple[tuple[int, int, str], Any]] = {}
+
+
+def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """原子写入二进制文件，POSIX 下强制权限（默认 0o600），失败自动清理临时文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    fd_closed = False
+    replaced = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd_closed = True
+            fh.write(data)
+            fh.flush()
+        if os.name != "nt":
+            os.chmod(tmp_path, mode)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                replaced = True
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if not replaced:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def atomic_write_text(
+    path: Path,
+    content: str,
+    mode: int = 0o600,
+    encoding: str = "utf-8",
+) -> None:
+    """原子写入文本文件，POSIX 下强制权限（默认 0o600）。"""
+    atomic_write_bytes(path, content.encode(encoding), mode=mode)
 
 
 @dataclass(frozen=True)
@@ -117,18 +169,22 @@ def verge_daemon_state_file(paths: AppPaths) -> Path:
 
 
 def load_yaml_file(path: Path) -> Any:
-    """读 YAML。文件不存在返回 None。按路径 + 内容哈希缓存，写入后自动失效。"""
+    """读 YAML。文件不存在返回 None。按路径 + (mtime_ns, size, sha256) 缓存，写入后自动失效。"""
     try:
+        st = path.stat()
         raw = path.read_bytes()
     except OSError:
         return None
-    digest = hash(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    fingerprint = (st.st_mtime_ns, len(raw), digest)
     cache_key = str(path)
-    hit = _YAML_CACHE.get(cache_key)
-    if hit is not None and hit[0] == digest:
-        return hit[1]
+    with _YAML_CACHE_LOCK:
+        hit = _YAML_CACHE.get(cache_key)
+        if hit is not None and hit[0] == fingerprint:
+            return copy.deepcopy(hit[1])
     data = yaml.load(raw.decode("utf-8"), Loader=_YamlLoader)
-    _YAML_CACHE[cache_key] = (digest, data)
+    with _YAML_CACHE_LOCK:
+        _YAML_CACHE[cache_key] = (fingerprint, copy.deepcopy(data))
     return data
 
 

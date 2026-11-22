@@ -957,7 +957,7 @@ def test_airport_without_iepl_labels_protocol_and_dynamic_stream_fragility(tmp_p
     monkeypatch.setattr(ai_watch_mod, "ai_target_verdict", lambda _p, _u: PROBE_OK)
     svc = AIWatchService(paths, agy_log_dir=log_dir)
     svc.query = _Query()  # type: ignore[assignment]
-    report = svc.watch()
+    svc.watch()
 
     # AI-MANUAL 从裸 vision 的 🇯🇵日本 01 | TE 主动迁往 🇸🇬 Singapore 01；
     # AI-GEMINI 因 attempt 4 连续失败从 🇯🇵 Tokyo 01 切往 🇸🇬 Singapore 01 并断开旧连接
@@ -989,7 +989,9 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     import os
     import socket
     import time
+
     import yaml
+
     from cproxy.backend import runtime as runtime_mod
     from cproxy.backend.runtime import RuntimeBackend, _optimize_ws_cdn_servers
     from cproxy.config import config_file, runtime_file
@@ -1044,7 +1046,8 @@ def test_ws_cdn_tls_blackhole_filter_play_log_reject_and_cross_session_retry(
     _optimize_ws_cdn_servers(proxies, probe_tls=True)
     assert proxies[0]["server"] == "172.67.143.95"
 
-    # 2. render_runtime 在 googleapis.com 之前注入 DOMAIN,play.googleapis.com,AI-AUTO，分流遥测流量避免占满 AI-GEMINI 且不触发客户端疯狂重试
+    # 2. render_runtime 在 googleapis.com 之前注入 play.googleapis.com 规则，
+    #    分流遥测流量避免占满 AI-GEMINI 且不触发客户端疯狂重试
     paths = _make_paths(tmp_path / "play-offload")
     cfg = {
         "mixed-port": 7890,
@@ -1311,9 +1314,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     from cproxy.services.ai_watch import (
         AIWatchService,
         classify_ai_connection_lifecycle,
-        reap_idle_gemini_connections,
     )
-    from cproxy.services.diagnostics import PROBE_DEAD, PROBE_OK
+    from cproxy.services.diagnostics import PROBE_DEAD
     from cproxy.services.query import QueryService
 
     paths = _make_paths(tmp_path / "stateful-sim")
@@ -1322,23 +1324,53 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     # Format: (id, group, leaf, host, port, upload, download, (lastsnd_ms, lastrcv_ms, recv_q, send_q), expected_state)
     matrix = [
         # Loopback 已写完 4.27MB 但内核 Recv-Q 仍有 2.48MB 排队上行（即便 lastsnd=27s, lastrcv=17s）-> uploading
-        ("codex-recvq-backlogged", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47334", 4_275_497, 3_947, (27_514, 17_016, 2_488_578, 0), "uploading"),
-        # IEPL 死连接在内核 Recv-Q 积压 671KB 但双方向已卡死 180s（>60s）无任何字节收发 -> idle_completed（必须回收以防永久阻塞热重载与迁出）
-        ("agy-recvq-stalled-180s", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "53900", 139_621, 4_252, (180_675, 180_631, 671_996, 0), "idle_completed"),
-        # 10.35MB 超大包上行 + gpt-6.1-sol 长思考已耗时 110s（download=3947 < 6000, idle=110s > 95s）-> 依然是 thinking，绝不误判为 idle_completed 强杀！
-        ("codex-thinking-ttfb", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47335", 10_350_000, 3_947, (110_000, 109_500, 0, 0), "thinking"),
+        (
+            "codex-recvq-backlogged", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47334",
+            4_275_497, 3_947, (27_514, 17_016, 2_488_578, 0), "uploading",
+        ),
+        # IEPL 死连接在内核 Recv-Q 积压 671KB 但双方向已卡死 180s（>60s）无任何字节收发
+        # -> idle_completed（必须回收以防永久阻塞热重载与迁出）
+        (
+            "agy-recvq-stalled-180s", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "53900",
+            139_621, 4_252, (180_675, 180_631, 671_996, 0), "idle_completed",
+        ),
+        # 10.35MB 超大包上行 + gpt-6.1-sol 长思考已耗时 110s（download=3947 < 6000, idle=110s > 95s）
+        # -> 依然是 thinking，绝不误判为 idle_completed 强杀！
+        (
+            "codex-thinking-ttfb", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "chatgpt.com", "47335",
+            10_350_000, 3_947, (110_000, 109_500, 0, 0), "thinking",
+        ),
         # agy 复用旧 HTTP/2 连接发起第二轮长思考（lastrcv=62s <= lastsnd=62.1s）-> thinking
-        ("agy-reused-thinking", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "39082", 7_229_624, 80_856, (62_100, 62_000, 0, 0), "thinking"),
+        (
+            "agy-reused-thinking", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "39082",
+            7_229_624, 80_856, (62_100, 62_000, 0, 0), "thinking",
+        ),
         # Send-Q 有未读 SSE 数据块 -> streaming
-        ("agy-sendq-streaming", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "52901", 280_000, 48_000, (19_000, 19_000, 0, 16_384), "streaming"),
+        (
+            "agy-sendq-streaming", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "52901",
+            280_000, 48_000, (19_000, 19_000, 0, 16_384), "streaming",
+        ),
         # 正常流式 SSE 收包中（:7890 向客户端发送 SSE lastsnd=800ms，客户端上次发包 lastrcv=4000ms）-> streaming
-        ("claude-sse-active", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "api.anthropic.com", "52902", 180_000, 32_000, (800, 4_000, 0, 0), "streaming"),
+        (
+            "claude-sse-active", "AI-MANUAL", "🇰🇷韩国 01 | 1X", "api.anthropic.com", "52902",
+            180_000, 32_000, (800, 4_000, 0, 0), "streaming",
+        ),
         # 已完成大包轮次并在连接池静默 40s (lastrcv > lastsnd + 400ms, recv_q=0, send_q=0) -> idle_completed
-        ("agy-turn-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "60611", 1_500_000, 64_000, (40_000, 42_000, 0, 0), "idle_completed"),
-        # WebSocket / HTTP2 20s 心跳 PING+PONG 同步回包（lastsnd == lastrcv == 10550ms, download >= 6000）-> idle_completed（不误判为 thinking 造成旧叶子僵尸残留）
-        ("codex-ws-ping-stale", "AI-MANUAL", "🇸🇬新加坡 01 | 1X", "chatgpt.com", "45368", 398_235, 218_662, (10_550, 10_550, 0, 0), "idle_completed"),
+        (
+            "agy-turn-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "60611",
+            1_500_000, 64_000, (40_000, 42_000, 0, 0), "idle_completed",
+        ),
+        # WebSocket / HTTP2 20s 心跳 PING+PONG 同步回包（lastsnd == lastrcv == 10550ms, download >= 6000）
+        # -> idle_completed（不误判为 thinking 造成旧叶子僵尸残留）
+        (
+            "codex-ws-ping-stale", "AI-MANUAL", "🇸🇬新加坡 01 | 1X", "chatgpt.com", "45368",
+            398_235, 218_662, (10_550, 10_550, 0, 0), "idle_completed",
+        ),
         # 小包后台轮询已完成并静默 8s -> idle_completed
-        ("agy-poll-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "38497", 3_200, 5_100, (8_000, 8_200, 0, 0), "idle_completed"),
+        (
+            "agy-poll-done-idle", "AI-GEMINI", "🇬🇧英国 01 | 1X", "daily-cloudcode-pa.googleapis.com", "38497",
+            3_200, 5_100, (8_000, 8_200, 0, 0), "idle_completed",
+        ),
     ]
 
     idle_map: dict[str, tuple[int, ...]] = {}
@@ -1507,21 +1539,26 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     # 4. 阶段 C：验证 Codex SQLite 重试日志自愈检测与仅 AI 排序变更免热重载不变量
     import sqlite3
     import time
+
     from cproxy.backend.runtime import is_only_ai_group_order_change
     from cproxy.services.ai_watch import detect_recent_codex_retry_failure, has_any_inflight_ai_connection
 
     assert has_any_inflight_ai_connection(paths, q.api) is True
     assert (
         is_only_ai_group_order_change(
-            "proxies:\n  - name: A\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [A, B]\nrules: [MATCH,AI-MANUAL]\n",
-            "proxies:\n  - name: A\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [B, A]\nrules: [MATCH,AI-MANUAL]\n",
+            "proxies:\n  - name: A\nproxy-groups:\n  - name: AI-MANUAL\n"
+            "    type: fallback\n    proxies: [A, B]\nrules: [MATCH,AI-MANUAL]\n",
+            "proxies:\n  - name: A\nproxy-groups:\n  - name: AI-MANUAL\n"
+            "    type: fallback\n    proxies: [B, A]\nrules: [MATCH,AI-MANUAL]\n",
         )
         is True
     )
     assert (
         is_only_ai_group_order_change(
-            "proxies:\n  - name: A\n    server: 1.1.1.1\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [A, B]\n",
-            "proxies:\n  - name: A\n    server: 1.1.1.2\nproxy-groups:\n  - name: AI-MANUAL\n    type: fallback\n    proxies: [B, A]\n",
+            "proxies:\n  - name: A\n    server: 1.1.1.1\nproxy-groups:\n"
+            "  - name: AI-MANUAL\n    type: fallback\n    proxies: [A, B]\n",
+            "proxies:\n  - name: A\n    server: 1.1.1.2\nproxy-groups:\n"
+            "  - name: AI-MANUAL\n    type: fallback\n    proxies: [B, A]\n",
         )
         is False
     )
@@ -1532,11 +1569,13 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     now_epoch = int(time.time())
     conn = sqlite3.connect(str(db_file))
     conn.execute(
-        "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, level TEXT, target TEXT, feedback_log_body TEXT)"
+        "CREATE TABLE logs ("
+        "id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, level TEXT, target TEXT, feedback_log_body TEXT)"
     )
     conn.execute(
         "INSERT INTO logs VALUES (1, ?, 100000000, 'WARN', 'codex_core::responses_retry', "
-        "'stream disconnected - retrying sampling request (2/5 in 431ms)... retries=2 max_retries=5 sampling_error=stream disconnected before completion: error sending request')",
+        "'stream disconnected - retrying sampling request (2/5 in 431ms)... retries=2 max_retries=5 "
+        "sampling_error=stream disconnected before completion: error sending request')",
         (now_epoch - 4,),
     )
     conn.commit()
@@ -1554,7 +1593,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     )
     conn.execute(
         "INSERT INTO logs VALUES (3, ?, 300000000, 'WARN', 'codex_core::responses_retry', "
-        "'stream connection failed, retrying: error=Stream disconnected before completion: error sending request retry_delay=5s')",
+        "'stream connection failed, retrying: error=Stream disconnected before completion: "
+        "error sending request retry_delay=5s')",
         (now_epoch - 2,),
     )
     conn.commit()
@@ -1655,7 +1695,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
         "🇬🇧英国 01 | IEPL 1.7X | CM",
     ]
 
-    # _inject_openai_cloudflare_hosts 将 chatgpt.com / api.openai.com 固定映射到真实 Cloudflare Anycast IP 并为 VLESS 节点开启 ip-version: ipv4
+    # _inject_openai_cloudflare_hosts 将 chatgpt.com / api.openai.com 固定映射到真实 Cloudflare Anycast IP，
+    # 并为 VLESS 节点开启 ip-version: ipv4
     from cproxy.backend.runtime import OPENAI_CLOUDFLARE_ANYCAST_IP, _inject_openai_cloudflare_hosts
 
     sample_rt = {
@@ -1671,7 +1712,8 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
 
     # 回环 HTTP/2 复用连接上 lastrcv_ms < lastsnd_ms 且差值 < 50ms（如 (55353, 55350)），或长上下文收到 ResponseID 后
     # 进入 65s 工具调用生成静默期（upload=1.33MB, download=12.4KB, lastsnd=65000, lastrcv=92000），
-    # 或复用/多路复用过 fetchAvailableModels（upload=417KB, download=54.3KB, lastsnd=35813, lastrcv=36400），严禁误判为 idle_completed
+    # 或复用/多路复用过 fetchAvailableModels（upload=417KB, download=54.3KB, lastsnd=35813, lastrcv=36400），
+    # 严禁误判为 idle_completed
     assert classify_ai_connection_lifecycle(830_000, 52_000, 55_353, 55_350, recv_q=0, send_q=0) == "thinking"
     assert classify_ai_connection_lifecycle(1_330_000, 12_400, 65_000, 92_000, recv_q=0, send_q=0) == "streaming"
     assert classify_ai_connection_lifecycle(417_187, 54_334, 35_813, 36_400, recv_q=0, send_q=0) == "streaming"
@@ -1723,8 +1765,11 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
     agy_giant_tool_dir.mkdir()
     prefix_resp = time.strftime("%m%d %H:%M:%S", time.localtime(now_epoch - 72))
     (agy_giant_tool_dir / "cli-20261030_131645.log").write_text(
-        f"I{prefix_resp}.100000 1 http_helpers.go:359] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1 ResponseID: abc\n"
-        f"I{prefix_new}.200000 1 run.go:301] Run: attempt 6 failed (stream reading error: unexpected EOF), retrying in 25s\n",
+        f"I{prefix_resp}.100000 1 http_helpers.go:359] URL: "
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse "
+        "Trace: 0x1 ResponseID: abc\n"
+        f"I{prefix_new}.200000 1 run.go:301] Run: attempt 6 failed "
+        "(stream reading error: unexpected EOF), retrying in 25s\n",
         encoding="utf-8",
     )
     giant_failed, _, _ = detect_recent_agy_retry_failure(
@@ -1734,8 +1779,12 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
 
     prefix_prev_fail = time.strftime("%m%d %H:%M:%S", time.localtime(now_epoch - 88))
     (agy_giant_tool_dir / "cli-20261030_131645.log").write_text(
-        f'I{prefix_prev_fail}.100000 1 run.go:301] Run: attempt 3 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), retrying in 11s\n'
-        f'I{prefix_new}.200000 1 run.go:301] Run: attempt 4 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), retrying in 22s\n',
+        f"I{prefix_prev_fail}.100000 1 run.go:301] Run: attempt 3 failed "
+        '(request failed: Post "https://daily-cloudcode-pa.googleapis.com/'
+        'v1internal:streamGenerateContent?alt=sse": EOF), retrying in 11s\n'
+        f"I{prefix_new}.200000 1 run.go:301] Run: attempt 4 failed "
+        '(request failed: Post "https://daily-cloudcode-pa.googleapis.com/'
+        'v1internal:streamGenerateContent?alt=sse": EOF), retrying in 22s\n',
         encoding="utf-8",
     )
     giant_post_eof_failed, _, _ = detect_recent_agy_retry_failure(
@@ -1746,6 +1795,7 @@ def test_stateful_ai_lifecycle_invariants_simulation(tmp_path: Path, monkeypatch
 
 def test_h2_keepalive_ping_injection_and_end_stream(tmp_path: Path):
     import asyncio
+
     from cproxy.services.h2_keepalive import H2_PREFACE, _forward_h2_frames_with_ping
 
     async def _run():
@@ -1802,6 +1852,7 @@ def test_h2_keepalive_ping_injection_and_end_stream(tmp_path: Path):
 
 def test_runtime_render_injects_h2_keepalive_rule_when_running(tmp_path: Path, monkeypatch):
     import yaml
+
     from cproxy.backend.runtime import RuntimeBackend
     from cproxy.config import config_file
     from cproxy.services import h2_keepalive
@@ -1825,7 +1876,13 @@ def test_runtime_render_injects_h2_keepalive_rule_when_running(tmp_path: Path, m
     rendered = yaml.safe_load(rt_path.read_text(encoding="utf-8"))
     proxy_names = [p["name"] for p in rendered["proxies"]]
     assert "H2-KEEPALIVE" in proxy_names
-    rule = "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE"
+    groups = {g["name"]: g for g in rendered["proxy-groups"]}
+    assert groups["AI-GEMINI-KEEPALIVE"]["proxies"] == ["H2-KEEPALIVE", "AI-GEMINI"]
+    assert groups["AI-MANUAL-KEEPALIVE"]["proxies"] == ["H2-KEEPALIVE", "AI-MANUAL"]
+    rule = (
+        "AND,((OR,((DOMAIN,daily-cloudcode-pa.googleapis.com),(DOMAIN,aicode.googleapis.com))),"
+        "(NETWORK,TCP),(NOT,((IN-TYPE,SOCKS5)))),AI-GEMINI-KEEPALIVE"
+    )
     assert rule in rendered["rules"]
     assert rendered["rules"].index(rule) < rendered["rules"].index("DOMAIN-SUFFIX,googleapis.com,AI-GEMINI")
 

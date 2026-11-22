@@ -16,18 +16,18 @@ const AI_MANUAL_REGION_ORDER = ["US", "JP", "SG", "KR", "GB", "TW", "FR", "DE"];
 const PANEL_INFO_RE = /剩余流量|套餐到期|距离下次重置|官网|群组|导航|下次重置|到期时间|流量重置|重置剩余|过期时间|有效期|Expire|Traffic|网址|公告|客服|频道|\b\d+(?:\.\d+)?\s*[KMGTPE]i?B\s*(?:[|/]|of)\s*\d+(?:\.\d+)?\s*[KMGTPE]i?B\b/i;
 
 const REGION_PATTERNS = [
-  ["HK", /香港|HK|Hong\s*Kong|🇭🇰/i],
-  ["TW", /台湾|台北|TW|Taiwan|🇹🇼|🇨🇳/i],
-  ["JP", /日本|东京|大阪|JP|Japan|🇯🇵/i],
-  ["KR", /韩国|首尔|KR|Korea|🇰🇷/i],
-  ["SG", /新加坡|狮城|SG|Singapore|🇸🇬/i],
-  ["US", /美国|洛杉矶|圣何塞|硅谷|西雅图|芝加哥|达拉斯|纽约|US|United\s*States|America|🇺🇸/i],
-  ["GB", /英国|伦敦|(?<!\d\s*)(?<!\d)\bGB\b|\bUK\b|United\s*Kingdom|Britain|🇬🇧/i],
-  ["DE", /德国|法兰克福|DE|Germany|🇩🇪/i],
-  ["FR", /法国|巴黎|FR|France|🇫🇷/i],
-  ["BR", /巴西|圣保罗|BR|Brazil|🇧🇷/i],
-  ["AE", /阿联酋|迪拜|AE|UAE|Dubai|🇦🇪/i],
-  ["AU", /澳大利亚|澳洲|悉尼|AU|Australia|🇦🇺/i],
+  ["HK", /🇭🇰|香港|Hong\s*Kong|(?<![A-Za-z0-9])HKG?(?![A-Za-z0-9])|(?<![A-Za-z0-9])HK\d/i],
+  ["JP", /🇯🇵|日本|东京|東京|大阪|Japan|Tokyo|Osaka|(?<![A-Za-z0-9])JPN?(?![A-Za-z0-9])|(?<![A-Za-z0-9])JP\d/i],
+  ["KR", /🇰🇷|韩国|韓國|首尔|首爾|釜山|Korea|Seoul|(?<![A-Za-z0-9])KOR?(?![A-Za-z0-9])|(?<![A-Za-z0-9])KR(?![A-Za-z0-9])|(?<![A-Za-z0-9])KR\d/i],
+  ["SG", /🇸🇬|新加坡|狮城|獅城|Singapore|(?<![A-Za-z0-9])SGP?(?![A-Za-z0-9])|(?<![A-Za-z0-9])SG\d/i],
+  ["TW", /🇹🇼|台湾|台灣|台北|新北|彰化|高雄|Taiwan|Taipei|Hinet|(?<![A-Za-z0-9])TWN?(?![A-Za-z0-9])|(?<![A-Za-z0-9])TW\d/i],
+  ["US", /🇺🇸|美国|美國|洛杉矶|圣何塞|硅谷|西雅图|纽约|芝加哥|达拉斯|United\s*States|America|Los\s*Angeles|San\s*Jose|Silicon\s*Valley|Seattle|(?<![A-Za-z0-9])USA?(?![A-Za-z0-9])|(?<![A-Za-z0-9])US\d|(?<![A-Za-z0-9])(?:LAX|SJC|SEA)(?![A-Za-z0-9])/i],
+  ["AU", /🇦🇺|澳大利亚|澳洲|悉尼|雪梨|墨尔本|Australia|Sydney|(?<![A-Za-z0-9])AUS?(?![A-Za-z0-9])|(?<![A-Za-z0-9])AU(?![A-Za-z0-9])|(?<![A-Za-z0-9])AU\d/i],
+  ["BR", /🇧🇷|巴西|圣保罗|聖保羅|Brazil|Sao\s*Paulo|(?<![A-Za-z0-9])BRA?(?![A-Za-z0-9])|(?<![A-Za-z0-9])BR(?![A-Za-z0-9])|(?<![A-Za-z0-9])BR\d/i],
+  ["AE", /🇦🇪|阿联酋|阿聯酋|迪拜|杜拜|Dubai|UAE|(?<![A-Za-z0-9])AE(?![A-Za-z0-9])/i],
+  ["DE", /🇩🇪|德国|德國|法兰克福|法蘭克福|慕尼黑|Germany|Frankfurt|(?<![A-Za-z0-9])DEU?(?![A-Za-z0-9])|(?<![A-Za-z0-9])DE(?![A-Za-z0-9])|(?<![A-Za-z0-9])DE\d/i],
+  ["FR", /🇫🇷|法国|法國|巴黎|France|Paris|(?<![A-Za-z0-9])FRA?(?![A-Za-z0-9])|(?<![A-Za-z0-9])FR(?![A-Za-z0-9])|(?<![A-Za-z0-9])FR\d/i],
+  ["GB", /🇬🇧|英国|英國|伦敦|倫敦|United\s*Kingdom|Britain|London|England|(?<![A-Za-z0-9])UK(?![A-Za-z0-9])|(?<!\d\s*)(?<!\d)(?<![A-Za-z0-9])GBR?(?![A-Za-z0-9])|(?<![A-Za-z0-9])GB\d/i],
 ];
 
 const AI_DOMAINS = new Set([
@@ -67,10 +67,19 @@ function matchRegion(name) {
 
 function parseMultiplier(name) {
   const text = String(name || "");
-  const m = text.match(/(?:×|x|X|\*)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:×|x|X|倍)/);
-  if (!m) return 1.0;
-  const val = parseFloat(m[1] || m[2]);
-  return Number.isFinite(val) ? val : 1.0;
+  const patterns = [
+    /(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*[xX×](?![A-Za-z0-9])/,
+    /(?<![A-Za-z0-9])[xX×]\s*(\d+(?:\.\d+)?)(?![A-Za-z0-9])/,
+    /(\d+(?:\.\d+)?)\s*倍(?:率)?/,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) {
+      const val = parseFloat(m[1]);
+      if (Number.isFinite(val)) return val;
+    }
+  }
+  return 1.0;
 }
 
 function isStreamFragileProxy(proxy, nameFallback = "") {
@@ -256,6 +265,9 @@ function main(config) {
       .filter(n => n && !isPanelInfoNode(n)),
     proxyMap
   );
+  if (allValidNodes.length === 0) {
+    return config;
+  }
 
   // 4. 构建 AI-GEMINI 候选池（韩/台/英/德/法/巴/阿/澳 优先，缺失时回退日/美/新）
   let geminiLeaves = [];
@@ -354,7 +366,10 @@ function main(config) {
     if (!group || typeof group !== "object") continue;
     const gtype = String(group.type || "").toLowerCase();
     if (Array.isArray(group.proxies)) {
-      group.proxies = group.proxies.filter(m => !isPanelInfoNode(m));
+      const cleaned = group.proxies.filter(m => !isPanelInfoNode(m));
+      if (cleaned.length > 0) {
+        group.proxies = cleaned;
+      }
     }
     if (["url-test", "urltest", "fallback", "load-balance", "loadbalance"].includes(gtype)) {
       if (typeof group.url === "string" && group.url.trim().toLowerCase().startsWith("http://")) {
@@ -431,13 +446,23 @@ function main(config) {
     "DOMAIN-SUFFIX,cursor.sh,DIRECT",
     "DOMAIN,safebrowsing.googleapis.com,DIRECT",
     "GEOIP,CN,DIRECT",
+    "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE",
+    "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE",
+    "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE",
   ]);
+  const isLegacyKeepaliveRule = rule => {
+    if (typeof rule !== "string") return false;
+    const parts = rule.split(",").map(s => s.trim());
+    if (parts.length < 2) return false;
+    const target = parts[parts.length - 1];
+    return target === "H2-KEEPALIVE" || target === "AI-MANUAL-KEEPALIVE" || target === "AI-GEMINI-KEEPALIVE";
+  };
 
   const frontSet = new Set([...aiRules, ...bulkDownloadDirect]);
   const rawRules = Array.isArray(config.rules) ? config.rules : [];
   const cleanRules = rawRules
     .map(normalizeIpCidrRule)
-    .filter(r => !frontSet.has(r) && !staleRules.has(r) && !isAiConflictRule(r));
+    .filter(r => !frontSet.has(r) && !staleRules.has(r) && !isLegacyKeepaliveRule(r) && !isAiConflictRule(r));
 
   config.rules = [...aiRules, ...bulkDownloadDirect, ...cleanRules];
   return config;

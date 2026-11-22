@@ -29,6 +29,7 @@ from .probe import (
     GEMINI_FAST_REGIONS,
     ProbeService,
     ProbeSummary,
+    _atomic_write_text,
     clear_gemini_geo_blocked_node,
     clear_stream_fragile_node,
     is_gemini_geo_blocked,
@@ -38,6 +39,7 @@ from .probe import (
     probe_paths_context,
     record_gemini_geo_blocked_node,
     record_stream_fragile_node,
+    update_ai_watch_state,
 )
 from .query import QueryService
 
@@ -356,8 +358,7 @@ class RebalanceService:
         order_updated = not _should_keep_previous_order(previous_order, ordered)
         effective_order = ordered if order_updated else previous_order
         if order_updated:
-            order_path.parent.mkdir(parents=True, exist_ok=True)
-            order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+            _atomic_write_text(order_path, json.dumps(ordered, ensure_ascii=False), mode=0o600)
 
         gemini_previous_order = _load_ai_gemini_order(self.paths)
         gemini_baseline = (
@@ -370,8 +371,7 @@ class RebalanceService:
         )
         effective_gemini_order = gemini_ordered if gemini_order_updated else (gemini_previous_order or gemini_ordered)
         if gemini_order_updated:
-            gemini_order_path.parent.mkdir(parents=True, exist_ok=True)
-            gemini_order_path.write_text(json.dumps(gemini_ordered, ensure_ascii=False), encoding="utf-8")
+            _atomic_write_text(gemini_order_path, json.dumps(gemini_ordered, ensure_ascii=False), mode=0o600)
 
         rerendered = False
         hot_reloaded = False
@@ -449,15 +449,12 @@ class RebalanceService:
         try:
             import time as _time
 
-            from ..config import ai_watch_state_file
-            from .ai_watch import _load_state as _load_watch_state
-            from .ai_watch import _save_state as _save_watch_state
-
-            if ai_watch_state_file(self.paths).exists():
-                w_state = _load_watch_state(self.paths)
+            def _record_rebalance_meta(w_state: dict) -> bool:
                 w_state["last_rebalance_ts"] = _time.time()
                 w_state["rebalance_runs"] = int(w_state.get("rebalance_runs") or 0) + 1
-                _save_watch_state(self.paths, w_state)
+                return True
+
+            update_ai_watch_state(self.paths, _record_rebalance_meta)
         except Exception:
             pass
 
@@ -523,13 +520,12 @@ class RebalanceService:
                     query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
-            except Exception:
+            except (Exception, SystemExit):
                 break
 
         if demoted:
             try:
-                order_path.parent.mkdir(parents=True, exist_ok=True)
-                order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+                _atomic_write_text(order_path, json.dumps(ordered, ensure_ascii=False), mode=0o600)
             except OSError:
                 pass
         return ordered, switched_to
@@ -551,14 +547,15 @@ class RebalanceService:
         geo_url = str((cfg.get("ai-google-geo-url") if isinstance(cfg, dict) else None) or DEFAULT_GOOGLE_GEO_URL)
         try:
             query = QueryService(self.paths)
-            group_obj = query.api.get_groups().get(AI_GEMINI_GROUP)
+            groups = query.api.get_groups()
+            group_obj = groups.get(AI_GEMINI_GROUP)
             if group_obj is None:
                 return ordered, switched_to
             from .probe import resolve_current_leaf
 
             active_node = (
                 switched_to
-                or resolve_current_leaf(query.api.get_groups(), AI_GEMINI_GROUP)
+                or resolve_current_leaf(groups, AI_GEMINI_GROUP)
                 or str(group_obj.current or "")
                 or (ordered[0] if ordered else "")
             )
@@ -606,13 +603,12 @@ class RebalanceService:
                         query.switch_group(AI_GEMINI_GROUP, next_candidate)
                 switched_to = next_candidate
                 active_node = next_candidate
-            except Exception:
+            except (Exception, SystemExit):
                 break
 
         if demoted:
             try:
-                order_path.parent.mkdir(parents=True, exist_ok=True)
-                order_path.write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+                _atomic_write_text(order_path, json.dumps(ordered, ensure_ascii=False), mode=0o600)
                 rt_path = RuntimeBackend(self.paths).render_runtime()
                 from .ai_watch import has_any_inflight_ai_connection
 
@@ -754,5 +750,5 @@ class RebalanceService:
                 except TypeError:
                     query.switch_group(group_name, best_candidate)
             return best_candidate
-        except Exception:
+        except (Exception, SystemExit):
             return None

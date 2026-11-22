@@ -12,33 +12,44 @@ from dataclasses import dataclass
 
 from .nodelist import match_region
 
-# 专线/中转/直连等线路类型识别模式
+# 专线/中转/直连等线路类型识别模式（使用纯 ASCII 字母边界，兼容 CJK 紧邻标签如 香港IEPL01）
 _LINE_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("iepl", re.compile(r"\bIEPL\b|内网专线", re.IGNORECASE)),
-    ("iplc", re.compile(r"\bIPLC\b|深港|沪日|沪美|广港|京德", re.IGNORECASE)),
-    ("bgp", re.compile(r"\bBGP\b|三网|Anycast", re.IGNORECASE)),
-    ("relay", re.compile(r"\bRelay\b|中转|隧道", re.IGNORECASE)),
-    ("direct", re.compile(r"直连|原生|\bDirect\b", re.IGNORECASE)),
+    ("iepl", re.compile(r"(?<![A-Za-z])IEPL(?![A-Za-z])|内网专线", re.IGNORECASE)),
+    ("iplc", re.compile(r"(?<![A-Za-z])IPLC(?![A-Za-z])|深港|沪日|沪美|广港|京德", re.IGNORECASE)),
+    ("iepl", re.compile(r"专线")),
+    ("bgp", re.compile(r"(?<![A-Za-z])BGP(?![A-Za-z])|三网|(?<![A-Za-z])Anycast(?![A-Za-z])", re.IGNORECASE)),
+    ("relay", re.compile(r"(?<![A-Za-z])Relay(?![A-Za-z])|中转|隧道", re.IGNORECASE)),
+    ("direct", re.compile(r"直连|原生|(?<![A-Za-z])Direct(?![A-Za-z])", re.IGNORECASE)),
 )
 
-# 倍率提取：支持 1.7X / 1.7x / x1.7 / X2 / 0.5倍率 / 2.0倍 等主流写法
+# 倍率提取：支持 1.7X / 1.7x / 0X / x1.7 / X2 / 0.5倍率 / 2.0倍 等主流写法
 _MULTIPLIER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*[xX×](?![A-Za-z0-9])"),
     re.compile(r"(?<![A-Za-z0-9])[xX×]\s*(\d+(?:\.\d+)?)(?![A-Za-z0-9])"),
     re.compile(r"(\d+(?:\.\d+)?)\s*倍(?:率)?"),
 )
 
-# 节点序号提取：优先匹配紧跟地区或分隔符后的 1~3 位编号（排除 1X 等倍率数字）
+# 编号提取前先屏蔽协议版本号与带宽/天数单位（避免把 HY2/CN2/365天/100G/100M 误认作节点序号）
+_INDEX_NOISE_RE = re.compile(
+    r"(?<![A-Za-z])(?:HY2|H2|H3|CN2|IPV[46]|V2RAY|V2|TLS1\.?[23]|SS2022)(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:天|小时|分钟|年|月|周|兆|Mbps|Gbps|Kbps|[KMGTPE]i?B|[GMK](?![A-Za-z])|ms)",
+    re.IGNORECASE,
+)
+
+# 节点序号提取：支持空格/分隔符/括号/CJK 紧邻，以及地区/线路前缀紧邻（如 US01 / Mitce US1-HY2 / 香港 (01) / 香港IEPL01）
 _INDEX_RE = re.compile(
-    r"(?:^|[\s|\-丨_#]|[^\x00-\x7F])0*(\d{1,3})(?=$|[\s|\-丨_]|[^\x00-\x7F])"
+    r"(?:^|[\s|\-丨_#(\[（【]|[^\x00-\x7F]"
+    r"|(?<![A-Za-z])(?:HK|JP|KR|SG|TW|US|GB|UK|DE|FR|AU|BR|AE|IN|IEPL|IPLC|BGP|CMI))"
+    r"(?<![0-9.])0*(\d{1,3})(?![0-9.])(?=$|[\s|\-丨_)\]）】]|[^\x00-\x7F])",
+    re.IGNORECASE,
 )
 
 # 运营商入口标识
 _CARRIER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("CM", re.compile(r"\bCM(?:CC)?\b|移动", re.IGNORECASE)),
-    ("CT", re.compile(r"\bCT(?:CC)?\b|\bCN2\b|电信", re.IGNORECASE)),
-    ("CU", re.compile(r"\bCU(?:CC)?\b|联通", re.IGNORECASE)),
-    ("BGP", re.compile(r"\bBGP\b|三网", re.IGNORECASE)),
+    ("CM", re.compile(r"(?<![A-Za-z])CM(?:CC|I)?(?![A-Za-z])|移动", re.IGNORECASE)),
+    ("CT", re.compile(r"(?<![A-Za-z])CT(?:CC)?(?![A-Za-z])|(?<![A-Za-z])CN2(?![0-9])|电信", re.IGNORECASE)),
+    ("CU", re.compile(r"(?<![A-Za-z])CU(?:CC)?(?![A-Za-z])|联通", re.IGNORECASE)),
+    ("BGP", re.compile(r"(?<![A-Za-z])BGP(?![A-Za-z])|三网", re.IGNORECASE)),
 )
 
 # 用户在 CLI 进行模糊匹配（如 `cproxy switch ai kr01` / `uk` / `hk`）时的地区同义词表
@@ -130,7 +141,7 @@ def parse_node_tag(name: str) -> NodeTag:
         if match:
             try:
                 val = float(match.group(1))
-                if 0.0 < val <= 100.0:
+                if 0.0 <= val <= 100.0:
                     multiplier = val
                     text_without_mult = text[: match.start()] + " " + text[match.end() :]
                     break
@@ -138,7 +149,8 @@ def parse_node_tag(name: str) -> NodeTag:
                 pass
 
     index: str | None = None
-    idx_match = _INDEX_RE.search(text_without_mult)
+    index_source = _INDEX_NOISE_RE.sub(" ", text_without_mult)
+    idx_match = _INDEX_RE.search(index_source)
     if idx_match:
         num = int(idx_match.group(1))
         index = f"{num:02d}" if num < 100 else str(num)

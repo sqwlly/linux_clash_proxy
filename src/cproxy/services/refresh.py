@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import time
 from collections.abc import Callable
@@ -14,11 +13,11 @@ from urllib.request import ProxyHandler, Request, build_opener
 import yaml
 
 from .. import __version__
-from ..backend.api import APIBackend, APIUnavailableError
+from ..backend.api import APIBackend, APIRequestError, APIUnavailableError
 from ..backend.models import GroupCheckReport
 from ..backend.process import ProcessBackend
 from ..backend.runtime import TEST_URL, RuntimeBackend
-from ..config import AppPaths, config_file, read_config, runtime_file
+from ..config import AppPaths, atomic_write_text, config_file, read_config, runtime_file
 from ..redaction import redact_text
 from ..snapshots import list_snapshots, restore_snapshot, snapshot_file
 from .diagnostics import DiagnosticsService
@@ -42,13 +41,18 @@ API_READY_TIMEOUT = 5.0
 API_READY_INTERVAL = 0.2
 
 # 安全相关键：订阅内容一律剔除，防止恶意/被劫持订阅注入
-# （例如 program-path 会让下次 cproxy start 执行攻击者指定的二进制）
+# （例如 program-path 会让下次 cproxy start 执行攻击者指定的二进制，
+# notify-webhook / ai-*-url / listeners 等会造成凭证外泄或监听劫持）
 SUBSCRIPTION_STRIP_KEYS = {
     "program-path",
     "api-timeout",
     "external-controller",
     "external-controller-tls",
     "external-controller-unix",
+    "external-controller-pipe",
+    "external-ui",
+    "external-ui-name",
+    "external-ui-url",
     "secret",
     "secret-file",
     "secret-systemd-credential",
@@ -57,6 +61,20 @@ SUBSCRIPTION_STRIP_KEYS = {
     "audit-journald",
     "allow-lan",
     "bind-address",
+    "authentication",
+    "tunnels",
+    "listeners",
+    "geox-url",
+    "notify-webhook",
+    "notify-desktop",
+    "subscriptions",
+    "connectivity-test-urls",
+    "ip-check-urls",
+    "ai-chatgpt-url",
+    "ai-openai-api-url",
+    "ai-gemini-api-url",
+    "ai-cloudcode-url",
+    "ai-google-geo-url",
 }
 
 # 本地优先键：本地配置已存在时保留本地值；本地缺失时接受订阅提供的值
@@ -72,21 +90,11 @@ LOCAL_PREFERRED_KEYS = {
     "test-url",
     "test-timeout",
     "connectivity-timeout",
-    "connectivity-test-urls",
-    "ip-check-urls",
-    "ai-chatgpt-url",
-    "ai-openai-api-url",
-    "ai-gemini-api-url",
-    "ai-cloudcode-url",
-    "ai-google-geo-url",
     "ai-probe-timeout",
     "ai-gemini-prefer",
     "ai-manual-prefer",
     "max-ai-multiplier",
-    "notify-webhook",
-    "notify-desktop",
     "refresh-groups",
-    "subscriptions",
     "profile",
 }
 
@@ -309,9 +317,26 @@ def _preserve_local_extra_proxies(merged: dict, existing: dict) -> None:
         for proxy in local_proxies
         if not any(str(proxy["name"]) == pfx or str(proxy["name"]).startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
     ]
-    sub_credentials = _subscription_account_credentials(merged_proxies) | _subscription_account_credentials(
-        local_main_proxies
+    merged_creds = {cred for proxy in merged_proxies if (cred := _proxy_credential(proxy))}
+    local_main_creds = {cred for proxy in local_main_proxies if (cred := _proxy_credential(proxy))}
+    merged_non_panel_names = {
+        str(proxy["name"]) for proxy in merged_proxies if not is_panel_info_node(str(proxy["name"]))
+    }
+    local_main_non_panel_names = {
+        str(proxy["name"]) for proxy in local_main_proxies if not is_panel_info_node(str(proxy["name"]))
+    }
+    same_provider = bool(
+        (merged_creds & local_main_creds) or (merged_non_panel_names & local_main_non_panel_names)
     )
+    if same_provider:
+        # 同一主订阅常规刷新：仅以新订阅凭证判定退役节点，避免把共享同一 UUID/密码的多节点自建代理误删
+        sub_credentials = _subscription_account_credentials(merged_proxies) | (
+            merged_creds & _subscription_account_credentials(local_main_proxies)
+        )
+    else:
+        sub_credentials = _subscription_account_credentials(merged_proxies) | _subscription_account_credentials(
+            local_main_proxies
+        )
 
     extra_names: set[str] = set()
     extra_proxies: list = []
@@ -419,7 +444,10 @@ def _download_subscription(paths: AppPaths, url: str, timeout: int) -> tuple[byt
     req.host/req.selector 为代理地址（绝对 URI 形式），复用同一对象会让
     "直连回退"实际又连回代理，回退形同虚设（2026-09-25 生产事故根因）。
     """
-    host = (urlparse(url).hostname or "").strip("[]").lower()
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"错误: 不支持的订阅地址（仅支持 http/https）: {redact_text(url)}")
+    host = parsed.hostname.strip("[]").lower()
     loopback = host in ("127.0.0.1", "localhost", "::1")
     try:
         port = int((read_config(paths).get("mixed-port") or 7890))
@@ -442,12 +470,19 @@ def _download_subscription(paths: AppPaths, url: str, timeout: int) -> tuple[byt
         opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
         with opener.open(_make_request(), timeout=timeout) as response:
             return _read_subscription_response(response)
-    except HTTPError:
-        # 代理链路已连通且站点返回 HTTP 错误：站点可达，属于真实错误（如
-        # token 失效），不做直连重试
-        raise
+    except HTTPError as proxied_http_exc:
+        if proxied_http_exc.code in {502, 503, 504}:
+            # 本机代理上游不可达时对明文 http:// 会返 502/503/504，视同代理故障回退直连
+            try:
+                proxied_http_exc.close()
+            except Exception:
+                pass
+            last_exc: Exception = proxied_http_exc
+        else:
+            # 代理链路已连通且站点返回明确 HTTP 错误（如 token 失效 401/403），不做直连重试
+            raise
     except OSError as proxied_exc:
-        last_exc: OSError = proxied_exc
+        last_exc = proxied_exc
 
     for attempt in range(SUBSCRIPTION_DIRECT_ATTEMPTS):
         if attempt:
@@ -496,7 +531,7 @@ def _prune_stale_ai_state(paths: AppPaths, merged: dict) -> None:
             if isinstance(items, list):
                 filtered = [str(item) for item in items if item and str(item) in valid_names]
                 if filtered != items:
-                    order_path.write_text(json.dumps(filtered, ensure_ascii=False), encoding="utf-8")
+                    atomic_write_text(order_path, json.dumps(filtered, ensure_ascii=False), mode=0o600)
         except (OSError, ValueError):
             pass
 
@@ -523,7 +558,7 @@ def _prune_stale_ai_state(paths: AppPaths, merged: dict) -> None:
                             cooldown.pop(k, None)
                             changed = True
                 if changed:
-                    watch_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                    atomic_write_text(watch_path, json.dumps(state, ensure_ascii=False), mode=0o600)
         except (OSError, ValueError):
             pass
 
@@ -574,7 +609,6 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
             for proxy in local_proxies
             if not any(str(proxy["name"]) == pfx or str(proxy["name"]).startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
         ]
-        local_sub_creds = _subscription_account_credentials(local_main_proxies)
         new_proxies = [
             proxy for proxy in data.get("proxies") or [] if isinstance(proxy, dict) and proxy.get("name")
         ]
@@ -583,6 +617,25 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
             # 订阅未返回任何节点：直接落盘会把 url-test/fallback 组重建成
             # 空成员（非法配置），宁可失败交给上层回滚，也不产出坏 config。
             raise ValueError("nodelist 订阅未返回任何节点，已跳过合并")
+        new_creds = {cred for proxy in new_proxies if (cred := _proxy_credential(proxy))}
+        local_main_creds = {cred for proxy in local_main_proxies if (cred := _proxy_credential(proxy))}
+        new_non_panel_names = {
+            str(proxy["name"]) for proxy in new_proxies if not is_panel_info_node(str(proxy["name"]))
+        }
+        local_main_non_panel_names = {
+            str(proxy["name"]) for proxy in local_main_proxies if not is_panel_info_node(str(proxy["name"]))
+        }
+        same_provider = bool(
+            (new_creds & local_main_creds) or (new_non_panel_names & local_main_non_panel_names)
+        )
+        if same_provider:
+            local_sub_creds = _subscription_account_credentials(new_proxies) | (
+                new_creds & _subscription_account_credentials(local_main_proxies)
+            )
+        else:
+            local_sub_creds = _subscription_account_credentials(new_proxies) | _subscription_account_credentials(
+                local_main_proxies
+            )
         new_name_set = set(new_node_names)
         old_node_names: list[str] = []
         preserved_local_proxies: list[dict] = []
@@ -591,12 +644,15 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
             if pname in new_name_set:
                 old_node_names.append(pname)
                 continue
+            if is_panel_info_node(pname) or _is_dedupe_artifact(pname, new_name_set):
+                old_node_names.append(pname)
+                continue
             is_extra_sub = any(pname == pfx or pname.startswith(f"{pfx} ") for pfx in extra_sub_prefixes)
             if is_extra_sub:
                 preserved_local_proxies.append(proxy)
                 continue
             cred = _proxy_credential(proxy)
-            if local_sub_creds and not is_panel_info_node(pname) and (not cred or cred not in local_sub_creds):
+            if local_sub_creds and (not cred or cred not in local_sub_creds):
                 preserved_local_proxies.append(proxy)
                 continue
             old_node_names.append(pname)
@@ -619,9 +675,11 @@ def update_source_from_subscription(paths: AppPaths, url: str, timeout: int = SU
     _dedupe_proxy_names(merged)
 
     snapshot_file(paths, path, "config")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(merged, fh, allow_unicode=True, sort_keys=False)
+    atomic_write_text(
+        path,
+        yaml.safe_dump(merged, allow_unicode=True, sort_keys=False),
+        mode=0o600,
+    )
     _prune_stale_ai_state(paths, merged)
     return path
 
@@ -685,6 +743,9 @@ def upsert_extra_subscription(paths: AppPaths, name: str, url: str, attach_to: s
         raise ValueError("附加订阅分组名不能为空")
     if not url:
         raise ValueError("订阅 URL 不能为空")
+    parsed_url = urlparse(url)
+    if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.hostname:
+        raise ValueError("订阅 URL 必须是有效的 http/https 地址")
 
     config = read_config(paths)
     group_names = {
@@ -723,15 +784,11 @@ def upsert_extra_subscription(paths: AppPaths, name: str, url: str, attach_to: s
 
     path = config_file(paths)
     snapshot_file(paths, path, "config")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        with temp_path.open("w", encoding="utf-8") as fh:
-            yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=False)
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    atomic_write_text(
+        path,
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        mode=0o600,
+    )
     return path
 
 
@@ -788,6 +845,8 @@ def apply_extra_subscriptions(
         try:
             raw, userinfo = _download_subscription(paths, url, SUBSCRIPTION_TIMEOUT)
             record_subscription_info(paths, name, userinfo)
+            if len(raw) > SUBSCRIPTION_MAX_BYTES:
+                raise RuntimeError("错误: 订阅内容超过大小限制")
             data = parse_subscription_payload(raw)
             record_subscription_info(paths, name, userinfo, data.get("proxies"))
             valid_proxies = [
@@ -857,9 +916,11 @@ def apply_extra_subscriptions(
 
     path = config_file(paths)
     snapshot_file(paths, path, "config")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=False)
+    atomic_write_text(
+        path,
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        mode=0o600,
+    )
     return results
 
 
@@ -931,45 +992,7 @@ class RefreshService:
 
         report.was_running = self.process.is_running()
         if report.was_running:
-            # 优先热重载：mihomo PUT /configs 重新加载配置但不中断既有连接，
-            # 避免打断长会话/长任务；API 不可用时回退为进程重启
-            try:
-                stage("正在热重载代理配置…")
-                self._api_factory(self.paths).reload_config(str(report.runtime_path))
-                report.hot_reloaded = True
-            except Exception:
-                stage("热重载不可用，正在重启代理…")
-                self.process.restart()
-                report.restarted = True
-
-                # 重启才是危险路径。热重载被 mihomo 拒绝时（HTTP 4xx/5xx 会抛）
-                # 我们已确知配置有问题；但 restart 后 mihomo 解析失败发生在
-                # start() 的存活检测窗口之后——进程随即 fatal 退出，refresh 却
-                # 已回报成功，代理就此静默宕机。这里确认内核真的起来了，失败则
-                # 回滚上一版 runtime 并重启：宁可退回旧配置，也不留下挂掉的代理。
-                try:
-                    self._wait_for_api()
-                except Exception as exc:
-                    stage("新配置未能加载，正在回滚上一版运行配置…")
-                    rolled_back = self._rollback_runtime()
-                    if rolled_back is None:
-                        raise RuntimeError(f"错误: 新配置加载失败，且没有可回滚的运行配置: {exc}") from exc
-                    report.runtime_path = rolled_back
-                    self.process.restart()
-                    try:
-                        self._wait_for_api()
-                    except Exception as retry_exc:
-                        raise RuntimeError(
-                            f"错误: 新配置加载失败，回滚后代理仍未就绪: {retry_exc}"
-                        ) from retry_exc
-                    raise RuntimeError(
-                        f"错误: 新配置加载失败，已回滚到上一版运行配置并重启代理: {exc}"
-                    ) from exc
-
-        if report.hot_reloaded:
-            # 热重载不经过 start()，须手动同步“已加载”指纹；否则 status/doctor
-            # 会一直误报“配置时效: 失败”（内核其实已加载新配置）
-            self.process.mark_runtime_applied(report.runtime_path)
+            self._apply_runtime(report, stage)
 
         config_applied = report.restarted or report.hot_reloaded
         if target_groups and config_applied:
@@ -982,6 +1005,73 @@ class RefreshService:
             else:
                 report.groups.append(GroupSwitchResult(group=name, current=None, action="跳过", detail="代理未运行"))
         return report
+
+    def _apply_runtime(
+        self,
+        report: RefreshReport,
+        stage: Callable[[str], None] | None = None,
+    ) -> None:
+        """热重载运行配置；遇到 4xx 配置拒绝时原地回滚而不杀死健康进程，遇到传输异常时回退重启并验证回滚。"""
+        def _notify(text: str) -> None:
+            if stage is not None:
+                stage(text)
+
+        try:
+            _notify("正在热重载代理配置…")
+            self._api_factory(self.paths).reload_config(str(report.runtime_path))
+            report.hot_reloaded = True
+        except APIRequestError as exc:
+            if 400 <= exc.status < 500 and exc.status not in {401, 403}:
+                # Mihomo 运行正常且明确拒绝了新配置（4xx 非鉴权错误）：直接回滚磁盘上的 runtime.yaml，
+                # 绝不重启杀死正在服务的健康内核。（401/403 可能是轮换 secret 导致，需回退重启使新密钥生效）
+                _notify("新配置被 Mihomo 拒绝，正在回滚上一版运行配置…")
+                rolled_back = self._rollback_runtime()
+                if rolled_back is None:
+                    raise RuntimeError(
+                        f"错误: 新配置被 Mihomo 拒绝 (HTTP {exc.status})，且没有可回滚的运行配置: {exc}"
+                    ) from exc
+                report.runtime_path = rolled_back
+                raise RuntimeError(
+                    f"错误: 新配置被 Mihomo 拒绝 (HTTP {exc.status})，已回滚到上一版运行配置（保留运行中代理）: {exc}"
+                ) from exc
+            self._restart_and_verify(report, _notify)
+        except Exception:
+            self._restart_and_verify(report, _notify)
+
+        if report.hot_reloaded:
+            # 热重载不经过 start()，须手动同步“已加载”指纹；否则 status/doctor
+            # 会一直误报“配置时效: 失败”（内核其实已加载新配置）
+            self.process.mark_runtime_applied(report.runtime_path)
+
+    def _restart_and_verify(
+        self,
+        report: RefreshReport,
+        notify: Callable[[str], None],
+    ) -> None:
+        notify("热重载不可用，正在重启代理…")
+        self.process.restart()
+        report.restarted = True
+
+        # 重启后确认内核真的起来了，失败则回滚上一版 runtime 并重启：
+        # 宁可退回旧配置，也不留下挂掉的代理。
+        try:
+            self._wait_for_api()
+        except Exception as exc:
+            notify("新配置未能加载，正在回滚上一版运行配置…")
+            rolled_back = self._rollback_runtime()
+            if rolled_back is None:
+                raise RuntimeError(f"错误: 新配置加载失败，且没有可回滚的运行配置: {exc}") from exc
+            report.runtime_path = rolled_back
+            self.process.restart()
+            try:
+                self._wait_for_api()
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    f"错误: 新配置加载失败，回滚后代理仍未就绪: {retry_exc}"
+                ) from retry_exc
+            raise RuntimeError(
+                f"错误: 新配置加载失败，已回滚到上一版运行配置并重启代理: {exc}"
+            ) from exc
 
     def refresh_extra_subscription(self, name: str, url: str, attach_to: str = "") -> RefreshReport:
         """保存并刷新一项附加订阅，不隐式刷新主订阅。"""
@@ -996,15 +1086,7 @@ class RefreshService:
         report.runtime_path = RuntimeBackend(self.paths).render_runtime()
         report.was_running = self.process.is_running()
         if report.was_running:
-            try:
-                self._api_factory(self.paths).reload_config(str(report.runtime_path))
-                report.hot_reloaded = True
-            except Exception:
-                self.process.restart()
-                report.restarted = True
-            if report.hot_reloaded:
-                # 同 refresh()：热重载后同步指纹，避免误报配置陈旧
-                self.process.mark_runtime_applied(report.runtime_path)
+            self._apply_runtime(report)
         return report
 
     def _rollback_runtime(self) -> Path | None:

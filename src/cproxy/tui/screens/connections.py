@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -16,6 +17,7 @@ from ...config import AppPaths
 from ...services.query import QueryService
 from ..widgets import NavigationDataTable as DataTable
 from ..widgets import NavigationInput as Input
+from ..widgets import coerce_worker_error, escape_markup, safe_call_from_thread
 
 _PLACEHOLDER_ROW_KEY = "__placeholder__"
 
@@ -34,7 +36,7 @@ def _cursor_row_key(table: DataTable) -> str | None:
         return None
 
 
-def _sync_table_rows(table: DataTable, column_keys, desired: Sequence[tuple[str, tuple[str, ...]]]) -> None:
+def _sync_table_rows(table: DataTable, column_keys, desired: Sequence[tuple[str, tuple[str | Text, ...]]]) -> None:
     """按 row key 增量同步表格：更新变化单元格、增删行，避免 clear+重建造成的闪烁与光标丢失。"""
     desired_keys = {key for key, _ in desired}
     for row_key in list(table.rows.keys()):
@@ -45,7 +47,7 @@ def _sync_table_rows(table: DataTable, column_keys, desired: Sequence[tuple[str,
             existing = table.get_row(key)
             for column_key, old, new in zip(column_keys, existing, cells):
                 if old != new:
-                    table.update_cell(key, column_key, new)
+                    table.update_cell(key, column_key, new, update_width=True)
         else:
             table.add_row(*cells, key=key)
 
@@ -81,7 +83,8 @@ class ConnectionsScreen(Widget):
                     yield Button("刷新", id="btn-refresh-connections", classes="action-button muted-button")
                 yield Label(
                     "↑↓ 移动  x 断开  a 全部断开  r 刷新",
-                    id="connections-action-status", classes="action-status",
+                    id="connections-action-status",
+                    classes="action-status",
                 )
 
     def on_mount(self) -> None:
@@ -102,21 +105,23 @@ class ConnectionsScreen(Widget):
     def _load_connections(self) -> None:
         try:
             connections = QueryService(self.paths).list_connections()
-            self.app.call_from_thread(self._apply_connections, connections, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._apply_connections, [], exc)
+            safe_call_from_thread(self, self._apply_connections, connections, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._apply_connections, [], coerce_worker_error(exc))
 
     def _apply_connections(self, connections: list[ConnectionEntry], error: Exception | None) -> None:
+        if not self.is_mounted:
+            return
         status = self.query_one("#connections-status", Label)
         if error is not None:
             self._connections = []
             self._visible_connections = []
             if isinstance(error, APIUnavailableError):
                 status.update("[#fb7185]○ API 不可访问[/]")
-                placeholder = ("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "─", "─", "─")
+                placeholder: tuple[str | Text, ...] = ("[#fb7185]Mihomo API 不可访问[/]", "─", "─", "─", "─", "─")
             else:
-                status.update(f"[#fb7185]错误: {error}[/]")
-                placeholder = (f"错误: {error}", "─", "─", "─", "─", "─")
+                status.update(f"[#fb7185]错误: {escape_markup(error)}[/]")
+                placeholder = (Text(f"错误: {error}"), "─", "─", "─", "─", "─")
             table = self.query_one("#connections-table", DataTable)
             _sync_table_rows(table, self._table_columns, [(_PLACEHOLDER_ROW_KEY, placeholder)])
             self._update_connection_detail(None)
@@ -132,12 +137,12 @@ class ConnectionsScreen(Widget):
         self._update_connection_status()
 
         if not self._visible_connections:
-            placeholder = (f"[#8b98aa]{self._empty_state_text()}[/]", "─", "─", "─", "─", "─")
+            placeholder: tuple[str | Text, ...] = (f"[#8b98aa]{self._empty_state_text()}[/]", "─", "─", "─", "─", "─")
             _sync_table_rows(table, self._table_columns, [(_PLACEHOLDER_ROW_KEY, placeholder)])
             self._update_connection_detail(None)
             return
 
-        desired: list[tuple[str, tuple[str, ...]]] = []
+        desired: list[tuple[str, tuple[str | Text, ...]]] = []
         by_key: dict[str, ConnectionEntry] = {}
         for index, connection in enumerate(self._visible_connections):
             key = _connection_row_key(connection, index)
@@ -146,10 +151,10 @@ class ConnectionsScreen(Widget):
                 (
                     key,
                     (
-                        self._compact_text(connection.host, 40),
-                        connection.rule,
-                        self._compact_text(" -> ".join(connection.proxy_chain) or "─", 34),
-                        self._compact_text(connection.process, 24),
+                        Text(self._compact_text(connection.host, 40)),
+                        Text(connection.rule),
+                        Text(self._compact_text(" -> ".join(connection.proxy_chain) or "─", 34)),
+                        Text(self._compact_text(connection.process, 24)),
                         self._format_bytes(connection.upload),
                         self._format_bytes(connection.download),
                     ),
@@ -188,17 +193,19 @@ class ConnectionsScreen(Widget):
             self._update_connection_detail(self._selected_connection())
 
     def action_close_selected(self) -> None:
+        self._confirm_close_all = False
         connection = self._selected_connection()
         status = self.query_one("#connections-action-status", Label)
         if connection is None or not connection.id:
             status.update("[#f6c177]尚未选择可断开的连接[/]")
             return
-        status.update(f"[#f6c177]正在断开: {connection.host}…[/]")
+        status.update(f"[#f6c177]正在断开: {escape_markup(connection.host)}…[/]")
         self._close_connections(connection.id, connection.host)
 
     def action_close_all(self) -> None:
         status = self.query_one("#connections-action-status", Label)
         if not self._connections:
+            self._confirm_close_all = False
             status.update("[#f6c177]没有活动连接[/]")
             return
 
@@ -207,8 +214,9 @@ class ConnectionsScreen(Widget):
             if self._filter_text:
                 status.update("[#f6c177]筛选条件会被忽略；请再次触发以断开全部活动连接[/]")
             else:
-                status.update("[#f6c177]请再次触发“断开全部连接”确认[/]")
+                status.update("[#f6c177]请再次触发“全部断开”确认[/]")
             return
+        self._confirm_close_all = False
         status.update("[#f6c177]正在断开全部连接…[/]")
         self._close_connections(None, "全部连接")
 
@@ -220,19 +228,21 @@ class ConnectionsScreen(Widget):
                 service.close_all_connections()
             else:
                 service.close_connection(connection_id)
-            self.app.call_from_thread(self._finish_close, label, None)
-        except Exception as exc:
-            self.app.call_from_thread(self._finish_close, label, exc)
+            safe_call_from_thread(self, self._finish_close, label, None)
+        except (Exception, SystemExit) as exc:
+            safe_call_from_thread(self, self._finish_close, label, coerce_worker_error(exc))
 
     def _finish_close(self, label: str, error: Exception | None) -> None:
+        if not self.is_mounted:
+            return
         status = self.query_one("#connections-action-status", Label)
         if error is None:
-            status.update(f"[#a3e635]已断开: {label}[/]")
+            status.update(f"[#a3e635]已断开: {escape_markup(label)}[/]")
             self.refresh_data()
         elif isinstance(error, APIUnavailableError):
             status.update("[#fb7185]API 不可访问[/]")
         else:
-            status.update(f"[#fb7185]断开失败: {error}[/]")
+            status.update(f"[#fb7185]断开失败: {escape_markup(error)}[/]")
 
     def _selected_connection(self) -> ConnectionEntry | None:
         table = self.query_one("#connections-table", DataTable)
@@ -279,13 +289,14 @@ class ConnectionsScreen(Widget):
         if connection is None:
             detail.update("[#8b98aa]选择连接后查看完整主机、进程、代理链路和 ID[/]")
             return
+        chain_text = " -> ".join(connection.proxy_chain) or "─"
         detail.update(
             "\n".join(
                 [
-                    f"[#8b98aa]主机[/] {connection.host}",
-                    f"[#8b98aa]进程[/] {connection.process or '─'}",
-                    f"[#8b98aa]链路[/] {' -> '.join(connection.proxy_chain) or '─'}",
-                    f"[#8b98aa]ID[/] {connection.id or '─'}",
+                    f"[#8b98aa]主机[/] {escape_markup(connection.host)}",
+                    f"[#8b98aa]进程[/] {escape_markup(connection.process or '─')}",
+                    f"[#8b98aa]链路[/] {escape_markup(chain_text)}",
+                    f"[#8b98aa]ID[/] {escape_markup(connection.id or '─')}",
                 ]
             )
         )

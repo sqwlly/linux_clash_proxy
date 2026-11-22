@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 
 from textual import work
@@ -14,7 +15,8 @@ from ...config import AppPaths
 from ...process import get_status
 from ...services.query import QueryService
 from ...services.speed import RateMeter, format_rate
-from ..ai_status import exit_line_or_idle, mode_markup
+from ..ai_status import IDLE, exit_line_or_idle, mode_markup
+from ..widgets import coerce_worker_error, escape_markup, safe_call_from_thread
 
 
 class DashboardScreen(Widget):
@@ -24,6 +26,7 @@ class DashboardScreen(Widget):
         self._refresh_timer: Timer | None = None
         self._timer_paused = False
         self._rate_meter = RateMeter()
+        self._rate_lock = threading.Lock()
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -102,6 +105,8 @@ class DashboardScreen(Widget):
             self._refresh_timer = None
 
     def refresh_data(self) -> None:
+        if not self.is_mounted:
+            return
         try:
             self.query_one("#dash-refresh-status", Label).update("[#f6c177]刷新中…[/]")
         except Exception:
@@ -113,53 +118,66 @@ class DashboardScreen(Widget):
         result: dict = {"snapshot": None, "status_error": None, "groups": None, "api_error": None, "traffic": None}
         try:
             result["snapshot"] = get_status(self.paths)
-        except Exception as exc:
-            result["status_error"] = str(exc)
+        except (Exception, SystemExit) as exc:
+            result["status_error"] = str(coerce_worker_error(exc))
 
         service = QueryService(self.paths)
         try:
             result["groups"] = service.get_ai_status_groups()
-        except Exception as exc:
-            result["api_error"] = str(exc)
+        except (Exception, SystemExit) as exc:
+            result["api_error"] = str(coerce_worker_error(exc))
         try:
             data = service.api.request("GET", "/connections")
+            if not isinstance(data, dict):
+                raise ValueError("connections 响应格式无效")
             upload = int(data.get("uploadTotal") or 0)
             download = int(data.get("downloadTotal") or 0)
+            raw_conns = data.get("connections")
+            conn_count = len(raw_conns) if isinstance(raw_conns, list) else 0
+            with self._rate_lock:
+                rate = self._rate_meter.sample(upload, download)
             result["traffic"] = {
                 "upload": upload,
                 "download": download,
-                "rate": self._rate_meter.sample(upload, download),
-                "connections": len(data.get("connections", [])),
+                "rate": rate,
+                "connections": conn_count,
             }
-        except Exception:
+        except (Exception, SystemExit):
             result["traffic"] = None
-        self.app.call_from_thread(self._apply_dashboard, result)
+        safe_call_from_thread(self, self._apply_dashboard, result)
+
+    def _reset_ai_labels(self) -> None:
+        for selector in ("#dash-ai-mode", "#dash-ai-active", "#dash-ai-gemini", "#dash-ai-standby"):
+            self.query_one(selector, Label).update(IDLE)
 
     def _apply_dashboard(self, result: dict) -> None:
+        if not self.is_mounted:
+            return
         snapshot = result["snapshot"]
         if snapshot is not None:
             status_text = "[#a3e635]● 运行中[/]" if snapshot.running else "[#fb7185]○ 已停止[/]"
             self.query_one("#dash-status", Label).update(status_text)
-            self.query_one("#dash-port", Label).update(str(snapshot.port))
-            self.query_one("#dash-controller", Label).update(snapshot.controller)
-            self.query_one("#dash-pid", Label).update(str(snapshot.pid) if snapshot.pid else "─")
+            self.query_one("#dash-port", Label).update(escape_markup(snapshot.port))
+            self.query_one("#dash-controller", Label).update(escape_markup(snapshot.controller))
+            self.query_one("#dash-pid", Label).update(escape_markup(snapshot.pid) if snapshot.pid else "─")
         else:
-            self.query_one("#dash-status", Label).update(f"[#fb7185]错误: {result['status_error']}[/]")
+            self.query_one("#dash-status", Label).update(
+                f"[#fb7185]错误: {escape_markup(result['status_error'])}[/]"
+            )
+            for selector in ("#dash-port", "#dash-controller", "#dash-pid"):
+                self.query_one(selector, Label).update(IDLE)
 
         groups = result["groups"]
         if groups is not None:
             self._apply_ai_route(groups)
         else:
             self.query_one("#dash-api-status", Label).update("[#fb7185]○ 不可访问[/]")
-            self.query_one("#dash-ai-mode", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-ai-active", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-ai-gemini", Label).update("[#8b98aa]─[/]")
-            self.query_one("#dash-ai-standby", Label).update("[#8b98aa]─[/]")
+            self._reset_ai_labels()
 
         traffic = result["traffic"]
         if traffic is None:
             for selector in ("#dash-download", "#dash-upload", "#dash-total", "#dash-connections"):
-                self.query_one(selector, Label).update("[#8b98aa]─[/]")
+                self.query_one(selector, Label).update(IDLE)
         else:
             rate = traffic.get("rate")
             if rate is None:
@@ -177,21 +195,24 @@ class DashboardScreen(Widget):
         )
 
     def _apply_ai_route(self, groups: dict) -> None:
+        if not self.is_mounted:
+            return
+        self.query_one("#dash-api-status", Label).update("[#a3e635]● 已连接[/]")
         try:
-            self.query_one("#dash-api-status", Label).update("[#a3e635]● 已连接[/]")
-
             route = resolve_ai_route(groups)
-            if not route.present:
-                # 组未配置时保持占位符，不拼半截数据
-                return
+        except Exception as exc:
+            self._reset_ai_labels()
+            self.query_one("#dash-ai-mode", Label).update(f"[#fb7185]错误: {escape_markup(exc)}[/]")
+            return
 
-            self.query_one("#dash-ai-mode", Label).update(mode_markup(route))
-            self.query_one("#dash-ai-active", Label).update(exit_line_or_idle(route.active, groups))
-            self.query_one("#dash-ai-gemini", Label).update(exit_line_or_idle(route.gemini, groups))
-            self.query_one("#dash-ai-standby", Label).update(exit_line_or_idle(route.standby, groups))
+        if not route.present:
+            self._reset_ai_labels()
+            return
 
-        except Exception:
-            pass
+        self.query_one("#dash-ai-mode", Label).update(mode_markup(route))
+        self.query_one("#dash-ai-active", Label).update(exit_line_or_idle(route.active, groups))
+        self.query_one("#dash-ai-gemini", Label).update(exit_line_or_idle(route.gemini, groups))
+        self.query_one("#dash-ai-standby", Label).update(exit_line_or_idle(route.standby, groups))
 
     def _format_bytes(self, bytes_val: int) -> str:
         if bytes_val == 0:

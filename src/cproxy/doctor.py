@@ -7,6 +7,7 @@ from .backend.api import APIBackend
 from .config import AppPaths, config_file, load_yaml_file, runtime_file
 from .geodata import check_country_mmdb
 from .process import get_status
+from .redaction import redact_text
 from .services.subscription_info import (
     MAIN_SUBSCRIPTION_KEY,
     load_subscription_info,
@@ -94,7 +95,7 @@ def run_doctor(paths: AppPaths) -> dict:
             source_data = data
             checks.append(DoctorCheck("原始配置", "正常", str(source)))
         except Exception as exc:
-            checks.append(DoctorCheck("原始配置", "失败", f"YAML 无效: {exc}", f"编辑 {source}"))
+            checks.append(DoctorCheck("原始配置", "失败", f"YAML 无效: {redact_text(str(exc))}", f"编辑 {source}"))
 
     if runtime.is_file():
         checks.append(DoctorCheck("运行配置", "正常", str(runtime)))
@@ -105,7 +106,9 @@ def run_doctor(paths: AppPaths) -> dict:
         snapshot = get_status(paths)
     except Exception as exc:
         snapshot = None
-        checks.append(DoctorCheck("代理状态", "失败", f"无法读取状态: {exc}", "先修复原始配置，再执行 cproxy doctor"))
+        checks.append(
+            DoctorCheck("代理状态", "失败", f"无法读取状态: {redact_text(str(exc))}", "先修复原始配置，再执行 cproxy doctor")
+        )
     if snapshot is not None:
         if snapshot.running:
             checks.append(DoctorCheck("代理进程", "正常", "运行中"))
@@ -121,7 +124,7 @@ def run_doctor(paths: AppPaths) -> dict:
         version_text = str(version.get("version") or version.get("meta") or "可访问") if isinstance(version, dict) else "可访问"
         checks.append(DoctorCheck("Mihomo API", "正常", version_text))
     except Exception as exc:
-        checks.append(DoctorCheck("Mihomo API", "失败", str(exc), "cproxy logs --lines 100"))
+        checks.append(DoctorCheck("Mihomo API", "失败", redact_text(str(exc)), "cproxy logs --lines 100"))
 
     geodata = check_country_mmdb(paths)
     checks.append(

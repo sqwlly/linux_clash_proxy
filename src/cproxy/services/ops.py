@@ -11,7 +11,8 @@ from ..backend.api import APIBackend
 from ..backend.process import SYSTEMD_SERVICE_NAME
 from ..backend.runtime import AI_STATUS_GROUPS, ai_exit_metrics
 from ..config import AppPaths
-from ..proxyenv import proxy_http_url
+from ..proxyenv import proxy_env_map
+from ..redaction import redact_text
 from .probe import ProbeService, default_group_for_profile
 from .probe_history import load_history_rows, probe_history_file
 
@@ -144,7 +145,7 @@ def get_ai_connections(paths: AppPaths) -> list[AIConnection]:
         if not any(keyword in host for keyword in AI_HOST_KEYWORDS):
             continue
         chains = item.get("chains") or []
-        route = " -> ".join(str(part) for part in chains[:3]) if chains else "-"
+        route = " -> ".join(str(part) for part in reversed(chains[:3])) if chains else "-"
         counts[host] += 1
         routes[host][route] += 1
 
@@ -172,18 +173,7 @@ def guard(
     if not command:
         return 0
 
-    http_url = proxy_http_url(paths)
-    env_patch = {
-        "HTTP_PROXY": http_url,
-        "HTTPS_PROXY": http_url,
-        "ALL_PROXY": http_url.replace("http://", "socks5h://"),
-        "http_proxy": http_url,
-        "https_proxy": http_url,
-        "all_proxy": http_url.replace("http://", "socks5h://"),
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    env = {**os.environ, **env_patch}
+    env = {**os.environ, **proxy_env_map(paths)}
     result = subprocess.run(command, env=env)
     return result.returncode
 
@@ -215,7 +205,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
             capture_output=True, text=True, timeout=5,
         )
         if result.stdout.strip():
-            service_lines.extend(result.stdout.strip().splitlines())
+            service_lines.extend(redact_text(line) for line in result.stdout.strip().splitlines())
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
@@ -252,7 +242,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
                 f"delay={'-' if delay is None else delay}"
             )
     except Exception as exc:
-        ai_lines.append(f"API 不可访问: {exc}")
+        ai_lines.append(f"API 不可访问: {redact_text(str(exc))}")
     sections.append(IncidentSection("ai-status", ai_lines))
 
     probe_lines: list[str] = []
@@ -273,7 +263,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
                 f"\tfailures={summary.failures}\tavg={summary.avg_delay}ms\tmax={summary.max_delay}ms"
             )
     except Exception as exc:
-        probe_lines.append(f"探测失败: {exc}")
+        probe_lines.append(f"探测失败: {redact_text(str(exc))}")
     sections.append(IncidentSection("probe", probe_lines))
 
     conn_lines: list[str] = []
@@ -285,7 +275,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
         else:
             conn_lines.append("无 AI 相关活动连接")
     except Exception as exc:
-        conn_lines.append(f"连接查询失败: {exc}")
+        conn_lines.append(f"连接查询失败: {redact_text(str(exc))}")
     sections.append(IncidentSection("connections", conn_lines))
 
     history_lines: list[str] = []
@@ -302,7 +292,7 @@ def build_incident(paths: AppPaths, profile: str = "codex") -> list[IncidentSect
         else:
             history_lines.append("无探测历史")
     except Exception as exc:
-        history_lines.append(f"历史读取失败: {exc}")
+        history_lines.append(f"历史读取失败: {redact_text(str(exc))}")
     sections.append(IncidentSection("recent-probe-history", history_lines))
 
     return sections

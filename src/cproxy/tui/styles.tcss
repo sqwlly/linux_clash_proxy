@@ -1,14 +1,9 @@
 /* CProxy TUI 主题系统：
  *
- *   关键语义色用 TCSS 变量（$primary / $warning / $success / $error /
- *   $foreground / $background / $surface / $panel），由 ``app.py`` 的
- *   ``DARK_THEME`` / ``LIGHT_THEME`` 注入。切换主题时，CSS 里所有
- *   ``$primary`` 引用都自动跟着换。
- *
- *   唯一保留硬编码的非语义色：
- *     - 边框灰 #2b394b / #253241 — 卡片边线，跨主题共用灰
- *     - 行间隔色 #24354a / #1b2634 — DataTable 行高亮
- *     - 文本「亮一档」#e8edf3 / #f8fbfc — 在 muted 之上的强调层
+ *   全部颜色均使用 TCSS 主题变量（$primary / $secondary / $warning / $success /
+ *   $error / $foreground / $background / $surface / $panel 及其 *-muted 派生色），
+ *   由 ``app.py`` 的 ``DARK_THEME`` / ``LIGHT_THEME`` 注入。切换深浅主题（Ctrl+T）时
+ *   所有组件与边框自动保持高对比度，不再硬编码深色十六进制值。
  *
  *   主题变量值见 ``cproxy.tui.app.DARK_THEME`` 与 ``LIGHT_THEME``。
  *
@@ -23,15 +18,11 @@
  *     - 面板标题 height : 1        (单行)
  *     - 行高 height     : auto     (让内容自适应，不要写死)
  *
- *   边框风格统一为「细灰边 + 左侧粗强调条」：
- *     - .panel { border: solid #2b394b } 给所有 panel 一个细灰边
+ *   边框风格统一为「细边 + 左侧粗强调条」：
+ *     - .panel { border: solid $secondary 40% } 给所有 panel 一个中性细边
  *     - .form-panel / .output-panel / .summary-panel 在 .panel 之上叠
- *       加 border-left: tall #xxx，颜色由语义（primary/warning/success）决定
- *     - .status-card / .proxy-group-card / .ai-route-panel 走同一套：
- *       先 .xxx-card 拿到细灰边，再叠 .xxx-{role}-card 的 border-left 强调
- *
- *   这样 ``output-panel`` 和 ``status-card`` 视觉上一致（同款边框 + 同款强调条），
- *   不会让人误以为是两类不同的组件。
+ *       加 border-left: tall $primary/$warning/$success
+ *     - .status-card / .proxy-group-card / .ai-route-panel 走同一套
  */
 
 Screen {
@@ -67,7 +58,7 @@ Tabs {
     color: $secondary;
     height: 2;
     padding: 0 1;
-    border-bottom: solid #253241;
+    border-bottom: solid $secondary 35%;
 }
 
 Tab {
@@ -86,17 +77,17 @@ Tab {
 }
 
 Tab:hover {
-    color: #e8edf3;
-    background: #1b2634;
+    color: $foreground;
+    background: $surface;
 }
 
 Tab:focus {
     color: $primary;
-    background: #172635;
+    background: $surface;
 }
 
 Tab.-active {
-    color: #071013;
+    color: auto;
     background: $primary;
     text-style: bold;
 }
@@ -110,7 +101,7 @@ TabPane {
     width: 1fr;
     height: auto;
     min-height: 6;
-    border: solid #2b394b;
+    border: solid $secondary 40%;
     padding: 0 1 1 1;
     margin: 0 1 0 0;
     background: $surface;
@@ -154,15 +145,13 @@ TabPane {
     color: $success;
 }
 
-/* muted 文本：原来 #8794a6 在 $surface（#151c26）底色上对比度偏低（WCAG ~3.2），
- * 调到 #9aa8bc 后 ~3.9，仍不算完美但已高于「勉强可读」线，并保留 muted 感。 */
 .label-key {
-    color: #9aa8bc;
+    color: $secondary;
     width: 8;
 }
 
 .metric-value {
-    color: #e8edf3;
+    color: $foreground;
     background: transparent;
     border: none;
     padding: 0 1;
@@ -172,29 +161,30 @@ TabPane {
 
 DataTable {
     height: 1fr;
-    background: #0d1218;
+    background: $background;
     color: $foreground;
     border: none;
     padding: 0;
 }
 
 DataTable > .datatable--header {
-    background: #172635;
+    background: $panel;
     color: $primary;
     text-style: bold;
 }
 
 DataTable > .datatable--odd-row {
-    background: #101820;
+    background: $surface;
 }
 
 DataTable > .datatable--cursor {
-    background: #24354a;
+    background: $primary-muted;
+    color: $foreground;
 }
 
 DataTable:focus > .datatable--cursor {
-    background: #315b68;
-    color: #f8fbfc;
+    background: $primary;
+    color: auto;
     text-style: bold;
 }
 
@@ -205,8 +195,8 @@ DataTable:focus {
 Input,
 .subscription-input {
     height: 2;
-    background: #0d1218;
-    color: #e8edf3;
+    background: $background;
+    color: $foreground;
     border: none;
     padding: 0 1;
 }
@@ -214,17 +204,17 @@ Input,
 Input:focus,
 .subscription-input:focus {
     border-left: tall $primary;
-    background: #111a23;
+    background: $surface;
 }
 
 TextArea {
-    background: #0d1218;
+    background: $background;
     color: $foreground;
 }
 
 TextArea:focus {
     border: tall $primary;
-    background: #101820;
+    background: $surface;
 }
 
 Checkbox {
@@ -245,7 +235,7 @@ Switch {
 }
 
 .proxy-group-card {
-    border: solid #2b394b;
+    border: solid $secondary 40%;
     padding: 0 1 0 1;
     margin: 0 1 0 0;
     height: 1fr;
@@ -307,7 +297,7 @@ Switch {
 }
 
 .ai-route-panel {
-    border: solid #2b394b;
+    border: solid $secondary 40%;
     padding: 0 1;
     margin: 0 1 0 0;
     background: $surface;
@@ -333,7 +323,7 @@ Switch {
 
 .log-viewer {
     height: 1fr;
-    background: #0d1218;
+    background: $background;
     border: none;
     padding: 0 1;
 }
@@ -360,8 +350,8 @@ Switch {
 .table-filter {
     height: 2;
     margin: 0;
-    background: #101820;
-    color: #e8edf3;
+    background: $background;
+    color: $foreground;
 }
 
 .toolbar {
@@ -379,95 +369,102 @@ Switch {
     max-height: 1;
     margin: 0 1 0 0;
     padding: 0 1;
-    background: #1b2633;
+    background: $panel;
     color: $foreground;
     border: none;
     text-style: none;
 }
 
 .action-button:hover {
-    background: #26364a;
+    background: $surface;
 }
 
 .action-button:focus {
     border-left: tall $primary;
-    background: #223348;
-    color: #f8fbfc;
+    background: $primary-muted;
+    color: $foreground;
     text-style: bold;
 }
 
 .action-button.-active {
     background: $primary;
-    color: #071013;
+    color: auto;
 }
 
 .primary-button {
-    background: #165d72;
-    color: #ecfeff;
+    background: $primary-muted;
+    color: $foreground;
 }
 
 .primary-button:hover {
-    background: #0e7490;
+    background: $primary;
+    color: auto;
 }
 
 .primary-button:focus {
     border-left: tall $primary;
-    background: #0e7490;
+    background: $primary;
+    color: auto;
 }
 
 .success-button {
-    background: #365314;
-    color: #f7fee7;
+    background: $success-muted;
+    color: $foreground;
 }
 
 .success-button:hover,
 .success-button:focus {
-    background: #4d7c0f;
+    background: $success;
+    color: auto;
 }
 
 .danger-button {
-    background: #1b1418;
+    background: $error-muted;
     color: $error;
 }
 
 .danger-button:hover,
 .danger-button:focus {
-    background: #3d1c24;
+    background: $error;
     border-left: tall $error;
-    color: #fecdd3;
+    color: auto;
 }
 
 .danger-button.-active {
     background: $error;
-    color: #071013;
+    color: auto;
 }
 
 .muted-button {
     background: transparent;
-    color: #9aa8bc;
+    color: $secondary;
 }
 
 .muted-button:hover,
 .muted-button:focus {
-    background: #1a2230;
-    color: #e8edf3;
+    background: $panel;
+    color: $foreground;
 }
 
-/* Toast 提示：默认主色（$primary）背景作为「普通通知」；information 走成功色
- * 替代缺失的 success 严重级；error 走错误色。无独立的 .toast--title 选择器：
- * Textual 8 的 Toast widget 不再暴露该内部类，原样式属历史遗留。 */
+/* Toast 提示：按 severity 映射主题语义色，文本用 auto 自动匹配深浅底对比度 */
 Toast {
     background: $primary;
-    color: #071013;
+    color: auto;
 }
 
-/* 代码库中「成功」类提示均用 severity="information"（无独立 success 级别） */
 Toast.-information {
     background: $success;
+    color: auto;
+}
+
+Toast.-warning {
+    background: $warning;
+    color: auto;
 }
 
 Toast.-error {
     background: $error;
+    color: auto;
 }
 
 #dashboard-grid {
@@ -484,19 +481,8 @@ Toast.-error {
     margin-bottom: 0;
 }
 
-.page-title {
-    color: #e8edf3;
-    text-style: bold;
-    background: transparent;
-    border-left: none;
-    border-bottom: none;
-    margin: 0;
-    padding: 0;
-    height: 1;
-}
-
 .panel {
-    border: solid #2b394b;
+    border: solid $secondary 40%;
     background: $surface;
     padding: 0 1;
     margin: 0;
@@ -547,7 +533,7 @@ Toast.-error {
 .output-area {
     height: 1fr;
     border: none;
-    background: #0d1218;
+    background: $background;
 }
 
 .output-area:focus {
@@ -565,7 +551,7 @@ Toast.-error {
 }
 
 .path-label {
-    color: #9aa8bc;
+    color: $secondary;
     background: transparent;
     border: none;
     padding: 0;
@@ -573,7 +559,7 @@ Toast.-error {
 }
 
 .status-strip {
-    color: #9aa8bc;
+    color: $secondary;
     background: transparent;
     border: none;
     padding: 0;
@@ -581,7 +567,7 @@ Toast.-error {
 }
 
 .action-status {
-    color: #9aa8bc;
+    color: $secondary;
     background: transparent;
     border: none;
     padding: 0;
@@ -594,8 +580,7 @@ Toast.-error {
     width: 6;
 }
 
-/* dashboard 紧凑布局：行高不再写死（8/6），改 auto 让卡片随内容自适应；
- * 旧写法在窄终端（<100 列）会把 traffic 卡片挤出可见区域。 */
+/* dashboard 紧凑布局：行高自动自适应，避免窄终端（<100 列）挤出 traffic 卡片 */
 .compact #dashboard-grid {
     layout: grid;
     grid-size: 2 2;
