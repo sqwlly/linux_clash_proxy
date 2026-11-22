@@ -6,6 +6,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -175,7 +176,9 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
 _IEPL_KEYWORDS = ("IEPL", "IPLC", "内网专线")
 STREAM_FRAGILE_TTL_SECONDS = 1800.0
 GEMINI_GEO_BLOCKED_TTL_SECONDS = 12 * 3600.0
-_ACTIVE_PATHS: ContextVar[AppPaths | None] = ContextVar("cproxy_probe_active_paths", default=None)
+_ACTIVE_PATHS_VAR: ContextVar[AppPaths | None] = ContextVar("cproxy_probe_active_paths", default=None)
+_ACTIVE_PATHS = _ACTIVE_PATHS_VAR
+_FRAGILE_STATE_LOCK = threading.RLock()
 _CONFIG_FRAGILE_CACHE: tuple[str, int, frozenset[str]] = ("", -1, frozenset())
 _DYNAMIC_FRAGILE_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
 _GEMINI_GEO_BLOCKED_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
@@ -257,7 +260,7 @@ def update_ai_watch_state(
 
     state_path = ai_watch_state_file(paths)
     lock_path = state_path.with_name(f"{state_path.name}.lock")
-    with _advisory_file_lock(lock_path):
+    with _FRAGILE_STATE_LOCK, _advisory_file_lock(lock_path):
         data: dict[str, Any] = {}
         if state_path.exists():
             try:
@@ -281,11 +284,11 @@ def invalidate_probe_state_cache() -> None:
 
 @contextmanager
 def probe_paths_context(paths: AppPaths | None) -> Iterator[None]:
-    token = _ACTIVE_PATHS.set(paths)
+    token = _ACTIVE_PATHS_VAR.set(paths)
     try:
         yield
     finally:
-        _ACTIVE_PATHS.reset(token)
+        _ACTIVE_PATHS_VAR.reset(token)
 
 
 def _load_config_fragile_nodes(paths: AppPaths) -> frozenset[str]:
@@ -347,7 +350,7 @@ def _load_dynamic_fragile_map(paths: AppPaths) -> dict[str, float]:
 def is_dynamic_stream_fragile(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
     if not name:
         return False
-    eff_paths = paths or _ACTIVE_PATHS.get()
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is None:
         return False
     fragile_map = _load_dynamic_fragile_map(eff_paths)
@@ -436,10 +439,10 @@ def _load_gemini_geo_blocked_map(paths: AppPaths) -> dict[str, float]:
 
 
 def is_gemini_geo_blocked(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
-    """判断节点是否近期被 Google/Gemini 判定为地区受限（CN 送中 / HK 等）。"""
+    """判断节点是否近期被 Google/Gemini 判定为地区受限（CN 送中 / HK / RU 等）。"""
     if not name:
         return False
-    eff_paths = paths or _ACTIVE_PATHS.get()
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is None:
         return False
     blocked_map = _load_gemini_geo_blocked_map(eff_paths)
@@ -506,7 +509,7 @@ def is_static_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool
     upper = str(name).upper()
     if any(kw in upper for kw in _IEPL_KEYWORDS):
         return True
-    eff_paths = paths or _ACTIVE_PATHS.get()
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is not None and str(name) in _load_config_fragile_nodes(eff_paths):
         return True
     return False
@@ -522,7 +525,7 @@ def is_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
         return False
     if is_static_iepl_node(name, paths):
         return True
-    eff_paths = paths or _ACTIVE_PATHS.get()
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
     if eff_paths is not None and is_dynamic_stream_fragile(name, eff_paths):
         return True
     return False
