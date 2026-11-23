@@ -2,9 +2,8 @@
 
 ## Git Policy
 
-- If the user explicitly asks for `commit and push`, `提交并推送`, or an equivalent publish request, the agent may commit the scoped project changes and push the current branch without asking for another confirmation.
+- After completing and verifying scoped project changes, automatically commit the scoped files and push the current branch without asking for another confirmation (unless the user explicitly asks not to commit or push).
 - Before committing, run `git status --short`, keep unrelated or pre-existing dirty files out of the commit, and include new files that belong to the requested change.
-- Do not push for ordinary code changes unless the user explicitly requested commit-and-push or publish.
 - Do not force push, delete branches, delete worktrees, or rewrite shared history unless the user explicitly confirms that exact operation.
 
 ## GeoIP Data
