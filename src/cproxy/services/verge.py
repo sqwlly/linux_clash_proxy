@@ -26,6 +26,7 @@ import yaml
 from ..backend.api import APIBackend, APIUnavailableError, normalize_controller_endpoint
 from ..config import (
     AppPaths,
+    ai_claude_order_file,
     ai_gemini_order_file,
     ai_manual_order_file,
     ai_watch_state_file,
@@ -38,7 +39,7 @@ from ..config import (
     verge_daemon_state_file,
 )
 from .ai_watch import AIWatchService, WatchReport, sample_connections_activity
-from .probe import is_gemini_geo_blocked, is_iepl_node, resolve_current_leaf
+from .probe import is_claude_blocked, is_gemini_geo_blocked, is_iepl_node, resolve_current_leaf
 from .rebalance import RebalanceReport, RebalanceService
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ class VergeStatusReport:
     rules_ok: bool = False
     ai_manual_rules_count: int = 0
     ai_gemini_rules_count: int = 0
+    ai_claude_rules_count: int = 0
     daemon_ok: bool = False
     daemon_pid: int | None = None
     daemon_pid_alive: bool = False
@@ -454,6 +456,8 @@ def try_hot_reload_verge_runtime(
         not force
         and "AI-MANUAL-KEEPALIVE" in groups_map
         and "AI-GEMINI-KEEPALIVE" in groups_map
+        and "AI-CLAUDE" in groups_map
+        and "AI-CLAUDE-KEEPALIVE" in groups_map
     ):
         return True
 
@@ -476,6 +480,7 @@ def try_hot_reload_verge_runtime(
         selectors = {}
     cur_manual = groups_map["AI-MANUAL"].current if "AI-MANUAL" in groups_map else None
     cur_gemini = groups_map["AI-GEMINI"].current if "AI-GEMINI" in groups_map else None
+    cur_claude = groups_map["AI-CLAUDE"].current if "AI-CLAUDE" in groups_map else None
 
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -536,12 +541,13 @@ def try_hot_reload_verge_runtime(
                 if rp["path"].startswith("./"):
                     rp["path"] = rp["path"][2:]
 
-    from ..backend.runtime import _load_ai_gemini_order, _load_ai_manual_order
+    from ..backend.runtime import _load_ai_claude_order, _load_ai_gemini_order, _load_ai_manual_order
     from .ban import filter_unbanned_nodes, is_node_banned, load_active_bans
 
     active_bans = load_active_bans(paths)
     manual_order = _load_ai_manual_order(paths)
     gemini_order = _load_ai_gemini_order(paths)
+    claude_order = _load_ai_claude_order(paths)
 
     def _apply_learned_order(leaves: list[str], order: list[str]) -> list[str]:
         if not order or not leaves:
@@ -587,6 +593,22 @@ def try_hot_reload_verge_runtime(
             ):
                 leaves = [cur_gemini] + [x for x in leaves if x != cur_gemini]
             grp["proxies"] = leaves
+        elif gname == "AI-CLAUDE":
+            leaves = [str(x) for x in grp["proxies"]]
+            if active_bans:
+                leaves = filter_unbanned_nodes(leaves, active_bans, keep_fallback=True)
+            leaves = _apply_learned_order(leaves, claude_order)
+            clean_leaves = [x for x in leaves if not is_claude_blocked(x, paths)]
+            if clean_leaves and len(clean_leaves) < len(leaves):
+                leaves = clean_leaves + [x for x in leaves if is_claude_blocked(x, paths)]
+            if (
+                cur_claude
+                and cur_claude in leaves
+                and not (active_bans and is_node_banned(cur_claude, active_bans))
+                and not is_claude_blocked(cur_claude, paths)
+            ):
+                leaves = [cur_claude] + [x for x in leaves if x != cur_claude]
+            grp["proxies"] = leaves
 
     try:
         payload_yaml = yaml.safe_dump(new_cfg, allow_unicode=True, sort_keys=False)
@@ -603,8 +625,9 @@ def try_hot_reload_verge_runtime(
         selectors = {
             g: t
             for g, t in selectors.items()
-            if not (active_bans and g in ("AI-MANUAL", "AI-GEMINI") and is_node_banned(str(t), active_bans))
+            if not (active_bans and g in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE") and is_node_banned(str(t), active_bans))
             and not (g == "AI-GEMINI" and is_gemini_geo_blocked(str(t), paths))
+            and not (g == "AI-CLAUDE" and is_claude_blocked(str(t), paths))
         }
         try:
             if selectors:
@@ -977,20 +1000,30 @@ class VergeDaemonService:
                         from .ban import is_node_banned, load_active_bans
 
                         gmap = api.get_groups()
-                        need_keepalive_mount = "AI-MANUAL" in gmap and "AI-MANUAL-KEEPALIVE" not in gmap
+                        need_keepalive_mount = "AI-MANUAL" in gmap and (
+                            "AI-MANUAL-KEEPALIVE" not in gmap
+                            or "AI-CLAUDE" not in gmap
+                            or "AI-CLAUDE-KEEPALIVE" not in gmap
+                        )
                         active_bans = load_active_bans(self.paths, now=now)
                         gem_obj = gmap.get("AI-GEMINI")
                         gem_cands = [c for c in (gem_obj.candidates if gem_obj else []) if c and c != "AI-AUTO"]
                         geo_blocked_cands = tuple(
                             sorted(c for c in gem_cands if is_gemini_geo_blocked(c, self.paths, now=now))
                         )
+                        claude_obj = gmap.get("AI-CLAUDE")
+                        claude_cands = [c for c in (claude_obj.candidates if claude_obj else []) if c and c != "AI-AUTO"]
+                        claude_blocked_cands = tuple(
+                            sorted(c for c in claude_cands if is_claude_blocked(c, self.paths, now=now))
+                        )
                         bans_sig = (
                             tuple((b.pattern, b.expires_at) for b in active_bans),
                             geo_blocked_cands,
+                            claude_blocked_cands,
                         )
                         need_ban_evict = False
-                        if (active_bans or geo_blocked_cands) and bans_sig != last_synced_bans_sig:
-                            for gname in ("AI-MANUAL", "AI-GEMINI"):
+                        if (active_bans or geo_blocked_cands or claude_blocked_cands) and bans_sig != last_synced_bans_sig:
+                            for gname in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE"):
                                 gobj = gmap.get(gname)
                                 cands = [c for c in (gobj.candidates if gobj else []) if c and c != "AI-AUTO"]
                                 if len(cands) > 1 and active_bans and any(
@@ -1003,6 +1036,13 @@ class VergeDaemonService:
                                 and len(gem_cands) > len(geo_blocked_cands)
                                 and gem_cands
                                 and gem_cands[0] in geo_blocked_cands
+                            ):
+                                need_ban_evict = True
+                            if (
+                                not need_ban_evict
+                                and len(claude_cands) > len(claude_blocked_cands)
+                                and claude_cands
+                                and claude_cands[0] in claude_blocked_cands
                             ):
                                 need_ban_evict = True
                             if not need_ban_evict:
@@ -1245,7 +1285,9 @@ def collect_scheduler_telemetry(
     watch_updated = watch_state.get("updated_at")
     if isinstance(watch_updated, (int, float)) and watch_updated > 0:
         watch_ts: float | None = float(watch_updated)
-    elif watch_mtime is not None and any(isinstance(watch_state.get(g), dict) for g in ("AI-MANUAL", "AI-GEMINI")):
+    elif watch_mtime is not None and any(
+        isinstance(watch_state.get(g), dict) for g in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE")
+    ):
         watch_ts = float(watch_mtime)
     else:
         watch_ts = None
@@ -1258,7 +1300,7 @@ def collect_scheduler_telemetry(
 
     # 汇总各出口最近判定
     last_verdicts: dict[str, str] = {}
-    for gname in ("AI-MANUAL", "AI-GEMINI"):
+    for gname in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE"):
         gs = watch_state.get(gname)
         if isinstance(gs, dict):
             gv = gs.get("last_verdict")
@@ -1286,7 +1328,7 @@ def collect_scheduler_telemetry(
     for raw_reb in (daemon_state.get("last_rebalance_ts"), watch_state.get("last_rebalance_ts")):
         if isinstance(raw_reb, (int, float)) and raw_reb > 0:
             reb_candidates.append(float(raw_reb))
-    for order_fn in (ai_manual_order_file, ai_gemini_order_file):
+    for order_fn in (ai_manual_order_file, ai_gemini_order_file, ai_claude_order_file):
         p = order_fn(paths)
         if p.exists():
             try:
@@ -1339,6 +1381,7 @@ def collect_scheduler_telemetry(
     timer_schedule = _probe_systemd_timer_schedule(paths, ts) if configured else {}
     manual_order_count = 0
     gemini_order_count = 0
+    claude_order_count = 0
     try:
         m_path = ai_manual_order_file(paths)
         if m_path.exists():
@@ -1350,23 +1393,31 @@ def collect_scheduler_telemetry(
             g_list = json.loads(g_path.read_text(encoding="utf-8"))
             if isinstance(g_list, list):
                 gemini_order_count = len(g_list)
+        c_path = ai_claude_order_file(paths)
+        if c_path.exists():
+            c_list = json.loads(c_path.read_text(encoding="utf-8"))
+            if isinstance(c_list, list):
+                claude_order_count = len(c_list)
     except Exception:
         pass
 
+    v_label_map = {"AI-MANUAL": "通用", "AI-GEMINI": "Gemini", "AI-CLAUDE": "Claude"}
     v_parts = [
-        f"{'通用' if g == 'AI-MANUAL' else 'Gemini'}={last_verdicts[g]}"
-        for g in ("AI-MANUAL", "AI-GEMINI")
+        f"{v_label_map[g]}={last_verdicts[g]}"
+        for g in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE")
         if g in last_verdicts
     ]
     watch_summary = ", ".join(v_parts) if v_parts else "就绪"
     if total_switches or total_reaped:
         watch_summary += f" · 切流 {total_switches} / 回收 {total_reaped}"
 
-    rebalance_summary = (
-        f"通用 {manual_order_count} 节点 · Gemini {gemini_order_count} 节点"
-        if (manual_order_count or gemini_order_count)
-        else "等待首轮测速"
-    )
+    if manual_order_count or gemini_order_count or claude_order_count:
+        reb_parts = [f"通用 {manual_order_count} 节点", f"Gemini {gemini_order_count} 节点"]
+        if claude_order_count:
+            reb_parts.append(f"Claude {claude_order_count} 节点")
+        rebalance_summary = " · ".join(reb_parts)
+    else:
+        rebalance_summary = "等待首轮测速"
 
     def _task_entry(
         name: str,
@@ -1618,7 +1669,7 @@ def collect_ai_egress_deep_status(
     last_verdicts = dict(sched.get("last_verdicts") or {})
     watch_state, _ = _load_watch_telemetry_state(paths)
 
-    conn_counts: dict[str, int] = {"AI-MANUAL": 0, "AI-GEMINI": 0}
+    conn_counts: dict[str, int] = {"AI-MANUAL": 0, "AI-GEMINI": 0, "AI-CLAUDE": 0}
     try:
         conns_payload = APIBackend(paths).get_connections()
         raw_conns = conns_payload.get("connections") if isinstance(conns_payload, dict) else []
@@ -1626,7 +1677,7 @@ def collect_ai_egress_deep_status(
             if not isinstance(c, dict):
                 continue
             chains = [str(x) for x in (c.get("chains") or [])]
-            for gname in ("AI-MANUAL", "AI-GEMINI"):
+            for gname in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE"):
                 if gname in chains:
                     conn_counts[gname] = conn_counts.get(gname, 0) + 1
     except Exception:
@@ -1636,7 +1687,7 @@ def collect_ai_egress_deep_status(
 
     active_bans = load_active_bans(paths, now=ts)
     details: dict[str, dict[str, Any]] = {}
-    for gname in ("AI-MANUAL", "AI-GEMINI"):
+    for gname in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE"):
         gobj = (groups_map or {}).get(gname)
         if gobj is None:
             continue
@@ -1672,6 +1723,7 @@ def collect_ai_egress_deep_status(
             and not is_iepl_node(c, paths)
             and not (active_bans and is_node_banned(c, active_bans))
             and not (gname == "AI-GEMINI" and is_gemini_geo_blocked(c, paths, now=ts))
+            and not (gname == "AI-CLAUDE" and is_claude_blocked(c, paths, now=ts))
         ]
         if len(next_standby) < 2:
             for c in leaf_cands:
@@ -1751,6 +1803,8 @@ def check_verge_effectiveness(
     python_direct_preempts_ai = False
     ai_manual_rules_count = 0
     ai_gemini_rules_count = 0
+    ai_claude_rules_count = 0
+    claude_mounted = False
     egress_list: list[VergeEgressStatus] = []
 
     telemetry = collect_scheduler_telemetry(
@@ -1766,12 +1820,16 @@ def check_verge_effectiveness(
             groups_present = [g for g in REQUIRED_VERGE_GROUPS if g in groups_map]
             missing_groups = [g for g in REQUIRED_VERGE_GROUPS if g not in groups_map]
             topology_ok = len(missing_groups) == 0
+            claude_mounted = "AI-CLAUDE" in groups_map
             keepalive_groups_mounted = (
-                "AI-MANUAL-KEEPALIVE" in groups_map and "AI-GEMINI-KEEPALIVE" in groups_map
+                "AI-MANUAL-KEEPALIVE" in groups_map
+                and "AI-GEMINI-KEEPALIVE" in groups_map
+                and (not claude_mounted or "AI-CLAUDE-KEEPALIVE" in groups_map)
             )
 
             # 统计当前活跃连接数
-            conn_counts: dict[str, int] = {"AI-MANUAL": 0, "AI-GEMINI": 0}
+            egress_groups = ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE") if claude_mounted else ("AI-MANUAL", "AI-GEMINI")
+            conn_counts: dict[str, int] = {g: 0 for g in egress_groups}
             try:
                 conns_payload = api.get_connections()
                 raw_conns = conns_payload.get("connections") if isinstance(conns_payload, dict) else []
@@ -1779,13 +1837,13 @@ def check_verge_effectiveness(
                     if not isinstance(c, dict):
                         continue
                     chains = [str(x) for x in (c.get("chains") or [])]
-                    for gname in ("AI-MANUAL", "AI-GEMINI"):
+                    for gname in egress_groups:
                         if gname in chains:
                             conn_counts[gname] = conn_counts.get(gname, 0) + 1
             except Exception:
                 pass
 
-            for gname in ("AI-MANUAL", "AI-GEMINI"):
+            for gname in egress_groups:
                 gobj = groups_map.get(gname)
                 if gobj is None:
                     egress_list.append(
@@ -1833,6 +1891,9 @@ def check_verge_effectiveness(
                 elif proxy_target in ("AI-GEMINI", "AI-GEMINI-KEEPALIVE"):
                     ai_gemini_rules_count += 1
                     seen_ai_rule = True
+                elif proxy_target in ("AI-CLAUDE", "AI-CLAUDE-KEEPALIVE"):
+                    ai_claude_rules_count += 1
+                    seen_ai_rule = True
                 elif (
                     not seen_ai_rule
                     and proxy_target.upper() == "DIRECT"
@@ -1858,10 +1919,13 @@ def check_verge_effectiveness(
     last_watch_age_sec: float | None = None
     if isinstance(last_watch_at, (int, float)) and last_watch_at > 0:
         last_watch_age_sec = max(0.0, ts - float(last_watch_at))
+    required_watch_groups = (
+        (*AI_WATCH_GROUPS, "AI-CLAUDE") if claude_mounted and "AI-CLAUDE" in last_verdicts else AI_WATCH_GROUPS
+    )
     watch_ok = bool(
         last_watch_age_sec is not None
         and last_watch_age_sec <= max_heartbeat_age_sec
-        and all(last_verdicts.get(group) == "ok" for group in AI_WATCH_GROUPS)
+        and all(last_verdicts.get(group) == "ok" for group in required_watch_groups)
     )
     switches_last_10m = sum(
         1
@@ -1939,6 +2003,7 @@ def check_verge_effectiveness(
         rules_ok=rules_ok,
         ai_manual_rules_count=ai_manual_rules_count,
         ai_gemini_rules_count=ai_gemini_rules_count,
+        ai_claude_rules_count=ai_claude_rules_count,
         daemon_ok=daemon_ok,
         daemon_pid=daemon_pid,
         daemon_pid_alive=pid_alive,

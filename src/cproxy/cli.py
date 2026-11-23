@@ -144,9 +144,14 @@ def _print_verge_tick(tick_report, *, raw: bool = False) -> None:
                 verdict = VERDICT_LABELS.get(item.verdict, item.verdict)
                 print(f"WATCH\t{item.group}\t{verdict}\t{item.current or '-'}\t{item.target or '-'}", flush=True)
         if reb_rep:
+            claude_part = (
+                f"\tAI-CLAUDE\t{reb_rep.claude_switched_to or '-'}"
+                if getattr(reb_rep, "claude_ordered", ())
+                else ""
+            )
             print(
                 f"REBALANCE\tAI-MANUAL\t{reb_rep.switched_to or '-'}\t"
-                f"AI-GEMINI\t{reb_rep.gemini_switched_to or '-'}",
+                f"AI-GEMINI\t{reb_rep.gemini_switched_to or '-'}{claude_part}",
                 flush=True,
             )
         return
@@ -166,9 +171,12 @@ def _print_verge_tick(tick_report, *, raw: bool = False) -> None:
     if reb_rep:
         sw_manual = f" -> {reb_rep.switched_to}" if reb_rep.switched_to else ""
         sw_gemini = f" -> {reb_rep.gemini_switched_to}" if reb_rep.gemini_switched_to else ""
+        claude_ord = getattr(reb_rep, "claude_ordered", ())
+        claude_sw = getattr(reb_rep, "claude_switched_to", None)
+        claude_seg = f" | AI-CLAUDE({len(claude_ord)}){f' -> {claude_sw}' if claude_sw else ''}" if claude_ord else ""
         print(
             f"[{ts_label}] 重排: AI-MANUAL({len(reb_rep.ordered)}){sw_manual} | "
-            f"AI-GEMINI({len(reb_rep.gemini_ordered)}){sw_gemini}",
+            f"AI-GEMINI({len(reb_rep.gemini_ordered)}){sw_gemini}{claude_seg}",
             flush=True,
         )
     for warn in tick_report.warnings:
@@ -236,7 +244,13 @@ def _print_verge_status(rep, *, raw: bool = False) -> None:
     topology_str = f"已挂载 {len(rep.groups_present)}/3" if rep.topology_ok else "缺失 " + ", ".join(rep.missing_groups)
     rules_str = "正常" if rep.rules_ok else "未挂载"
     print(f"策略组      {topology_str}")
-    print(f"分流规则    {rules_str} · AI-MANUAL {rep.ai_manual_rules_count} 条 · AI-GEMINI {rep.ai_gemini_rules_count} 条")
+    claude_rules_suffix = (
+        f" · AI-CLAUDE {rep.ai_claude_rules_count} 条" if getattr(rep, "ai_claude_rules_count", 0) > 0 else ""
+    )
+    print(
+        f"分流规则    {rules_str} · AI-MANUAL {rep.ai_manual_rules_count} 条"
+        f" · AI-GEMINI {rep.ai_gemini_rules_count} 条{claude_rules_suffix}"
+    )
 
     if rep.remedies:
         _print_section("建议操作")
@@ -666,18 +680,23 @@ def run(argv: list[str] | None = None) -> int:
                     print("代理未运行，跳过稳定度重排")
                 return 0
             if args.raw:
+                claude_ord = getattr(rebalance_report, "claude_ordered", ())
+                claude_sw = getattr(rebalance_report, "claude_switched_to", None)
+                claude_meta = f"\tclaude={len(claude_ord)}\tclaude_switched={claude_sw or '-'}" if claude_ord else ""
                 print(
                     f"REBALANCE\tmanual={len(rebalance_report.ordered)}\t"
                     f"gemini={len(rebalance_report.gemini_ordered)}\t"
                     f"rerendered={str(rebalance_report.rerendered).lower()}\t"
                     f"hot_reloaded={str(rebalance_report.hot_reloaded).lower()}\t"
                     f"switched={rebalance_report.switched_to or '-'}\t"
-                    f"gemini_switched={rebalance_report.gemini_switched_to or '-'}"
+                    f"gemini_switched={rebalance_report.gemini_switched_to or '-'}{claude_meta}"
                 )
                 for index, name in enumerate(rebalance_report.ordered, start=1):
                     print(f"MANUAL_NODE\t{index}\t{name}")
                 for index, name in enumerate(rebalance_report.gemini_ordered, start=1):
                     print(f"GEMINI_NODE\t{index}\t{name}")
+                for index, name in enumerate(claude_ord, start=1):
+                    print(f"CLAUDE_NODE\t{index}\t{name}")
                 return 0
             print(_section_heading("结果"))
             print(f"稳定度排序（{len(rebalance_report.ordered)} 个节点）:")
@@ -687,15 +706,23 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"AI-GEMINI 稳定度排序（{len(rebalance_report.gemini_ordered)} 个节点）:")
                 for index, name in enumerate(rebalance_report.gemini_ordered, start=1):
                     print(f"  {index}. {name}")
+            if getattr(rebalance_report, "claude_ordered", ()):
+                print(f"AI-CLAUDE 稳定度排序（{len(rebalance_report.claude_ordered)} 个节点）:")
+                for index, name in enumerate(rebalance_report.claude_ordered, start=1):
+                    print(f"  {index}. {name}")
             if rebalance_report.rerendered:
                 print(f"已写入稳定度排序: {rebalance_report.order_path}")
                 if rebalance_report.gemini_order_path:
                     print(f"已写入 AI-GEMINI 排序: {rebalance_report.gemini_order_path}")
+                if getattr(rebalance_report, "claude_order_path", ""):
+                    print(f"已写入 AI-CLAUDE 排序: {rebalance_report.claude_order_path}")
                 print("运行配置: " + ("已热重载" if rebalance_report.hot_reloaded else "已渲染（代理未运行）"))
             if rebalance_report.switched_to:
                 print(f"出口切换: {rebalance_report.switched_to}")
             if rebalance_report.gemini_switched_to:
                 print(f"AI-GEMINI 出口切换: {rebalance_report.gemini_switched_to}")
+            if getattr(rebalance_report, "claude_switched_to", None):
+                print(f"AI-CLAUDE 出口切换: {rebalance_report.claude_switched_to}")
             return 0
         if args.command == "ai-watch":
             watch_report = AIWatchService(default_paths()).watch(dry_run=args.dry_run)

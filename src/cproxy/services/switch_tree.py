@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from ..backend.models import ProxyGroup
 from ..backend.runtime import (
     AI_AUTO_GROUP,
+    AI_CLAUDE_GROUP,
     AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     AI_REGION_JP,
@@ -47,6 +48,7 @@ AUTO_DISPLAY = {
 ENTRY_DEFAULT = "默认流量"
 ENTRY_AI = "AI 出口"
 ENTRY_GEMINI = "Gemini 出口"
+ENTRY_CLAUDE = "Claude 出口"
 ENTRY_GLOBAL = "全局"
 DIM_STYLE = "\033[2m"
 REGION_LABEL_VALUES = frozenset(SWITCH_REGION_LABELS.values())
@@ -128,6 +130,8 @@ def display_entry(name: str, match_group: str | None) -> str:
         return ENTRY_AI
     if name == AI_GEMINI_GROUP:
         return ENTRY_GEMINI
+    if name == AI_CLAUDE_GROUP:
+        return ENTRY_CLAUDE
     if name == "GLOBAL":
         return ENTRY_GLOBAL
     return name
@@ -192,7 +196,7 @@ def build_switch_tree(
     selectable = {name for name, group in groups.items() if _is_selectable(group)}
     # AI-MANUAL / AI-GEMINI 已改为 fallback（故障转移）类型，但仍允许手动指定节点：
     # mihomo fallback 尊重手动选择直到节点挂。放行以便 switch 树/交互选择继续列出它们。
-    for ai_fallback_group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+    for ai_fallback_group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_CLAUDE_GROUP):
         if ai_fallback_group in groups:
             selectable.add(ai_fallback_group)
     skip = _entry_skip_names(extra)
@@ -208,6 +212,7 @@ def build_switch_tree(
     add(match_group)
     add(AI_MANUAL_GROUP)
     add(AI_GEMINI_GROUP)
+    add(AI_CLAUDE_GROUP)
     for name in extra:
         add(name)
     add("GLOBAL")
@@ -348,6 +353,8 @@ def _entry_role(name: str, match_group: str | None) -> str:
         return "决定 AI 出口"
     if name == AI_GEMINI_GROUP:
         return "决定 Gemini 出口"
+    if name == AI_CLAUDE_GROUP:
+        return "决定 Claude 出口"
     if name == "GLOBAL":
         return "绕过规则"
     return ""

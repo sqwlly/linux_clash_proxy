@@ -11,7 +11,7 @@
 ## 核心特性
 
 - **AI 流量精细分流与地区防封锁**
-  - 自动构建 `AI-GEMINI`（针对 Google / Gemini / Cloud Code 自动优选韩、台、英、欧等合规低延迟地区）与 `AI-MANUAL`（针对 OpenAI / Codex / Claude / Copilot 优选美、日、新等主力节点）。
+  - 自动构建 `AI-GEMINI`（针对 Google / Gemini / Cloud Code 自动优选韩、台、英、欧等合规低延迟地区）、`AI-CLAUDE`（针对 Anthropic / Claude Code 覆盖 `api.anthropic.com`、`claude.ai` 与 `platform.claude.com` / `claude.com` 统一独立出口防跨区风控，接入本地 `:7895` H2 PING 保活与 403/地区风控隔离）与 `AI-MANUAL`（针对 OpenAI / Codex / Copilot 优选美、日、新等主力节点）。
   - 自动清洗机场订阅中的冲突 AI 规则，置顶注入 AI 域名与进程规则，开发下载源（PyPI / npm / PyTorch）与国内流量自动直连。
 - **长连接抗断流优选（Anti-EOF）**
   - 自动识别在 15~60s 模型思考或工具执行空闲期易被网关掐断的节点（如 `IEPL` / `IPLC` 专线或裸 TCP `xtls-rprx-vision`），优先将 `1X`、`WebSocket`、`gRPC` 等长连接稳态节点排在首位，并将高倍率（`>= 3.0X`）节点自动沉底。

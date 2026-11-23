@@ -381,7 +381,7 @@ class APIBackend:
         gtype = str(group.type).lower()
         if gtype in {"select", "selector"}:
             return True
-        return gtype == "fallback" and name in {"AI-MANUAL", "AI-GEMINI"}
+        return gtype == "fallback" and name in {"AI-MANUAL", "AI-GEMINI", "AI-CLAUDE"}
 
     def selector_now(self) -> dict[str, str]:
         """当前 Selector 及 AI 出口（AI-MANUAL/AI-GEMINI）的选中项，供热重载后原样写回。
@@ -456,12 +456,12 @@ class APIBackend:
             chains = [str(part) for part in (item.get("chains") or [])]
             chain_set = set(chains)
             leaf_upper = chains[0].upper() if chains else ""
-            on_gemini_safe = (
-                "AI-GEMINI" in chain_set
+            on_protected_ai_safe = (
+                ("AI-GEMINI" in chain_set or "AI-CLAUDE" in chain_set)
                 and bool(leaf_upper)
                 and not any(kw in leaf_upper for kw in ("IEPL", "IPLC", "内网专线"))
             )
-            if on_gemini_safe:
+            if on_protected_ai_safe:
                 continue
             if isinstance(group_names, dict):
                 should_drop = any(

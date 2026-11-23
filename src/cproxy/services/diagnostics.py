@@ -42,6 +42,7 @@ DEFAULT_AI_PROBE_TARGETS = [
     ("ChatGPT Web", "https://chatgpt.com"),
     ("OpenAI API", "https://api.openai.com/v1/models"),
     ("Gemini API", "https://generativelanguage.googleapis.com/v1beta/models"),
+    ("Claude API", "https://api.anthropic.com/v1/messages"),
 ]
 # 无鉴权识别 Google 核心 GeoIP“送中 (CN)”与 HK 门禁的探测地址（命中 AI-GEMINI 的 google.com 规则）：
 # Google GWS 在将出口 IP 判为 CN（送中）或 HK 时，会在 GET 响应头下发 `domain=.google.com.hk` Cookie。
@@ -65,17 +66,23 @@ PROBE_OK = "ok"
 PROBE_GEO_BLOCKED = "geo_blocked"
 PROBE_DEAD = "dead"
 
-# Gemini/Google 地区门禁的错误标记（响应体小写后做子串匹配）
+# Gemini/Google 与 Anthropic/Claude 地区门禁/风控拦截的错误标记（响应体小写后做子串匹配）
 GEO_BLOCK_MARKERS = (
     "location is not supported",
     "location not supported",
     "not supported for the api use",
     "available in your country",
+    "not available in your country",
+    "country, region, or territory not supported",
+    "request_not_allowed",
     "location_not_eligible",
     "your location is not eligible",
     "unsupported_country_code",
+    "unsupported_country",
     "region is not supported",
 )
+
+ANTHROPIC_API_HOSTS = frozenset({"api.anthropic.com"})
 
 GOOGLE_GEO_BLOCKED_COOKIE_DOMAINS = (
     "domain=.google.com.hk",
@@ -196,6 +203,14 @@ def _is_geo_blocked(body: str) -> bool:
     return any(marker in body for marker in GEO_BLOCK_MARKERS)
 
 
+def _is_anthropic_api_url(url: str) -> bool:
+    try:
+        host = (urlparse(str(url or "").strip().lower()).hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    return host in ANTHROPIC_API_HOSTS
+
+
 def _url_indicates_geo_blocked(url_text: str) -> bool:
     url_lower = str(url_text or "").strip().lower()
     if not url_lower:
@@ -279,6 +294,8 @@ def _probe_target(opener, url: str, timeout: int, retries: int) -> tuple[str, st
                         return PROBE_GEO_BLOCKED, "位置不支持（地区门禁重定向）"
                     return PROBE_OK, f"HTTP {exc.code}"
                 if 400 <= exc.code < 500:
+                    if exc.code == 403 and _is_anthropic_api_url(url):
+                        return PROBE_GEO_BLOCKED, "Anthropic/Cloudflare 403 拦截或地区受限"
                     if _headers_or_url_indicate_geo_blocked(
                         _safe_attr(exc, "headers", None), str(_safe_attr(exc, "url", "") or "")
                     ) or _is_geo_blocked(_read_error_body(exc)):
@@ -439,6 +456,7 @@ class DiagnosticsService:
             ("ChatGPT Web", _config_str(config, "ai-chatgpt-url", DEFAULT_AI_PROBE_TARGETS[0][1])),
             ("OpenAI API", _config_str(config, "ai-openai-api-url", DEFAULT_AI_PROBE_TARGETS[1][1])),
             ("Gemini API", _config_str(config, "ai-gemini-api-url", DEFAULT_AI_PROBE_TARGETS[2][1])),
+            ("Claude API", _config_str(config, "ai-claude-api-url", DEFAULT_AI_PROBE_TARGETS[3][1])),
         ]
         opener = _proxy_opener(self.paths)
 

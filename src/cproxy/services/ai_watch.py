@@ -18,9 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..backend.runtime import AI_AUTO_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
+from ..backend.runtime import AI_AUTO_GROUP, AI_CLAUDE_GROUP, AI_GEMINI_GROUP, AI_MANUAL_GROUP, delay_state
 from ..config import (
     AppPaths,
+    ai_claude_order_file,
     ai_gemini_order_file,
     ai_manual_order_file,
     ai_watch_state_file,
@@ -36,16 +37,20 @@ from .diagnostics import (
     ai_target_verdict,
 )
 from .probe import (
+    CLAUDE_BLOCKED_TTL_SECONDS,
     GEMINI_GEO_BLOCKED_TTL_SECONDS,
     STREAM_FRAGILE_TTL_SECONDS,
     _advisory_file_lock,
     _atomic_write_text,
+    clear_claude_blocked_node,
     clear_gemini_geo_blocked_node,
     invalidate_probe_state_cache,
+    is_claude_blocked,
     is_gemini_geo_blocked,
     is_iepl_node,
     is_static_iepl_node,
     probe_paths_context,
+    record_claude_blocked_node,
     record_gemini_geo_blocked_node,
     resolve_current_leaf,
 )
@@ -109,6 +114,8 @@ AI_STREAM_HOSTS = frozenset(
         "api.openai.com",
         "api.anthropic.com",
         "claude.ai",
+        "claude.com",
+        "platform.claude.com",
     }
 )
 
@@ -507,6 +514,7 @@ def reap_idle_gemini_connections(
     *,
     current_leaf: str | None = None,
     manual_leaf: str | None = None,
+    claude_leaf: str | None = None,
     dry_run: bool = False,
 ) -> list[str]:
     """主动清理 agy / codex / claude 连接池中闲置的 AI HTTP/2 连接，
@@ -551,7 +559,13 @@ def reap_idle_gemini_connections(
         if "H2-KEEPALIVE" in chain_set:
             continue
         leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
-        active_leaf = manual_leaf if AI_MANUAL_GROUP in chain_set and manual_leaf else current_leaf
+        active_leaf: str | None
+        if AI_CLAUDE_GROUP in chain_set and claude_leaf:
+            active_leaf = claude_leaf
+        elif AI_MANUAL_GROUP in chain_set and manual_leaf:
+            active_leaf = manual_leaf
+        else:
+            active_leaf = current_leaf
         on_stale_leaf = bool(active_leaf and leaf and leaf != active_leaf)
         # 当本地 :7895 保活网关在线时，其出站腿以 SOCKS5 协议接入 mihomo（chains 不含 H2-KEEPALIVE），
         # 由网关自身通过 4.5s/35s H2·WS PING 维护连接池健康；严禁在当前活跃叶子上误杀其底层 Socks5 长连接。
@@ -698,7 +712,7 @@ def has_active_ai_transfer(
 
 
 def has_any_inflight_ai_connection(paths: AppPaths, api=None) -> bool:
-    """检测任意 AI 策略组（AI-MANUAL / AI-GEMINI）是否存在正在上传、模型思考或流式输出中的活跃连接。
+    """检测任意 AI 策略组（AI-MANUAL / AI-GEMINI / AI-CLAUDE）是否存在正在上传、模型思考或流式输出中的活跃连接。
     用于拦截周期性 `cproxy render --apply` 与 `rebalance` 的破坏性 `PUT /configs?force=true` 热重载。
     """
     if api is None:
@@ -708,8 +722,10 @@ def has_any_inflight_ai_connection(paths: AppPaths, api=None) -> bool:
             api = APIBackend(paths)
         except Exception:
             return False
-    return has_active_ai_transfer(paths, api, AI_MANUAL_GROUP) or has_active_ai_transfer(
-        paths, api, AI_GEMINI_GROUP
+    return (
+        has_active_ai_transfer(paths, api, AI_MANUAL_GROUP)
+        or has_active_ai_transfer(paths, api, AI_GEMINI_GROUP)
+        or has_active_ai_transfer(paths, api, AI_CLAUDE_GROUP)
     )
 
 
@@ -837,13 +853,8 @@ DEFAULT_CLOUDCODE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
 
 def _watch_urls(paths: AppPaths, group: str) -> tuple[str, ...]:
-    """AI-MANUAL 测 ChatGPT Web + OpenAI API，AI-GEMINI 测 Gemini API + Cloud Code + Google Geo。
-
-    多端点看护：
-    - AI-GEMINI 同时覆盖 Gemini API、agy 实际连接的 `daily-cloudcode-pa.googleapis.com`
-      （识别 Cloud Code 链路断流），以及 `www.google.com/?hl=en`（无鉴权识别 Google GWS
-      将出口 IP 判为 CN“送中”或 HK 下发 `.google.com.hk` Cookie 的隐性地区门禁）；
-    - AI-MANUAL 同时覆盖 `chatgpt.com` 与 `api.openai.com/v1/models`。
+    """AI-MANUAL 测 ChatGPT Web + OpenAI API，AI-GEMINI 测 Gemini API + Cloud Code + Google Geo，
+    AI-CLAUDE 测 Anthropic Messages API（区分正常 405/401 与 403/WAF/地区拦截）。
     """
     config = read_config(paths)
     if group == AI_GEMINI_GROUP:
@@ -855,6 +866,9 @@ def _watch_urls(paths: AppPaths, group: str) -> tuple[str, ...]:
             if candidate and candidate not in urls:
                 urls.append(candidate)
         return tuple(urls)
+    if group == AI_CLAUDE_GROUP:
+        claude_url = str(config.get("ai-claude-api-url") or DEFAULT_AI_PROBE_TARGETS[3][1])
+        return (claude_url,)
     primary = str(config.get("ai-chatgpt-url") or DEFAULT_AI_PROBE_TARGETS[0][1])
     secondary = str(config.get("ai-openai-api-url") or DEFAULT_AI_PROBE_TARGETS[1][1])
     return (primary, secondary) if primary != secondary else (primary,)
@@ -904,6 +918,7 @@ def _save_state(
     state: dict,
     *,
     cleared_geo_blocked: dict[str, float] | None = None,
+    cleared_claude_blocked: dict[str, float] | None = None,
     cleared_stream_fragile: dict[str, float] | None = None,
     clear_shared_circuit: bool = False,
     now: float | None = None,
@@ -927,6 +942,8 @@ def _save_state(
                 merged[k] = _merge_timestamp_map(disk.get(k), v, cleared_geo_blocked)
             elif k == "gemini_geo_log_blocked":
                 merged[k] = _merge_timestamp_map(disk.get(k), v, None)
+            elif k == "claude_blocked":
+                merged[k] = _merge_timestamp_map(disk.get(k), v, cleared_claude_blocked)
             elif k == "stream_fragile":
                 merged[k] = _merge_timestamp_map(disk.get(k), v, cleared_stream_fragile)
             elif k == "last_rebalance_ts":
@@ -937,7 +954,11 @@ def _save_state(
                 merged[k] = max(int(disk.get(k) or 0), int(v or 0))
             elif k == "last_verdicts" and isinstance(v, dict) and isinstance(disk.get(k), dict):
                 merged[k] = {**disk[k], **v}
-            elif k in (AI_MANUAL_GROUP, AI_GEMINI_GROUP) and isinstance(v, dict) and isinstance(disk.get(k), dict):
+            elif (
+                k in (AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_CLAUDE_GROUP)
+                and isinstance(v, dict)
+                and isinstance(disk.get(k), dict)
+            ):
                 disk_gs = disk[k]
                 merged_gs = dict(v)
                 disk_switch = float(disk_gs.get("last_switch_ts") or 0.0)
@@ -966,6 +987,8 @@ def _save_state(
             merged.pop("shared_circuit_open_until", None)
         if cleared_geo_blocked and "gemini_geo_blocked" not in state and "gemini_geo_blocked" in disk:
             merged["gemini_geo_blocked"] = _merge_timestamp_map(disk.get("gemini_geo_blocked"), None, cleared_geo_blocked)
+        if cleared_claude_blocked and "claude_blocked" not in state and "claude_blocked" in disk:
+            merged["claude_blocked"] = _merge_timestamp_map(disk.get("claude_blocked"), None, cleared_claude_blocked)
         if cleared_stream_fragile and "stream_fragile" not in state and "stream_fragile" in disk:
             merged["stream_fragile"] = _merge_timestamp_map(disk.get("stream_fragile"), None, cleared_stream_fragile)
 
@@ -1671,7 +1694,12 @@ def _promote_gemini_order_head(
     若提供 `demote`（刚故障/超时的旧节点），将其降级到非静态 IEPL 分区末尾（`sink_tail=True` 时沉底至整个列表末尾）。"""
     if not target or is_static_iepl_node(target, paths):
         return
-    order_path = ai_gemini_order_file(paths) if group == AI_GEMINI_GROUP else ai_manual_order_file(paths)
+    if group == AI_GEMINI_GROUP:
+        order_path = ai_gemini_order_file(paths)
+    elif group == AI_CLAUDE_GROUP:
+        order_path = ai_claude_order_file(paths)
+    else:
+        order_path = ai_manual_order_file(paths)
     if not order_path.exists():
         return
     try:
@@ -1760,10 +1788,16 @@ class AIWatchService:
             state = _load_state(self.paths)
             now = time.time()
             cleared_geo_blocked: dict[str, float] = {}
+            cleared_claude_blocked: dict[str, float] = {}
             shared_failure = _shared_failure_active(state, now)
             if shared_failure:
                 state["shared_circuit_open_until"] = now + SWITCH_CIRCUIT_COOLDOWN_SECONDS
-            for group in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+            watch_targets: tuple[str, ...] = (
+                (AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_CLAUDE_GROUP)
+                if AI_CLAUDE_GROUP in groups
+                else (AI_MANUAL_GROUP, AI_GEMINI_GROUP)
+            )
+            for group in watch_targets:
                 report.results.append(
                     self._watch_group(
                         groups,
@@ -1772,12 +1806,13 @@ class AIWatchService:
                         now,
                         dry_run,
                         cleared_geo_blocked=cleared_geo_blocked,
+                        cleared_claude_blocked=cleared_claude_blocked,
                         allow_automatic_switch=not shared_failure,
                     )
                 )
             watched_groups = {r.group for r in report.results}
             clear_shared_circuit = False
-            if watched_groups == {AI_MANUAL_GROUP, AI_GEMINI_GROUP} and all(
+            if {AI_MANUAL_GROUP, AI_GEMINI_GROUP}.issubset(watched_groups) and all(
                 r.verdict == PROBE_DEAD for r in report.results
             ):
                 state["shared_circuit_open_until"] = now + SWITCH_CIRCUIT_COOLDOWN_SECONDS
@@ -1788,11 +1823,14 @@ class AIWatchService:
             gemini_leaf = (gemini_res.target or gemini_res.current) if gemini_res else None
             manual_res = next((r for r in report.results if r.group == AI_MANUAL_GROUP), None)
             manual_leaf = (manual_res.target or manual_res.current) if manual_res else None
+            claude_res = next((r for r in report.results if r.group == AI_CLAUDE_GROUP), None)
+            claude_leaf = (claude_res.target or claude_res.current) if claude_res else None
             report.reaped_connections = reap_idle_gemini_connections(
                 self.paths,
                 getattr(self.query, "api", None),
                 current_leaf=gemini_leaf,
                 manual_leaf=manual_leaf,
+                claude_leaf=claude_leaf,
                 dry_run=dry_run,
             )
             report.reaped_pids = reap_stale_agy_processes(self.proc_root, now=now, dry_run=dry_run)
@@ -1814,6 +1852,7 @@ class AIWatchService:
                     self.paths,
                     state,
                     cleared_geo_blocked=cleared_geo_blocked or None,
+                    cleared_claude_blocked=cleared_claude_blocked or None,
                     clear_shared_circuit=clear_shared_circuit,
                     now=now,
                 )
@@ -1850,6 +1889,7 @@ class AIWatchService:
         dry_run: bool,
         *,
         cleared_geo_blocked: dict[str, float] | None = None,
+        cleared_claude_blocked: dict[str, float] | None = None,
         allow_automatic_switch: bool = True,
     ) -> WatchGroupResult:
         group_obj = groups.get(group)
@@ -2019,9 +2059,11 @@ class AIWatchService:
                         self.paths, getattr(self.query, "api", None), group, previous_active
                     ):
                         gs.setdefault("cooldown", {})[previous_active] = now
-                    if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and not is_static_iepl_node(current, self.paths):
+                    if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP) and not is_static_iepl_node(
+                        current, self.paths
+                    ):
                         _promote_gemini_order_head(self.paths, current, group=group, demote=previous_active)
-                if group != AI_GEMINI_GROUP or is_static_iepl_node(previous_active, self.paths):
+                if group not in (AI_GEMINI_GROUP, AI_CLAUDE_GROUP) or is_static_iepl_node(previous_active, self.paths):
                     drop_fn = getattr(self.query, "_drop_stale_ai_connections", None)
                     if callable(drop_fn):
                         try:
@@ -2058,6 +2100,20 @@ class AIWatchService:
                     if cleared_geo_blocked is not None:
                         cleared_geo_blocked[current] = now
                     clear_gemini_geo_blocked_node(self.paths, current)
+            if (
+                not dry_run
+                and not active_busy
+                and group == AI_CLAUDE_GROUP
+                and current
+                and ai_target_verdict is _DEFAULT_AI_TARGET_VERDICT
+            ):
+                cb_map = state.get("claude_blocked")
+                if isinstance(cb_map, dict) and current in cb_map:
+                    cb_map.pop(current, None)
+                    state["claude_blocked"] = cb_map
+                if cleared_claude_blocked is not None:
+                    cleared_claude_blocked[current] = now
+                clear_claude_blocked_node(self.paths, current)
             cooldown_map = gs.get("cooldown", {})
             other_group_name = (
                 AI_GEMINI_GROUP
@@ -2099,7 +2155,7 @@ class AIWatchService:
             if (
                 not dry_run
                 and group_obj is not None
-                and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+                and group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP)
                 and (on_banned or on_static_iepl or on_soft_unhealthy)
             ):
                 cand_1x = self._pick_next(groups, group_obj, current, cooldown_map, now)
@@ -2134,6 +2190,10 @@ class AIWatchService:
                             and not (
                                 group == AI_GEMINI_GROUP
                                 and is_gemini_geo_blocked(str(c), self.paths, now=now)
+                            )
+                            and not (
+                                group == AI_CLAUDE_GROUP
+                                and is_claude_blocked(str(c), self.paths, now=now)
                             )
                             and not (groups.get(c) is not None and groups[c].candidates)
                             and not (active_bans_now and is_node_banned(str(c), active_bans_now))
@@ -2242,7 +2302,7 @@ class AIWatchService:
                 # 仅在 AI-MANUAL、地区封锁、客户端真实重试报错或易断流节点切换时关闭旧连接；
                 # 当 AI-GEMINI 已在健康节点上被动切换时，不强杀活跃 TCP 连接，防止掐断并发 agy 会话的流式输出。
                 should_drop = (
-                    group != AI_GEMINI_GROUP
+                    group not in (AI_GEMINI_GROUP, AI_CLAUDE_GROUP)
                     or verdict == PROBE_GEO_BLOCKED
                     or log_triggered
                     or is_static_iepl_node(current, self.paths)
@@ -2273,6 +2333,7 @@ class AIWatchService:
                 )
                 other_leaf = resolve_current_leaf(groups, other_grp) if other_grp and other_grp in groups else None
                 is_geo_blocked_switch = verdict == PROBE_GEO_BLOCKED and group == AI_GEMINI_GROUP
+                is_claude_blocked_switch = verdict == PROBE_GEO_BLOCKED and group == AI_CLAUDE_GROUP
                 if current:
                     cooldown[current] = now
                     if is_geo_blocked_switch:
@@ -2302,6 +2363,20 @@ class AIWatchService:
                             lgb[current] = now
                             state["gemini_geo_log_blocked"] = lgb
                         record_gemini_geo_blocked_node(self.paths, current, now=now)
+                    elif is_claude_blocked_switch:
+                        cb = state.get("claude_blocked")
+                        if not isinstance(cb, dict):
+                            cb = {}
+                        cb = {
+                            str(k): float(v)
+                            for k, v in cb.items()
+                            if k
+                            and isinstance(v, (int, float))
+                            and (now - float(v)) < CLAUDE_BLOCKED_TTL_SECONDS
+                        }
+                        cb[current] = now
+                        state["claude_blocked"] = cb
+                        record_claude_blocked_node(self.paths, current, now=now)
                     elif log_triggered and (current != other_leaf or ai_target_verdict is not _DEFAULT_AI_TARGET_VERDICT):
                         sf = state.get("stream_fragile")
                         if not isinstance(sf, dict):
@@ -2313,7 +2388,7 @@ class AIWatchService:
                         }
                         sf[current] = now
                         state["stream_fragile"] = sf
-                if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP):
+                if group in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP):
                     # 设切流静默保护窗（Codex / agy 单轮底层 HTTP 超时约 65-75s，设 75s 防止旧连接滞后报错误杀新健康节点）
                     silence_sec = 75.0
                     gs["last_log_fail_ts"] = max(
@@ -2331,10 +2406,12 @@ class AIWatchService:
                         self.paths,
                         target,
                         group=group,
-                        demote=current if (is_geo_blocked_switch or current != other_leaf) else None,
-                        sink_tail=is_geo_blocked_switch,
+                        demote=current
+                        if (is_geo_blocked_switch or is_claude_blocked_switch or current != other_leaf)
+                        else None,
+                        sink_tail=(is_geo_blocked_switch or is_claude_blocked_switch),
                     )
-                    if is_geo_blocked_switch:
+                    if is_geo_blocked_switch or is_claude_blocked_switch:
                         try:
                             from ..backend.runtime import RuntimeBackend
                             from ..config import config_file
@@ -2380,7 +2457,7 @@ class AIWatchService:
         active_bans = load_active_bans(self.paths, now=now)
         candidates = [c for c in group.candidates if c and not is_panel_info_node(str(c))]
         group_name = getattr(group, "name", "")
-        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP)
         if is_managed_ai:
             other_group = (
                 AI_GEMINI_GROUP
@@ -2417,6 +2494,10 @@ class AIWatchService:
             non_geo = [c for c in candidates if c and not is_gemini_geo_blocked(str(c), self.paths, now=now)]
             geo_tail = [c for c in candidates if c and is_gemini_geo_blocked(str(c), self.paths, now=now)]
             candidates = non_geo + geo_tail
+        elif group_name == AI_CLAUDE_GROUP:
+            non_blocked = [c for c in candidates if c and not is_claude_blocked(str(c), self.paths, now=now)]
+            blocked_tail = [c for c in candidates if c and is_claude_blocked(str(c), self.paths, now=now)]
+            candidates = non_blocked + blocked_tail
         for cand in candidates:
             if not cand or cand == current:
                 continue
@@ -2430,6 +2511,8 @@ class AIWatchService:
             if entry is not None and (entry.alive is False or delay_state(entry.delay) == "timeout"):
                 continue
             if group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(str(cand), self.paths, now=now):
+                continue
+            if group_name == AI_CLAUDE_GROUP and is_claude_blocked(str(cand), self.paths, now=now):
                 continue
             ts = cooldown.get(cand)
             if ts is not None and now - float(ts) < COOLDOWN_SECONDS:

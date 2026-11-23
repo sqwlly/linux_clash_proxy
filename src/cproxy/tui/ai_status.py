@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from ..backend.runtime import AI_GEMINI_GROUP, AIExit, AIRoute, delay_state
+from ..backend.runtime import AI_CLAUDE_GROUP, AI_GEMINI_GROUP, AIExit, AIRoute, delay_state
 from ..names import normalize_name
 from .widgets import escape_markup
 
@@ -86,4 +86,8 @@ def chain_markup(route: AIRoute) -> str:
         lines.append("")
         lines.append(f"[{_CHAIN_ROOT}]Gemini {escape_markup(AI_GEMINI_GROUP)}[/]")
         lines.append(f"└─ [{_OK}]{escape_markup(normalize_name(route.gemini.node))}[/]")
+    if route.claude is not None:
+        lines.append("")
+        lines.append(f"[{_CHAIN_ROOT}]Claude {escape_markup(AI_CLAUDE_GROUP)}[/]")
+        lines.append(f"└─ [{_OK}]{escape_markup(normalize_name(route.claude.node))}[/]")
     return "\n".join(lines)

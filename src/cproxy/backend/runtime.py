@@ -12,6 +12,7 @@ import yaml
 from ..config import (
     AppPaths,
     _YamlLoader,
+    ai_claude_order_file,
     ai_gemini_order_file,
     ai_manual_order_file,
     atomic_write_bytes,
@@ -34,8 +35,10 @@ AI_AUTO_GROUP = "AI-AUTO"
 AI_US_GROUP = "AI-US"
 AI_SG_GROUP = "AI-SG"
 AI_GEMINI_GROUP = "AI-GEMINI"
+AI_CLAUDE_GROUP = "AI-CLAUDE"
 AI_MANUAL_KEEPALIVE_GROUP = "AI-MANUAL-KEEPALIVE"
 AI_GEMINI_KEEPALIVE_GROUP = "AI-GEMINI-KEEPALIVE"
+AI_CLAUDE_KEEPALIVE_GROUP = "AI-CLAUDE-KEEPALIVE"
 AI_REGION_JP = "🇯🇵 Japan"
 AI_REGION_US = "🇺🇸 United States"
 AI_REGION_SG = "🇸🇬 Singapore"
@@ -44,10 +47,19 @@ GEMINI_TEST_URL = "https://www.gstatic.com/generate_204"
 KEEPALIVE_TEST_URL = "http://cp.cloudflare.com/generate_204"
 # 实测 agy Gemini 可用的地区（美/日/新/港常被 Google 判 location not supported；台/韩/英低延迟区排欧陆/南美前）
 AI_GEMINI_REGION_ORDER = ("TW", "KR", "GB", "DE", "FR", "BR", "AE", "AU")
-AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_AUTO_GROUP})
+# 实测 Anthropic / Claude Code 稳定合规地区（严格排除香港/大陆，美/日/新低延迟主力排欧亚前）
+AI_CLAUDE_REGION_ORDER = ("US", "JP", "SG", "GB", "DE", "FR", "TW", "KR")
+AI_POLICY_GROUPS = frozenset({AI_MANUAL_GROUP, AI_GEMINI_GROUP, AI_CLAUDE_GROUP, AI_AUTO_GROUP})
 # AI 面板（`cproxy ai-status` / `cproxy incident`）要展示的组，及展示顺序。
-# 单一来源：此前 cli_render 与 services.ops 各硬编码了一份同样的 5 元组。
-AI_STATUS_GROUPS = (AI_MANUAL_GROUP, AI_AUTO_GROUP, AI_US_GROUP, AI_SG_GROUP, AI_GEMINI_GROUP)
+# 单一来源：此前 cli_render 与 services.ops 各硬编码了一份同样的元组。
+AI_STATUS_GROUPS = (
+    AI_MANUAL_GROUP,
+    AI_AUTO_GROUP,
+    AI_US_GROUP,
+    AI_SG_GROUP,
+    AI_GEMINI_GROUP,
+    AI_CLAUDE_GROUP,
+)
 CHINAMAX_RULE = "RULE-SET,ChinaMax,DIRECT"
 CHINAMAX_PROVIDER = {
     "type": "file",
@@ -72,7 +84,7 @@ AI_DOMAINS = frozenset((
     "production-openaicom-storage.azureedge.net",
     "openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net",
     "chat.openai.com.cdn.cloudflare.net",
-    "sora.com", "anthropic.com", "claude.ai", "claudeusercontent.com",
+    "sora.com", "anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com",
     "x.ai", "grok.com", "openai.azure.com", "githubcopilot.com",
     "meta.ai", "llama.com", "meta.com",
     "challenges.cloudflare.com",
@@ -110,7 +122,9 @@ def _is_ai_conflict_rule(rule: object, ai_group: str = AI_MANUAL_GROUP) -> bool:
     else:
         return False
     # 末段为目标组（no-resolve 等修饰符位于中间）
-    keepalive_targets = frozenset({"H2-KEEPALIVE", "AI-MANUAL-KEEPALIVE", "AI-GEMINI-KEEPALIVE"})
+    keepalive_targets = frozenset(
+        {"H2-KEEPALIVE", "AI-MANUAL-KEEPALIVE", "AI-GEMINI-KEEPALIVE", "AI-CLAUDE-KEEPALIVE"}
+    )
     allowed = (AI_POLICY_GROUPS | keepalive_targets) if ai_group in AI_POLICY_GROUPS else frozenset({ai_group})
     return hit and parts[-1] not in allowed
 
@@ -168,8 +182,10 @@ RESERVED_MATCH_NAMES = frozenset(
         AI_US_GROUP,
         AI_SG_GROUP,
         AI_GEMINI_GROUP,
+        AI_CLAUDE_GROUP,
         AI_MANUAL_KEEPALIVE_GROUP,
         AI_GEMINI_KEEPALIVE_GROUP,
+        AI_CLAUDE_KEEPALIVE_GROUP,
         AI_REGION_JP,
         AI_REGION_US,
         AI_REGION_SG,
@@ -287,10 +303,11 @@ class AIRoute:
     active: AIExit
     standby: AIExit
     gemini: AIExit | None
+    claude: AIExit | None = None
 
 
 def resolve_ai_route(groups: dict[str, ProxyGroup]) -> AIRoute:
-    """解析 AI 出口（备用/Gemini 一并），供 CLI 与 TUI 共用。
+    """解析 AI 出口（备用/Gemini/Claude 一并），供 CLI 与 TUI 共用。
 
     这是「AI-MANUAL 的 now 可能是嵌套组、也可能是真实节点」这一不变式的单一定义点。
     备用组的映射分两种口径（见 `ai_standby_peer`）：自动模式按**池组**取显式成对
@@ -313,6 +330,11 @@ def resolve_ai_route(groups: dict[str, ProxyGroup]) -> AIRoute:
         gemini_node, gemini_delay, gemini_alive = ai_exit_metrics(groups, AI_GEMINI_GROUP)
         gemini = AIExit(AI_GEMINI_GROUP, gemini_node, gemini_delay, gemini_alive)
 
+    claude: AIExit | None = None
+    if AI_CLAUDE_GROUP in groups:
+        claude_node, claude_delay, claude_alive = ai_exit_metrics(groups, AI_CLAUDE_GROUP)
+        claude = AIExit(AI_CLAUDE_GROUP, claude_node, claude_delay, claude_alive)
+
     return AIRoute(
         present=manual is not None and auto is not None,
         auto_mode=auto_mode,
@@ -320,6 +342,7 @@ def resolve_ai_route(groups: dict[str, ProxyGroup]) -> AIRoute:
         active=AIExit(pool, active_node, active_delay, active_alive),
         standby=AIExit(standby_group, standby_node, standby_delay, standby_alive),
         gemini=gemini,
+        claude=claude,
     )
 
 
@@ -488,6 +511,49 @@ def _collect_gemini_nodes(
     return ordered
 
 
+def _collect_claude_nodes(
+    proxies: list | None,
+    group_map: dict[str, dict],
+    extra_names: list[str],
+    prefer: list | None = None,
+) -> list[str]:
+    """收集 Claude / Anthropic 专用出口：优先美/日/新/欧/台/韩合规地区，严格排除香港，1X/ws/grpc 排 IEPL/裸vision 前。"""
+    extra_set = set(extra_names)
+    proxy_by_name = _proxy_map(proxies)
+    buckets: dict[str, list[str]] = {code: [] for code in AI_CLAUDE_REGION_ORDER}
+    seen: set[str] = set()
+
+    def add(code: str, name: str) -> None:
+        if (
+            code not in buckets
+            or not name
+            or name in seen
+            or is_panel_info_node(name)
+            or name in extra_set
+            or _is_extra_node(name, extra_names)
+            or name in group_map
+        ):
+            return
+        seen.add(name)
+        buckets[code].append(name)
+
+    for proxy in proxies or []:
+        if not isinstance(proxy, dict) or not proxy.get("name"):
+            continue
+        name = str(proxy["name"])
+        add(match_region(name), name)
+
+    ordered: list[str] = []
+    for code in AI_CLAUDE_REGION_ORDER:
+        ordered.extend(_prefer_non_iepl_nodes(buckets[code], proxy_by_name))
+    ordered = _prefer_non_iepl_nodes(ordered, proxy_by_name)
+    for name in reversed([str(item) for item in prefer or []]):
+        if name in ordered:
+            ordered.remove(name)
+            ordered.insert(0, name)
+    return ordered
+
+
 def _collect_extra_ai_nodes(
     proxies: list | None,
     group_map: dict[str, dict],
@@ -543,6 +609,11 @@ def _load_ai_manual_order(paths: AppPaths) -> list[str]:
 def _load_ai_gemini_order(paths: AppPaths) -> list[str]:
     """读取 rebalance 持久化的 AI-GEMINI 稳定度排序；缺失/损坏时返回空列表（回退静态序）。"""
     return _load_order_file(ai_gemini_order_file(paths))
+
+
+def _load_ai_claude_order(paths: AppPaths) -> list[str]:
+    """读取 rebalance 持久化的 AI-CLAUDE 稳定度排序；缺失/损坏时返回空列表（回退静态序）。"""
+    return _load_order_file(ai_claude_order_file(paths))
 
 
 DEFAULT_MAX_AI_MULTIPLIER = 3.0
@@ -618,8 +689,19 @@ def _sanitize_auto_groups(groups: list) -> None:
        同秒触发，会对共享节点（如英国/韩国节点）产生 4 路并发测速踩踏，导致排在队尾的测速
        超时并引发 fallback 误切换。将非 AI 组的 300s 周期错峰为互质素数周期可根除碰撞。
     """
-    managed_ai = {AI_US_GROUP, AI_SG_GROUP, AI_AUTO_GROUP, AI_MANUAL_GROUP, AI_GEMINI_GROUP}
-    keepalive_groups = {AI_MANUAL_KEEPALIVE_GROUP, AI_GEMINI_KEEPALIVE_GROUP}
+    managed_ai = {
+        AI_US_GROUP,
+        AI_SG_GROUP,
+        AI_AUTO_GROUP,
+        AI_MANUAL_GROUP,
+        AI_GEMINI_GROUP,
+        AI_CLAUDE_GROUP,
+    }
+    keepalive_groups = {
+        AI_MANUAL_KEEPALIVE_GROUP,
+        AI_GEMINI_KEEPALIVE_GROUP,
+        AI_CLAUDE_KEEPALIVE_GROUP,
+    }
     stagger_idx = 0
     for group in groups:
         if not isinstance(group, dict):
@@ -1120,7 +1202,11 @@ def is_only_ai_group_order_change(old_text: str, new_text: str) -> bool:
             return False
         if og == ng:
             continue
-        if og.get("name") != ng.get("name") or og.get("name") not in (AI_MANUAL_GROUP, AI_GEMINI_GROUP):
+        if og.get("name") != ng.get("name") or og.get("name") not in (
+            AI_MANUAL_GROUP,
+            AI_GEMINI_GROUP,
+            AI_CLAUDE_GROUP,
+        ):
             return False
         if {k: v for k, v in og.items() if k != "proxies"} != {k: v for k, v in ng.items() if k != "proxies"}:
             return False
@@ -1197,6 +1283,23 @@ def _resolve_healthy_ws_cdn_ip(domain: str, port: int, sni: str) -> str | None:
     """返回当前最优的可完成 TLS 握手的健康 CDN Anycast IP。"""
     healthy = _resolve_healthy_ws_cdn_ips(domain, port, sni)
     return healthy[0] if healthy else None
+
+
+def _tune_anytls_idle_sessions(proxies: list | None) -> None:
+    """放宽 anytls 节点的短空闲会话回收（如订阅默认的 30s），减少 AI 工具执行/长思考间隙冷重连抖动。"""
+    if not isinstance(proxies, list):
+        return
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        if str(proxy.get("type") or "").strip().lower() != "anytls":
+            continue
+        raw_timeout = proxy.get("idle-session-timeout")
+        if isinstance(raw_timeout, int) and not isinstance(raw_timeout, bool) and 0 < raw_timeout < 120:
+            proxy["idle-session-timeout"] = 120
+        raw_check = proxy.get("idle-session-check-interval")
+        if isinstance(raw_check, int) and not isinstance(raw_check, bool) and 0 < raw_check < 60:
+            proxy["idle-session-check-interval"] = 60
 
 
 def _optimize_ws_cdn_servers(
@@ -1367,6 +1470,7 @@ class RuntimeBackend:
             raise ValueError(f"配置文件格式无效（顶层必须是 YAML 映射）: {source_path}")
 
         _sanitize_dns_fallback_filter(data)
+        _tune_anytls_idle_sessions(data.get("proxies"))
         _optimize_ws_cdn_servers(
             data.get("proxies"),
             probe_tls=not bool(os.environ.get("PYTEST_CURRENT_TEST")),
@@ -1469,7 +1573,7 @@ class RuntimeBackend:
         ) + _deprioritize_high_multiplier(
             [n for n in extra_gemini_nodes if n not in gemini_leaves], max_mult=max_ai_mult
         )
-        from ..services.probe import is_gemini_geo_blocked
+        from ..services.probe import is_claude_blocked, is_gemini_geo_blocked
 
         prefer_set = {str(p) for p in gemini_prefer if p}
         non_geo_blocked_gemini = [
@@ -1480,6 +1584,37 @@ class RuntimeBackend:
         ]
         if non_geo_blocked_gemini and geo_blocked_gemini:
             gemini_proxies = non_geo_blocked_gemini + geo_blocked_gemini
+
+        claude_prefer = data.get("ai-claude-prefer")
+        if not isinstance(claude_prefer, list):
+            claude_prefer = []
+        claude_order = _load_ai_claude_order(self.paths)
+        claude_leaves = _collect_claude_nodes(data.get("proxies"), group_map, extra_names, claude_prefer)
+        claude_leaves = filter_unbanned_nodes(claude_leaves, active_bans, keep_fallback=True)
+        if not claude_leaves:
+            claude_leaves = list(us_proxies) + list(jp_proxies) + list(sg_proxies)
+        raw_extra_claude = _collect_extra_ai_nodes(
+            data.get("proxies"), group_map, extra_names, AI_CLAUDE_REGION_ORDER
+        )
+        extra_claude_nodes = filter_unbanned_nodes(
+            raw_extra_claude,
+            active_bans,
+            keep_fallback=False,
+        )
+        claude_proxies = _order_manual_candidates(
+            claude_leaves, claude_prefer, claude_order, max_mult=max_ai_mult
+        ) + _deprioritize_high_multiplier(
+            [n for n in extra_claude_nodes if n not in claude_leaves], max_mult=max_ai_mult
+        )
+        claude_prefer_set = {str(p) for p in claude_prefer if p}
+        non_blocked_claude = [
+            n for n in claude_proxies if n in claude_prefer_set or not is_claude_blocked(n, self.paths)
+        ]
+        blocked_claude = [
+            n for n in claude_proxies if n not in claude_prefer_set and is_claude_blocked(n, self.paths)
+        ]
+        if non_blocked_claude and blocked_claude:
+            claude_proxies = non_blocked_claude + blocked_claude
 
         groups = _drop_named_groups(groups, set(EMOJI_REGION_GROUPS))
         group_map = {group["name"]: group for group in groups if isinstance(group, dict) and group.get("name")}
@@ -1547,6 +1682,16 @@ class RuntimeBackend:
                 "max-failed-times": 1,
                 "expected-status": 204,
             },
+            {
+                "name": AI_CLAUDE_GROUP,
+                "type": "fallback",
+                "proxies": claude_proxies,
+                "url": TEST_URL,
+                "interval": 120,
+                "lazy": False,
+                "max-failed-times": 2,
+                "expected-status": 204,
+            },
         ]
         if h2_keepalive_active:
             ai_groups.extend(
@@ -1567,6 +1712,14 @@ class RuntimeBackend:
                         "interval": 15,
                         "lazy": False,
                     },
+                    {
+                        "name": AI_CLAUDE_KEEPALIVE_GROUP,
+                        "type": "fallback",
+                        "proxies": ["H2-KEEPALIVE", AI_CLAUDE_GROUP],
+                        "url": KEEPALIVE_TEST_URL,
+                        "interval": 15,
+                        "lazy": False,
+                    },
                 ]
             )
 
@@ -1576,8 +1729,10 @@ class RuntimeBackend:
             AI_US_GROUP,
             AI_SG_GROUP,
             AI_GEMINI_GROUP,
+            AI_CLAUDE_GROUP,
             AI_MANUAL_KEEPALIVE_GROUP,
             AI_GEMINI_KEEPALIVE_GROUP,
+            AI_CLAUDE_KEEPALIVE_GROUP,
         }
         filtered_groups = [group for group in groups if not (isinstance(group, dict) and group.get("name") in managed_names)]
 
@@ -1615,6 +1770,10 @@ class RuntimeBackend:
         codex_keepalive_rule = (
             "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com),(DOMAIN,api.openai.com))),(NETWORK,TCP),"
             f"(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),{AI_MANUAL_KEEPALIVE_GROUP}"
+        )
+        claude_keepalive_rule = (
+            "AND,((DOMAIN,api.anthropic.com),(NETWORK,TCP),"
+            f"(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),{AI_CLAUDE_KEEPALIVE_GROUP}"
         )
         ai_rules = [
             # Google / Gemini / Antigravity —— 必须排在 PROCESS-NAME,agy 之前，
@@ -1666,10 +1825,12 @@ class RuntimeBackend:
             f"DOMAIN,chat.openai.com.cdn.cloudflare.net,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,sora.com,{AI_MANUAL_GROUP}",
             f"DOMAIN,cdn.auth0.com,{AI_MANUAL_GROUP}",
-            # Anthropic
-            f"DOMAIN-SUFFIX,anthropic.com,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,claude.ai,{AI_MANUAL_GROUP}",
-            f"DOMAIN-SUFFIX,claudeusercontent.com,{AI_MANUAL_GROUP}",
+            # Anthropic / Claude Code（独立 AI-CLAUDE 出口，含 platform.claude.com / claude.com OAuth 域名统一出口防风控）
+            *([claude_keepalive_rule] if h2_keepalive_active else []),
+            f"DOMAIN-SUFFIX,anthropic.com,{AI_CLAUDE_GROUP}",
+            f"DOMAIN-SUFFIX,claude.ai,{AI_CLAUDE_GROUP}",
+            f"DOMAIN-SUFFIX,claude.com,{AI_CLAUDE_GROUP}",
+            f"DOMAIN-SUFFIX,claudeusercontent.com,{AI_CLAUDE_GROUP}",
             # xAI / Meta AI / Azure OpenAI / GitHub Copilot
             f"DOMAIN-SUFFIX,x.ai,{AI_MANUAL_GROUP}",
             f"DOMAIN-SUFFIX,grok.com,{AI_MANUAL_GROUP}",
@@ -1717,8 +1878,14 @@ class RuntimeBackend:
             "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE",
             "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE",
             "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE",
+            # 旧版曾将 Anthropic/Claude 归入 AI-MANUAL，现独立至 AI-CLAUDE，热重载时清理残留死规则
+            f"DOMAIN-SUFFIX,anthropic.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,claude.ai,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,claude.com,{AI_MANUAL_GROUP}",
+            f"DOMAIN-SUFFIX,claudeusercontent.com,{AI_MANUAL_GROUP}",
             h2_keepalive_rule,
             codex_keepalive_rule,
+            claude_keepalive_rule,
         }
 
         clean_rules = [

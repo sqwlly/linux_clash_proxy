@@ -24,10 +24,12 @@ DEFAULT_KEEPALIVE_PORT = 7895
 DEFAULT_UPSTREAM_PROXY_HOST = "127.0.0.1"
 DEFAULT_UPSTREAM_PROXY_PORT = 7890
 CLOUDCODE_HOST = "daily-cloudcode-pa.googleapis.com"
+ANTHROPIC_API_HOST = "api.anthropic.com"
 H1_TO_H2_HOSTS = frozenset(
     {
         CLOUDCODE_HOST,
         "aicode.googleapis.com",
+        ANTHROPIC_API_HOST,
     }
 )
 KEEPALIVE_HOSTS = frozenset(
@@ -37,6 +39,7 @@ KEEPALIVE_HOSTS = frozenset(
         "chatgpt.com",
         "ws.chatgpt.com",
         "api.openai.com",
+        ANTHROPIC_API_HOST,
     }
 )
 LEAF_CERT_SANS = (
@@ -46,8 +49,10 @@ LEAF_CERT_SANS = (
     "*.chatgpt.com",
     "openai.com",
     "*.openai.com",
+    ANTHROPIC_API_HOST,
+    "*.anthropic.com",
 )
-LEAF_SAN_VERSION = "v2:googleapis+chatgpt+openai"
+LEAF_SAN_VERSION = "v3:googleapis+chatgpt+openai+anthropic"
 CA_COMMON_NAME = "cproxy Local H2 Keepalive CA"
 # 上游 Cloudflare 按 TLS 指纹挑战。stdlib OpenSSL 会得到 Cf-Mitigated，
 # 同一出口上完整 Chrome 指纹可以到达源站（401，缺登录态）。
@@ -2260,7 +2265,7 @@ class H2KeepaliveProxy:
                 or target_host not in KEEPALIVE_HOSTS
                 or target_port != 443
             )
-            if not passthrough and target_host in H1_TO_H2_HOSTS:
+            if not passthrough and target_host in (CLOUDCODE_HOST, "aicode.googleapis.com"):
                 passthrough = await asyncio.to_thread(
                     client_prefers_passthrough,
                     self.trust_installed_mtime,
@@ -2310,7 +2315,14 @@ class H2KeepaliveProxy:
 
             try:
                 await client_w.start_tls(self.server_ssl)
-            except ssl.SSLError:
+            except ssl.SSLError as exc:
+                # 若客户端（如未配置 NODE_EXTRA_CA_CERTS 的原生 claude.exe）拒绝本地叶子证书，
+                # 短期降级该主机为透明 TCP 直通，确保客户端重试立即成功而非锁死。
+                err_text = str(exc).lower()
+                if target_host == ANTHROPIC_API_HOST and any(
+                    tok in err_text for tok in ("unknown ca", "unknown_ca", "certificate unknown", "bad certificate")
+                ):
+                    self._passthrough_until[target_host] = time.monotonic() + 300.0
                 return
 
             cli_ssl_obj = client_w.get_extra_info("ssl_object")

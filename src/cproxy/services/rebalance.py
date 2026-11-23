@@ -16,16 +16,31 @@ from ..backend.api import APIBackend
 from ..backend.process import ProcessBackend
 from ..backend.runtime import (
     AI_AUTO_GROUP,
+    AI_CLAUDE_GROUP,
     AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     DEFAULT_MAX_AI_MULTIPLIER,
     RuntimeBackend,
     _deprioritize_high_multiplier,
+    _load_ai_claude_order,
     _load_ai_gemini_order,
     _load_ai_manual_order,
 )
-from ..config import AppPaths, ai_gemini_order_file, ai_manual_order_file, read_config, runtime_file
-from .diagnostics import DEFAULT_GOOGLE_GEO_URL, PROBE_GEO_BLOCKED, PROBE_OK, ai_target_verdict
+from ..config import (
+    AppPaths,
+    ai_claude_order_file,
+    ai_gemini_order_file,
+    ai_manual_order_file,
+    read_config,
+    runtime_file,
+)
+from .diagnostics import (
+    DEFAULT_AI_PROBE_TARGETS,
+    DEFAULT_GOOGLE_GEO_URL,
+    PROBE_GEO_BLOCKED,
+    PROBE_OK,
+    ai_target_verdict,
+)
 from .nodelist import match_region
 from .probe import (
     GEMINI_FAST_REGIONS,
@@ -33,13 +48,16 @@ from .probe import (
     ProbeService,
     ProbeSummary,
     _atomic_write_text,
+    clear_claude_blocked_node,
     clear_gemini_geo_blocked_node,
     clear_stream_fragile_node,
+    is_claude_blocked,
     is_gemini_geo_blocked,
     is_healthy_non_iepl_summary,
     is_iepl_node,
     is_static_iepl_node,
     probe_paths_context,
+    record_claude_blocked_node,
     record_gemini_geo_blocked_node,
     record_stream_fragile_node,
     resolve_current_leaf,
@@ -53,6 +71,7 @@ def _atomic_write_json(path: Path, payload: object) -> None:
 
 REBALANCE_PROFILE = "codex"
 REBALANCE_GEMINI_PROFILE = "gemini"
+REBALANCE_CLAUDE_PROFILE = "claude"
 # 排序时对历史失败惩罚的加权倍数：跨多次探测的惩罚自然平滑单轮噪声，
 # 削弱「一轮 5/5、下一轮 1/5」的名次翻转。
 HISTORY_PENALTY_WEIGHT = 4.0
@@ -70,26 +89,30 @@ def _smooth_rank_key(
     *,
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
+    penalize_claude_blocked: bool = False,
 ):
     """`rank_key` 基础上加重历史惩罚权重。
 
     rank_key = (-成功数, 失败数, 最大延迟+惩罚, 平均延迟+惩罚, 惩罚, 名字)。
     这里把已叠加的惩罚还原成裸延迟，再按权重重新叠加，得到更稳的排序。
-    当 `prefer_non_iepl=True`（AI-GEMINI / AI-MANUAL）时：
+    当 `prefer_non_iepl=True`（AI-GEMINI / AI-MANUAL / AI-CLAUDE）时：
     - Tier 0: 零动态断流且本轮全通健康的非专线节点（healthy_non_iepl）
     - Tier 1: 零动态断流且本轮多数成功的非专线节点（alive_non_iepl）
     - Tier 2: 曾有动态重试记录但本身非静态 IEPL/裸 vision 的存活节点（防止 1X 节点偶发重试后跌到 50s 必断的 IEPL 之后）
     - Tier 3: 静态 IEPL / 裸 vision 健康节点
     - Tier 4: 其余劣化/超时节点
-    - Tier 5: 近期被 Google/Gemini 判定为地区受限（送中 CN / HK）的隔离节点
+    - Tier 5: 近期被 Google/Gemini 或 Anthropic/Claude 判定为地区受限/风控的隔离节点
     """
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     weighted = penalty * HISTORY_PENALTY_WEIGHT
     max_w = max_plus_p - penalty + weighted
     avg_w = avg_plus_p - penalty + weighted
-    geo_quarantined = penalize_gemini_geo_blocked and is_gemini_geo_blocked(summary.name)
+    geo_quarantined = (
+        (penalize_gemini_geo_blocked and is_gemini_geo_blocked(summary.name))
+        or (penalize_claude_blocked and is_claude_blocked(summary.name))
+    )
     if not prefer_non_iepl:
-        if penalize_gemini_geo_blocked:
+        if penalize_gemini_geo_blocked or penalize_claude_blocked:
             return (
                 1 if geo_quarantined else 0,
                 neg_success,
@@ -188,6 +211,9 @@ class RebalanceReport:
     gemini_ordered: tuple[str, ...] = ()
     gemini_order_path: str = ""
     gemini_switched_to: str | None = None
+    claude_ordered: tuple[str, ...] = ()
+    claude_order_path: str = ""
+    claude_switched_to: str | None = None
 
 
 class RebalanceService:
@@ -208,6 +234,7 @@ class RebalanceService:
             max_mult = DEFAULT_MAX_AI_MULTIPLIER
         manual_prefer = cfg.get("ai-manual-prefer") if isinstance(cfg, dict) else None
         gemini_prefer = cfg.get("ai-gemini-prefer") if isinstance(cfg, dict) else None
+        claude_prefer = cfg.get("ai-claude-prefer") if isinstance(cfg, dict) else None
 
         probe_service = ProbeService(self.paths)
         if not dry_run and not is_external and type(probe_service) is ProbeService and not os.environ.get("PYTEST_CURRENT_TEST"):
@@ -215,6 +242,7 @@ class RebalanceService:
 
             prev_manual = _load_ai_manual_order(self.paths)
             prev_gemini = _load_ai_gemini_order(self.paths)
+            prev_claude = _load_ai_claude_order(self.paths)
             if (
                 prev_manual
                 and not is_static_iepl_node(prev_manual[0], self.paths)
@@ -228,6 +256,8 @@ class RebalanceService:
                     reason="deferred-inflight-ai-transfer",
                     gemini_ordered=tuple(prev_gemini),
                     gemini_order_path=str(ai_gemini_order_file(self.paths)) if prev_gemini else "",
+                    claude_ordered=tuple(prev_claude),
+                    claude_order_path=str(ai_claude_order_file(self.paths)) if prev_claude else "",
                 )
         report = probe_service.probe(
             group=AI_MANUAL_GROUP,
@@ -276,6 +306,42 @@ class RebalanceService:
         except (RuntimeError, KeyError, ValueError):
             gemini_report = None
             gemini_ordered = []
+
+        claude_report = None
+        claude_ordered: list[str] = []
+        claude_order_path = ai_claude_order_file(self.paths)
+        try:
+            claude_groups_available = True
+            if type(probe_service) is ProbeService:
+                try:
+                    claude_groups_available = AI_CLAUDE_GROUP in probe_service.api.get_groups()
+                except Exception:
+                    claude_groups_available = False
+            if claude_groups_available:
+                claude_report = probe_service.probe(
+                    group=AI_CLAUDE_GROUP,
+                    profile=REBALANCE_CLAUDE_PROFILE,
+                    record_history=True,
+                )
+                claude_ordered = [
+                    summary.name
+                    for summary in sorted(
+                        claude_report.summaries,
+                        key=lambda s: _smooth_rank_key(
+                            s,
+                            prefer_non_iepl=True,
+                            penalize_claude_blocked=True,
+                        ),
+                    )
+                ]
+                claude_ordered = _deprioritize_high_multiplier(
+                    claude_ordered,
+                    max_mult=max_mult,
+                    prefer=claude_prefer if isinstance(claude_prefer, list) else None,
+                )
+        except (RuntimeError, KeyError, ValueError):
+            claude_report = None
+            claude_ordered = []
 
         if ordered and not self._should_switch_current(report, ordered[0], AI_MANUAL_GROUP):
             cur_manual = getattr(report, "current", None)
@@ -351,6 +417,49 @@ class RebalanceService:
             ):
                 gemini_ordered = [cur_gemini] + [n for n in gemini_ordered if n != cur_gemini]
 
+        if (
+            claude_ordered
+            and claude_report is not None
+            and not self._should_switch_current(claude_report, claude_ordered[0], AI_CLAUDE_GROUP)
+        ):
+            cur_claude = getattr(claude_report, "current", None)
+            cur_claude_verdict = getattr(claude_report, "current_verdict", None)
+            cur_claude_summary = next(
+                (s for s in getattr(claude_report, "summaries", ()) or () if getattr(s, "name", None) == cur_claude),
+                None,
+            )
+            best_claude_summary = next(
+                (
+                    s
+                    for s in getattr(claude_report, "summaries", ()) or ()
+                    if getattr(s, "name", None) == claude_ordered[0]
+                ),
+                None,
+            )
+            cur_claude_usable = bool(
+                cur_claude_verdict is not None
+                and not is_claude_blocked(cur_claude, self.paths)
+                and (
+                    getattr(cur_claude_verdict, "stable", False)
+                    or cur_claude_summary is None
+                    or (
+                        getattr(cur_claude_summary, "success_count", 0) > 0
+                        and getattr(cur_claude_summary, "success_count", 0)
+                        >= getattr(best_claude_summary, "success_count", 0)
+                    )
+                )
+            )
+            if (
+                cur_claude
+                and cur_claude_usable
+                and cur_claude in claude_ordered
+                and not (
+                    is_static_iepl_node(cur_claude, self.paths)
+                    and not is_static_iepl_node(claude_ordered[0], self.paths)
+                )
+            ):
+                claude_ordered = [cur_claude] + [n for n in claude_ordered if n != cur_claude]
+
         if dry_run:
             return RebalanceReport(
                 ordered=tuple(ordered),
@@ -360,6 +469,8 @@ class RebalanceService:
                 reason="dry-run",
                 gemini_ordered=tuple(gemini_ordered),
                 gemini_order_path=str(gemini_order_path) if gemini_ordered else "",
+                claude_ordered=tuple(claude_ordered),
+                claude_order_path=str(claude_order_path) if claude_ordered else "",
             )
 
         from .ban import filter_unbanned_nodes, load_active_bans
@@ -390,6 +501,17 @@ class RebalanceService:
         if gemini_order_updated:
             _atomic_write_json(gemini_order_path, gemini_ordered)
 
+        claude_previous_order = _load_ai_claude_order(self.paths)
+        if latest_bans and claude_ordered:
+            claude_ordered = filter_unbanned_nodes(claude_ordered, latest_bans, keep_fallback=True)
+            claude_previous_order = filter_unbanned_nodes(claude_previous_order, latest_bans, keep_fallback=True)
+        claude_order_updated = bool(
+            claude_ordered and not _should_keep_previous_order(claude_previous_order, claude_ordered)
+        )
+        effective_claude_order = claude_ordered if claude_order_updated else (claude_previous_order or claude_ordered)
+        if claude_order_updated:
+            _atomic_write_json(claude_order_path, claude_ordered)
+
         rerendered = False
         hot_reloaded = False
         if is_external:
@@ -410,7 +532,7 @@ class RebalanceService:
             rerendered = True
 
             is_stale = getattr(process, "is_runtime_stale", lambda _path=None: False)(runtime_path)
-            if running and (order_updated or gemini_order_updated or runtime_changed or is_stale):
+            if running and (order_updated or gemini_order_updated or claude_order_updated or runtime_changed or is_stale):
                 from ..backend.runtime import is_only_ai_group_order_change
                 from .ai_watch import has_any_inflight_ai_connection
 
@@ -463,6 +585,18 @@ class RebalanceService:
                     gemini_switched_to,
                 )
 
+        claude_switched_to: str | None = None
+        if running and claude_report is not None and effective_claude_order:
+            claude_switched_to = self._switch_if_current_unstable(
+                claude_report, effective_claude_order[0], AI_CLAUDE_GROUP
+            )
+            if type(probe_service) is ProbeService and not os.environ.get("PYTEST_CURRENT_TEST"):
+                effective_claude_order, claude_switched_to = self._verify_claude_api_eligibility(
+                    list(effective_claude_order),
+                    claude_order_path,
+                    claude_switched_to,
+                )
+
         try:
             import time as _time
 
@@ -485,6 +619,9 @@ class RebalanceService:
             gemini_ordered=tuple(effective_gemini_order),
             gemini_order_path=str(gemini_order_path) if effective_gemini_order else "",
             gemini_switched_to=gemini_switched_to,
+            claude_ordered=tuple(effective_claude_order),
+            claude_order_path=str(claude_order_path) if effective_claude_order else "",
+            claude_switched_to=claude_switched_to,
         )
 
     def _verify_gemini_stream_hold(
@@ -663,6 +800,92 @@ class RebalanceService:
                 pass
         return ordered, switched_to
 
+    def _verify_claude_api_eligibility(
+        self,
+        ordered: list[str],
+        order_path,
+        switched_to: str | None,
+        max_attempts: int = 4,
+    ) -> tuple[list[str], str | None]:
+        """对 AI-CLAUDE 当前生效节点做一次 Anthropic API 403/地区风控实测验毒。
+
+        若当前出口触发 403 / 地区限制 / Cloudflare WAF 拦截，立即写入 12h 隔离池、
+        沉底并切至下一干净候选，避免 Claude Code 请求撞上被封 IP。
+        """
+        cfg = read_config(self.paths)
+        claude_url = str(
+            (cfg.get("ai-claude-api-url") if isinstance(cfg, dict) else None)
+            or DEFAULT_AI_PROBE_TARGETS[3][1]
+        )
+        try:
+            query = QueryService(self.paths)
+            groups = query.api.get_groups()
+            group_obj = groups.get(AI_CLAUDE_GROUP)
+            if group_obj is None:
+                return ordered, switched_to
+            active_node = (
+                switched_to
+                or resolve_current_leaf(groups, AI_CLAUDE_GROUP)
+                or str(group_obj.current or "")
+                or (ordered[0] if ordered else "")
+            )
+        except Exception:
+            return ordered, switched_to
+
+        tried: set[str] = set()
+        demoted = False
+        for _ in range(max(1, max_attempts)):
+            if not active_node or active_node in tried:
+                break
+            tried.add(active_node)
+            try:
+                verdict = ai_target_verdict(self.paths, claude_url, timeout=4, retries=1)
+            except Exception:
+                break
+            if verdict == PROBE_OK:
+                clear_claude_blocked_node(self.paths, active_node)
+                break
+            if verdict != PROBE_GEO_BLOCKED:
+                break
+            record_claude_blocked_node(self.paths, active_node)
+            if active_node in ordered:
+                ordered.remove(active_node)
+                ordered.append(active_node)
+                demoted = True
+            next_candidate = next(
+                (c for c in ordered if c not in tried and not is_claude_blocked(c, self.paths)),
+                None,
+            )
+            if not next_candidate:
+                break
+            try:
+                try:
+                    query.switch_group(
+                        AI_CLAUDE_GROUP,
+                        next_candidate,
+                        drop_connections=True,
+                        force_drop=True,
+                    )
+                except TypeError:
+                    try:
+                        query.switch_group(AI_CLAUDE_GROUP, next_candidate, drop_connections=True)
+                    except TypeError:
+                        query.switch_group(AI_CLAUDE_GROUP, next_candidate)
+                switched_to = next_candidate
+                active_node = next_candidate
+                from .ai_watch import record_external_automatic_switch
+
+                record_external_automatic_switch(self.paths, AI_CLAUDE_GROUP, next_candidate)
+            except (Exception, SystemExit):
+                break
+
+        if demoted:
+            try:
+                _atomic_write_json(Path(order_path), ordered)
+            except OSError:
+                pass
+        return ordered, switched_to
+
     @staticmethod
     def _should_switch_current(
         report,
@@ -686,10 +909,17 @@ class RebalanceService:
             and (best_summary is None or getattr(best_summary, "success_count", 0) > 0)
         ):
             return True
+        if (
+            group_name == AI_CLAUDE_GROUP
+            and is_claude_blocked(current_node)
+            and not is_claude_blocked(best_candidate)
+            and (best_summary is None or getattr(best_summary, "success_count", 0) > 0)
+        ):
+            return True
         cur_is_failing = cur_summary is not None and getattr(cur_summary, "success_count", 0) <= getattr(
             cur_summary, "failures", 0
         )
-        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+        is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP)
         migrating_off_static_iepl_with_majority_1x = (
             is_managed_ai
             and (is_static_iepl_node(current_node) or cur_is_failing)
@@ -741,6 +971,8 @@ class RebalanceService:
                 return None
             if group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(best_candidate, self.paths):
                 return None
+            if group_name == AI_CLAUDE_GROUP and is_claude_blocked(best_candidate, self.paths):
+                return None
 
             query = QueryService(self.paths)
             groups_map = query.api.get_groups()
@@ -753,11 +985,17 @@ class RebalanceService:
             live_current = resolve_current_leaf(groups_map, group_name) or getattr(group_obj, "current", None)
             if rep_current and live_current and live_current != rep_current:
                 live_banned = bool(active_bans and is_node_banned(live_current, active_bans))
-                live_geo_blocked = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(live_current, self.paths)
+                live_geo_blocked = (
+                    (group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(live_current, self.paths))
+                    or (group_name == AI_CLAUDE_GROUP and is_claude_blocked(live_current, self.paths))
+                )
                 if not live_banned and not live_geo_blocked and not is_static_iepl_node(live_current, self.paths):
                     return None
             current_node = live_current or rep_current
-            cur_geo_blocked = group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(current_node, self.paths)
+            cur_geo_blocked = (
+                (group_name == AI_GEMINI_GROUP and is_gemini_geo_blocked(current_node, self.paths))
+                or (group_name == AI_CLAUDE_GROUP and is_claude_blocked(current_node, self.paths))
+            )
             cur_banned = bool(current_node and active_bans and is_node_banned(current_node, active_bans))
             from .ai_watch import automatic_switch_block_reason, has_active_ai_transfer
 
@@ -775,7 +1013,7 @@ class RebalanceService:
             should_drop = (
                 cur_geo_blocked
                 or cur_banned
-                or group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP)
+                or group_name not in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP)
                 or is_static_iepl_node(current_node, self.paths)
             )
             try:

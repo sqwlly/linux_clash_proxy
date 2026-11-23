@@ -7,6 +7,7 @@ from ..backend.api import APIBackend, APIUnavailableError
 from ..backend.models import ConnectionEntry, ProviderEntry, ProxyGroup, QueryContext
 from ..backend.runtime import (
     AI_AUTO_GROUP,
+    AI_CLAUDE_GROUP,
     AI_GEMINI_GROUP,
     AI_MANUAL_GROUP,
     AI_PROCESS_NAMES,
@@ -28,6 +29,7 @@ AI_SWITCH_DROP_GROUPS = frozenset(
         AI_US_GROUP,
         AI_SG_GROUP,
         AI_GEMINI_GROUP,
+        AI_CLAUDE_GROUP,
         AI_REGION_JP,
         AI_REGION_US,
         AI_REGION_SG,
@@ -242,7 +244,7 @@ class QueryService:
             leaf = str(chains[0]) if isinstance(chains, list) and chains else ""
             if keep_leaf and leaf == keep_leaf:
                 continue
-            if not force and group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP) and leaf:
+            if not force and group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP) and leaf:
                 upload = self._to_int(item.get("upload"))
                 download = self._to_int(item.get("download"))
                 raw_meta = item.get("metadata")
@@ -312,7 +314,9 @@ class QueryService:
             return False
         if group_name == AI_GEMINI_GROUP:
             return AI_GEMINI_GROUP in chain_names
-        if AI_GEMINI_GROUP in chain_names:
+        if group_name == AI_CLAUDE_GROUP:
+            return AI_CLAUDE_GROUP in chain_names
+        if AI_GEMINI_GROUP in chain_names or AI_CLAUDE_GROUP in chain_names:
             return False
         if group_name in chain_names or AI_MANUAL_GROUP in chain_names:
             return True

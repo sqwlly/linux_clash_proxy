@@ -21,7 +21,9 @@ GROUP_ALIASES: dict[str, str] = {
     "ai出口": "AI-MANUAL",
     "ai 出口": "AI-MANUAL",
     "codex": "AI-MANUAL",
-    "claude": "AI-MANUAL",
+    "claude": "AI-CLAUDE",
+    "ai-claude": "AI-CLAUDE",
+    "anthropic": "AI-CLAUDE",
     "chatgpt": "AI-MANUAL",
     "gemini": "AI-GEMINI",
     "ai-gemini": "AI-GEMINI",
@@ -82,6 +84,8 @@ def resolve_group_alias(
     alias_target = GROUP_ALIASES.get(lower)
     if alias_target and alias_target in group_set:
         return alias_target
+    if alias_target == "AI-CLAUDE" and "AI-MANUAL" in group_set:
+        return "AI-MANUAL"
 
     folded = normalize_name(needle).lower()
     folded_hits = [name for name in group_list if normalize_name(name).lower() == folded]

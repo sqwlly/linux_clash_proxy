@@ -867,7 +867,10 @@ rules:
     assert "DOMAIN-KEYWORD,claude,PROXY" not in rules
 
     # AI 域名覆盖与下载直连规则应注入，且前移到订阅规则之前
-    assert "DOMAIN-SUFFIX,claudeusercontent.com,AI-MANUAL" in rules
+    assert "DOMAIN-SUFFIX,anthropic.com,AI-CLAUDE" in rules
+    assert "DOMAIN-SUFFIX,claude.ai,AI-CLAUDE" in rules
+    assert "DOMAIN-SUFFIX,claude.com,AI-CLAUDE" in rules
+    assert "DOMAIN-SUFFIX,claudeusercontent.com,AI-CLAUDE" in rules
     assert "DOMAIN-SUFFIX,sora.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,grok.com,AI-MANUAL" in rules
     assert "DOMAIN-SUFFIX,meta.ai,AI-MANUAL" in rules

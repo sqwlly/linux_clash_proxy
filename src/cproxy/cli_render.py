@@ -15,6 +15,7 @@ from .backend.api import APIBackend
 from .backend.models import AIProbeReport, ProxyGroup
 from .backend.runtime import (
     AI_AUTO_GROUP,
+    AI_CLAUDE_GROUP,
     AI_GEMINI_GROUP,
     AI_SG_GROUP,
     AI_STATUS_GROUPS,
@@ -412,7 +413,7 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
     的单一实现负责，CLI 与 TUI 不会各算一套。
     """
     route = resolve_ai_route(groups)
-    active, standby, gemini = route.active, route.standby, route.gemini
+    active, standby, gemini, claude = route.active, route.standby, route.gemini, route.claude
     return {
         "auto_mode": route.auto_mode,
         # 非自动池这一支的旧值先后是「兜底 <节点名>」（把节点当组名）与「兜底 · 手动」
@@ -436,6 +437,14 @@ def _resolve_ai_route(groups: dict) -> dict[str, object]:
         "gemini_alive": gemini.alive if gemini is not None else None,
         "gemini_summary": (
             _exit_summary(AI_GEMINI_GROUP, gemini.node, gemini.delay) if gemini is not None else "-"
+        ),
+        "claude_present": claude is not None,
+        "claude_group": AI_CLAUDE_GROUP,
+        "claude_node": claude.node if claude is not None else "-",
+        "claude_delay": _delay_cell(claude.delay) if claude is not None else "-",
+        "claude_alive": claude.alive if claude is not None else None,
+        "claude_summary": (
+            _exit_summary(AI_CLAUDE_GROUP, claude.node, claude.delay) if claude is not None else "-"
         ),
     }
 
@@ -697,6 +706,10 @@ def _render_ai_status(groups: dict, raw: bool, json_output: bool = False) -> int
     if route["gemini_present"]:
         exits.append(
             ("Gemini", AI_GEMINI_GROUP, route["gemini_node"], route["gemini_delay"], route["gemini_alive"])
+        )
+    if route.get("claude_present"):
+        exits.append(
+            ("Claude", AI_CLAUDE_GROUP, route["claude_node"], route["claude_delay"], route["claude_alive"])
         )
     exit_rows: list[list[TableCell]] = [
         [
@@ -1050,7 +1063,7 @@ def _render_ai_egress_topology(egress_details: dict, gemini_summary: str) -> Non
     print()
     headers = ["通道", "看护", "线路品质", "活跃连接", "候选池健康度", "顺位备选"]
     rows: list[list[TableCell]] = []
-    for label, group_key in (("通用出口", "AI-MANUAL"), ("Gemini", "AI-GEMINI")):
+    for label, group_key in (("通用出口", "AI-MANUAL"), ("Gemini", "AI-GEMINI"), ("Claude", "AI-CLAUDE")):
         info = egress_details.get(group_key)
         if not isinstance(info, dict):
             continue
@@ -1210,6 +1223,7 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
         ai_mode = "-"
         ai_summary = "-"
         gemini_summary = "-"
+        claude_summary = "-"
         groups_map: dict = {}
         try:
             groups_map = QueryService(paths).get_ai_status_groups()
@@ -1219,6 +1233,8 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
             ai_summary = str(route["active_summary"])
             if route.get("gemini_present"):
                 gemini_summary = str(route["gemini_summary"])
+            if route.get("claude_present"):
+                claude_summary = str(route["claude_summary"])
         except APIUnavailableError:
             pass
         try:
@@ -1272,6 +1288,7 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
                 "ai_mode": ai_mode,
                 "ai_route": ai_summary,
                 "ai_gemini_route": gemini_summary,
+                "ai_claude_route": claude_summary,
                 "metrics": {
                     "connections": _connection_count(paths) if api_text == "可访问" else None,
                     "uptime_seconds": metrics.uptime_seconds,
@@ -1364,6 +1381,8 @@ def _render_status(raw: bool, process_top: int = STATUS_PROCESS_TOP_DEFAULT, jso
     ]
     if gemini_summary != "-":
         ai_rows.append(("Gemini", _accent(gemini_summary)))
+    if claude_summary != "-":
+        ai_rows.append(("Claude", _accent(claude_summary)))
     _render_kv(ai_rows)
     _render_ai_egress_topology(egress_details, gemini_summary)
 

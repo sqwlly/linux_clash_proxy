@@ -51,13 +51,17 @@ PROFILES = {
     "codex": {"url": "https://chatgpt.com/backend-api/codex/responses/compact", "strategy": "conservative"},
     "chatgpt": {"url": "https://chatgpt.com", "strategy": "balanced"},
     "github": {"url": "https://github.com", "strategy": "balanced"},
-    "claude": {"url": "https://claude.ai", "strategy": "conservative"},
+    "claude": {"url": "https://api.anthropic.com/v1/messages", "strategy": "conservative"},
     "gemini": {"url": "https://generativelanguage.googleapis.com/v1beta/models", "strategy": "conservative"},
 }
 
 
 def default_group_for_profile(profile: str) -> str:
-    return "AI-GEMINI" if profile == "gemini" else DEFAULT_GROUP
+    if profile == "gemini":
+        return "AI-GEMINI"
+    if profile == "claude":
+        return "AI-CLAUDE"
+    return DEFAULT_GROUP
 
 
 @dataclass(frozen=True)
@@ -176,12 +180,14 @@ def resolve_current_leaf(groups: dict[str, ProxyGroup], group_name: str) -> str 
 _IEPL_KEYWORDS = ("IEPL", "IPLC", "内网专线")
 STREAM_FRAGILE_TTL_SECONDS = 1800.0
 GEMINI_GEO_BLOCKED_TTL_SECONDS = 12 * 3600.0
+CLAUDE_BLOCKED_TTL_SECONDS = 12 * 3600.0
 _ACTIVE_PATHS_VAR: ContextVar[AppPaths | None] = ContextVar("cproxy_probe_active_paths", default=None)
 _ACTIVE_PATHS = _ACTIVE_PATHS_VAR
 _FRAGILE_STATE_LOCK = threading.RLock()
 _CONFIG_FRAGILE_CACHE: tuple[str, int, frozenset[str]] = ("", -1, frozenset())
 _DYNAMIC_FRAGILE_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
 _GEMINI_GEO_BLOCKED_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
+_CLAUDE_BLOCKED_CACHE: tuple[str, int, int, dict[str, float]] = ("", -1, -1, {})
 
 
 def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
@@ -277,9 +283,10 @@ def update_ai_watch_state(
 
 
 def invalidate_probe_state_cache() -> None:
-    global _DYNAMIC_FRAGILE_CACHE, _GEMINI_GEO_BLOCKED_CACHE
+    global _DYNAMIC_FRAGILE_CACHE, _GEMINI_GEO_BLOCKED_CACHE, _CLAUDE_BLOCKED_CACHE
     _DYNAMIC_FRAGILE_CACHE = ("", -1, -1, {})
     _GEMINI_GEO_BLOCKED_CACHE = ("", -1, -1, {})
+    _CLAUDE_BLOCKED_CACHE = ("", -1, -1, {})
 
 
 @contextmanager
@@ -502,6 +509,99 @@ def clear_gemini_geo_blocked_node(paths: AppPaths, name: str | None) -> None:
         pass
 
 
+def _load_claude_blocked_map(paths: AppPaths) -> dict[str, float]:
+    global _CLAUDE_BLOCKED_CACHE
+    try:
+        from ..config import ai_watch_state_file
+
+        state_path = ai_watch_state_file(paths)
+        if not state_path.exists():
+            return {}
+        st = state_path.stat()
+        key = str(state_path)
+        if (
+            _CLAUDE_BLOCKED_CACHE[0] == key
+            and _CLAUDE_BLOCKED_CACHE[1] == st.st_mtime_ns
+            and _CLAUDE_BLOCKED_CACHE[2] == st.st_size
+        ):
+            return _CLAUDE_BLOCKED_CACHE[3]
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        raw = data.get("claude_blocked") if isinstance(data, dict) else None
+        parsed = (
+            {str(k): float(v) for k, v in raw.items() if k and isinstance(v, (int, float))}
+            if isinstance(raw, dict)
+            else {}
+        )
+        _CLAUDE_BLOCKED_CACHE = (key, st.st_mtime_ns, st.st_size, parsed)
+        return parsed
+    except Exception:
+        return {}
+
+
+def is_claude_blocked(name: str | None, paths: AppPaths | None = None, *, now: float | None = None) -> bool:
+    """判断节点是否近期被 Anthropic / Claude 判定为 403/地区风控隔离。"""
+    if not name:
+        return False
+    eff_paths = paths or _ACTIVE_PATHS_VAR.get()
+    if eff_paths is None:
+        return False
+    blocked_map = _load_claude_blocked_map(eff_paths)
+    ts = blocked_map.get(str(name))
+    if ts is None:
+        return False
+    ts_now = time.time() if now is None else now
+    return (ts_now - float(ts)) < CLAUDE_BLOCKED_TTL_SECONDS
+
+
+def record_claude_blocked_node(paths: AppPaths, name: str | None, *, now: float | None = None) -> None:
+    """持久化记录节点在 AI-CLAUDE 上触发 403/地区风控（TTL 12 小时）。"""
+    if not name:
+        return
+    try:
+        ts_now = time.time() if now is None else now
+        node = str(name)
+
+        def _mutate(data: dict[str, Any]) -> bool:
+            cb = data.get("claude_blocked")
+            if not isinstance(cb, dict):
+                cb = {}
+            cb = {
+                str(k): float(v)
+                for k, v in cb.items()
+                if k and isinstance(v, (int, float)) and (ts_now - float(v)) < CLAUDE_BLOCKED_TTL_SECONDS
+            }
+            cb[node] = ts_now
+            data["claude_blocked"] = cb
+            return True
+
+        update_ai_watch_state(paths, _mutate)
+    except Exception:
+        pass
+
+
+def clear_claude_blocked_node(paths: AppPaths, name: str | None) -> None:
+    if not name:
+        return
+    try:
+        from ..config import ai_watch_state_file
+
+        if not ai_watch_state_file(paths).exists():
+            return
+        node = str(name)
+
+        def _mutate(data: dict[str, Any]) -> bool:
+            cb = data.get("claude_blocked")
+            if not isinstance(cb, dict) or node not in cb:
+                return False
+            cb.pop(node, None)
+            data["claude_blocked"] = cb
+            return True
+
+        update_ai_watch_state(paths, _mutate)
+    except Exception:
+        pass
+
+
 def is_static_iepl_node(name: str | None, paths: AppPaths | None = None) -> bool:
     """判定节点是否为静态专线/裸 vision 易断流节点（名称含 IEPL/IPLC/内网专线，或底层协议为裸 TCP xtls-rprx-vision）。"""
     if not name:
@@ -633,9 +733,17 @@ def probe_rank_key(
     *,
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
+    penalize_claude_blocked: bool = False,
 ) -> tuple[int, int, int, int, int, int, int, int, str]:
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
-    geo_tier = 1 if (penalize_gemini_geo_blocked and is_gemini_geo_blocked(summary.name)) else 0
+    geo_tier = (
+        1
+        if (
+            (penalize_gemini_geo_blocked and is_gemini_geo_blocked(summary.name))
+            or (penalize_claude_blocked and is_claude_blocked(summary.name))
+        )
+        else 0
+    )
     healthy_non_iepl = is_healthy_non_iepl_summary(summary)
     if prefer_non_iepl:
         if healthy_non_iepl and not geo_tier:
@@ -663,6 +771,7 @@ def active_candidates_after_round(
     *,
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
+    penalize_claude_blocked: bool = False,
 ) -> set[str]:
     penalties = history_penalties or {}
     summaries = [
@@ -681,6 +790,7 @@ def active_candidates_after_round(
             for s in summaries
             if is_healthy_non_iepl_summary(s)
             and not (penalize_gemini_geo_blocked and is_gemini_geo_blocked(s.name))
+            and not (penalize_claude_blocked and is_claude_blocked(s.name))
         )
         keep = max(keep, healthy_non_iepl_count)
     active = {
@@ -691,6 +801,7 @@ def active_candidates_after_round(
                 s,
                 prefer_non_iepl=prefer_non_iepl,
                 penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
+                penalize_claude_blocked=penalize_claude_blocked,
             ),
         )[:keep]
     }
@@ -699,6 +810,7 @@ def active_candidates_after_round(
             if (
                 not is_static_iepl_node(s.name)
                 and not (penalize_gemini_geo_blocked and is_gemini_geo_blocked(s.name))
+                and not (penalize_claude_blocked and is_claude_blocked(s.name))
                 and (s.success_count > 0 or (s.failures <= 1 and s.history_penalty_ms < 200))
             ):
                 active.add(s.name)
@@ -749,6 +861,7 @@ def switch_skip_reason(
     *,
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
+    penalize_claude_blocked: bool = False,
 ) -> str:
     if best is None:
         return "没有可切换的成功节点"
@@ -758,6 +871,12 @@ def switch_skip_reason(
         penalize_gemini_geo_blocked
         and is_gemini_geo_blocked(current)
         and not is_gemini_geo_blocked(best.name)
+    ):
+        return ""
+    if (
+        penalize_claude_blocked
+        and is_claude_blocked(current)
+        and not is_claude_blocked(best.name)
     ):
         return ""
     if prefer_non_iepl and is_iepl_node(current) and is_healthy_non_iepl_summary(best):
@@ -783,6 +902,7 @@ def _preview_reason(
     *,
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
+    penalize_claude_blocked: bool = False,
 ) -> str:
     if not verdict.stable:
         if not current_verdict.stable:
@@ -794,6 +914,7 @@ def _preview_reason(
                 strategy,
                 prefer_non_iepl=prefer_non_iepl,
                 penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
+                penalize_claude_blocked=penalize_claude_blocked,
             )
         return verdict.reason
     return switch_skip_reason(
@@ -804,6 +925,7 @@ def _preview_reason(
         strategy,
         prefer_non_iepl=prefer_non_iepl,
         penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
+        penalize_claude_blocked=penalize_claude_blocked,
     )
 
 
@@ -938,8 +1060,12 @@ class ProbeService:
                     {n: results[n] for n in active},
                     current,
                     penalties,
-                    prefer_non_iepl=(group in ("AI-GEMINI", "AI-MANUAL") or profile in ("gemini", "codex")),
+                    prefer_non_iepl=(
+                        group in ("AI-GEMINI", "AI-MANUAL", "AI-CLAUDE")
+                        or profile in ("gemini", "codex", "claude")
+                    ),
                     penalize_gemini_geo_blocked=(group == "AI-GEMINI" or profile == "gemini"),
+                    penalize_claude_blocked=(group == "AI-CLAUDE" or profile == "claude"),
                 )
                 if show_progress:
                     progress.commit(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}")
@@ -947,8 +1073,12 @@ class ProbeService:
         if show_progress:
             progress.commit("完成")
 
-        prefer_non_iepl = group in ("AI-GEMINI", "AI-MANUAL") or profile in ("gemini", "codex")
+        prefer_non_iepl = (
+            group in ("AI-GEMINI", "AI-MANUAL", "AI-CLAUDE")
+            or profile in ("gemini", "codex", "claude")
+        )
         penalize_gemini_geo = group == "AI-GEMINI" or profile == "gemini"
+        penalize_claude_geo = group == "AI-CLAUDE" or profile == "claude"
         summaries = tuple(
             ProbeSummary(
                 name=n,
@@ -966,6 +1096,7 @@ class ProbeService:
                     s,
                     prefer_non_iepl=prefer_non_iepl,
                     penalize_gemini_geo_blocked=penalize_gemini_geo,
+                    penalize_claude_blocked=penalize_claude_geo,
                 ),
             )
             if successful
@@ -983,6 +1114,7 @@ class ProbeService:
             strategy,
             prefer_non_iepl=prefer_non_iepl,
             penalize_gemini_geo_blocked=penalize_gemini_geo,
+            penalize_claude_blocked=penalize_claude_geo,
         )
 
         switched = False
@@ -1003,7 +1135,7 @@ class ProbeService:
                     query = QueryService(self.paths)
                     query.api = self.api
                     for grp, _target in reversed(path):
-                        if grp != "AI-GEMINI" or is_iepl_node(current):
+                        if grp not in ("AI-GEMINI", "AI-CLAUDE") or is_iepl_node(current):
                             query._drop_stale_ai_connections(grp, keep_leaf=best.name)
                 except Exception:
                     pass

@@ -1,9 +1,9 @@
 // cproxy Clash Verge (Rev) 全局扩展脚本 (Preprocess Script)
 // 完整移植自 cproxy runtime.py：
 // 1. 节点重名消歧、443 WebSocket CDN 独立 Host 优选、TCP Keep-Alive (15s) 与防断流参数加固
-// 2. 自动构建 AI-GEMINI / AI-MANUAL / AI-AUTO / AI-US / AI-SG 策略组
+// 2. 自动构建 AI-GEMINI / AI-CLAUDE / AI-MANUAL / AI-AUTO / AI-US / AI-SG 策略组
 // 3. 1X / WebSocket / gRPC 抗断流节点排在 IEPL / 裸 xtls-rprx-vision 之前，高倍率 (>=3X) 沉底
-// 4. 剔除订阅冲突 AI 规则，置顶注入 Google/Gemini/Cloud Code 与 OpenAI/Codex/Claude 分流规则
+// 4. 剔除订阅冲突 AI 规则，置顶注入 Google/Gemini/Cloud Code、Anthropic/Claude 与 OpenAI/Codex 分流规则
 
 const TEST_URL = "https://cp.cloudflare.com/generate_204";
 const GEMINI_TEST_URL = "https://www.gstatic.com/generate_204";
@@ -12,6 +12,7 @@ const DEFAULT_KEEPALIVE_PORT = 7895;
 const DEFAULT_MAX_AI_MULTIPLIER = 3.0;
 const STAGGERED_AUTO_INTERVALS = [317, 323, 331, 337, 347, 349, 353, 359];
 const AI_GEMINI_REGION_ORDER = ["TW", "KR", "GB", "DE", "FR", "BR", "AE", "AU"];
+const AI_CLAUDE_REGION_ORDER = ["US", "JP", "SG", "GB", "DE", "FR", "TW", "KR"];
 const AI_MANUAL_REGION_ORDER = ["US", "JP", "SG", "KR", "GB", "TW", "FR", "DE"];
 
 const PANEL_INFO_RE = /剩余流量|套餐到期|距离下次重置|官网|群组|导航|下次重置|到期时间|流量重置|重置剩余|过期时间|有效期|Expire|Traffic|网址|公告|客服|频道|\b\d+(?:\.\d+)?\s*[KMGTPE]i?B\s*(?:[|/]|of)\s*\d+(?:\.\d+)?\s*[KMGTPE]i?B\b/i;
@@ -41,7 +42,7 @@ const AI_DOMAINS = new Set([
   "production-openaicom-storage.azureedge.net",
   "openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net",
   "chat.openai.com.cdn.cloudflare.net",
-  "sora.com", "anthropic.com", "claude.ai", "claudeusercontent.com",
+  "sora.com", "anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com",
   "x.ai", "grok.com", "openai.azure.com", "githubcopilot.com",
   "meta.ai", "llama.com", "meta.com",
   "challenges.cloudflare.com",
@@ -189,6 +190,22 @@ function optimizeWsCdnServers(proxies) {
   }
 }
 
+function tuneAnytlsProxies(proxies) {
+  if (!Array.isArray(proxies)) return;
+  for (const proxy of proxies) {
+    if (!proxy || typeof proxy !== "object") continue;
+    if (String(proxy.type || "").trim().toLowerCase() !== "anytls") continue;
+    const rawTimeout = proxy["idle-session-timeout"];
+    if (typeof rawTimeout === "number" && rawTimeout > 0 && rawTimeout < 120) {
+      proxy["idle-session-timeout"] = 120;
+    }
+    const rawCheck = proxy["idle-session-check-interval"];
+    if (typeof rawCheck === "number" && rawCheck > 0 && rawCheck < 60) {
+      proxy["idle-session-check-interval"] = 60;
+    }
+  }
+}
+
 function isAiConflictRule(rule) {
   if (typeof rule !== "string") return false;
   const parts = rule.split(",").map(s => s.trim());
@@ -206,7 +223,16 @@ function isAiConflictRule(rule) {
     return false;
   }
   const target = parts[parts.length - 1];
-  return hit && !["AI-MANUAL", "AI-GEMINI", "AI-AUTO", "AI-MANUAL-KEEPALIVE", "AI-GEMINI-KEEPALIVE", "H2-KEEPALIVE"].includes(target);
+  return hit && ![
+    "AI-MANUAL",
+    "AI-GEMINI",
+    "AI-CLAUDE",
+    "AI-AUTO",
+    "AI-MANUAL-KEEPALIVE",
+    "AI-GEMINI-KEEPALIVE",
+    "AI-CLAUDE-KEEPALIVE",
+    "H2-KEEPALIVE",
+  ].includes(target);
 }
 
 function normalizeIpCidrRule(rule) {
@@ -221,8 +247,9 @@ function normalizeIpCidrRule(rule) {
 function main(config) {
   if (!config || typeof config !== "object") return config;
 
-  // 1. 消歧重名节点 & 优选 443 WS CDN 子域
+  // 1. 消歧重名节点、放宽 anytls 空闲会话超时 & 优选 443 WS CDN 子域
   dedupeProxyNames(config);
+  tuneAnytlsProxies(config.proxies);
   optimizeWsCdnServers(config.proxies);
 
   // 2. 清理易卡死 mihomo 的 geosite fallback-filter、补齐游戏/加速器 fake-ip-filter & 注入长连接保活设置
@@ -332,7 +359,18 @@ function main(config) {
   }
   const geminiProxies = deprioritizeHighMultiplier(geminiLeaves);
 
-  // 5. 构建 AI-US / AI-SG / AI-MANUAL 候选池
+  // 5. 构建 AI-CLAUDE / AI-US / AI-SG / AI-MANUAL 候选池
+  let claudeLeaves = [];
+  for (const code of AI_CLAUDE_REGION_ORDER) {
+    for (const n of buckets.get(code) || []) {
+      if (!claudeLeaves.includes(n)) claudeLeaves.push(n);
+    }
+  }
+  if (claudeLeaves.length === 0) {
+    claudeLeaves = [...allValidNodes];
+  }
+  const claudeProxies = deprioritizeHighMultiplier(preferNonIeplNodes(claudeLeaves, proxyMap));
+
   let usProxies = deprioritizeHighMultiplier(buckets.get("US") || []);
   let sgProxies = deprioritizeHighMultiplier(buckets.get("SG") || []);
   const fallbackPool = usProxies.length
@@ -383,6 +421,16 @@ function main(config) {
       "expected-status": 204,
     },
     {
+      name: "AI-CLAUDE",
+      type: "fallback",
+      proxies: claudeProxies,
+      url: TEST_URL,
+      interval: 120,
+      lazy: false,
+      "max-failed-times": 2,
+      "expected-status": 204,
+    },
+    {
       name: "AI-MANUAL-KEEPALIVE",
       type: "fallback",
       proxies: ["H2-KEEPALIVE", "AI-MANUAL"],
@@ -398,6 +446,14 @@ function main(config) {
       interval: 15,
       lazy: false,
     },
+    {
+      name: "AI-CLAUDE-KEEPALIVE",
+      type: "fallback",
+      proxies: ["H2-KEEPALIVE", "AI-CLAUDE"],
+      url: KEEPALIVE_TEST_URL,
+      interval: 15,
+      lazy: false,
+    },
   ];
 
   const managedNames = new Set([
@@ -406,8 +462,10 @@ function main(config) {
     "AI-AUTO",
     "AI-MANUAL",
     "AI-GEMINI",
+    "AI-CLAUDE",
     "AI-MANUAL-KEEPALIVE",
     "AI-GEMINI-KEEPALIVE",
+    "AI-CLAUDE-KEEPALIVE",
   ]);
   const rawGroups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
   const filteredGroups = rawGroups.filter(g => g && !managedNames.has(String(g.name || "")));
@@ -441,6 +499,8 @@ function main(config) {
     "AND,((OR,((DOMAIN,daily-cloudcode-pa.googleapis.com),(DOMAIN,aicode.googleapis.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),AI-GEMINI-KEEPALIVE";
   const codexKeepaliveRule =
     "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com),(DOMAIN,api.openai.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN))),(NOT,((OR,((PROCESS-NAME,chrome.exe),(PROCESS-NAME,msedge.exe),(PROCESS-NAME,firefox.exe),(PROCESS-NAME,brave.exe)))))),AI-MANUAL-KEEPALIVE";
+  const claudeKeepaliveRule =
+    "AND,((DOMAIN,api.anthropic.com),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN))),(NOT,((OR,((PROCESS-NAME,chrome.exe),(PROCESS-NAME,msedge.exe),(PROCESS-NAME,firefox.exe),(PROCESS-NAME,brave.exe)))))),AI-CLAUDE-KEEPALIVE";
 
   const aiRules = [
     "DOMAIN-SUFFIX,google.com,AI-GEMINI",
@@ -482,9 +542,11 @@ function main(config) {
     "DOMAIN,chat.openai.com.cdn.cloudflare.net,AI-MANUAL",
     "DOMAIN-SUFFIX,sora.com,AI-MANUAL",
     "DOMAIN,cdn.auth0.com,AI-MANUAL",
-    "DOMAIN-SUFFIX,anthropic.com,AI-MANUAL",
-    "DOMAIN-SUFFIX,claude.ai,AI-MANUAL",
-    "DOMAIN-SUFFIX,claudeusercontent.com,AI-MANUAL",
+    claudeKeepaliveRule,
+    "DOMAIN-SUFFIX,anthropic.com,AI-CLAUDE",
+    "DOMAIN-SUFFIX,claude.ai,AI-CLAUDE",
+    "DOMAIN-SUFFIX,claude.com,AI-CLAUDE",
+    "DOMAIN-SUFFIX,claudeusercontent.com,AI-CLAUDE",
     "DOMAIN-SUFFIX,x.ai,AI-MANUAL",
     "DOMAIN-SUFFIX,grok.com,AI-MANUAL",
     "DOMAIN-SUFFIX,meta.ai,AI-MANUAL",
@@ -567,13 +629,22 @@ function main(config) {
     "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(IN-TYPE,HTTP)),H2-KEEPALIVE",
     "AND,((DOMAIN,daily-cloudcode-pa.googleapis.com),(NOT,((IN-TYPE,SOCKS5)))),H2-KEEPALIVE",
     "AND,((OR,((DOMAIN,chatgpt.com),(DOMAIN,ws.chatgpt.com))),(NETWORK,TCP),(OR,((IN-TYPE,HTTP),(IN-TYPE,TUN)))),H2-KEEPALIVE",
+    "DOMAIN-SUFFIX,anthropic.com,AI-MANUAL",
+    "DOMAIN-SUFFIX,claude.ai,AI-MANUAL",
+    "DOMAIN-SUFFIX,claude.com,AI-MANUAL",
+    "DOMAIN-SUFFIX,claudeusercontent.com,AI-MANUAL",
   ]);
   const isLegacyKeepaliveRule = rule => {
     if (typeof rule !== "string") return false;
     const parts = rule.split(",").map(s => s.trim());
     if (parts.length < 2) return false;
     const target = parts[parts.length - 1];
-    return target === "H2-KEEPALIVE" || target === "AI-MANUAL-KEEPALIVE" || target === "AI-GEMINI-KEEPALIVE";
+    return (
+      target === "H2-KEEPALIVE" ||
+      target === "AI-MANUAL-KEEPALIVE" ||
+      target === "AI-GEMINI-KEEPALIVE" ||
+      target === "AI-CLAUDE-KEEPALIVE"
+    );
   };
 
   const frontSet = new Set([...aiRules, ...gameDirectRules, ...bulkDownloadDirect]);

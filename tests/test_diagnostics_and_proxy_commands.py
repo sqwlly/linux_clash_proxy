@@ -320,8 +320,8 @@ def test_ai_probe_uses_panel_timeout_by_default(tmp_path: Path, monkeypatch):
 
     report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
 
-    assert len(report.results) == 3
-    assert captured == [3, 3, 3]
+    assert len(report.results) == 4
+    assert captured == [3, 3, 3, 3]
 
     captured.clear()
     (config_dir / "config.yaml").write_text(
@@ -331,7 +331,7 @@ def test_ai_probe_uses_panel_timeout_by_default(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
     DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
-    assert captured == [6, 6, 6]
+    assert captured == [6, 6, 6, 6]
 
 
 def test_ai_probe_retries_transient_failures(tmp_path: Path, monkeypatch):
@@ -346,6 +346,7 @@ def test_ai_probe_retries_transient_failures(tmp_path: Path, monkeypatch):
         "http://probe.local/chatgpt": 0,
         "http://probe.local/openai-api": 0,
         "http://probe.local/gemini-api": 0,
+        "http://probe.local/claude-api": 0,
     }
 
     class _Response:
@@ -380,17 +381,19 @@ def test_ai_probe_retries_transient_failures(tmp_path: Path, monkeypatch):
         "mixed-port: 7890\n"
         "ai-chatgpt-url: http://probe.local/chatgpt\n"
         "ai-openai-api-url: http://probe.local/openai-api\n"
-        "ai-gemini-api-url: http://probe.local/gemini-api\n",
+        "ai-gemini-api-url: http://probe.local/gemini-api\n"
+        "ai-claude-api-url: http://probe.local/claude-api\n",
         encoding="utf-8",
     )
 
     report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe()
 
-    assert [item.ok for item in report.results] == [True, True, True]
+    assert [item.ok for item in report.results] == [True, True, True, True]
     assert attempts == {
         "http://probe.local/chatgpt": 2,
         "http://probe.local/openai-api": 2,
         "http://probe.local/gemini-api": 1,
+        "http://probe.local/claude-api": 1,
     }
 
 
@@ -408,6 +411,7 @@ def test_ai_probe_waits_between_retries(tmp_path: Path, monkeypatch):
         "http://probe.local/chatgpt": 0,
         "http://probe.local/openai-api": 0,
         "http://probe.local/gemini-api": 0,
+        "http://probe.local/claude-api": 0,
     }
 
     class _Response:
@@ -436,7 +440,8 @@ def test_ai_probe_waits_between_retries(tmp_path: Path, monkeypatch):
         "mixed-port: 7890\n"
         "ai-chatgpt-url: http://probe.local/chatgpt\n"
         "ai-openai-api-url: http://probe.local/openai-api\n"
-        "ai-gemini-api-url: http://probe.local/gemini-api\n",
+        "ai-gemini-api-url: http://probe.local/gemini-api\n"
+        "ai-claude-api-url: http://probe.local/claude-api\n",
         encoding="utf-8",
     )
 
@@ -542,6 +547,6 @@ def test_run_ai_probe_reports_each_result(tmp_path, monkeypatch):
     seen = []
     report = DiagnosticsService(default_paths(tmp_path)).run_ai_probe(on_result=seen.append)
 
-    assert [item.name for item in seen] == ["ChatGPT Web", "OpenAI API", "Gemini API"]
+    assert [item.name for item in seen] == ["ChatGPT Web", "OpenAI API", "Gemini API", "Claude API"]
     assert seen == report.results
     assert all(item.ok for item in report.results)
