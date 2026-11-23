@@ -93,6 +93,7 @@ LOCAL_PREFERRED_KEYS = {
     "ai-probe-timeout",
     "ai-gemini-prefer",
     "ai-manual-prefer",
+    "ai-claude-prefer",
     "max-ai-multiplier",
     "refresh-groups",
     "profile",

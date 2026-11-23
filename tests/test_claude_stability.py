@@ -482,3 +482,177 @@ def test_verge_status_and_hot_reload_surface_ai_claude(tmp_path: Path, monkeypat
     assert claude_egress.active_connections == 1
     assert claude_egress.last_verdict == "ok"
     assert try_hot_reload_verge_runtime is not None
+
+
+def test_ai_claude_prefer_region_and_node_order_end_to_end(tmp_path: Path, monkeypatch):
+    from cproxy.services.nodelist import apply_prefer_order, prefer_rank_for_node
+    from cproxy.services.verge import render_verge_preprocess_script
+
+    prefer = ["🇯🇵 Japan 01", "JP", "🇸🇬 Singapore 01", "SG", "🇺🇸 United States 02", "US"]
+    nodes = [
+        "🇺🇸 United States 01",
+        "🇺🇸 United States 02",
+        "🇹🇼 Taiwan 03",
+        "🇸🇬 Singapore 04",
+        "🇸🇬 Singapore 01",
+        "🇯🇵 Japan 03",
+        "🇯🇵 Japan 01",
+    ]
+    assert prefer_rank_for_node("🇯🇵 Japan 01", prefer) == 0
+    assert prefer_rank_for_node("🇯🇵 Japan 03", prefer) == 1
+    assert prefer_rank_for_node("🇸🇬 Singapore 01", prefer) == 2
+    assert prefer_rank_for_node("🇹🇼 Taiwan 03", prefer) == len(prefer)
+    assert prefer_rank_for_node("🇬🇧 United Kingdom 01", ["UK"]) == 0
+    assert apply_prefer_order(nodes, prefer) == [
+        "🇯🇵 Japan 01",
+        "🇯🇵 Japan 03",
+        "🇸🇬 Singapore 01",
+        "🇸🇬 Singapore 04",
+        "🇺🇸 United States 02",
+        "🇺🇸 United States 01",
+        "🇹🇼 Taiwan 03",
+    ]
+
+    # 1. Runtime rendering respects exact + region prefer and still demotes high-multiplier JP nodes
+    paths = _make_paths(tmp_path)
+    raw_cfg = {
+        "mixed-port": 7890,
+        "ai-claude-prefer": prefer,
+        "proxies": [
+            _anytls_node("🇺🇸 United States 01", "us1.example.com"),
+            _anytls_node("🇺🇸 United States 02", "us2.example.com"),
+            _anytls_node("🇹🇼 Taiwan 03", "tw3.example.com"),
+            _anytls_node("🇸🇬 Singapore 01", "sg1.example.com"),
+            _anytls_node("🇯🇵 Japan 03", "jp3.example.com"),
+            _anytls_node("🇯🇵 Japan 01", "jp1.example.com"),
+            _anytls_node("🇯🇵 Japan 5X", "jp5x.example.com"),
+        ],
+        "proxy-groups": [],
+        "rules": ["MATCH,DIRECT"],
+    }
+    config_file(paths).write_text(yaml.safe_dump(raw_cfg, allow_unicode=True), encoding="utf-8")
+    rt_path = RuntimeBackend(paths).render_runtime()
+    rt = yaml.safe_load(rt_path.read_text(encoding="utf-8"))
+    claude_grp = next(g for g in rt["proxy-groups"] if g["name"] == AI_CLAUDE_GROUP)
+    assert claude_grp["proxies"] == [
+        "🇯🇵 Japan 01",
+        "🇯🇵 Japan 03",
+        "🇸🇬 Singapore 01",
+        "🇺🇸 United States 02",
+        "🇺🇸 United States 01",
+        "🇹🇼 Taiwan 03",
+        "🇯🇵 Japan 5X",
+    ]
+
+    # 2. probe_rank_key prioritizes healthy preferred node over faster unpreferred region
+    s_jp1 = probe_mod.ProbeSummary("🇯🇵 Japan 01", (88, 89, 88), 0)
+    s_tw3 = probe_mod.ProbeSummary("🇹🇼 Taiwan 03", (60, 60, 62), 0)
+    s_jp_dead = probe_mod.ProbeSummary("🇯🇵 Japan 02", (), 3)
+    assert probe_mod.probe_rank_key(s_jp1, prefer_non_iepl=True, prefer=prefer) < probe_mod.probe_rank_key(
+        s_tw3, prefer_non_iepl=True, prefer=prefer
+    )
+    assert probe_mod.probe_rank_key(s_tw3, prefer_non_iepl=True, prefer=prefer) < probe_mod.probe_rank_key(
+        s_jp_dead, prefer_non_iepl=True, prefer=prefer
+    )
+
+    # 3. AIWatchService._pick_next prefers same-region JP backup before faster TW when JP 01 fails
+    groups = {
+        "AI-CLAUDE": ProxyGroup(
+            "AI-CLAUDE",
+            "Fallback",
+            "🇯🇵 Japan 01",
+            ["🇹🇼 Taiwan 03", "🇺🇸 United States 02", "🇸🇬 Singapore 01", "🇯🇵 Japan 03", "🇯🇵 Japan 01"],
+        ),
+        "🇹🇼 Taiwan 03": ProxyGroup("🇹🇼 Taiwan 03", "AnyTLS", "-", [], alive=True, delay=60),
+        "🇸🇬 Singapore 01": ProxyGroup("🇸🇬 Singapore 01", "AnyTLS", "-", [], alive=True, delay=85),
+        "🇺🇸 United States 02": ProxyGroup("🇺🇸 United States 02", "AnyTLS", "-", [], alive=True, delay=195),
+        "🇯🇵 Japan 03": ProxyGroup("🇯🇵 Japan 03", "AnyTLS", "-", [], alive=True, delay=105),
+        "🇯🇵 Japan 01": ProxyGroup("🇯🇵 Japan 01", "AnyTLS", "-", [], alive=True, delay=88),
+    }
+    svc = ai_watch_mod.AIWatchService(paths)
+    svc.query = SimpleNamespace(api=SimpleNamespace(get_groups=lambda: groups))
+    assert svc._pick_next(groups, groups["AI-CLAUDE"], "🇯🇵 Japan 01", {}, time.time()) == "🇯🇵 Japan 03"
+
+    # 4. RebalanceService persists ai-claude-order.json in prefer-tier order (JP -> SG -> US -> TW)
+    def _fake_probe(self, *, group, profile, record_history=False, **_kw):
+        if group == AI_CLAUDE_GROUP:
+            summaries = (
+                probe_mod.ProbeSummary("🇹🇼 Taiwan 03", (60, 60, 60), 0),
+                probe_mod.ProbeSummary("🇺🇸 United States 01", (210, 210, 210), 0),
+                probe_mod.ProbeSummary("🇺🇸 United States 02", (195, 195, 195), 0),
+                probe_mod.ProbeSummary("🇸🇬 Singapore 01", (85, 85, 85), 0),
+                probe_mod.ProbeSummary("🇯🇵 Japan 03", (105, 105, 105), 0),
+                probe_mod.ProbeSummary("🇯🇵 Japan 01", (88, 88, 88), 0),
+            )
+            return SimpleNamespace(
+                group=group,
+                profile=profile,
+                current="🇯🇵 Japan 01",
+                current_verdict=probe_mod.StabilityVerdict(True, "ok"),
+                verdict=probe_mod.StabilityVerdict(True, "ok"),
+                summaries=summaries,
+            )
+        s = probe_mod.ProbeSummary("🇹🇼 Taiwan 03", (60, 60, 60), 0)
+        return SimpleNamespace(
+            group=group,
+            profile=profile,
+            current="🇹🇼 Taiwan 03",
+            current_verdict=probe_mod.StabilityVerdict(True, "ok"),
+            verdict=probe_mod.StabilityVerdict(True, "ok"),
+            summaries=(s,),
+        )
+
+    monkeypatch.setattr(rebalance_mod.ProbeService, "probe", _fake_probe)
+    monkeypatch.setattr(
+        rebalance_mod.ProbeService,
+        "__init__",
+        lambda self, p: setattr(self, "paths", p)
+        or setattr(
+            self,
+            "api",
+            SimpleNamespace(get_groups=lambda: {"AI-MANUAL": None, "AI-GEMINI": None, "AI-CLAUDE": None}),
+        ),
+    )
+    rep = rebalance_mod.RebalanceService(paths).rebalance(dry_run=True, external_only=True)
+    assert rep.claude_ordered == (
+        "🇯🇵 Japan 01",
+        "🇯🇵 Japan 03",
+        "🇸🇬 Singapore 01",
+        "🇺🇸 United States 02",
+        "🇺🇸 United States 01",
+        "🇹🇼 Taiwan 03",
+    )
+
+    # 5. Rendered Clash Verge Script.js preserves JP-first prefer order even on manual profile refresh
+    node_bin = shutil.which("node")
+    if node_bin:
+        rendered_js = render_verge_preprocess_script(paths)
+        assert "🇯🇵 Japan 01" in rendered_js
+        script_file = tmp_path / "Script.js"
+        script_file.write_text(rendered_js, encoding="utf-8")
+        runner = (
+            "const fs = require('fs'); const vm = require('vm');"
+            f"const code = fs.readFileSync({json.dumps(str(script_file))}, 'utf8') + '\\n;globalThis.__main = main;';"
+            "const ctx = { console, globalThis: {} }; ctx.globalThis = ctx;"
+            "vm.createContext(ctx); vm.runInContext(code, ctx);"
+            "const out = ctx.__main(JSON.parse(fs.readFileSync(0, 'utf8')));"
+            "process.stdout.write(JSON.stringify(out));"
+        )
+        proc = subprocess.run(
+            [node_bin, "-e", runner],
+            input=json.dumps(raw_cfg),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        out_cfg = json.loads(proc.stdout)
+        verge_claude = next(g for g in out_cfg["proxy-groups"] if g["name"] == AI_CLAUDE_GROUP)
+        assert verge_claude["proxies"] == [
+            "🇯🇵 Japan 01",
+            "🇯🇵 Japan 03",
+            "🇸🇬 Singapore 01",
+            "🇺🇸 United States 02",
+            "🇺🇸 United States 01",
+            "🇹🇼 Taiwan 03",
+            "🇯🇵 Japan 5X",
+        ]

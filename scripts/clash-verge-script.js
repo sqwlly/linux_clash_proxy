@@ -14,6 +14,10 @@ const STAGGERED_AUTO_INTERVALS = [317, 323, 331, 337, 347, 349, 353, 359];
 const AI_GEMINI_REGION_ORDER = ["TW", "KR", "GB", "DE", "FR", "BR", "AE", "AU"];
 const AI_CLAUDE_REGION_ORDER = ["US", "JP", "SG", "GB", "DE", "FR", "TW", "KR"];
 const AI_MANUAL_REGION_ORDER = ["US", "JP", "SG", "KR", "GB", "TW", "FR", "DE"];
+const AI_CLAUDE_PREFER = [];
+const AI_GEMINI_PREFER = [];
+const AI_MANUAL_PREFER = [];
+const PREFER_REGION_CODES = new Set(["HK", "JP", "KR", "SG", "TW", "US", "AU", "BR", "AE", "DE", "FR", "GB", "UK"]);
 
 const PANEL_INFO_RE = /剩余流量|套餐到期|距离下次重置|官网|群组|导航|下次重置|到期时间|流量重置|重置剩余|过期时间|有效期|Expire|Traffic|网址|公告|客服|频道|\b\d+(?:\.\d+)?\s*[KMGTPE]i?B\s*(?:[|/]|of)\s*\d+(?:\.\d+)?\s*[KMGTPE]i?B\b/i;
 
@@ -118,12 +122,50 @@ function preferNonIeplNodes(names, proxyMap) {
   return [...clean, ...fragile];
 }
 
-function deprioritizeHighMultiplier(names, maxMult = DEFAULT_MAX_AI_MULTIPLIER) {
+function normalizePreferRegionCode(token) {
+  const cleaned = String(token || "").trim().toUpperCase();
+  if (!PREFER_REGION_CODES.has(cleaned)) return null;
+  return cleaned === "UK" ? "GB" : cleaned;
+}
+
+function preferRankForNode(name, prefer) {
+  if (!Array.isArray(prefer) || prefer.length === 0) return 0;
+  const nodeName = String(name || "").trim();
+  let nodeRegion = null;
+  for (let i = 0; i < prefer.length; i += 1) {
+    const token = String(prefer[i] || "").trim();
+    if (!token) continue;
+    const reg = normalizePreferRegionCode(token);
+    if (reg !== null) {
+      if (nodeRegion === null) nodeRegion = matchRegion(nodeName);
+      if (nodeRegion === reg) return i;
+    } else if (nodeName === token) {
+      return i;
+    }
+  }
+  return prefer.length;
+}
+
+function applyPreferOrder(names, prefer) {
+  if (!Array.isArray(names) || names.length === 0) return [];
+  if (!Array.isArray(prefer) || prefer.length === 0) return [...names];
+  return names
+    .map((name, idx) => ({ name, idx, rank: preferRankForNode(name, prefer) }))
+    .sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.idx - b.idx))
+    .map(item => item.name);
+}
+
+function deprioritizeHighMultiplier(names, maxMult = DEFAULT_MAX_AI_MULTIPLIER, prefer = []) {
   if (maxMult <= 0) return [...names];
+  const pinned = new Set(
+    (Array.isArray(prefer) ? prefer : [])
+      .map(item => String(item || "").trim())
+      .filter(token => token && normalizePreferRegionCode(token) === null)
+  );
   const normal = [];
   const high = [];
   for (const name of names) {
-    if (parseMultiplier(name) < maxMult) {
+    if (pinned.has(name) || parseMultiplier(name) < maxMult) {
       normal.push(name);
     } else {
       high.push(name);
@@ -357,7 +399,11 @@ function main(config) {
   if (geminiLeaves.length === 0) {
     geminiLeaves = [...allValidNodes];
   }
-  const geminiProxies = deprioritizeHighMultiplier(geminiLeaves);
+  const geminiProxies = deprioritizeHighMultiplier(
+    applyPreferOrder(geminiLeaves, AI_GEMINI_PREFER),
+    DEFAULT_MAX_AI_MULTIPLIER,
+    AI_GEMINI_PREFER
+  );
 
   // 5. 构建 AI-CLAUDE / AI-US / AI-SG / AI-MANUAL 候选池
   let claudeLeaves = [];
@@ -369,7 +415,11 @@ function main(config) {
   if (claudeLeaves.length === 0) {
     claudeLeaves = [...allValidNodes];
   }
-  const claudeProxies = deprioritizeHighMultiplier(preferNonIeplNodes(claudeLeaves, proxyMap));
+  const claudeProxies = deprioritizeHighMultiplier(
+    applyPreferOrder(preferNonIeplNodes(claudeLeaves, proxyMap), AI_CLAUDE_PREFER),
+    DEFAULT_MAX_AI_MULTIPLIER,
+    AI_CLAUDE_PREFER
+  );
 
   let usProxies = deprioritizeHighMultiplier(buckets.get("US") || []);
   let sgProxies = deprioritizeHighMultiplier(buckets.get("SG") || []);
@@ -392,7 +442,11 @@ function main(config) {
   if (manualLeaves.length === 0) {
     manualLeaves = [...allValidNodes];
   }
-  manualLeaves = deprioritizeHighMultiplier(preferNonIeplNodes(manualLeaves, proxyMap));
+  manualLeaves = deprioritizeHighMultiplier(
+    applyPreferOrder(preferNonIeplNodes(manualLeaves, proxyMap), AI_MANUAL_PREFER),
+    DEFAULT_MAX_AI_MULTIPLIER,
+    AI_MANUAL_PREFER
+  );
   const manualCandidates = [...manualLeaves, "AI-AUTO"];
 
   config.proxies = [

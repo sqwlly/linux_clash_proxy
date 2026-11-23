@@ -23,8 +23,10 @@ from ..config import (
 from ..services.nodelist import (
     SUBSCRIPTION_REGION_ORDER,
     SWITCH_REGION_LABELS,
+    apply_prefer_order,
     is_panel_info_node,
     match_region,
+    normalize_prefer_region_code,
 )
 from ..snapshots import snapshot_file
 from .api import APIBackend
@@ -504,11 +506,7 @@ def _collect_gemini_nodes(
     for code in AI_GEMINI_REGION_ORDER:
         ordered.extend(_prefer_non_iepl_nodes(buckets[code], proxy_by_name))
     ordered = _prefer_non_iepl_nodes(ordered, proxy_by_name)
-    for name in reversed([str(item) for item in prefer or []]):
-        if name in ordered:
-            ordered.remove(name)
-            ordered.insert(0, name)
-    return ordered
+    return apply_prefer_order(ordered, prefer)
 
 
 def _collect_claude_nodes(
@@ -547,11 +545,7 @@ def _collect_claude_nodes(
     for code in AI_CLAUDE_REGION_ORDER:
         ordered.extend(_prefer_non_iepl_nodes(buckets[code], proxy_by_name))
     ordered = _prefer_non_iepl_nodes(ordered, proxy_by_name)
-    for name in reversed([str(item) for item in prefer or []]):
-        if name in ordered:
-            ordered.remove(name)
-            ordered.insert(0, name)
-    return ordered
+    return apply_prefer_order(ordered, prefer)
 
 
 def _collect_extra_ai_nodes(
@@ -630,7 +624,11 @@ def _deprioritize_high_multiplier(
         return list(nodes)
     from ..services.node_tags import parse_node_tag
 
-    pinned = {str(item) for item in (prefer or []) if item}
+    pinned = {
+        str(item).strip()
+        for item in (prefer or [])
+        if item and normalize_prefer_region_code(str(item)) is None
+    }
     normal: list[str] = []
     high: list[str] = []
     for name in nodes:
@@ -648,28 +646,27 @@ def _order_manual_candidates(
     *,
     max_mult: float = DEFAULT_MAX_AI_MULTIPLIER,
 ) -> list[str]:
-    """按「用户钉选 → 实测稳定度序 → 静态地区兜底」排 AI-MANUAL 叶子候选，并将高倍率节点沉底。
+    """按「用户钉选（节点名/地区码）→ 实测稳定度序 → 静态地区兜底」排 AI 叶子候选，并将高倍率节点沉底。
 
-    AI-MANUAL 是 fallback：mihomo 按列表顺序找第一个存活节点，顺序即兜底优先级。
-    prefer 是 config 的 ai-manual-prefer（手动钉选），order 是 cproxy ai-rebalance
-    的实测稳定度序，静态兜底沿用美/日/新 + 非 IEPL 优先。
+    AI-MANUAL / AI-GEMINI / AI-CLAUDE 均为 fallback：mihomo 按列表顺序找第一个存活节点，顺序即兜底优先级。
+    prefer 是 config 的 ai-*-prefer（支持精确节点名与地区码如 JP/SG/US），order 是 cproxy ai-rebalance
+    的实测稳定度序，同偏好等级内仍按实测稳定度与非 IEPL 排序。
     """
     leaves_set = {str(name) for name in leaves}
-    ordered: list[str] = []
+    base: list[str] = []
     seen: set[str] = set()
 
     def add(name: str) -> None:
         if not name or name in seen or name not in leaves_set:
             return
         seen.add(name)
-        ordered.append(name)
+        base.append(name)
 
-    for name in [str(item) for item in prefer or []]:
-        add(name)
     for name in [str(item) for item in order or []]:
         add(name)
     for name in leaves:
         add(name)
+    ordered = apply_prefer_order(base, prefer)
     return _deprioritize_high_multiplier(ordered, max_mult=max_mult, prefer=prefer)
 
 
@@ -1606,13 +1603,8 @@ class RuntimeBackend:
         ) + _deprioritize_high_multiplier(
             [n for n in extra_claude_nodes if n not in claude_leaves], max_mult=max_ai_mult
         )
-        claude_prefer_set = {str(p) for p in claude_prefer if p}
-        non_blocked_claude = [
-            n for n in claude_proxies if n in claude_prefer_set or not is_claude_blocked(n, self.paths)
-        ]
-        blocked_claude = [
-            n for n in claude_proxies if n not in claude_prefer_set and is_claude_blocked(n, self.paths)
-        ]
+        non_blocked_claude = [n for n in claude_proxies if not is_claude_blocked(n, self.paths)]
+        blocked_claude = [n for n in claude_proxies if is_claude_blocked(n, self.paths)]
         if non_blocked_claude and blocked_claude:
             claude_proxies = non_blocked_claude + blocked_claude
 

@@ -2451,14 +2451,30 @@ class AIWatchService:
         其次是曾有动态断流记录但非静态 IEPL 的节点；静态 IEPL/裸 vision 不作为自动切换目标。
         """
         from .ban import is_node_banned, load_active_bans
-        from .nodelist import is_panel_info_node, match_region
+        from .nodelist import is_panel_info_node, match_region, prefer_rank_for_node
         from .probe import GEMINI_FAST_REGIONS
 
         active_bans = load_active_bans(self.paths, now=now)
         candidates = [c for c in group.candidates if c and not is_panel_info_node(str(c))]
         group_name = getattr(group, "name", "")
         is_managed_ai = group_name in (AI_GEMINI_GROUP, AI_MANUAL_GROUP, AI_CLAUDE_GROUP)
+        group_prefer: list[str] = []
         if is_managed_ai:
+            try:
+                cfg_data = read_config(self.paths)
+                if isinstance(cfg_data, dict):
+                    pref_key = (
+                        "ai-claude-prefer"
+                        if group_name == AI_CLAUDE_GROUP
+                        else ("ai-gemini-prefer" if group_name == AI_GEMINI_GROUP else "ai-manual-prefer")
+                    )
+                    raw_pref = cfg_data.get(pref_key)
+                    if isinstance(raw_pref, list):
+                        group_prefer = [
+                            str(item).strip() for item in raw_pref if item is not None and str(item).strip()
+                        ]
+            except Exception:
+                group_prefer = []
             other_group = (
                 AI_GEMINI_GROUP
                 if group_name == AI_MANUAL_GROUP
@@ -2470,15 +2486,16 @@ class AIWatchService:
                 else None
             )
 
-            def _cand_sort_key(c: str) -> tuple[int, int, int]:
+            def _cand_sort_key(c: str) -> tuple[int, int, int, int]:
                 collides = 1 if (other_active and str(c) == other_active) else 0
+                pref_rank = prefer_rank_for_node(str(c), group_prefer) if group_prefer else 0
                 entry = groups.get(c)
                 d = int(entry.delay or 0) if entry is not None and entry.delay is not None else 0
                 reg = match_region(str(c))
                 in_fast_reg = reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None)
                 fast_tier = 0 if ((0 < d < 350) or (in_fast_reg and (d == 0 or d < 450))) else 1
                 slow_penalty = 1 if d >= 450 else 0
-                return (collides, fast_tier, slow_penalty)
+                return (collides, pref_rank, fast_tier, slow_penalty)
 
             clean_non_iepl = [c for c in candidates if c and not is_iepl_node(str(c), self.paths)]
             clean_non_iepl.sort(key=lambda c: _cand_sort_key(str(c)))

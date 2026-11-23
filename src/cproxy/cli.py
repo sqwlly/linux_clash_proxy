@@ -340,7 +340,7 @@ def _run_verge(args: Namespace) -> int:
 
     if action == "script":
         out_path = Path(args.output) if args.output else None
-        script_text = export_verge_script(out_path)
+        script_text = export_verge_script(out_path, paths=paths)
         if args.json:
             emit_json(
                 "verge",

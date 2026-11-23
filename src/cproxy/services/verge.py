@@ -270,21 +270,51 @@ def load_verge_preprocess_script() -> str:
         return repo_fallback.read_text(encoding="utf-8")
 
 
-def export_verge_script(output_path: Path | None = None) -> str:
-    """导出 Clash Verge 全局扩展脚本内容；若给定 output_path 则写入文件。"""
+def _clean_prefer_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if item is not None and str(item).strip()]
+
+
+def render_verge_preprocess_script(paths: AppPaths | None = None) -> str:
+    """渲染内置 Clash Verge 全局扩展脚本，并注入 config.yaml 中的 ai-*-prefer 偏好顺序。"""
     content = load_verge_preprocess_script()
+    if paths is None:
+        return content
+    try:
+        cfg = read_config(paths)
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        return content
+    for cfg_key, js_const in (
+        ("ai-claude-prefer", "AI_CLAUDE_PREFER"),
+        ("ai-gemini-prefer", "AI_GEMINI_PREFER"),
+        ("ai-manual-prefer", "AI_MANUAL_PREFER"),
+    ):
+        prefs = _clean_prefer_list(cfg.get(cfg_key))
+        if prefs:
+            placeholder = f"const {js_const} = [];"
+            replacement = f"const {js_const} = {json.dumps(prefs, ensure_ascii=False)};"
+            content = content.replace(placeholder, replacement, 1)
+    return content
+
+
+def export_verge_script(output_path: Path | None = None, *, paths: AppPaths | None = None) -> str:
+    """导出 Clash Verge 全局扩展脚本内容；若给定 output_path 则写入文件。"""
+    content = render_verge_preprocess_script(paths)
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
     return content
 
 
-def inject_verge_global_script(verge_dir: Path) -> tuple[Path, bool]:
+def inject_verge_global_script(verge_dir: Path, *, paths: AppPaths | None = None) -> tuple[Path, bool]:
     """将全局扩展脚本直接注入 Clash Verge 的 `profiles/Script.js`，并在 `profiles.yaml` 的 `chain` 中自动启用。
 
     返回 `(写入的 JS 路径, 是否自动启用了 chain)`。
     """
-    content = load_verge_preprocess_script()
+    content = render_verge_preprocess_script(paths)
     profiles_yaml = verge_dir / "profiles.yaml"
     script_uid = "Script"
     script_filename = "Script.js"
@@ -543,6 +573,12 @@ def try_hot_reload_verge_runtime(
 
     from ..backend.runtime import _load_ai_claude_order, _load_ai_gemini_order, _load_ai_manual_order
     from .ban import filter_unbanned_nodes, is_node_banned, load_active_bans
+    from .nodelist import apply_prefer_order
+
+    cfg_local = read_config(paths)
+    manual_prefer = _clean_prefer_list(cfg_local.get("ai-manual-prefer")) if isinstance(cfg_local, dict) else []
+    gemini_prefer = _clean_prefer_list(cfg_local.get("ai-gemini-prefer")) if isinstance(cfg_local, dict) else []
+    claude_prefer = _clean_prefer_list(cfg_local.get("ai-claude-prefer")) if isinstance(cfg_local, dict) else []
 
     active_bans = load_active_bans(paths)
     manual_order = _load_ai_manual_order(paths)
@@ -574,6 +610,8 @@ def try_hot_reload_verge_runtime(
             if active_bans:
                 leaves = filter_unbanned_nodes(leaves, active_bans, keep_fallback=True)
             leaves = _apply_learned_order(leaves, manual_order)
+            if manual_prefer:
+                leaves = apply_prefer_order(leaves, manual_prefer)
             if cur_manual and cur_manual in leaves and not (active_bans and is_node_banned(cur_manual, active_bans)):
                 leaves = [cur_manual] + [x for x in leaves if x != cur_manual]
             grp["proxies"] = leaves + (["AI-AUTO"] if has_auto else [])
@@ -582,6 +620,8 @@ def try_hot_reload_verge_runtime(
             if active_bans:
                 leaves = filter_unbanned_nodes(leaves, active_bans, keep_fallback=True)
             leaves = _apply_learned_order(leaves, gemini_order)
+            if gemini_prefer:
+                leaves = apply_prefer_order(leaves, gemini_prefer)
             clean_leaves = [x for x in leaves if not is_gemini_geo_blocked(x, paths)]
             if clean_leaves and len(clean_leaves) < len(leaves):
                 leaves = clean_leaves + [x for x in leaves if is_gemini_geo_blocked(x, paths)]
@@ -598,6 +638,8 @@ def try_hot_reload_verge_runtime(
             if active_bans:
                 leaves = filter_unbanned_nodes(leaves, active_bans, keep_fallback=True)
             leaves = _apply_learned_order(leaves, claude_order)
+            if claude_prefer:
+                leaves = apply_prefer_order(leaves, claude_prefer)
             clean_leaves = [x for x in leaves if not is_claude_blocked(x, paths)]
             if clean_leaves and len(clean_leaves) < len(leaves):
                 leaves = clean_leaves + [x for x in leaves if is_claude_blocked(x, paths)]
@@ -664,7 +706,7 @@ def install_verge_oneclick(
         verge_dir=verge_dir,
     )
     fallback_js = paths.config_dir / "clash-verge-script.js"
-    export_verge_script(fallback_js)
+    export_verge_script(fallback_js, paths=paths)
 
     eff_ca_trust = (verge_dir is None) if install_ca_trust is None else bool(install_ca_trust)
     if eff_ca_trust:
@@ -680,7 +722,7 @@ def install_verge_oneclick(
             pass
 
     try:
-        injected_js, chain_enabled = inject_verge_global_script(target_dir)
+        injected_js, chain_enabled = inject_verge_global_script(target_dir, paths=paths)
     except OSError as exc:
         raise RuntimeError(f"无法注入 Clash Verge 全局扩展脚本: {target_dir}: {exc}") from exc
 

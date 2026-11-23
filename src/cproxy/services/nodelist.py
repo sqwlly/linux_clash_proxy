@@ -155,6 +155,54 @@ def match_region(proxy_name: str) -> str:
     return "OTHER"
 
 
+_PREFER_REGION_ALIASES: dict[str, str] = {"UK": "GB"}
+_KNOWN_PREFER_REGIONS: frozenset[str] = frozenset(REGION_PATTERNS.keys()) | frozenset(_PREFER_REGION_ALIASES.keys())
+
+
+def normalize_prefer_region_code(token: str) -> str | None:
+    """若偏好项为受支持的 2 字母地区码（如 JP / SG / US / UK），返回标准地区码，否则返回 None。"""
+    cleaned = str(token or "").strip().upper()
+    if cleaned in _KNOWN_PREFER_REGIONS:
+        return _PREFER_REGION_ALIASES.get(cleaned, cleaned)
+    return None
+
+
+def prefer_rank_for_node(name: str, prefer: list | tuple | None) -> int:
+    """返回节点在用户偏好列表中的最高优先级下标（越小越靠前）；未命中返回 len(prefer)。
+
+    偏好项支持：
+    - 精确节点名（如 `"🇯🇵 Japan 01"`）
+    - 2 字母地区码（如 `"JP"` / `"SG"` / `"US"` / `"GB"` / `"UK"`）
+    """
+    if not prefer:
+        return 0
+    items = [str(item).strip() for item in prefer if item is not None and str(item).strip()]
+    if not items:
+        return 0
+    node_name = str(name or "").strip()
+    node_region: str | None = None
+    for idx, token in enumerate(items):
+        reg_code = normalize_prefer_region_code(token)
+        if reg_code is not None:
+            if node_region is None:
+                node_region = match_region(node_name)
+            if node_region == reg_code:
+                return idx
+        elif node_name == token:
+            return idx
+    return len(items)
+
+
+def apply_prefer_order(nodes: list[str], prefer: list | tuple | None) -> list[str]:
+    """按用户偏好（精确节点名或地区码）稳定重排节点列表；同级内部保留原有顺序。"""
+    if not nodes or not prefer:
+        return list(nodes)
+    items = [str(item).strip() for item in prefer if item is not None and str(item).strip()]
+    if not items:
+        return list(nodes)
+    return sorted(nodes, key=lambda n: prefer_rank_for_node(str(n), items))
+
+
 def _parse_host_port(hostport: str, uri: str) -> tuple[str, int]:
     text = hostport.strip()
     if text.startswith("["):

@@ -40,6 +40,7 @@ PORTABLE_CONFIG_KEYS = (
     "subscriptions",
     "ai-manual-prefer",
     "ai-gemini-prefer",
+    "ai-claude-prefer",
     "max-ai-multiplier",
     "refresh-groups",
     "tun",

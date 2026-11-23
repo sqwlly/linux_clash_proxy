@@ -734,7 +734,8 @@ def probe_rank_key(
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
     penalize_claude_blocked: bool = False,
-) -> tuple[int, int, int, int, int, int, int, int, str]:
+    prefer: list[str] | tuple[str, ...] | None = None,
+) -> tuple[int, int, int, int, int, int, int, int, int, str]:
     neg_success, failures, max_plus_p, avg_plus_p, penalty, name = summary.rank_key()
     geo_tier = (
         1
@@ -754,6 +755,16 @@ def probe_rank_key(
             iepl_tier = 2
     else:
         iepl_tier = 0
+    if prefer:
+        from .nodelist import prefer_rank_for_node
+
+        prefer_tier = (
+            prefer_rank_for_node(summary.name, prefer)
+            if (not geo_tier and iepl_tier < 2 and summary.success_count > 0 and failures == 0)
+            else len(prefer) + 1
+        )
+    else:
+        prefer_tier = 0
     if prefer_non_iepl and iepl_tier < 2:
         from .nodelist import match_region
 
@@ -761,7 +772,7 @@ def probe_rank_key(
         region_tier = 0 if (reg in GEMINI_FAST_REGIONS or reg in ("OTHER", None)) else 1
     else:
         region_tier = 0
-    return (geo_tier, neg_success, failures, iepl_tier, region_tier, max_plus_p, avg_plus_p, penalty, name)
+    return (geo_tier, neg_success, failures, iepl_tier, prefer_tier, region_tier, max_plus_p, avg_plus_p, penalty, name)
 
 
 def active_candidates_after_round(
@@ -772,6 +783,7 @@ def active_candidates_after_round(
     prefer_non_iepl: bool = False,
     penalize_gemini_geo_blocked: bool = False,
     penalize_claude_blocked: bool = False,
+    prefer: list[str] | tuple[str, ...] | None = None,
 ) -> set[str]:
     penalties = history_penalties or {}
     summaries = [
@@ -802,6 +814,7 @@ def active_candidates_after_round(
                 prefer_non_iepl=prefer_non_iepl,
                 penalize_gemini_geo_blocked=penalize_gemini_geo_blocked,
                 penalize_claude_blocked=penalize_claude_blocked,
+                prefer=prefer,
             ),
         )[:keep]
     }
@@ -1018,6 +1031,27 @@ class ProbeService:
         candidates = filter_unbanned_nodes(candidates, load_active_bans(self.paths), keep_fallback=True)
         current = resolve_current_leaf(groups, group)
 
+        prefer_list: list[str] = []
+        try:
+            from ..config import read_config
+
+            cfg_data = read_config(self.paths)
+            if isinstance(cfg_data, dict):
+                pref_key = (
+                    "ai-claude-prefer"
+                    if (group == "AI-CLAUDE" or profile == "claude")
+                    else (
+                        "ai-gemini-prefer"
+                        if (group == "AI-GEMINI" or profile == "gemini")
+                        else ("ai-manual-prefer" if group == "AI-MANUAL" else "")
+                    )
+                )
+                raw_pref = cfg_data.get(pref_key) if pref_key else None
+                if isinstance(raw_pref, list):
+                    prefer_list = [str(item).strip() for item in raw_pref if item is not None and str(item).strip()]
+        except Exception:
+            prefer_list = []
+
         results: dict[str, dict] = {n: {"delays": [], "failures": 0} for n in candidates}
         active = set(candidates)
 
@@ -1066,6 +1100,7 @@ class ProbeService:
                     ),
                     penalize_gemini_geo_blocked=(group == "AI-GEMINI" or profile == "gemini"),
                     penalize_claude_blocked=(group == "AI-CLAUDE" or profile == "claude"),
+                    prefer=prefer_list,
                 )
                 if show_progress:
                     progress.commit(f"筛选 | 保留 {len(active)} | 淘汰 {before - len(active)}")
@@ -1097,6 +1132,7 @@ class ProbeService:
                     prefer_non_iepl=prefer_non_iepl,
                     penalize_gemini_geo_blocked=penalize_gemini_geo,
                     penalize_claude_blocked=penalize_claude_geo,
+                    prefer=prefer_list,
                 ),
             )
             if successful

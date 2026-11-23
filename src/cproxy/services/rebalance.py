@@ -41,7 +41,7 @@ from .diagnostics import (
     PROBE_OK,
     ai_target_verdict,
 )
-from .nodelist import match_region
+from .nodelist import match_region, prefer_rank_for_node
 from .probe import (
     GEMINI_FAST_REGIONS,
     GEMINI_GEO_BLOCKED_TTL_SECONDS,
@@ -323,21 +323,36 @@ class RebalanceService:
                     profile=REBALANCE_CLAUDE_PROFILE,
                     record_history=True,
                 )
+                claude_prefer_list = (
+                    [str(item).strip() for item in claude_prefer if item is not None and str(item).strip()]
+                    if isinstance(claude_prefer, list)
+                    else []
+                )
                 claude_ordered = [
                     summary.name
                     for summary in sorted(
                         claude_report.summaries,
-                        key=lambda s: _smooth_rank_key(
-                            s,
-                            prefer_non_iepl=True,
-                            penalize_claude_blocked=True,
+                        key=lambda s: (
+                            0
+                            if (
+                                s.success_count > 0
+                                and not is_claude_blocked(s.name, self.paths)
+                                and not is_static_iepl_node(s.name, self.paths)
+                            )
+                            else 1,
+                            prefer_rank_for_node(s.name, claude_prefer_list),
+                            _smooth_rank_key(
+                                s,
+                                prefer_non_iepl=True,
+                                penalize_claude_blocked=True,
+                            ),
                         ),
                     )
                 ]
                 claude_ordered = _deprioritize_high_multiplier(
                     claude_ordered,
                     max_mult=max_mult,
-                    prefer=claude_prefer if isinstance(claude_prefer, list) else None,
+                    prefer=claude_prefer_list or None,
                 )
         except (RuntimeError, KeyError, ValueError):
             claude_report = None
