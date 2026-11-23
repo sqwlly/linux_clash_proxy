@@ -413,6 +413,13 @@ class ProxiesScreen(Widget):
     def _switch_node(self, group_name: str, node_name: str) -> None:
         try:
             QueryService(self.paths).switch_group(group_name, node_name)
+            if group_name in ("AI-CLAUDE", "AI-MANUAL", "AI-GEMINI"):
+                try:
+                    from ...services.verge import persist_manual_ai_prefer
+
+                    persist_manual_ai_prefer(self.paths, group_name, node_name)
+                except Exception:
+                    pass
             safe_call_from_thread(self, self._finish_switch_node, group_name, node_name, None)
         except (Exception, SystemExit) as exc:
             safe_call_from_thread(self, self._finish_switch_node, group_name, node_name, coerce_worker_error(exc))

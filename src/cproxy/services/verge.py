@@ -29,6 +29,7 @@ from ..config import (
     ai_claude_order_file,
     ai_gemini_order_file,
     ai_manual_order_file,
+    ai_prefer_sync_file,
     ai_watch_state_file,
     atomic_write_bytes,
     atomic_write_text,
@@ -748,6 +749,235 @@ def install_verge_oneclick(
 
 
 _DAEMON_STATE_LOCK = threading.RLock()
+_PREFER_SYNC_LOCK = threading.RLock()
+
+MANAGED_AI_PREFER_CONFIG_KEYS: dict[str, str] = {
+    "AI-CLAUDE": "ai-claude-prefer",
+    "AI-MANUAL": "ai-manual-prefer",
+    "AI-GEMINI": "ai-gemini-prefer",
+}
+_NON_LEAF_AI_TARGETS = frozenset(
+    {
+        "AI-AUTO",
+        "AI-US",
+        "AI-SG",
+        "AI-MANUAL",
+        "AI-GEMINI",
+        "AI-CLAUDE",
+        "AI-MANUAL-KEEPALIVE",
+        "AI-GEMINI-KEEPALIVE",
+        "AI-CLAUDE-KEEPALIVE",
+        "H2-KEEPALIVE",
+        "DIRECT",
+        "REJECT",
+    }
+)
+
+
+def _load_prefer_sync_state(paths: AppPaths) -> dict[str, Any]:
+    path = ai_prefer_sync_file(paths)
+    with _PREFER_SYNC_LOCK:
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+
+def _save_prefer_sync_state(paths: AppPaths, state: dict[str, Any]) -> None:
+    path = ai_prefer_sync_file(paths)
+    with _PREFER_SYNC_LOCK:
+        try:
+            atomic_write_text(
+                path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                mode=0o600,
+            )
+        except OSError:
+            pass
+
+
+def record_cproxy_fixed_selection(paths: AppPaths, group_name: str, target_name: str) -> None:
+    """记录由 cproxy 自身写入的 AI 策略组 fixed 目标，防止守护进程误把自动切流当成用户手动点选。"""
+    if group_name not in MANAGED_AI_PREFER_CONFIG_KEYS or not target_name:
+        return
+    with _PREFER_SYNC_LOCK:
+        state = _load_prefer_sync_state(paths)
+        synced = dict(state.get("synced_fixed") or {})
+        synced[group_name] = str(target_name).strip()
+        state["synced_fixed"] = synced
+        state["updated_at"] = time.time()
+        _save_prefer_sync_state(paths, state)
+
+
+def persist_manual_ai_prefer(
+    paths: AppPaths,
+    group_name: str,
+    selected_node: str,
+    *,
+    verge_dir: Path | None = None,
+) -> list[str] | None:
+    """将用户手动选中的 AI 出口节点持久化到 config.yaml、order 文件与 Clash Verge Script.js。"""
+    from ..audit import write_audit_event
+    from .nodelist import apply_prefer_order, is_panel_info_node, merge_manual_prefer
+
+    cfg_key = MANAGED_AI_PREFER_CONFIG_KEYS.get(group_name)
+    node = str(selected_node or "").strip()
+    if not cfg_key or not node or node in _NON_LEAF_AI_TARGETS or is_panel_info_node(node):
+        return None
+
+    cfg_path = config_file(paths)
+    if not cfg_path.exists():
+        return None
+    existing_cfg = read_config(paths)
+    if not isinstance(existing_cfg, dict):
+        return None
+
+    old_prefer = _clean_prefer_list(existing_cfg.get(cfg_key))
+    new_prefer = merge_manual_prefer(old_prefer, node)
+    if not new_prefer:
+        return None
+
+    changed = new_prefer != old_prefer
+    if changed:
+        merged = dict(existing_cfg)
+        merged[cfg_key] = new_prefer
+        rendered = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        atomic_write_text(cfg_path, rendered, mode=0o600)
+
+    order_path = (
+        ai_claude_order_file(paths)
+        if group_name == "AI-CLAUDE"
+        else (ai_gemini_order_file(paths) if group_name == "AI-GEMINI" else ai_manual_order_file(paths))
+    )
+    if order_path.exists():
+        try:
+            raw_ord = json.loads(order_path.read_text(encoding="utf-8"))
+            if isinstance(raw_ord, list) and raw_ord:
+                reordered = apply_prefer_order([str(x) for x in raw_ord if x], new_prefer)
+                if reordered != raw_ord:
+                    atomic_write_text(
+                        order_path,
+                        json.dumps(reordered, ensure_ascii=False) + "\n",
+                        mode=0o600,
+                    )
+        except Exception:
+            pass
+
+    if verge_dir is not None or bool(existing_cfg.get("verge-mode")):
+        try:
+            target_dir = verge_dir or discover_clash_verge_config().source_dir
+            if target_dir is not None and target_dir.is_dir():
+                inject_verge_global_script(target_dir, paths=paths)
+            export_verge_script(paths.config_dir / "clash-verge-script.js", paths=paths)
+        except Exception as exc:
+            logger.warning("sync manual prefer to Verge Script.js failed: %s", exc)
+
+    record_cproxy_fixed_selection(paths, group_name, node)
+    if changed:
+        try:
+            write_audit_event(
+                paths,
+                action="sync_manual_prefer",
+                target=group_name,
+                result="ok",
+                detail={"selected": node, "prefer": new_prefer},
+            )
+        except Exception:
+            pass
+    return new_prefer
+
+
+def sync_manual_verge_preferences(
+    paths: AppPaths,
+    api: APIBackend,
+    *,
+    verge_dir: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, list[str]]:
+    """检测用户在 Clash Verge GUI 手动点选的 AI 节点（mihomo `fixed` 变化），自动持久化到偏好与 Script.js。
+
+    严格区分：
+    - 首次观测：只建立基线，不改写 config.yaml；
+    - cproxy 自动切流（ai-watch / rebalance / 热重载恢复）：已由 `APIBackend.switch_group` 写入基线，不覆盖偏好；
+    - mihomo 被动 fallback：`fixed` 不变或为空，不覆盖偏好；
+    - 用户在 Verge GUI 手动点击新叶子：`fixed` 变化且不等于基线，自动写入 `ai-*-prefer` 并同步 `Script.js`。
+    """
+    from .ban import is_node_banned, load_active_bans
+    from .nodelist import is_panel_info_node
+
+    if not config_file(paths).exists():
+        return {}
+    try:
+        groups = api.get_groups()
+    except Exception:
+        return {}
+    if not isinstance(groups, dict):
+        return {}
+
+    state = _load_prefer_sync_state(paths)
+    synced_fixed: dict[str, str] = {
+        str(k): str(v) for k, v in (state.get("synced_fixed") or {}).items() if k and v
+    }
+    active_bans = load_active_bans(paths)
+    updated: dict[str, list[str]] = {}
+    state_dirty = False
+
+    for group_name in MANAGED_AI_PREFER_CONFIG_KEYS:
+        gobj = groups.get(group_name)
+        if gobj is None:
+            continue
+        live_fixed = str(getattr(gobj, "fixed", None) or "").strip()
+        live_current = str(getattr(gobj, "current", None) or "").strip()
+        known = synced_fixed.get(group_name)
+
+        if known is None:
+            baseline = live_fixed or (live_current if live_current and live_current != "-" else "")
+            if baseline:
+                synced_fixed[group_name] = baseline
+                state_dirty = True
+            continue
+
+        if not live_fixed or live_fixed == known:
+            continue
+
+        cand_entry = groups.get(live_fixed)
+        is_nested = bool(cand_entry is not None and getattr(cand_entry, "candidates", None))
+        is_valid_leaf = (
+            live_fixed in (gobj.candidates or ())
+            and live_fixed not in _NON_LEAF_AI_TARGETS
+            and not is_nested
+            and not is_panel_info_node(live_fixed)
+            and not (active_bans and is_node_banned(live_fixed, active_bans))
+            and not (group_name == "AI-CLAUDE" and is_claude_blocked(live_fixed, paths))
+            and not (group_name == "AI-GEMINI" and is_gemini_geo_blocked(live_fixed, paths))
+        )
+        if not is_valid_leaf:
+            synced_fixed[group_name] = live_fixed
+            state_dirty = True
+            continue
+
+        if dry_run:
+            from .nodelist import merge_manual_prefer
+
+            cfg = read_config(paths)
+            old_pref = _clean_prefer_list(cfg.get(MANAGED_AI_PREFER_CONFIG_KEYS[group_name])) if isinstance(cfg, dict) else []
+            updated[group_name] = merge_manual_prefer(old_pref, live_fixed)
+            continue
+
+        new_prefer = persist_manual_ai_prefer(paths, group_name, live_fixed, verge_dir=verge_dir)
+        synced_fixed[group_name] = live_fixed
+        state_dirty = True
+        if new_prefer:
+            updated[group_name] = new_prefer
+
+    if state_dirty and not dry_run:
+        state["synced_fixed"] = synced_fixed
+        state["updated_at"] = time.time()
+        _save_prefer_sync_state(paths, state)
+    return updated
 
 
 def _load_daemon_state(paths: AppPaths) -> dict[str, Any]:
@@ -885,6 +1115,10 @@ class VergeDaemonService:
         api = APIBackend(self.paths)
         idle_map = sample_connections_activity(self.paths, api, now=now)
         report.sampled_connections = len(idle_map)
+        try:
+            sync_manual_verge_preferences(self.paths, api, dry_run=dry_run)
+        except Exception:
+            pass
 
         watch_svc = AIWatchService(self.paths)
         try:
@@ -1008,6 +1242,7 @@ class VergeDaemonService:
         last_watch_ts = 0.0
         last_rebalance_ts = 0.0
         last_keepalive_mount_check_ts = 0.0
+        last_prefer_sync_ts = 0.0
         ticks = 0
         api = APIBackend(self.paths)
 
@@ -1035,6 +1270,12 @@ class VergeDaemonService:
                         else:
                             last_keepalive_error[0] = ""
                 idle_map = sample_connections_activity(self.paths, api, now=now)
+                if (now - last_prefer_sync_ts) >= 5.0:
+                    last_prefer_sync_ts = now
+                    try:
+                        sync_manual_verge_preferences(self.paths, api, dry_run=dry_run)
+                    except Exception:
+                        pass
                 if eff_keepalive and (now - last_keepalive_mount_check_ts) >= 60.0:
                     last_keepalive_mount_check_ts = now
                     try:

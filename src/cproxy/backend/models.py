@@ -12,6 +12,7 @@ class ProxyGroup:
     alive: bool | None = None
     delay: int | None = None
     source: str = "api"
+    fixed: str | None = None
 
 
 @dataclass(frozen=True)

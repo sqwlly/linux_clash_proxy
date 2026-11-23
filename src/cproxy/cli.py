@@ -605,7 +605,8 @@ def run(argv: list[str] | None = None) -> int:
                 ai_groups = service.get_ai_status_groups()
             return _render_ai_status(ai_groups, args.raw, args.json)
         if args.command == "switch":
-            service = QueryService(default_paths())
+            paths = default_paths()
+            service = QueryService(paths)
             path = _resolve_switch(service, args)
             root_group = path[0][0]
             snapshot = service.groups_snapshot
@@ -617,6 +618,20 @@ def run(argv: list[str] | None = None) -> int:
                 old_leaf = resolve_current_leaf(service.groups_snapshot, service.last_switch_from) or service.last_switch_from
             snapshot = service.groups_snapshot
             new_leaf = resolve_current_leaf(snapshot, root_group)
+            synced_prefer: list[str] | None = None
+            raw_target = path[-1][1] if path else ""
+            raw_target_entry = snapshot.get(raw_target) if snapshot else None
+            if (
+                root_group in ("AI-CLAUDE", "AI-MANUAL", "AI-GEMINI")
+                and new_leaf
+                and not (raw_target_entry is not None and raw_target_entry.candidates)
+            ):
+                try:
+                    from .services.verge import persist_manual_ai_prefer
+
+                    synced_prefer = persist_manual_ai_prefer(paths, root_group, new_leaf)
+                except Exception:
+                    synced_prefer = None
             old_selection = normalize_name(old_leaf) if old_leaf else None
             new_selection = normalize_name(new_leaf or group.current)
             delays = {name: item.delay for name, item in snapshot.items() if item.delay is not None}
@@ -632,6 +647,15 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"  ({_delay_label(new_delay)})")
             else:
                 print()
+            if synced_prefer:
+                from .services.nodelist import normalize_prefer_region_code
+
+                reg_hint = next(
+                    (tok for tok in synced_prefer[1:2] if normalize_prefer_region_code(tok) is not None),
+                    "",
+                )
+                suffix = f"（{reg_hint} 同区优先兜底）" if reg_hint else ""
+                print(f"偏好同步: 已记住 {new_selection}{suffix}")
             return 0
         if args.command == "probe-stable-node":
             probe_report = ProbeService(default_paths()).probe(

@@ -656,3 +656,112 @@ def test_ai_claude_prefer_region_and_node_order_end_to_end(tmp_path: Path, monke
             "🇹🇼 Taiwan 03",
             "🇯🇵 Japan 5X",
         ]
+
+
+def test_manual_verge_click_auto_syncs_prefer_without_clobbering_auto_failover(tmp_path: Path):
+    from cproxy.services.nodelist import merge_manual_prefer
+    from cproxy.services.verge import (
+        record_cproxy_fixed_selection,
+        sync_manual_verge_preferences,
+    )
+
+    base = ["🇯🇵 Japan 01", "JP", "🇸🇬 Singapore 01", "SG", "🇺🇸 United States 02", "US"]
+    # 跨区点击：新节点 + 同地区码置顶，保留原跨区灾备
+    assert merge_manual_prefer(base, "🇺🇸 United States 02") == [
+        "🇺🇸 United States 02",
+        "US",
+        "🇯🇵 Japan 01",
+        "JP",
+        "🇸🇬 Singapore 01",
+        "SG",
+    ]
+    # 同区点击：替换同区旧精确钉选，不堆积冗余条目
+    assert merge_manual_prefer(base, "🇯🇵 Japan 03") == [
+        "🇯🇵 Japan 03",
+        "JP",
+        "🇸🇬 Singapore 01",
+        "SG",
+        "🇺🇸 United States 02",
+        "US",
+    ]
+    assert merge_manual_prefer([], "🇯🇵 Japan 01") == ["🇯🇵 Japan 01", "JP"]
+
+    paths = _make_paths(tmp_path)
+    verge_dir = tmp_path / "verge"
+    (verge_dir / "profiles").mkdir(parents=True, exist_ok=True)
+    config_file(paths).write_text(
+        yaml.safe_dump(
+            {
+                "mixed-port": 7897,
+                "verge-mode": True,
+                "ai-claude-prefer": base,
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    ai_claude_order_file(paths).write_text(
+        json.dumps(["🇯🇵 Japan 01", "🇯🇵 Japan 03", "🇸🇬 Singapore 01", "🇺🇸 United States 02", "🇺🇸 United States 04"]),
+        encoding="utf-8",
+    )
+
+    state_box = {"now": "🇯🇵 Japan 01", "fixed": "🇯🇵 Japan 01"}
+
+    def _make_api():
+        return SimpleNamespace(
+            get_groups=lambda: {
+                "AI-CLAUDE": ProxyGroup(
+                    "AI-CLAUDE",
+                    "Fallback",
+                    state_box["now"],
+                    ["🇯🇵 Japan 01", "🇯🇵 Japan 03", "🇸🇬 Singapore 01", "🇺🇸 United States 02", "🇺🇸 United States 04"],
+                    fixed=state_box["fixed"],
+                ),
+                "🇯🇵 Japan 01": ProxyGroup("🇯🇵 Japan 01", "AnyTLS", "-", [], alive=True, delay=88),
+                "🇯🇵 Japan 03": ProxyGroup("🇯🇵 Japan 03", "AnyTLS", "-", [], alive=True, delay=105),
+                "🇸🇬 Singapore 01": ProxyGroup("🇸🇬 Singapore 01", "AnyTLS", "-", [], alive=True, delay=85),
+                "🇺🇸 United States 02": ProxyGroup("🇺🇸 United States 02", "AnyTLS", "-", [], alive=True, delay=195),
+                "🇺🇸 United States 04": ProxyGroup("🇺🇸 United States 04", "AnyTLS", "-", [], alive=True, delay=210),
+            }
+        )
+
+    api = _make_api()
+
+    # 1. 首次观测仅建基线，不改动 config.yaml
+    assert sync_manual_verge_preferences(paths, api, verge_dir=verge_dir) == {}
+    assert yaml.safe_load(config_file(paths).read_text(encoding="utf-8"))["ai-claude-prefer"] == base
+
+    # 2. 模拟用户在 Clash Verge GUI 直接点选 🇺🇸 United States 02 -> 自动持久化到 config.yaml、order 与 Script.js
+    state_box["now"] = "🇺🇸 United States 02"
+    state_box["fixed"] = "🇺🇸 United States 02"
+    res = sync_manual_verge_preferences(paths, api, verge_dir=verge_dir)
+    expected_us = ["🇺🇸 United States 02", "US", "🇯🇵 Japan 01", "JP", "🇸🇬 Singapore 01", "SG"]
+    assert res == {"AI-CLAUDE": expected_us}
+    assert yaml.safe_load(config_file(paths).read_text(encoding="utf-8"))["ai-claude-prefer"] == expected_us
+    assert json.loads(ai_claude_order_file(paths).read_text(encoding="utf-8"))[:2] == [
+        "🇺🇸 United States 02",
+        "🇺🇸 United States 04",
+    ]
+    script_text = (verge_dir / "profiles" / "Script.js").read_text(encoding="utf-8")
+    assert 'const AI_CLAUDE_PREFER = ["🇺🇸 United States 02", "US", "🇯🇵 Japan 01", "JP", "🇸🇬 Singapore 01", "SG"];' in script_text
+
+    # 3. 模拟 cproxy ai-watch/rebalance 自动故障转移（APIBackend.switch_group 先记账）-> 不覆盖用户偏好
+    record_cproxy_fixed_selection(paths, "AI-CLAUDE", "🇺🇸 United States 04")
+    state_box["now"] = "🇺🇸 United States 04"
+    state_box["fixed"] = "🇺🇸 United States 04"
+    assert sync_manual_verge_preferences(paths, api, verge_dir=verge_dir) == {}
+    assert yaml.safe_load(config_file(paths).read_text(encoding="utf-8"))["ai-claude-prefer"] == expected_us
+
+    # 4. 模拟 mihomo 被动 fallback（仅 now 变化，fixed 不变或为空）-> 不覆盖用户偏好
+    state_box["now"] = "🇸🇬 Singapore 01"
+    state_box["fixed"] = None
+    assert sync_manual_verge_preferences(paths, api, verge_dir=verge_dir) == {}
+    assert yaml.safe_load(config_file(paths).read_text(encoding="utf-8"))["ai-claude-prefer"] == expected_us
+
+    # 5. 模拟点选被 403 隔离的节点 -> 忽略，不污染 config.yaml
+    probe_mod.record_claude_blocked_node(paths, "🇯🇵 Japan 03")
+    state_box["now"] = "🇯🇵 Japan 03"
+    state_box["fixed"] = "🇯🇵 Japan 03"
+    assert sync_manual_verge_preferences(paths, api, verge_dir=verge_dir) == {}
+    assert yaml.safe_load(config_file(paths).read_text(encoding="utf-8"))["ai-claude-prefer"] == expected_us

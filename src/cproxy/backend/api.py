@@ -331,6 +331,8 @@ class APIBackend:
         history = payload.get("history") or []
         alive = payload.get("alive")
         delay = _latest_history_delay(history, alive=alive)
+        raw_fixed = payload.get("fixed")
+        fixed = str(raw_fixed).strip() or None if raw_fixed else None
         return ProxyGroup(
             name=name,
             type=str(payload.get("type", "")),
@@ -339,6 +341,7 @@ class APIBackend:
             alive=alive,
             delay=delay,
             source="api",
+            fixed=fixed,
         )
 
     def get_delays(self, *, request_timeout: float | None = None) -> dict[str, int]:
@@ -500,6 +503,14 @@ class APIBackend:
 
     def switch_group(self, group_name: str, target_name: str) -> None:
         self.request("PUT", f"/proxies/{quote(group_name, safe='')}", {"name": target_name})
+        if group_name in ("AI-MANUAL", "AI-GEMINI", "AI-CLAUDE") and target_name:
+            try:
+                from ..services.verge import record_cproxy_fixed_selection
+
+                if self.paths.state_dir.is_dir():
+                    record_cproxy_fixed_selection(self.paths, group_name, target_name)
+            except Exception:
+                pass
 
     def delay_test(self, target_name: str, url: str, timeout: int, *, request_timeout: float | None = None) -> dict[str, Any]:
         query = urlencode({"url": url, "timeout": timeout})

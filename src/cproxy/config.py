@@ -173,6 +173,11 @@ def verge_daemon_state_file(paths: AppPaths) -> Path:
     return paths.state_dir / "verge-daemon.json"
 
 
+def ai_prefer_sync_file(paths: AppPaths) -> Path:
+    """记录最近一次由 cproxy 自身或已同步的 AI 策略组 fixed 节点，用于区分 Verge GUI 手动点选与自动切流。"""
+    return paths.state_dir / "ai-prefer-sync.json"
+
+
 def load_yaml_file(path: Path) -> Any:
     """读 YAML。文件不存在返回 None。按路径 + (mtime_ns, size, sha256) 缓存，写入后自动失效。"""
     try:

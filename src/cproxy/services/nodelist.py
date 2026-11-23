@@ -203,6 +203,40 @@ def apply_prefer_order(nodes: list[str], prefer: list | tuple | None) -> list[st
     return sorted(nodes, key=lambda n: prefer_rank_for_node(str(n), items))
 
 
+def merge_manual_prefer(existing: list | tuple | None, selected_node: str) -> list[str]:
+    """将用户手动选中的节点及其所属地区置顶合并到偏好列表，同时保留既有跨区灾备顺位。
+
+    示例：原列表 `["🇯🇵 Japan 01", "JP", "🇸🇬 Singapore 01", "SG"]`
+    - 跨区点击 `🇺🇸 United States 02` -> `["🇺🇸 United States 02", "US", "🇯🇵 Japan 01", "JP", "🇸🇬 Singapore 01", "SG"]`
+    - 同区点击 `🇯🇵 Japan 03` -> `["🇯🇵 Japan 03", "JP", "🇸🇬 Singapore 01", "SG"]`（同区旧精确钉选由 JP 覆盖，避免列表膨胀）
+    """
+    node = str(selected_node or "").strip()
+    if not node:
+        return [str(item).strip() for item in (existing or []) if item is not None and str(item).strip()]
+    sel_region = match_region(node)
+    has_region = sel_region not in ("OTHER", "HK", "CN") and normalize_prefer_region_code(sel_region) is not None
+    result: list[str] = [node]
+    if has_region:
+        result.append(sel_region)
+    seen = set(result)
+    for raw in existing or []:
+        token = str(raw or "").strip()
+        if not token or token in seen:
+            continue
+        tok_reg = normalize_prefer_region_code(token)
+        if tok_reg is not None:
+            if has_region and tok_reg == sel_region:
+                continue
+            result.append(tok_reg)
+            seen.add(tok_reg)
+            continue
+        if has_region and match_region(token) == sel_region:
+            continue
+        result.append(token)
+        seen.add(token)
+    return result
+
+
 def _parse_host_port(hostport: str, uri: str) -> tuple[str, int]:
     text = hostport.strip()
     if text.startswith("["):
